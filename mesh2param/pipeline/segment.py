@@ -1,0 +1,459 @@
+"""Stage 2: Surface Segmentation.
+
+Clusters mesh faces into regions belonging to a single analytic surface type
+using region-growing with normal clustering, followed by curvature-based
+classification.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+
+import numpy as np
+from scipy.spatial import cKDTree
+from sklearn.cluster import KMeans
+
+from mesh2param.config import SegmentConfig
+from mesh2param.models.mesh import CleanedMesh
+from mesh2param.models.region import FaceRegion, SurfaceType
+
+logger = logging.getLogger(__name__)
+
+
+def segment_mesh(
+    cleaned: CleanedMesh,
+    config: SegmentConfig | None = None,
+) -> list[FaceRegion]:
+    """Segment a cleaned mesh into surface regions.
+
+    Args:
+        cleaned: Output of Stage 1 (Mesh Ingestion & Cleanup).
+        config: Segmentation configuration. Uses defaults if None.
+
+    Returns:
+        List of FaceRegion objects, each containing face indices
+        and a preliminary surface type label.
+    """
+    if config is None:
+        config = SegmentConfig()
+
+    adjacency = _build_face_adjacency(cleaned.faces)
+    labels = _region_growing(cleaned.normals, adjacency, config)
+    labels = _merge_small_regions(labels, adjacency, cleaned.normals, config.min_region_faces)
+    labels = _curvature_split(labels, cleaned, adjacency, config)
+
+    regions = _build_regions(labels, cleaned, adjacency)
+    logger.info("Segmented mesh into %d regions", len(regions))
+    return regions
+
+
+def _build_face_adjacency(faces: np.ndarray) -> dict[int, set[int]]:
+    """Build face-face adjacency from shared edges.
+
+    Two faces are adjacent if they share exactly two vertices (an edge).
+    """
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge = (min(v0, v1), max(v0, v1))
+            edge_to_faces[edge].append(fi)
+
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for edge, face_list in edge_to_faces.items():
+        for i in range(len(face_list)):
+            for j in range(i + 1, len(face_list)):
+                adjacency[face_list[i]].add(face_list[j])
+                adjacency[face_list[j]].add(face_list[i])
+
+    # Ensure every face has an entry even if isolated
+    for fi in range(len(faces)):
+        if fi not in adjacency:
+            adjacency[fi] = set()
+
+    return dict(adjacency)
+
+
+def _region_growing(
+    normals: np.ndarray,
+    adjacency: dict[int, set[int]],
+    config: SegmentConfig,
+) -> np.ndarray:
+    """Assign each face to a region via flood-fill on normal similarity.
+
+    Seeds are chosen as the face with the most unassigned neighbors.
+    Growing uses an adaptive angle threshold: tight for planar regions,
+    looser for curved surfaces.
+    """
+    n_faces = len(normals)
+    labels = np.full(n_faces, -1, dtype=np.int64)
+    assigned = np.zeros(n_faces, dtype=bool)
+
+    plane_thresh = np.cos(np.radians(config.plane_angle_threshold_deg))
+    curved_thresh = np.cos(np.radians(config.curved_angle_threshold_deg))
+
+    region_id = 0
+
+    while not assigned.all():
+        # Pick seed: unassigned face with the most unassigned neighbors
+        seed = _pick_seed(assigned, adjacency)
+        if seed is None:
+            break
+
+        # Flood-fill from seed
+        queue = [seed]
+        labels[seed] = region_id
+        assigned[seed] = True
+        region_normals = [normals[seed]]
+
+        while queue:
+            current = queue.pop(0)
+            for neighbor in adjacency.get(current, set()):
+                if assigned[neighbor]:
+                    continue
+
+                # Adaptive threshold: use the running average normal of the
+                # region so far to decide the threshold. If the region average
+                # normal is very consistent (low spread), use the tight planar
+                # threshold; otherwise use the curved threshold.
+                avg_normal = np.mean(region_normals, axis=0)
+                avg_normal /= np.linalg.norm(avg_normal) + 1e-15
+
+                # Similarity of the candidate face to the region average
+                dot = np.dot(normals[neighbor], avg_normal)
+
+                # Similarity of the candidate to its specific neighbor in the queue
+                dot_local = np.dot(normals[neighbor], normals[current])
+
+                # Use the stricter planar threshold for the global check,
+                # but also accept if the local neighbor-to-neighbor angle is
+                # within the curved threshold
+                if dot >= plane_thresh or dot_local >= curved_thresh:
+                    labels[neighbor] = region_id
+                    assigned[neighbor] = True
+                    queue.append(neighbor)
+                    region_normals.append(normals[neighbor])
+
+        region_id += 1
+
+    return labels
+
+
+def _pick_seed(assigned: np.ndarray, adjacency: dict[int, set[int]]) -> int | None:
+    """Pick the unassigned face with the most unassigned neighbors."""
+    unassigned = np.where(~assigned)[0]
+    if len(unassigned) == 0:
+        return None
+
+    best = unassigned[0]
+    best_count = -1
+    for fi in unassigned:
+        count = sum(1 for n in adjacency.get(fi, set()) if not assigned[n])
+        if count > best_count:
+            best_count = count
+            best = fi
+
+    return int(best)
+
+
+def _merge_small_regions(
+    labels: np.ndarray,
+    adjacency: dict[int, set[int]],
+    normals: np.ndarray,
+    min_faces: int,
+) -> np.ndarray:
+    """Merge regions with fewer than min_faces into the most similar neighbor."""
+    labels = labels.copy()
+    changed = True
+
+    while changed:
+        changed = False
+        unique_labels, counts = np.unique(labels, return_counts=True)
+
+        for label, count in zip(unique_labels, counts):
+            if label < 0 or count >= min_faces:
+                continue
+
+            face_mask = labels == label
+            region_faces = np.where(face_mask)[0]
+            avg_normal = normals[face_mask].mean(axis=0)
+            norm_len = np.linalg.norm(avg_normal)
+            if norm_len > 1e-15:
+                avg_normal /= norm_len
+
+            # Find neighboring regions
+            neighbor_labels: dict[int, float] = {}
+            for fi in region_faces:
+                for ni in adjacency.get(fi, set()):
+                    nl = labels[ni]
+                    if nl != label and nl >= 0:
+                        if nl not in neighbor_labels:
+                            nl_mask = labels == nl
+                            nl_avg = normals[nl_mask].mean(axis=0)
+                            nl_norm = np.linalg.norm(nl_avg)
+                            if nl_norm > 1e-15:
+                                nl_avg /= nl_norm
+                            neighbor_labels[nl] = float(np.dot(avg_normal, nl_avg))
+
+            if not neighbor_labels:
+                continue
+
+            # Merge into the neighbor with the most similar normal,
+            # but only if the similarity exceeds a minimum threshold.
+            # Without this, distinct planar faces (e.g., box sides at 90°)
+            # would cascade-merge into a single region.
+            best_neighbor = max(neighbor_labels, key=neighbor_labels.get)
+            merge_similarity_threshold = np.cos(np.radians(45.0))
+            if neighbor_labels[best_neighbor] >= merge_similarity_threshold:
+                labels[face_mask] = best_neighbor
+                changed = True
+
+    # Renumber labels to be contiguous 0..N-1
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+
+    return labels
+
+
+def _curvature_split(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+    config: SegmentConfig,
+) -> np.ndarray:
+    """Split regions with high curvature variance using k-means on (normal, curvature)."""
+    labels = labels.copy()
+    vertex_curvatures = _estimate_vertex_curvatures(cleaned)
+    face_curvatures = _vertex_to_face_curvatures(vertex_curvatures, cleaned.faces)
+
+    next_label = int(labels.max()) + 1
+    unique_labels = np.unique(labels)
+
+    for label in unique_labels:
+        mask = labels == label
+        count = int(mask.sum())
+        if count < config.min_region_faces * 2:
+            # Too small to meaningfully split
+            continue
+
+        region_curvatures = face_curvatures[mask]
+        curv_var = float(np.var(region_curvatures))
+
+        if curv_var < config.curvature_variance_threshold:
+            continue
+
+        # Build feature vectors: (nx, ny, nz, curvature)
+        region_normals = cleaned.normals[mask]
+        features = np.column_stack([region_normals, region_curvatures])
+
+        # Try 2 to max_clusters and pick the best silhouette
+        region_indices = np.where(mask)[0]
+        best_k = _find_best_k(features, config.max_kmeans_clusters)
+
+        if best_k <= 1:
+            continue
+
+        km = KMeans(n_clusters=best_k, n_init=5, random_state=42)
+        sub_labels = km.fit_predict(features)
+
+        # Assign new labels
+        for k in range(best_k):
+            sub_mask = sub_labels == k
+            if k == 0:
+                # Keep the original label for cluster 0
+                pass
+            else:
+                labels[region_indices[sub_mask]] = next_label
+                next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+
+    return labels
+
+
+def _find_best_k(features: np.ndarray, max_k: int) -> int:
+    """Pick the best number of clusters using inertia elbow heuristic."""
+    n_samples = len(features)
+    max_k = min(max_k, n_samples)
+    if max_k < 2:
+        return 1
+
+    inertias = []
+    for k in range(1, max_k + 1):
+        km = KMeans(n_clusters=k, n_init=5, random_state=42)
+        km.fit(features)
+        inertias.append(km.inertia_)
+
+    if len(inertias) < 2:
+        return 1
+
+    # Simple elbow: find the k where the relative drop in inertia becomes small
+    for i in range(1, len(inertias)):
+        if inertias[i - 1] < 1e-15:
+            return i
+        relative_drop = (inertias[i - 1] - inertias[i]) / inertias[i - 1]
+        if relative_drop < 0.3:
+            return i
+
+    return max_k
+
+
+def _estimate_vertex_curvatures(cleaned: CleanedMesh) -> np.ndarray:
+    """Estimate discrete mean curvature per vertex using the angle deficit method.
+
+    For each vertex, the curvature is approximated by:
+        H ≈ (2π - sum_of_angles_at_vertex) / mixed_area
+
+    This is a simplified version — returns absolute curvature magnitude per vertex.
+    """
+    n_verts = len(cleaned.vertices)
+    angle_sums = np.zeros(n_verts, dtype=np.float64)
+    areas = np.zeros(n_verts, dtype=np.float64)
+
+    for face in cleaned.faces:
+        v0, v1, v2 = cleaned.vertices[face[0]], cleaned.vertices[face[1]], cleaned.vertices[face[2]]
+
+        # Edges
+        e01 = v1 - v0
+        e02 = v2 - v0
+        e12 = v2 - v1
+
+        # Angles at each vertex of the triangle
+        def _angle(a: np.ndarray, b: np.ndarray) -> float:
+            cos_a = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-15)
+            return float(np.arccos(np.clip(cos_a, -1, 1)))
+
+        a0 = _angle(e01, e02)
+        a1 = _angle(-e01, e12)
+        a2 = _angle(-e02, -e12)
+
+        angle_sums[face[0]] += a0
+        angle_sums[face[1]] += a1
+        angle_sums[face[2]] += a2
+
+        # Triangle area contribution (1/3 of face area to each vertex)
+        face_area = 0.5 * np.linalg.norm(np.cross(e01, e02))
+        for vi in face:
+            areas[vi] += face_area / 3.0
+
+    # Gaussian curvature via angle deficit
+    gauss_curvature = np.zeros(n_verts, dtype=np.float64)
+    valid = areas > 1e-15
+    gauss_curvature[valid] = (2.0 * np.pi - angle_sums[valid]) / areas[valid]
+
+    return np.abs(gauss_curvature)
+
+
+def _vertex_to_face_curvatures(
+    vertex_curvatures: np.ndarray, faces: np.ndarray
+) -> np.ndarray:
+    """Average vertex curvatures to get a per-face curvature estimate."""
+    return vertex_curvatures[faces].mean(axis=1)
+
+
+def _classify_surface_type(
+    normals: np.ndarray, curvatures: np.ndarray
+) -> SurfaceType:
+    """Classify a region based on its curvature and normal statistics.
+
+    - Near-zero mean curvature → PLANE
+    - Constant positive curvature in one direction → CYLINDER
+    - Linearly varying curvature → CONE
+    - Constant curvature in both directions → SPHERE
+    """
+    mean_curv = float(np.mean(curvatures))
+    std_curv = float(np.std(curvatures))
+
+    # Normal spread: if normals are tightly clustered → planar
+    avg_normal = normals.mean(axis=0)
+    norm = np.linalg.norm(avg_normal)
+    if norm > 1e-15:
+        avg_normal /= norm
+    dots = normals @ avg_normal
+    normal_spread = float(1.0 - np.mean(dots))
+
+    # Thresholds (empirically chosen for prismatic parts)
+    if normal_spread < 0.01 and mean_curv < 0.5:
+        return SurfaceType.PLANE
+
+    if mean_curv < 0.1:
+        # Low curvature but some normal variation → could still be a large-radius cylinder
+        # or a near-planar face. Default to PLANE for very low spread.
+        if normal_spread < 0.05:
+            return SurfaceType.PLANE
+
+    if std_curv / (mean_curv + 1e-15) < 0.5:
+        # Relatively uniform curvature
+        if normal_spread < 0.5:
+            return SurfaceType.CYLINDER
+        else:
+            return SurfaceType.SPHERE
+
+    if std_curv / (mean_curv + 1e-15) < 1.0:
+        return SurfaceType.CONE
+
+    return SurfaceType.UNKNOWN
+
+
+def _find_boundary_edges(
+    face_indices: np.ndarray, faces: np.ndarray
+) -> list[tuple[int, int]]:
+    """Find edges that border exactly one face in the region (boundary edges)."""
+    face_set = set(face_indices.tolist())
+    edge_count: dict[tuple[int, int], int] = defaultdict(int)
+
+    for fi in face_indices:
+        face = faces[fi]
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge = (min(v0, v1), max(v0, v1))
+            edge_count[edge] += 1
+
+    # Boundary edges appear exactly once within the region
+    return [(v0, v1) for (v0, v1), count in edge_count.items() if count == 1]
+
+
+def _build_regions(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> list[FaceRegion]:
+    """Convert label array into a list of FaceRegion objects."""
+    vertex_curvatures = _estimate_vertex_curvatures(cleaned)
+    face_curvatures = _vertex_to_face_curvatures(vertex_curvatures, cleaned.faces)
+
+    regions = []
+    for region_id in range(int(labels.max()) + 1):
+        mask = labels == region_id
+        face_indices = np.where(mask)[0]
+
+        if len(face_indices) == 0:
+            continue
+
+        region_normals = cleaned.normals[face_indices]
+        region_curvatures = face_curvatures[face_indices]
+
+        # Get unique vertices for this region
+        region_vertex_indices = np.unique(cleaned.faces[face_indices].ravel())
+        region_vertices = cleaned.vertices[region_vertex_indices]
+
+        surface_type = _classify_surface_type(region_normals, region_curvatures)
+        boundary_edges = _find_boundary_edges(face_indices, cleaned.faces)
+
+        regions.append(
+            FaceRegion(
+                region_id=region_id,
+                face_indices=face_indices,
+                surface_type=surface_type,
+                vertices=region_vertices,
+                normals=region_normals,
+                boundary_edges=boundary_edges,
+            )
+        )
+
+    return regions

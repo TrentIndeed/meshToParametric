@@ -41,6 +41,11 @@ def segment_mesh(
     adjacency = _build_face_adjacency(cleaned.faces)
     labels = _region_growing(cleaned.normals, adjacency, config)
     labels = _merge_small_regions(labels, adjacency, cleaned.normals, config.min_region_faces)
+    labels = _split_flat_from_curved(labels, cleaned.normals, adjacency)
+    # Use a smaller min_faces for the post-split merge so that small flat
+    # strips (e.g. 2-4 face plane regions between cylinder holes) don't get
+    # re-absorbed into the adjacent cylinder region they were just split from.
+    labels = _merge_small_regions(labels, adjacency, cleaned.normals, min(config.min_region_faces, 2))
     labels = _curvature_split(labels, cleaned, adjacency, config)
 
     regions = _build_regions(labels, cleaned, adjacency)
@@ -217,6 +222,92 @@ def _merge_small_regions(
     return labels
 
 
+def _split_flat_from_curved(
+    labels: np.ndarray,
+    normals: np.ndarray,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Split regions that contain both flat and curved faces.
+
+    Region growing may merge flat side faces into adjacent cylinder regions
+    because the face-to-face angle between the last cylinder face and the
+    first flat face is within the curved threshold. This post-processing step
+    detects such mixed regions and separates the flat faces into their own
+    connected components.
+
+    A face is considered "flat" if its normal is closely aligned with a
+    principal axis (within ~8°). Flat faces that form a connected component
+    within the region are split out.
+    """
+    labels = labels.copy()
+    next_label = int(labels.max()) + 1
+    unique_labels = np.unique(labels)
+
+    for label in unique_labels:
+        mask = labels == label
+        face_indices = np.where(mask)[0]
+        if len(face_indices) < 4:
+            continue
+
+        # Check normal spread — only process regions with mixed normals
+        region_normals = normals[face_indices]
+        avg_n = region_normals.mean(axis=0)
+        avg_norm = np.linalg.norm(avg_n)
+        if avg_norm > 0.95:
+            # Already a tight planar cluster — skip
+            continue
+
+        # Classify each face as flat or curved
+        # A face is flat if its normal is within ~15° of a principal axis
+        axis_threshold = np.cos(np.radians(15.0))
+        is_flat = np.max(np.abs(region_normals), axis=1) >= axis_threshold
+
+        n_flat = int(is_flat.sum())
+        n_curved = len(face_indices) - n_flat
+        if n_flat == 0 or n_curved == 0:
+            # All flat or all curved — no split needed
+            continue
+
+        # Find connected components of flat faces within this region
+        flat_faces = set(face_indices[is_flat].tolist())
+        visited = set()
+
+        for start in flat_faces:
+            if start in visited:
+                continue
+            # BFS to find connected flat component
+            component = []
+            queue = [start]
+            while queue:
+                fi = queue.pop(0)
+                if fi in visited:
+                    continue
+                visited.add(fi)
+                component.append(fi)
+                for ni in adjacency.get(fi, set()):
+                    if ni in flat_faces and ni not in visited:
+                        queue.append(ni)
+
+            if len(component) >= 2:
+                # Split this flat component into its own region, but only
+                # if the flat faces share a similar normal direction
+                comp_normals = normals[component]
+                comp_avg = comp_normals.mean(axis=0)
+                comp_norm = np.linalg.norm(comp_avg)
+                if comp_norm > 0.9:
+                    # Reasonably tight cluster — split it out
+                    for fi in component:
+                        labels[fi] = next_label
+                    next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+
+    return labels
+
+
 def _curvature_split(
     labels: np.ndarray,
     cleaned: CleanedMesh,
@@ -362,9 +453,9 @@ def _classify_surface_type(
     """Classify a region based on its curvature and normal statistics.
 
     - Near-zero mean curvature → PLANE
-    - Constant positive curvature in one direction → CYLINDER
+    - Normals spread in a ring (1 small SVD value) → CYLINDER
     - Linearly varying curvature → CONE
-    - Constant curvature in both directions → SPHERE
+    - Normals spread in all 3D directions → SPHERE
     """
     mean_curv = float(np.mean(curvatures))
     std_curv = float(np.std(curvatures))
@@ -382,20 +473,36 @@ def _classify_surface_type(
         return SurfaceType.PLANE
 
     if mean_curv < 0.1:
-        # Low curvature but some normal variation → could still be a large-radius cylinder
-        # or a near-planar face. Default to PLANE for very low spread.
-        if normal_spread < 0.05:
+        if normal_spread < 0.1:
             return SurfaceType.PLANE
+
+    # Use SVD on normals to distinguish cylinder vs sphere.
+    # Cylinder normals lie in a plane (perpendicular to the axis),
+    # so SVD of centered normals will have one near-zero singular value.
+    # Sphere normals spread in all 3 directions.
+    if len(normals) >= 3:
+        centered_n = normals - normals.mean(axis=0)
+        _, s_vals, _ = np.linalg.svd(centered_n, full_matrices=False)
+        s_vals = s_vals / (s_vals[0] + 1e-15)  # normalize
+        # If smallest singular value is small relative to the largest,
+        # normals are roughly coplanar → cylinder
+        is_coplanar = s_vals[2] < 0.2
+    else:
+        is_coplanar = True
 
     if std_curv / (mean_curv + 1e-15) < 0.5:
         # Relatively uniform curvature
-        if normal_spread < 0.5:
+        if is_coplanar:
             return SurfaceType.CYLINDER
         else:
             return SurfaceType.SPHERE
 
     if std_curv / (mean_curv + 1e-15) < 1.0:
         return SurfaceType.CONE
+
+    # High curvature variance — try SVD-based classification
+    if is_coplanar:
+        return SurfaceType.CYLINDER
 
     return SurfaceType.UNKNOWN
 

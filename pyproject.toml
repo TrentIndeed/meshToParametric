@@ -33,6 +33,10 @@ include = ["mesh2param*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "visual: tests that generate visualization output",
+    "slow: tests that take > 10s (e.g. Onshape API)",
+]
 
 [tool.ruff]
 line-length = 100

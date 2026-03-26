@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mesh2param Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0F172A;
+            color: #E2E8F0;
+            font-family: 'JetBrains Mono', 'SF Mono', monospace;
+            overflow: hidden;
+        }
+        #header {
+            position: fixed; top: 0; left: 0; right: 0;
+            padding: 12px 24px;
+            background: #0F172A;
+            border-bottom: 1px solid #1E293B;
+            z-index: 10;
+            display: flex; align-items: center; gap: 12px;
+        }
+        #header .dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #22C55E; box-shadow: 0 0 6px #22C55E88;
+        }
+        #header h1 { font-size: 14px; font-weight: 700; }
+        #header .subtitle { color: #475569; font-size: 11px; }
+        #canvas-container {
+            position: fixed; top: 48px; left: 0; right: 0; bottom: 0;
+        }
+        #info {
+            position: fixed; bottom: 16px; left: 16px;
+            background: #111827; border: 1px solid #1E293B;
+            border-radius: 8px; padding: 12px 16px;
+            font-size: 11px; color: #94A3B8;
+            max-width: 300px;
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <div class="dot"></div>
+        <h1>MESH2PARAM</h1>
+        <span class="subtitle">Three.js Viewer</span>
+    </div>
+    <div id="canvas-container"></div>
+    <div id="info">
+        Orbit: Left click + drag<br>
+        Pan: Right click + drag<br>
+        Zoom: Scroll wheel<br>
+        <br>
+        Load a model: <code>/?model=path/to/model.glb</code>
+    </div>
+    <script src="viewer.js" type="module"></script>
+</body>
+</html>

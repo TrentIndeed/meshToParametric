@@ -17,7 +17,7 @@ from mesh2param.models.mesh import CleanedMesh
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = {".stl", ".obj", ".ply"}
+SUPPORTED_EXTENSIONS = {".stl", ".obj", ".ply", ".3mf"}
 
 
 def ingest_mesh(
@@ -71,7 +71,21 @@ def _validate_file(path: Path) -> None:
 
 
 def _load_mesh(path: Path) -> trimesh.Trimesh:
-    loaded = trimesh.load(str(path), force="mesh")
+    loaded = trimesh.load(str(path))
+
+    # 3MF and some formats return a Scene; extract the first mesh geometry
+    if isinstance(loaded, trimesh.Scene):
+        meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            raise ValueError("Scene contains no triangle meshes.")
+        loaded = meshes[0]
+        if len(meshes) > 1:
+            logger.warning(
+                "Scene contains %d meshes; using the first one ('%s')",
+                len(meshes),
+                next(iter(loaded.metadata.get("name", "unnamed")), "unnamed"),
+            )
+
     if not isinstance(loaded, trimesh.Trimesh):
         raise ValueError(
             f"File did not produce a single triangle mesh. "

@@ -40,7 +40,7 @@ examples/      — sample STL files and expected outputs
 ## Pipeline Stages
 1. **Mesh Ingestion & Cleanup** (IMPLEMENTED) — load, repair, remesh → `CleanedMesh`
 2. **Surface Segmentation** (IMPLEMENTED) — region-growing with normal clustering, curvature-based splitting, surface type classification → `FaceRegion` list
-3. **Primitive Fitting** — RANSAC + least-squares for plane/cylinder/cone/sphere → `FittedSurface` list
+3. **Primitive Fitting** (IMPLEMENTED) — RANSAC + least-squares for plane/cylinder/cone/sphere → `FittedSurface` list
 4. **Topology & Edge Classification** — adjacency graph, fillet/chamfer/sharp edge detection → `SurfaceGraph`
 5. **Feature Recognition** — rule-based pattern matching → ordered `Feature` list
 6. **Onshape Export** — sequential feature creation via Onshape REST API v6

@@ -1,0 +1,42 @@
+/* Dark theme for pytest-html reports matching viz renders */
+body {
+    background: #0F172A;
+    color: #E2E8F0;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+}
+h1, h2, h3 {
+    color: #F1F5F9;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+th {
+    background: #1E293B;
+    color: #94A3B8;
+    padding: 8px 12px;
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+td {
+    padding: 8px 12px;
+    border-bottom: 1px solid #1E293B;
+    font-size: 13px;
+}
+tr:hover {
+    background: #111827;
+}
+.passed {
+    color: #22C55E;
+}
+.failed {
+    color: #EF4444;
+}
+.skipped {
+    color: #F59E0B;
+}
+a {
+    color: #60A5FA;
+}

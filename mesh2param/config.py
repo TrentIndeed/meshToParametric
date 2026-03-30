@@ -30,3 +30,12 @@ class FitConfig(BaseModel):
     snap_tolerance: float = 0.05  # snap params to round values within this abs tolerance
     axis_snap_angle_deg: float = 2.0  # snap axis to principal axis if within this angle
     try_alternative_types: bool = True  # retry with other surface types if RMS too high
+
+
+class TopologyConfig(BaseModel):
+    """Configuration for Stage 4: Topology & Edge Classification."""
+
+    sharp_angle_threshold_deg: float = 160.0  # dihedral below this → SHARP
+    smooth_angle_threshold_deg: float = 175.0  # dihedral above this → SMOOTH
+    fillet_radius_ratio: float = 0.05  # max fillet radius as fraction of bbox diagonal
+    chamfer_width_ratio: float = 0.05  # max chamfer extent as fraction of bbox diagonal

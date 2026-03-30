@@ -158,47 +158,52 @@ def _extract_profile_and_holes(
     all_proj = cleaned.vertices[:, primary_axis]
     extrude_start = float(all_proj.min())
 
-    # Slice at midpoint
-    mid = (all_proj.min() + all_proj.max()) / 2.0
-    origin = [0.0, 0.0, 0.0]
-    origin[primary_axis] = mid
+    # Take multiple slices along the extrusion axis and use the one that
+    # gives the largest profile area. The midpoint slice can miss geometry
+    # that's wider at the faces (e.g., bracket legs wider at the surface).
     normal = [0.0, 0.0, 0.0]
     normal[primary_axis] = 1.0
 
-    try:
-        section = mesh.section(plane_origin=origin, plane_normal=normal)
-        if section is None:
-            return None, extrude_start, []
+    best_profile = None
+    best_area = 0.0
 
-        # Get 3D vertices of the cross-section directly
-        # and project onto the profile axes
-        section_verts = np.array(section.vertices)
-        s2d, _ = section.to_planar()
-        polygons = s2d.polygons_closed
-    except Exception as e:
-        logger.error("Mesh section failed: %s", e)
+    offsets = [0.05, 0.25, 0.5, 0.75, 0.95]  # fractions along extrusion axis
+    extent = float(all_proj.max() - all_proj.min())
+
+    for frac in offsets:
+        slice_pos = float(all_proj.min()) + extent * frac
+        origin = [0.0, 0.0, 0.0]
+        origin[primary_axis] = slice_pos
+
+        try:
+            section = mesh.section(plane_origin=origin, plane_normal=normal)
+            if section is None:
+                continue
+            section_verts = np.array(section.vertices)
+            s2d, _ = section.to_planar()
+            polygons = s2d.polygons_closed
+            if len(polygons) == 0:
+                continue
+
+            largest = max(polygons, key=lambda p: p.area)
+            if largest.area > best_area:
+                best_area = largest.area
+                poly_coords_2d = np.array(largest.exterior.coords)[:-1]
+
+                from scipy.spatial import cKDTree
+                all_2d = s2d.vertices
+                tree_2d = cKDTree(all_2d)
+                _, indices = tree_2d.query(poly_coords_2d)
+
+                matched_3d = section_verts[indices]
+                best_profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched_3d]
+        except Exception:
+            continue
+
+    if best_profile is None:
         return None, extrude_start, []
 
-    if len(polygons) == 0:
-        return None, extrude_start, []
-
-    # Take largest polygon and map its 2D coords to mesh axes
-    # The to_planar transform maps (ax_u, ax_v) -> 2D, but the mapping
-    # isn't always identity. Instead, use the section's 3D vertices directly.
-    # Find which 3D vertices correspond to the largest polygon's outline.
-    largest = max(polygons, key=lambda p: p.area)
-    poly_coords_2d = np.array(largest.exterior.coords)[:-1]
-
-    # Match 2D polygon vertices to 3D section vertices via nearest-neighbor
-    from scipy.spatial import cKDTree
-    all_2d = s2d.vertices
-    tree_2d = cKDTree(all_2d)
-    _, indices = tree_2d.query(poly_coords_2d)
-
-    # Get the corresponding 3D coordinates and project onto profile axes
-    matched_3d = section_verts[indices]
-    profile_2d = [(float(p[ax_u]), float(p[ax_v])) for p in matched_3d]
-    profile_2d = _simplify_profile(profile_2d, tolerance=0.1)
+    profile_2d = _simplify_profile(best_profile, tolerance=0.1)
 
     holes = [
         f for f in feature_tree.features

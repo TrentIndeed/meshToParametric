@@ -249,22 +249,28 @@ class Stage6CadQueryViz(BaseVisualizer):
 
         if original_mesh is not None:
             # Side-by-side: original mesh (left) vs CadQuery solid (right)
-            p = self._make_plotter(save_path, shape=(1, 2), window_size=(1600, 800))
+            p = self._make_plotter(save_path, shape=(1, 2), window_size=(1920, 1080))
 
+            # Left panel: original mesh in wireframe + solid
             p.subplot(0, 0)
             p.set_background(self.BACKGROUND_COLOR)
-            p.add_mesh(original_mesh, color="#94A3B8", opacity=0.7)
-            p.add_text("Original Mesh", position="upper_left", font_size=14, color="white")
+            p.add_mesh(original_mesh, color="#64748B", opacity=0.6,
+                       show_edges=True, edge_color="#334155", line_width=1)
+            p.add_text("Original Mesh", position="upper_left",
+                       font_size=18, color="#E2E8F0")
             p.camera_position = "iso"
 
+            # Right panel: CadQuery solid in bright color with strong edges
             p.subplot(0, 1)
             p.set_background(self.BACKGROUND_COLOR)
-            p.add_mesh(cq_mesh, color="#6366F1", opacity=0.9, show_edges=True, edge_color="#1E293B")
+            p.add_mesh(cq_mesh, color="#22D3EE", opacity=1.0,
+                       show_edges=True, edge_color="#0E7490", line_width=2,
+                       specular=0.8, specular_power=30)
             vol_err = cq_result.volume_error_pct
             status_color = "#22C55E" if vol_err < 5 else "#F59E0B" if vol_err < 10 else "#EF4444"
             p.add_text(
-                f"CadQuery Solid (vol err: {vol_err:.1f}%)",
-                position="upper_left", font_size=14, color=status_color,
+                f"CadQuery Solid  |  Volume Error: {vol_err:.1f}%",
+                position="upper_left", font_size=18, color=status_color,
             )
             p.camera_position = "iso"
 
@@ -274,7 +280,7 @@ class Stage6CadQueryViz(BaseVisualizer):
                 test_name="CadQuery Solid Reconstruction",
                 pass_criteria="CadQuery solid (right) matches original mesh (left) in overall shape; "
                 "holes are present at correct positions; volume error < 5%",
-                analysis_guide="Left = original mesh. Right = reconstructed CadQuery solid with edges. "
+                analysis_guide="Left = original mesh (gray). Right = reconstructed CadQuery solid (cyan). "
                 "The solid should reproduce the base profile shape and hole positions. Missing holes "
                 "indicate failed cuts. Shape mismatch means the profile extraction missed features.",
             )

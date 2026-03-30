@@ -150,6 +150,49 @@ def body1mesh_export(body1mesh_features, body1mesh_cleaned):
     return export_to_onshape(body1mesh_features, body1mesh_cleaned, ExportConfig(dry_run=True))
 
 
+@pytest.fixture(scope="session")
+def body1mesh_cadquery(body1mesh_features, body1mesh_cleaned):
+    """CadQuery solid reconstruction of Body1Mesh.
+
+    Runs in a subprocess to avoid VTK conflicts between cadquery and pyvista.
+    """
+    import subprocess, sys, json, tempfile, pickle
+
+    # Serialize inputs to a temp file
+    tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+    pickle.dump((body1mesh_features, body1mesh_cleaned), tmp_in)
+    tmp_in.close()
+
+    tmp_out = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+    tmp_out.close()
+
+    script = f"""
+import pickle, sys
+sys.path.insert(0, '.')
+with open(r'{tmp_in.name}', 'rb') as f:
+    features, cleaned = pickle.load(f)
+from mesh2param.pipeline.export_cadquery import export_cadquery
+result = export_cadquery(features, cleaned)
+# Clear the solid (not picklable), keep tessellated data
+result.solid = None
+with open(r'{tmp_out.name}', 'wb') as f:
+    pickle.dump(result, f)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"CadQuery subprocess failed:\n{proc.stderr}")
+
+    with open(tmp_out.name, "rb") as f:
+        result = pickle.load(f)
+
+    os.unlink(tmp_in.name)
+    os.unlink(tmp_out.name)
+    return result
+
+
 @pytest.fixture
 def tmp_stl(tmp_path, simple_box_mesh):
     """Save a simple box mesh to a temp STL file."""

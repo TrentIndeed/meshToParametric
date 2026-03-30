@@ -49,3 +49,14 @@ class RecognizeConfig(BaseModel):
     boss_max_height_ratio: float = 0.8  # max boss height as fraction of bbox diagonal
     slot_max_width_ratio: float = 0.3  # max slot width as fraction of bbox diagonal
     min_feature_faces: int = 3  # minimum faces for a feature
+
+
+class ExportConfig(BaseModel):
+    """Configuration for Stage 6: Onshape Export."""
+
+    dry_run: bool = True  # generate plan without calling API
+    onshape_base_url: str = "https://cad.onshape.com"
+    api_timeout: float = 30.0
+    rate_limit_delay: float = 1.0
+    max_retries: int = 3
+    volume_tolerance_pct: float = 5.0  # acceptable volume error %

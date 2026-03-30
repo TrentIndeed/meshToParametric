@@ -1,4 +1,4 @@
-"""Stage 6 visualizations: Onshape Export validation."""
+"""Stage 6 visualizations: Onshape Export validation & CadQuery solid."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from pathlib import Path
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import pyvista as pv
 
-from mesh2param.viz.base import add_report_banner_mpl
+from mesh2param.viz.base import BaseVisualizer, add_report_banner_mpl, add_report_banner_pv
 from mesh2param.viz.colors import DARK_ACCENT, DARK_BG, DARK_GRID
 
 
@@ -219,3 +220,75 @@ class Stage6Viz:
         plt.close(fig)
 
         return fig
+
+
+class Stage6CadQueryViz(BaseVisualizer):
+    """Visualization for CadQuery solid reconstruction."""
+
+    def cadquery_solid_3d(
+        self,
+        cq_result,
+        original_mesh: pv.PolyData | None = None,
+        save_path: str | Path | None = None,
+    ) -> str | None:
+        """Render the CadQuery solid alongside the original mesh.
+
+        Args:
+            cq_result: CadQueryResult with .solid attribute.
+            original_mesh: Optional original mesh for side-by-side comparison.
+            save_path: Path to save the screenshot.
+        """
+        if cq_result.tess_vertices is None or cq_result.tess_faces is None:
+            return None
+
+        # Build PyVista mesh from pre-tessellated data
+        verts = cq_result.tess_vertices
+        faces = cq_result.tess_faces
+        pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
+        cq_mesh = pv.PolyData(verts, pv_faces)
+
+        if original_mesh is not None:
+            # Side-by-side: original mesh (left) vs CadQuery solid (right)
+            p = self._make_plotter(save_path, shape=(1, 2), window_size=(1600, 800))
+
+            p.subplot(0, 0)
+            p.set_background(self.BACKGROUND_COLOR)
+            p.add_mesh(original_mesh, color="#94A3B8", opacity=0.7)
+            p.add_text("Original Mesh", position="upper_left", font_size=14, color="white")
+            p.camera_position = "iso"
+
+            p.subplot(0, 1)
+            p.set_background(self.BACKGROUND_COLOR)
+            p.add_mesh(cq_mesh, color="#6366F1", opacity=0.9, show_edges=True, edge_color="#1E293B")
+            vol_err = cq_result.volume_error_pct
+            status_color = "#22C55E" if vol_err < 5 else "#F59E0B" if vol_err < 10 else "#EF4444"
+            p.add_text(
+                f"CadQuery Solid (vol err: {vol_err:.1f}%)",
+                position="upper_left", font_size=14, color=status_color,
+            )
+            p.camera_position = "iso"
+
+            p.subplot(0, 0)
+            add_report_banner_pv(
+                p,
+                test_name="CadQuery Solid Reconstruction",
+                pass_criteria="CadQuery solid (right) matches original mesh (left) in overall shape; "
+                "holes are present at correct positions; volume error < 5%",
+                analysis_guide="Left = original mesh. Right = reconstructed CadQuery solid with edges. "
+                "The solid should reproduce the base profile shape and hole positions. Missing holes "
+                "indicate failed cuts. Shape mismatch means the profile extraction missed features.",
+            )
+        else:
+            p = self._make_plotter(save_path, window_size=(1024, 768))
+            p.add_mesh(cq_mesh, color="#6366F1", opacity=0.9, show_edges=True, edge_color="#1E293B")
+            p.camera_position = "iso"
+            add_report_banner_pv(
+                p,
+                test_name="CadQuery Solid",
+                pass_criteria="Solid has correct base profile and holes",
+                analysis_guide="Purple solid = CadQuery reconstruction from feature tree.",
+            )
+
+        return self._finalize(p, save_path)
+
+

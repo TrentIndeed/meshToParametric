@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+import pyvista as pv
 import pytest
 
 from mesh2param.pipeline.export_onshape import ExportResult
-from mesh2param.viz.stage6_export import Stage6Viz
+from mesh2param.viz.stage6_export import Stage6CadQueryViz, Stage6Viz
+
+
+def _to_pv(cleaned) -> pv.PolyData:
+    faces = np.column_stack([np.full(len(cleaned.faces), 3), cleaned.faces])
+    return pv.PolyData(cleaned.vertices.copy(), faces.ravel())
 
 
 # --- Visual tests (dry-run pipeline on Body1Mesh.3mf) ---
@@ -140,3 +147,44 @@ class TestStage6Correctness:
     def test_api_log_has_rate_limit(self, sample_api_log):
         rate_limited = [e for e in sample_api_log if e["status_code"] == 429]
         assert len(rate_limited) == 1
+
+
+# --- CadQuery export tests ---
+
+
+class TestStage6CadQueryVisual:
+
+    @pytest.mark.visual
+    def test_cadquery_solid_3d(self, body1mesh_cleaned, body1mesh_cadquery, save_path):
+        viz = Stage6CadQueryViz()
+        out = save_path("cadquery_solid_3d.png")
+        viz.cadquery_solid_3d(
+            body1mesh_cadquery,
+            original_mesh=_to_pv(body1mesh_cleaned),
+            save_path=out,
+        )
+        assert os.path.exists(out)
+
+
+class TestStage6CadQueryPipeline:
+
+    def test_tessellation_exists(self, body1mesh_cadquery):
+        assert body1mesh_cadquery.tess_vertices is not None
+        assert body1mesh_cadquery.tess_faces is not None
+        assert len(body1mesh_cadquery.tess_vertices) > 10
+
+    def test_cad_volume_positive(self, body1mesh_cadquery):
+        assert body1mesh_cadquery.cad_volume > 0
+
+    def test_volume_error_under_10_pct(self, body1mesh_cadquery):
+        assert body1mesh_cadquery.volume_error_pct < 10.0
+
+    def test_script_generated(self, body1mesh_cadquery):
+        assert len(body1mesh_cadquery.script) > 0
+        assert "cadquery" in body1mesh_cadquery.script
+
+    def test_to_dict(self, body1mesh_cadquery):
+        d = body1mesh_cadquery.to_dict()
+        assert "mesh_volume" in d
+        assert "cad_volume" in d
+        assert d["script_lines"] > 1

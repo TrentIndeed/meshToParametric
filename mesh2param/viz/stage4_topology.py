@@ -35,11 +35,9 @@ class Stage4Viz(BaseVisualizer):
         p = self._make_plotter(save_path)
         p.add_mesh(mesh, color="#94A3B8", opacity=0.3)
 
-        legend_entries = []
+        present_types = {e.transition_type for e in edges}
         for etype in TransitionType:
             type_edges = [e for e in edges if e.transition_type == etype]
-            if not type_edges:
-                continue
             color = EDGE_COLORS.get(etype.value.upper(), "#6B7280")
             width = _LINE_WIDTHS.get(etype, 2)
 
@@ -57,10 +55,18 @@ class Stage4Viz(BaseVisualizer):
             if all_pts:
                 line_mesh = pv.PolyData(np.array(all_pts), lines=cells)
                 p.add_mesh(line_mesh, color=color, line_width=width)
-                legend_entries.append([etype.value.upper(), color])
 
-        if legend_entries:
-            p.add_legend(legend_entries, bcolor=DARK_BG, face=None)
+        # Always show all four types in the legend as a color key;
+        # dim the label for types not present in this model.
+        legend_entries = []
+        for etype in TransitionType:
+            color = EDGE_COLORS.get(etype.value.upper(), "#6B7280")
+            label = etype.value.upper()
+            if etype not in present_types:
+                label = f"({label})"
+            legend_entries.append([label, color])
+
+        p.add_legend(legend_entries, bcolor=DARK_BG, face=None)
         p.camera_position = "iso"
 
         add_report_banner_pv(

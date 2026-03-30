@@ -8,11 +8,10 @@ import numpy as np
 import pyvista as pv
 import pytest
 
-from mesh2param.config import FitConfig, IngestConfig, SegmentConfig
+from mesh2param.config import FitConfig
 from mesh2param.models.region import SurfaceType
 from mesh2param.models.surface import FittedSurface
 from mesh2param.pipeline.fit import compute_residuals, fit_surfaces
-from mesh2param.pipeline.segment import segment_mesh
 from mesh2param.viz.stage3_fit import Stage3Viz
 
 
@@ -49,19 +48,6 @@ def _make_sphere_points(n=300, radius=10.0):
         r * np.sin(theta) * np.sin(phi),
         r * np.cos(theta),
     ])
-
-
-# --- Fixtures ---
-
-
-@pytest.fixture(scope="session")
-def body1mesh_regions(body1mesh_cleaned):
-    return segment_mesh(body1mesh_cleaned, SegmentConfig())
-
-
-@pytest.fixture(scope="session")
-def body1mesh_fitted(body1mesh_regions, body1mesh_cleaned):
-    return fit_surfaces(body1mesh_regions, body1mesh_cleaned, FitConfig())
 
 
 # --- Visual tests (use Body1Mesh.3mf) ---

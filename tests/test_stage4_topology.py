@@ -1,19 +1,30 @@
 """Tests for Stage 4: Topology & Edge Classification.
 
-Visual tests are skipped — Stage 4 pipeline (topology.py) is not yet implemented.
-Correctness tests validate data model contracts using synthetic data.
+Visual tests run the full pipeline on Body1Mesh.3mf.
+Correctness tests validate both data model contracts and pipeline outputs.
 """
 
 from __future__ import annotations
 
+import os
+
 import networkx as nx
 import numpy as np
+import pyvista as pv
 import pytest
 
+from mesh2param.config import TopologyConfig
 from mesh2param.models.surface import SurfaceEdge, TransitionType
+from mesh2param.pipeline.topology import build_topology
+from mesh2param.viz.stage4_topology import Stage4Viz
 
 
-# --- Synthetic data helpers ---
+# --- Helpers ---
+
+
+def _to_pv(cleaned) -> pv.PolyData:
+    faces = np.column_stack([np.full(len(cleaned.faces), 3), cleaned.faces])
+    return pv.PolyData(cleaned.vertices.copy(), faces.ravel())
 
 
 def _make_box_graph() -> nx.Graph:
@@ -53,25 +64,106 @@ def _make_mixed_edges() -> list[SurfaceEdge]:
     return edges
 
 
-# --- Visual tests (skipped until pipeline exists) ---
+# --- Visual tests (run full pipeline on Body1Mesh.3mf) ---
 
 
 class TestStage4Visual:
 
     @pytest.mark.visual
-    def test_edge_classification_3d(self, save_path):
-        pytest.fail("Stage 4 pipeline (topology.py) not implemented — no visual output")
+    def test_edge_classification_3d(self, body1mesh_cleaned, body1mesh_topology, save_path):
+        graph, edges = body1mesh_topology
+        viz = Stage4Viz()
+        out = save_path("edge_classification_3d.png")
+        viz.edge_classification_3d(_to_pv(body1mesh_cleaned), edges, save_path=out)
+        assert os.path.exists(out)
 
     @pytest.mark.visual
-    def test_adjacency_graph_2d(self, save_path):
-        pytest.fail("Stage 4 pipeline (topology.py) not implemented — no visual output")
+    def test_adjacency_graph_2d(self, body1mesh_topology, save_path):
+        graph, edges = body1mesh_topology
+        viz = Stage4Viz()
+        out = save_path("adjacency_graph_2d.png")
+        viz.adjacency_graph_2d(graph, save_path=out)
+        assert os.path.exists(out)
 
     @pytest.mark.visual
-    def test_dihedral_histogram(self, save_path):
-        pytest.fail("Stage 4 pipeline (topology.py) not implemented — no visual output")
+    def test_dihedral_histogram(self, body1mesh_topology, save_path):
+        graph, edges = body1mesh_topology
+        viz = Stage4Viz()
+        out = save_path("dihedral_histogram.png")
+        viz.dihedral_histogram(edges, save_path=out)
+        assert os.path.exists(out)
 
 
-# --- Correctness tests (data model contracts) ---
+# --- Pipeline correctness tests ---
+
+
+class TestStage4Pipeline:
+
+    def test_graph_has_all_regions(self, body1mesh_regions, body1mesh_topology):
+        graph, _ = body1mesh_topology
+        assert graph.number_of_nodes() == len(body1mesh_regions)
+
+    def test_graph_is_connected(self, body1mesh_topology):
+        graph, _ = body1mesh_topology
+        assert nx.is_connected(graph), "Surface graph should be connected for a single part"
+
+    def test_edges_have_valid_angles(self, body1mesh_topology):
+        _, edges = body1mesh_topology
+        for e in edges:
+            assert 0 <= e.dihedral_angle <= 180.0, (
+                f"Edge ({e.surface_a_id}, {e.surface_b_id}) has invalid angle {e.dihedral_angle}"
+            )
+
+    def test_edges_reference_valid_surfaces(self, body1mesh_regions, body1mesh_topology):
+        _, edges = body1mesh_topology
+        region_ids = {r.region_id for r in body1mesh_regions}
+        for e in edges:
+            assert e.surface_a_id in region_ids
+            assert e.surface_b_id in region_ids
+
+    def test_edges_have_vertices(self, body1mesh_topology):
+        _, edges = body1mesh_topology
+        for e in edges:
+            assert e.edge_vertices is not None
+            assert len(e.edge_vertices) >= 2, (
+                f"Edge ({e.surface_a_id}, {e.surface_b_id}) has < 2 vertices"
+            )
+
+    def test_has_sharp_edges(self, body1mesh_topology):
+        _, edges = body1mesh_topology
+        sharp = [e for e in edges if e.transition_type == TransitionType.SHARP]
+        assert len(sharp) >= 1, "Body1Mesh should have at least one sharp edge"
+
+    def test_graph_node_attributes(self, body1mesh_topology):
+        graph, _ = body1mesh_topology
+        for n in graph.nodes():
+            assert "surface_type" in graph.nodes[n]
+            assert "area" in graph.nodes[n]
+            assert "label" in graph.nodes[n]
+
+    def test_graph_edge_attributes(self, body1mesh_topology):
+        graph, _ = body1mesh_topology
+        for u, v, d in graph.edges(data=True):
+            assert "transition_type" in d
+            assert "dihedral_angle" in d
+
+    def test_edge_ids_are_ordered(self, body1mesh_topology):
+        """surface_a_id < surface_b_id by convention."""
+        _, edges = body1mesh_topology
+        for e in edges:
+            assert e.surface_a_id < e.surface_b_id
+
+    def test_to_dict_roundtrip(self, body1mesh_topology):
+        _, edges = body1mesh_topology
+        for e in edges:
+            d = e.to_dict()
+            assert d["surface_a_id"] == e.surface_a_id
+            assert d["surface_b_id"] == e.surface_b_id
+            assert d["transition_type"] == e.transition_type.value
+            assert d["dihedral_angle"] == e.dihedral_angle
+
+
+# --- Data model correctness tests ---
 
 
 class TestStage4Correctness:

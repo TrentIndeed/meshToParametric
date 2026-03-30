@@ -9,9 +9,10 @@ import numpy as np
 import pytest
 import trimesh
 
-from mesh2param.config import FitConfig, IngestConfig, SegmentConfig, TopologyConfig
+from mesh2param.config import FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig
 from mesh2param.pipeline.fit import fit_surfaces
 from mesh2param.pipeline.ingest import ingest_mesh
+from mesh2param.pipeline.recognize import recognize_features
 from mesh2param.pipeline.segment import segment_mesh
 from mesh2param.pipeline.topology import build_topology
 
@@ -130,6 +131,16 @@ def body1mesh_fitted(body1mesh_regions, body1mesh_cleaned):
 def body1mesh_topology(body1mesh_regions, body1mesh_fitted, body1mesh_cleaned):
     """Build topology graph and classify edges for Body1Mesh."""
     return build_topology(body1mesh_regions, body1mesh_fitted, body1mesh_cleaned, TopologyConfig())
+
+
+@pytest.fixture(scope="session")
+def body1mesh_features(body1mesh_regions, body1mesh_fitted, body1mesh_topology, body1mesh_cleaned):
+    """Recognize features for Body1Mesh."""
+    graph, edges = body1mesh_topology
+    return recognize_features(
+        body1mesh_regions, body1mesh_fitted, graph, edges,
+        body1mesh_cleaned, RecognizeConfig(),
+    )
 
 
 @pytest.fixture

@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 import trimesh
 
-from mesh2param.config import FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig
+from mesh2param.config import ExportConfig, FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig
+from mesh2param.pipeline.export_onshape import export_to_onshape
 from mesh2param.pipeline.fit import fit_surfaces
 from mesh2param.pipeline.ingest import ingest_mesh
 from mesh2param.pipeline.recognize import recognize_features
@@ -141,6 +142,12 @@ def body1mesh_features(body1mesh_regions, body1mesh_fitted, body1mesh_topology, 
         body1mesh_regions, body1mesh_fitted, graph, edges,
         body1mesh_cleaned, RecognizeConfig(),
     )
+
+
+@pytest.fixture(scope="session")
+def body1mesh_export(body1mesh_features, body1mesh_cleaned):
+    """Dry-run export of Body1Mesh features."""
+    return export_to_onshape(body1mesh_features, body1mesh_cleaned, ExportConfig(dry_run=True))
 
 
 @pytest.fixture

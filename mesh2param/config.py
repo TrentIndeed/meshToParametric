@@ -39,3 +39,13 @@ class TopologyConfig(BaseModel):
     smooth_angle_threshold_deg: float = 175.0  # dihedral above this → SMOOTH
     fillet_radius_ratio: float = 0.05  # max fillet radius as fraction of bbox diagonal
     chamfer_width_ratio: float = 0.05  # max chamfer extent as fraction of bbox diagonal
+
+
+class RecognizeConfig(BaseModel):
+    """Configuration for Stage 5: Feature Recognition."""
+
+    hole_max_radius_ratio: float = 0.15  # max hole radius as fraction of bbox diagonal
+    pocket_max_depth_ratio: float = 0.8  # max pocket depth as fraction of bbox diagonal
+    boss_max_height_ratio: float = 0.8  # max boss height as fraction of bbox diagonal
+    slot_max_width_ratio: float = 0.3  # max slot width as fraction of bbox diagonal
+    min_feature_faces: int = 3  # minimum faces for a feature

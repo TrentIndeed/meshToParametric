@@ -27,12 +27,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ConstructionStep:
+    """A single step in the CAD construction process, with tessellated geometry."""
+
+    name: str
+    tess_vertices: np.ndarray  # (V, 3)
+    tess_faces: np.ndarray  # (F, 3)
+    volume: float = 0.0
+
+
+@dataclass
 class CadQueryResult:
     """Output of the CadQuery export pipeline."""
 
     solid: object | None = None  # cq.Workplane, lazy-imported
     tess_vertices: np.ndarray | None = None  # (V, 3) tessellated solid verts
     tess_faces: np.ndarray | None = None  # (F, 3) tessellated solid faces
+    construction_steps: list[ConstructionStep] = field(default_factory=list)
     script: str = ""
     step_path: str = ""
     mesh_volume: float = 0.0
@@ -48,6 +59,7 @@ class CadQueryResult:
             "status": self.status,
             "step_path": self.step_path,
             "script_lines": self.script.count("\n") + 1,
+            "construction_steps": len(self.construction_steps),
         }
 
 
@@ -92,10 +104,13 @@ def export_cadquery(
     if use_llm:
         build_order = _llm_plan_build_order(feature_tree, cleaned)
 
-    # Build the CadQuery solid: import the mesh as the base body,
-    # then cut clean parametric holes into it.
-    solid, script = _build_from_mesh_and_cut_holes(
-        cleaned, hole_features, build_order=build_order,
+    # Build the CadQuery solid step-by-step:
+    # 1. Extrude base profile (no holes)
+    # 2. Cut each hole one at a time
+    # Each step is tessellated for the construction slideshow.
+    solid, script, steps = _build_stepwise(
+        profiles, depth, extrude_dir, extrude_start,
+        hole_features, build_order=build_order,
     )
 
     # Compute CAD volume
@@ -108,7 +123,7 @@ def export_cadquery(
     volume_error = abs(cad_volume - mesh_volume) / (mesh_volume + 1e-15) * 100
     status = "PASS" if volume_error < 10.0 else "FAIL"
 
-    # Tessellate for visualization (done now, before pyvista might conflict)
+    # Final tessellation
     tess_verts, tess_faces = _tessellate_solid(solid)
 
     # Export STEP
@@ -130,6 +145,7 @@ def export_cadquery(
         solid=solid,
         tess_vertices=tess_verts,
         tess_faces=tess_faces,
+        construction_steps=steps,
         script=script,
         step_path=step_path,
         mesh_volume=mesh_volume,
@@ -359,6 +375,124 @@ mechanical part, determine the optimal construction order for building it in Cad
 # ---------------------------------------------------------------------------
 # Heuristic construction (fallback)
 # ---------------------------------------------------------------------------
+
+
+def _build_stepwise(
+    profiles: list[list[tuple[float, float]]],
+    depth: float,
+    extrude_dir: np.ndarray,
+    extrude_start: float,
+    holes: list[Feature],
+    build_order: BuildPlan | None = None,
+) -> tuple[object, str, list[ConstructionStep]]:
+    """Build the solid step-by-step, tessellating at each stage.
+
+    Returns (final_solid, script, construction_steps).
+    Each step captures the solid state for the visual slideshow.
+    """
+    import cadquery as cq
+
+    abs_dir = np.abs(extrude_dir)
+    primary_axis = int(np.argmax(abs_dir))
+    plane_map = {0: "YZ", 1: "XZ", 2: "XY"}
+    plane_name = plane_map[primary_axis]
+    origin_3d = [0.0, 0.0, 0.0]
+    origin_3d[primary_axis] = extrude_start
+
+    steps: list[ConstructionStep] = []
+    script_lines = ["import cadquery as cq", ""]
+
+    # Step 1: Extrude base profile
+    wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
+    wp = wp.polyline(profiles[0]).close().extrude(depth)
+
+    # Union additional profiles
+    for profile in profiles[1:]:
+        try:
+            extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
+            extra = extra.polyline(profile).close().extrude(depth)
+            wp = wp.union(extra)
+        except Exception:
+            pass
+
+    script_lines.append(f"# Step 1: Extrude base profile on {plane_name}")
+    script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
+    script_lines.append(f"result = result.polyline(profile).close().extrude({depth})")
+
+    v, f = _tessellate_solid(wp)
+    vol = abs(float(wp.val().Volume())) if wp else 0
+    steps.append(ConstructionStep(
+        name="Base Extrusion", tess_vertices=v, tess_faces=f, volume=vol,
+    ))
+
+    # Reorder holes
+    if build_order is not None and len(holes) > 0:
+        ordered = []
+        used = set()
+        for fi in build_order.feature_order:
+            hi = fi - 1
+            if 0 <= hi < len(holes):
+                ordered.append((holes[hi], build_order.notes.get(fi, "")))
+                used.add(hi)
+        for hi, h in enumerate(holes):
+            if hi not in used:
+                ordered.append((h, ""))
+    else:
+        ordered = [(h, "") for h in holes]
+
+    # Steps 2+: Cut each hole
+    for i, (hole, note) in enumerate(ordered):
+        sketch = hole.sketch_geometry
+        if sketch.get("type") != "circle":
+            continue
+
+        center = np.array(sketch["center"], dtype=float)
+        radius = float(sketch["radius"])
+        h_depth = float(hole.depth)
+        h_dir = np.array(hole.direction, dtype=float)
+        h_dir = h_dir / (np.linalg.norm(h_dir) + 1e-15)
+        is_through = hole.type == FeatureType.THROUGH_HOLE
+
+        if is_through:
+            cut_start = center - h_dir * (h_depth / 2 + h_depth * 0.5)
+            cut_length = h_depth * 2
+        else:
+            cut_start = center - h_dir * (h_depth / 2)
+            cut_length = h_depth
+
+        hole_name = f"{'Through' if is_through else 'Blind'} Hole (r={radius:.1f})"
+        if note:
+            hole_name += f" — {note}"
+
+        try:
+            hole_plane = cq.Plane(
+                origin=cq.Vector(*cut_start.tolist()),
+                normal=cq.Vector(*h_dir.tolist()),
+            )
+            hole_solid = cq.Workplane(hole_plane).circle(radius).extrude(cut_length)
+            wp = wp.cut(hole_solid)
+
+            v, f = _tessellate_solid(wp)
+            vol = abs(float(wp.val().Volume()))
+            steps.append(ConstructionStep(
+                name=hole_name, tess_vertices=v, tess_faces=f, volume=vol,
+            ))
+
+            script_lines.append(f"# Step {len(steps)}: Cut {hole_name}")
+            script_lines.append(
+                f"h{i} = cq.Plane(origin=cq.Vector({cut_start[0]:.4f}, "
+                f"{cut_start[1]:.4f}, {cut_start[2]:.4f}), "
+                f"normal=cq.Vector({h_dir[0]:.4f}, {h_dir[1]:.4f}, {h_dir[2]:.4f}))"
+            )
+            script_lines.append(
+                f"result = result.cut(cq.Workplane(h{i})"
+                f".circle({radius:.4f}).extrude({cut_length:.4f}))"
+            )
+        except Exception as e:
+            logger.warning("Failed to cut hole %d: %s", i, e)
+
+    script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
+    return wp, "\n".join(script_lines), steps
 
 
 def _build_from_mesh_and_cut_holes(

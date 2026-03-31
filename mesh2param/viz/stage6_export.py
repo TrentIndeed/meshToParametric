@@ -223,7 +223,70 @@ class Stage6Viz:
 
 
 class Stage6CadQueryViz(BaseVisualizer):
-    """Visualization for CadQuery solid reconstruction."""
+    """Visualization for CadQuery solid reconstruction.
+
+    Styled to match Fusion 360's viewport appearance:
+    - Light gray gradient background
+    - Silver/aluminum PBR metallic body material
+    - Dark edge outlines
+    - Clean sans-serif labels
+    """
+
+    # Fusion 360-style background: light gray gradient
+    _BG_TOP = "#D4D8DC"
+    _BG_BOTTOM = "#F0F2F4"
+
+    # Fusion 360-style body color: aluminum silver
+    _BODY_COLOR = "#B0B8C0"
+    _BODY_METALLIC = 0.45
+    _BODY_ROUGHNESS = 0.35
+
+    # Highlight for newly-changed geometry in each step
+    _HIGHLIGHT_COLOR = "#FF6B35"
+    _HIGHLIGHT_METALLIC = 0.2
+    _HIGHLIGHT_ROUGHNESS = 0.5
+
+    # Edge styling
+    _EDGE_COLOR = "#2D3436"
+    _EDGE_WIDTH = 1
+
+    # Text
+    _LABEL_COLOR = "#2D3436"
+    _SUBLABEL_COLOR = "#636E72"
+
+    def _setup_fusion_panel(self, plotter):
+        """Apply Fusion 360 viewport styling to a plotter/subplot."""
+        plotter.set_background(self._BG_BOTTOM, top=self._BG_TOP)
+        try:
+            plotter.enable_anti_aliasing("ssaa")
+        except Exception:
+            pass
+
+    def _add_body_mesh(self, plotter, mesh, highlight=False):
+        """Add a mesh with Fusion 360-style material."""
+        color = self._HIGHLIGHT_COLOR if highlight else self._BODY_COLOR
+        try:
+            plotter.add_mesh(
+                mesh,
+                color=color,
+                pbr=True,
+                metallic=self._BODY_METALLIC,
+                roughness=self._BODY_ROUGHNESS,
+                show_edges=True,
+                edge_color=self._EDGE_COLOR,
+                line_width=self._EDGE_WIDTH,
+            )
+        except Exception:
+            # PBR fallback for subplots that don't support it
+            plotter.add_mesh(
+                mesh,
+                color=color,
+                show_edges=True,
+                edge_color=self._EDGE_COLOR,
+                line_width=self._EDGE_WIDTH,
+                specular=0.6,
+                specular_power=30,
+            )
 
     def cadquery_solid_3d(
         self,
@@ -231,70 +294,142 @@ class Stage6CadQueryViz(BaseVisualizer):
         original_mesh: pv.PolyData | None = None,
         save_path: str | Path | None = None,
     ) -> str | None:
-        """Render the CadQuery solid alongside the original mesh.
+        """Render the construction process as a Fusion 360-style slideshow.
 
-        Args:
-            cq_result: CadQueryResult with .solid attribute.
-            original_mesh: Optional original mesh for side-by-side comparison.
-            save_path: Path to save the screenshot.
+        Renders each step as a separate frame, then composites them into
+        a single grid image using matplotlib.
         """
-        if cq_result.tess_vertices is None or cq_result.tess_faces is None:
+        import matplotlib
+        if save_path is not None:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+        from io import BytesIO
+
+        steps = getattr(cq_result, "construction_steps", [])
+
+        # Build list of (label, sub_label, tess_verts, tess_faces) for each panel
+        panels = []
+        for i, step in enumerate(steps):
+            if step.tess_faces is None or len(step.tess_faces) == 0:
+                continue
+            panels.append((
+                f"Step {i + 1}: {step.name}",
+                f"{step.volume:,.0f} mm\u00B3",
+                step.tess_vertices,
+                step.tess_faces,
+            ))
+
+        # Add original mesh as final panel
+        if original_mesh is not None:
+            verts_orig = np.array(original_mesh.points)
+            faces_orig = original_mesh.faces.reshape(-1, 4)[:, 1:]
+            vol_err = cq_result.volume_error_pct
+            panels.append((
+                "Original Mesh",
+                f"Volume error: {vol_err:.1f}%",
+                verts_orig,
+                faces_orig,
+            ))
+
+        if not panels:
             return None
 
-        # Build PyVista mesh from pre-tessellated data
-        verts = cq_result.tess_vertices
-        faces = cq_result.tess_faces
-        pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
-        cq_mesh = pv.PolyData(verts, pv_faces)
+        # Render each panel to an image buffer
+        panel_images = []
+        for label, sub_label, verts, faces in panels:
+            img = self._render_single_panel(verts, faces, label, sub_label)
+            panel_images.append(img)
 
-        if original_mesh is not None:
-            # Side-by-side: original mesh (left) vs CadQuery solid (right)
-            p = self._make_plotter(save_path, shape=(1, 2), window_size=(1920, 1080))
+        # Composite into a grid using matplotlib
+        cols = min(4, len(panel_images))
+        rows = max(1, (len(panel_images) + cols - 1) // cols)
 
-            # Left panel: original mesh in wireframe + solid
-            p.subplot(0, 0)
-            p.set_background(self.BACKGROUND_COLOR)
-            p.add_mesh(original_mesh, color="#64748B", opacity=0.6,
-                       show_edges=True, edge_color="#334155", line_width=1)
-            p.add_text("Original Mesh", position="upper_left",
-                       font_size=18, color="#E2E8F0")
-            p.camera_position = "iso"
+        fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows))
+        fig.patch.set_facecolor(self._BG_BOTTOM)
 
-            # Right panel: CadQuery solid in bright color with strong edges
-            p.subplot(0, 1)
-            p.set_background(self.BACKGROUND_COLOR)
-            p.add_mesh(cq_mesh, color="#22D3EE", opacity=1.0,
-                       show_edges=True, edge_color="#0E7490", line_width=2,
-                       specular=0.8, specular_power=30)
-            vol_err = cq_result.volume_error_pct
-            status_color = "#22C55E" if vol_err < 5 else "#F59E0B" if vol_err < 10 else "#EF4444"
-            p.add_text(
-                f"CadQuery Solid  |  Volume Error: {vol_err:.1f}%",
-                position="upper_left", font_size=18, color=status_color,
-            )
-            p.camera_position = "iso"
+        if rows == 1 and cols == 1:
+            axes = np.array([[axes]])
+        elif rows == 1:
+            axes = axes[np.newaxis, :]
+        elif cols == 1:
+            axes = axes[:, np.newaxis]
 
-            p.subplot(0, 0)
-            add_report_banner_pv(
-                p,
-                test_name="CadQuery Solid Reconstruction",
-                pass_criteria="CadQuery solid (right) matches original mesh (left) in overall shape; "
-                "holes are present at correct positions; volume error < 5%",
-                analysis_guide="Left = original mesh (gray). Right = reconstructed CadQuery solid (cyan). "
-                "The solid should reproduce the base profile shape and hole positions. Missing holes "
-                "indicate failed cuts. Shape mismatch means the profile extraction missed features.",
-            )
+        for i, img in enumerate(panel_images):
+            r, c = divmod(i, cols)
+            axes[r, c].imshow(img)
+            axes[r, c].axis("off")
+
+        # Hide empty panels
+        for i in range(len(panel_images), rows * cols):
+            r, c = divmod(i, cols)
+            axes[r, c].axis("off")
+
+        fig.suptitle(
+            "CadQuery Construction Sequence",
+            fontsize=16, fontweight="bold", color=self._LABEL_COLOR, y=0.98,
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+        if save_path:
+            fig.savefig(save_path, dpi=180, bbox_inches="tight",
+                        facecolor=self._BG_BOTTOM)
+            plt.close(fig)
+            return str(save_path)
         else:
-            p = self._make_plotter(save_path, window_size=(1024, 768))
-            p.add_mesh(cq_mesh, color="#6366F1", opacity=0.9, show_edges=True, edge_color="#1E293B")
-            p.camera_position = "iso"
-            add_report_banner_pv(
-                p,
-                test_name="CadQuery Solid",
-                pass_criteria="Solid has correct base profile and holes",
-                analysis_guide="Purple solid = CadQuery reconstruction from feature tree.",
+            plt.show()
+            return None
+
+    def _render_single_panel(
+        self,
+        verts: np.ndarray,
+        faces: np.ndarray,
+        label: str,
+        sub_label: str,
+    ) -> np.ndarray:
+        """Render a single construction step to an image array."""
+        pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
+        mesh = pv.PolyData(verts.copy(), pv_faces)
+        mesh.compute_normals(cell_normals=True, point_normals=True, inplace=True)
+
+        p = pv.Plotter(off_screen=True, window_size=(800, 800))
+        p.set_background(self._BG_BOTTOM, top=self._BG_TOP)
+
+        try:
+            p.add_mesh(
+                mesh,
+                color=self._BODY_COLOR,
+                pbr=True,
+                metallic=self._BODY_METALLIC,
+                roughness=self._BODY_ROUGHNESS,
+                show_edges=True,
+                edge_color=self._EDGE_COLOR,
+                line_width=self._EDGE_WIDTH,
+            )
+        except Exception:
+            p.add_mesh(
+                mesh,
+                color=self._BODY_COLOR,
+                show_edges=True,
+                edge_color=self._EDGE_COLOR,
+                line_width=self._EDGE_WIDTH,
+                specular=0.6,
+                specular_power=30,
             )
 
-        return self._finalize(p, save_path)
+        p.add_text(label, position="upper_left", font_size=14,
+                   color=self._LABEL_COLOR, font="arial")
+        p.add_text(sub_label, position="lower_left", font_size=11,
+                   color=self._SUBLABEL_COLOR, font="arial")
+
+        try:
+            p.enable_anti_aliasing("ssaa")
+        except Exception:
+            pass
+
+        p.camera_position = "iso"
+        img = p.screenshot(return_img=True)
+        p.close()
+        return img
 
 

@@ -165,6 +165,17 @@ class TestStage6CadQueryVisual:
         )
         assert os.path.exists(out)
 
+    @pytest.mark.visual
+    def test_construction_gif(self, body1mesh_cleaned, body1mesh_cadquery, save_path):
+        viz = Stage6CadQueryViz()
+        out = save_path("construction_sequence.gif")
+        viz.construction_gif(
+            body1mesh_cadquery,
+            original_mesh=_to_pv(body1mesh_cleaned),
+            save_path=out,
+        )
+        assert os.path.exists(out)
+
 
 class TestStage6CadQueryPipeline:
 

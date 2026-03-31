@@ -23,6 +23,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import pyvista as pv
+
 from mesh2param.config import (
     FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig,
 )
@@ -31,8 +33,9 @@ from mesh2param.pipeline.ingest import ingest_mesh
 from mesh2param.pipeline.recognize import recognize_features
 from mesh2param.pipeline.segment import segment_mesh
 from mesh2param.pipeline.topology import build_topology
+from mesh2param.viz.stage6_export import Stage6CadQueryViz
 
-from tests.conftest import discover_model_pairs
+from tests.conftest import discover_model_pairs, VISUAL_REPORTS_DIR
 
 
 MODEL_PAIRS = discover_model_pairs()
@@ -97,12 +100,20 @@ if result.solid is not None:
         n2 += 1
         exp2.Next()
     metrics['n_edges'] = n2
+
+    # Tessellate for visual comparison
+    tess = val.tessellate(tolerance=1.0, angularTolerance=0.3)
+    import numpy as np
+    metrics['tess_verts'] = np.array([(v.x, v.y, v.z) for v in tess[0]], dtype=np.float64)
+    metrics['tess_faces'] = np.array(tess[1], dtype=np.int64)
 else:
     metrics['cad_volume'] = 0.0
     metrics['bbox_min'] = [0, 0, 0]
     metrics['bbox_max'] = [0, 0, 0]
     metrics['n_faces'] = 0
     metrics['n_edges'] = 0
+    metrics['tess_verts'] = None
+    metrics['tess_faces'] = None
 
 with open(r'{tmp_out.name}', 'wb') as f:
     pickle.dump(metrics, f)
@@ -155,12 +166,16 @@ while exp2.More():
     n_edges += 1
     exp2.Next()
 
+import numpy as np
+tess = val.tessellate(tolerance=1.0, angularTolerance=0.3)
 metrics = {{
     'volume': float(val.Volume()),
     'bbox_min': [bb.xmin, bb.ymin, bb.zmin],
     'bbox_max': [bb.xmax, bb.ymax, bb.zmax],
     'n_faces': n_faces,
     'n_edges': n_edges,
+    'tess_verts': np.array([(v.x, v.y, v.z) for v in tess[0]], dtype=np.float64),
+    'tess_faces': np.array(tess[1], dtype=np.int64),
 }}
 with open(r'{tmp_out.name}', 'wb') as f:
     pickle.dump(metrics, f)
@@ -254,3 +269,76 @@ class TestStepComparison:
             f"Only {cad_faces} faces — expected more from hole cuts "
             f"(reference has {ref_faces})"
         )
+
+    @pytest.mark.visual
+    def test_visual_comparison(self, name, mesh_path, step_path):
+        """Side-by-side render: reference STEP vs reconstructed CadQuery solid."""
+        tree, cleaned = _run_pipeline(mesh_path)
+        result = _export_cadquery_subprocess(tree, cleaned)
+        ref = _load_reference_step(step_path)
+
+        out_dir = os.path.join(VISUAL_REPORTS_DIR, "step_comparison")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{name}_comparison.png")
+
+        _render_comparison(ref, result, name, out_path)
+        assert os.path.exists(out_path)
+
+
+def _render_comparison(ref: dict, cad: dict, name: str, save_path: str):
+    """Render reference STEP vs reconstructed solid side-by-side."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    viz = Stage6CadQueryViz()
+
+    # Compute fixed bounds from both
+    all_verts = []
+    if ref.get("tess_verts") is not None:
+        all_verts.append(ref["tess_verts"])
+    if cad.get("tess_verts") is not None:
+        all_verts.append(cad["tess_verts"])
+    if not all_verts:
+        return
+    combined = np.concatenate(all_verts)
+    fixed_bounds = (combined.min(axis=0) - 5, combined.max(axis=0) + 5)
+
+    # Render reference STEP
+    ref_img = viz._render_single_panel(
+        ref["tess_verts"], ref["tess_faces"],
+        "Reference STEP",
+        f'{ref["volume"]:,.0f} mm³  |  {ref["n_faces"]} faces',
+        fixed_bounds=fixed_bounds,
+    )
+
+    # Render reconstructed solid
+    cad_img = viz._render_single_panel(
+        cad["tess_verts"], cad["tess_faces"],
+        "Reconstructed (CadQuery)",
+        f'{cad["cad_volume"]:,.0f} mm³  |  {cad["n_faces"]} faces',
+        fixed_bounds=fixed_bounds,
+    )
+
+    # Composite side-by-side with stats
+    vol_err = abs(cad["cad_volume"] - ref["volume"]) / (ref["volume"] + 1e-15) * 100
+    status_color = "#27AE60" if vol_err < 5 else "#F39C12" if vol_err < 15 else "#E74C3C"
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig.patch.set_facecolor("#F0F2F4")
+
+    axes[0].imshow(ref_img)
+    axes[0].axis("off")
+    axes[0].set_title("Reference STEP", fontsize=13, color="#2D3436", pad=8)
+
+    axes[1].imshow(cad_img)
+    axes[1].axis("off")
+    axes[1].set_title("Reconstructed (CadQuery)", fontsize=13, color="#2D3436", pad=8)
+
+    fig.suptitle(
+        f"{name}  —  Volume error: {vol_err:.1f}%",
+        fontsize=15, fontweight="bold", color=status_color, y=0.98,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="#F0F2F4")
+    plt.close(fig)

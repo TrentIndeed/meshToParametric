@@ -4,8 +4,11 @@ Endpoints:
   GET  /                  → main viewer page
   POST /api/upload        → upload mesh file, run pipeline, return feature tree
   GET  /api/step/{index}  → get tessellated geometry for a construction step
-  GET  /api/model         → get the final model geometry (GLB)
   GET  /api/status        → pipeline status and token count
+  POST /auth/signup       → create account
+  POST /auth/login        → login
+  GET  /auth/verify       → verify token
+  POST /settings/*        → change password, delete account
 """
 
 from __future__ import annotations
@@ -14,19 +17,43 @@ import json
 import logging
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from mesh2param.db.database import init_db
+from mesh2param.api.auth import router as auth_router
+from mesh2param.api.settings import router as settings_router
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="mesh2param")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="mesh2param", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Auth + settings routers
+app.include_router(auth_router)
+app.include_router(settings_router)
 
 # In-memory state for the current session
 _state = {

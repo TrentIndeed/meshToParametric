@@ -398,22 +398,32 @@ class Stage6CadQueryViz(BaseVisualizer):
         If is_sketch=True, renders as a flat profile with XYZ axis grid
         (Fusion 360 sketch mode).
         """
-        pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
-        mesh = pv.PolyData(verts.copy(), pv_faces)
-        mesh.compute_normals(cell_normals=True, point_normals=True, inplace=True)
-
         p = pv.Plotter(off_screen=True, window_size=(800, 800))
         p.set_background(self._BG_BOTTOM, top=self._BG_TOP)
 
         if is_sketch:
-            # Fusion 360 sketch mode: XYZ origin axes + grid + wireframe profile
+            # Fusion 360 sketch mode: XYZ origin axes + grid + profile lines
             self._add_origin_axes(p, verts)
-            p.add_mesh(
-                mesh, color="#3498DB", style="wireframe",
-                line_width=3, opacity=1.0,
+            # Draw the profile as a closed polyline (not a mesh)
+            n_pts = len(verts)
+            line_pts = []
+            line_cells = []
+            idx = 0
+            for i in range(n_pts):
+                j = (i + 1) % n_pts
+                line_pts.append(verts[i])
+                line_pts.append(verts[j])
+                line_cells.extend([2, idx, idx + 1])
+                idx += 2
+            line_mesh = pv.PolyData(
+                np.array(line_pts), lines=line_cells,
             )
+            p.add_mesh(line_mesh, color="#2C3E50", line_width=3)
         else:
             # Solid body rendering
+            pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
+            mesh = pv.PolyData(verts.copy(), pv_faces)
+            mesh.compute_normals(cell_normals=True, point_normals=True, inplace=True)
             try:
                 p.add_mesh(
                     mesh,

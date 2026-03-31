@@ -19,7 +19,10 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 renderer.setSize(container.clientWidth, container.clientHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.2;
+renderer.toneMappingExposure = 1.4;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -28,21 +31,28 @@ controls.dampingFactor = 0.08;
 controls.minDistance = 10;
 controls.maxDistance = 2000;
 
-// ── Lighting ──
-const ambient = new THREE.AmbientLight(0xffffff, 0.5);
-scene.add(ambient);
+// ── Studio Lighting (3-point + hemisphere) ──
+const hemi = new THREE.HemisphereLight(0xC8D8E8, 0x2D3436, 0.6);
+scene.add(hemi);
 
-const key = new THREE.DirectionalLight(0xffffff, 0.9);
-key.position.set(150, 200, 100);
+const key = new THREE.DirectionalLight(0xFFFFFF, 1.2);
+key.position.set(150, 250, 120);
+key.castShadow = true;
+key.shadow.mapSize.width = 1024;
+key.shadow.mapSize.height = 1024;
 scene.add(key);
 
-const fill = new THREE.DirectionalLight(0x8888ff, 0.3);
-fill.position.set(-100, 50, -100);
+const fill = new THREE.DirectionalLight(0x8899BB, 0.5);
+fill.position.set(-120, 80, -80);
 scene.add(fill);
 
-const rim = new THREE.DirectionalLight(0xffffff, 0.2);
-rim.position.set(0, -100, 0);
+const rim = new THREE.DirectionalLight(0xFFFFFF, 0.3);
+rim.position.set(-50, -80, 150);
 scene.add(rim);
+
+const bottom = new THREE.DirectionalLight(0x445566, 0.15);
+bottom.position.set(0, -200, 0);
+scene.add(bottom);
 
 // ── Grid + Axes ──
 function createGrid() {
@@ -107,18 +117,22 @@ async function loadStep(index) {
     geo.setIndex(indices);
     geo.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0xB0B8C0,
-      metalness: 0.4,
-      roughness: 0.35,
-      envMapIntensity: 0.5,
+    const mat = new THREE.MeshPhysicalMaterial({
+      color: 0xC0C8D0,
+      metalness: 0.5,
+      roughness: 0.28,
+      clearcoat: 0.15,
+      clearcoatRoughness: 0.3,
+      reflectivity: 0.6,
     });
     const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     modelGroup.add(mesh);
 
     // Feature edges only (hide internal triangle diagonals)
     const edgeGeo = new THREE.EdgesGeometry(geo, 25);
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 });
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0x2D3436, linewidth: 1.5 });
     modelGroup.add(new THREE.LineSegments(edgeGeo, edgeMat));
   }
 
@@ -184,13 +198,10 @@ function populateUI(statusData) {
     item.onclick = () => loadStep(i);
     list.appendChild(item);
 
-    // Timeline step — thumbnail rendered async
+    // Timeline step — thumbnail rendered async (no text overlay)
     const tStep = document.createElement('div');
     tStep.className = 'timeline-step';
-    tStep.innerHTML = `
-      <span class="step-num">${i + 1}</span>
-      <span class="label">${step.name.split('(')[0].trim()}</span>
-    `;
+    tStep.innerHTML = `<span class="step-num">${i + 1}</span>`;
     tStep.onclick = () => loadStep(i);
     timeline.appendChild(tStep);
 

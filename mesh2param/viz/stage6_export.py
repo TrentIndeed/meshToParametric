@@ -431,10 +431,13 @@ class Stage6CadQueryViz(BaseVisualizer):
             line_mesh = pv.PolyData(np.array(line_pts), lines=line_cells)
             p.add_mesh(line_mesh, color="#2C3E50", line_width=3)
         else:
-            # Solid body rendering with clean edges
+            # Solid body rendering — only show feature edges (not internal
+            # triangle diagonals on flat faces)
             pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
             mesh = pv.PolyData(verts.copy(), pv_faces)
             mesh.compute_normals(cell_normals=True, point_normals=True, inplace=True)
+
+            # Add the solid surface (no triangle edges)
             try:
                 p.add_mesh(
                     mesh,
@@ -442,20 +445,29 @@ class Stage6CadQueryViz(BaseVisualizer):
                     pbr=True,
                     metallic=self._BODY_METALLIC,
                     roughness=self._BODY_ROUGHNESS,
-                    show_edges=True,
-                    edge_color=self._EDGE_COLOR,
-                    line_width=self._EDGE_WIDTH,
                 )
             except Exception:
                 p.add_mesh(
                     mesh,
                     color=self._BODY_COLOR,
-                    show_edges=True,
-                    edge_color=self._EDGE_COLOR,
-                    line_width=self._EDGE_WIDTH,
                     specular=0.6,
                     specular_power=30,
                 )
+
+            # Add only the sharp feature edges (where adjacent faces meet
+            # at > 30°), hiding the internal triangle splits on flat faces
+            try:
+                feat_edges = mesh.extract_feature_edges(
+                    boundary_edges=True,
+                    feature_edges=True,
+                    manifold_edges=False,
+                    non_manifold_edges=False,
+                    feature_angle=30,
+                )
+                p.add_mesh(feat_edges, color=self._EDGE_COLOR,
+                           line_width=self._EDGE_WIDTH + 1)
+            except Exception:
+                pass
 
         p.add_text(label, position="upper_left", font_size=14,
                    color=self._LABEL_COLOR, font="arial")
@@ -472,7 +484,7 @@ class Stage6CadQueryViz(BaseVisualizer):
             bmin, bmax = fixed_bounds
             center = (bmin + bmax) / 2
             size = np.linalg.norm(bmax - bmin)
-            cam_dist = size * 1.2
+            cam_dist = size * 1.8
             p.camera.focal_point = center.tolist()
             p.camera.position = (
                 center[0] + cam_dist * 0.5,

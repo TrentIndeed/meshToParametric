@@ -339,11 +339,19 @@ class Stage6CadQueryViz(BaseVisualizer):
         if not panels:
             return None
 
+        # Compute fixed bounding box from all panels for consistent camera
+        all_verts = np.concatenate([v for _, _, v, _, _ in panels])
+        fixed_bounds = (
+            all_verts.min(axis=0) - 5,
+            all_verts.max(axis=0) + 5,
+        )
+
         # Render each panel to an image buffer
         panel_images = []
         for label, sub_label, verts, faces, is_sketch in panels:
             img = self._render_single_panel(verts, faces, label, sub_label,
-                                            is_sketch=is_sketch)
+                                            is_sketch=is_sketch,
+                                            fixed_bounds=fixed_bounds)
             panel_images.append(img)
 
         # Composite into a grid using matplotlib
@@ -392,19 +400,24 @@ class Stage6CadQueryViz(BaseVisualizer):
         label: str,
         sub_label: str,
         is_sketch: bool = False,
+        fixed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> np.ndarray:
         """Render a single construction step to an image array.
 
-        If is_sketch=True, renders as a flat profile with XYZ axis grid
-        (Fusion 360 sketch mode).
+        All panels use the same camera bounds so sizing stays consistent.
+        XYZ origin axes are shown on every panel.
         """
         p = pv.Plotter(off_screen=True, window_size=(800, 800))
         p.set_background(self._BG_BOTTOM, top=self._BG_TOP)
 
+        # XYZ origin axes on every panel
+        ref_verts = verts if fixed_bounds is None else np.vstack([
+            fixed_bounds[0], fixed_bounds[1],
+        ])
+        self._add_origin_axes(p, ref_verts)
+
         if is_sketch:
-            # Fusion 360 sketch mode: XYZ origin axes + grid + profile lines
-            self._add_origin_axes(p, verts)
-            # Draw the profile as a closed polyline (not a mesh)
+            # Draw the profile as a closed polyline
             n_pts = len(verts)
             line_pts = []
             line_cells = []
@@ -415,12 +428,10 @@ class Stage6CadQueryViz(BaseVisualizer):
                 line_pts.append(verts[j])
                 line_cells.extend([2, idx, idx + 1])
                 idx += 2
-            line_mesh = pv.PolyData(
-                np.array(line_pts), lines=line_cells,
-            )
+            line_mesh = pv.PolyData(np.array(line_pts), lines=line_cells)
             p.add_mesh(line_mesh, color="#2C3E50", line_width=3)
         else:
-            # Solid body rendering
+            # Solid body rendering with clean edges
             pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
             mesh = pv.PolyData(verts.copy(), pv_faces)
             mesh.compute_normals(cell_normals=True, point_normals=True, inplace=True)
@@ -456,7 +467,23 @@ class Stage6CadQueryViz(BaseVisualizer):
         except Exception:
             pass
 
-        p.camera_position = "iso"
+        # Fixed camera: use bounds to set consistent view across all panels
+        if fixed_bounds is not None:
+            bmin, bmax = fixed_bounds
+            center = (bmin + bmax) / 2
+            size = np.linalg.norm(bmax - bmin)
+            cam_dist = size * 1.2
+            p.camera.focal_point = center.tolist()
+            p.camera.position = (
+                center[0] + cam_dist * 0.5,
+                center[1] + cam_dist * 0.7,
+                center[2] + cam_dist * 0.5,
+            )
+            p.camera.up = (0, 1, 0)
+            p.reset_camera_clipping_range()
+        else:
+            p.camera_position = "iso"
+
         img = p.screenshot(return_img=True)
         p.close()
         return img
@@ -527,6 +554,16 @@ class Stage6CadQueryViz(BaseVisualizer):
         frames: list[Image.Image] = []
         durations: list[int] = []
 
+        # Compute fixed bounds from all steps + original mesh
+        all_step_verts = [s.tess_vertices for s in steps
+                         if s.tess_vertices is not None and len(s.tess_vertices) > 0]
+        if original_mesh is not None:
+            all_step_verts.append(np.array(original_mesh.points))
+        if not all_step_verts:
+            return None
+        all_verts = np.concatenate(all_step_verts)
+        fixed_bounds = (all_verts.min(axis=0) - 5, all_verts.max(axis=0) + 5)
+
         # Render each construction step
         for i, step in enumerate(steps):
             if step.tess_faces is None or len(step.tess_faces) == 0:
@@ -538,6 +575,7 @@ class Stage6CadQueryViz(BaseVisualizer):
                 f"Step {i + 1}/{len(steps)}: {step.name}",
                 vol_text,
                 is_sketch=is_sketch,
+                fixed_bounds=fixed_bounds,
             )
             frames.append(Image.fromarray(img))
             durations.append(frame_duration_ms)
@@ -551,6 +589,7 @@ class Stage6CadQueryViz(BaseVisualizer):
                 verts, faces,
                 "Complete — Original Mesh",
                 f"Volume error: {vol_err:.1f}%",
+                fixed_bounds=fixed_bounds,
             )
             frames.append(Image.fromarray(img))
             durations.append(final_hold_ms)

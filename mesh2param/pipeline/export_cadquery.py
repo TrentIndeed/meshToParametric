@@ -909,26 +909,19 @@ def _build_solid(
 
 
 def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Tessellate a CadQuery solid into vertices and faces for visualization."""
+    """Tessellate a CadQuery solid into vertices and faces for visualization.
+
+    Uses CadQuery's built-in tessellation which respects flat B-rep faces
+    better than STL export. Flat planar faces get minimal triangles.
+    """
     try:
-        from OCP.StlAPI import StlAPI_Writer
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        import tempfile
-        import os
-
-        shape = solid.val().wrapped
-        BRepMesh_IncrementalMesh(shape, 0.05, False, 0.05, True)
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        try:
-            writer = StlAPI_Writer()
-            writer.Write(shape, tmp_path)
-            mesh = trimesh.load(tmp_path)
-            return np.array(mesh.vertices, dtype=np.float64), np.array(mesh.faces, dtype=np.int64)
-        finally:
-            os.unlink(tmp_path)
+        import cadquery as cq
+        tess = solid.val().tessellate(tolerance=1.0, angularTolerance=0.3)
+        verts = np.array([(v.x, v.y, v.z) for v in tess[0]], dtype=np.float64)
+        faces = np.array(tess[1], dtype=np.int64)
+        if len(verts) == 0 or len(faces) == 0:
+            return None, None
+        return verts, faces
     except Exception as e:
         logger.warning("Tessellation failed: %s", e)
         return None, None

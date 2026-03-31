@@ -410,8 +410,6 @@ def _build_stepwise(
     script_lines = ["import cadquery as cq", ""]
 
     # --- Step 0: Sketch (2D profile wire) ---
-    # Store the profile points as vertices and edge pairs as "faces"
-    # for the viz layer to draw as lines (not a tessellated solid).
     axes = [0, 1, 2]
     axes.remove(primary_axis)
     ax_u, ax_v = axes
@@ -438,14 +436,33 @@ def _build_stepwise(
     script_lines.append(f"result = result.polyline(profile).close()")
 
     # --- Step 1: Extrude base profile ---
+    # Try extruding; if it lands on the wrong side of the workplane,
+    # flip by extruding in the opposite direction.
     wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
     wp = wp.polyline(profiles[0]).close().extrude(depth)
 
+    # Verify the extrusion went toward the part, not away from it
+    bb = wp.val().BoundingBox()
+    bb_vals = [
+        (bb.xmin, bb.xmax), (bb.ymin, bb.ymax), (bb.zmin, bb.zmax),
+    ]
+    actual_min = bb_vals[primary_axis][0]
+    actual_max = bb_vals[primary_axis][1]
+    expected_max = extrude_start + depth
+
+    if abs(actual_max - expected_max) > depth * 0.5:
+        # Extrusion went the wrong way — flip it
+        logger.info("Flipping extrusion direction (went to %.1f instead of %.1f)",
+                     actual_max, expected_max)
+        wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
+        wp = wp.polyline(profiles[0]).close().extrude(-depth)
+
     # Union additional profiles (small pads around hole locations)
+    extrude_sign = depth if abs(actual_max - expected_max) <= depth * 0.5 else -depth
     for profile in profiles[1:]:
         try:
             extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
-            extra = extra.polyline(profile).close().extrude(depth)
+            extra = extra.polyline(profile).close().extrude(extrude_sign)
             wp = wp.union(extra)
         except Exception:
             pass

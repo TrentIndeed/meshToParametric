@@ -474,6 +474,15 @@ def _build_stepwise(
     else:
         ordered = [(h, "") for h in holes]
 
+    # Compute the solid's bounding box corners for projecting hole spans
+    bb = wp.val().BoundingBox()
+    bbox_corners = np.array([
+        [bb.xmin, bb.ymin, bb.zmin], [bb.xmax, bb.ymin, bb.zmin],
+        [bb.xmin, bb.ymax, bb.zmin], [bb.xmax, bb.ymax, bb.zmin],
+        [bb.xmin, bb.ymin, bb.zmax], [bb.xmax, bb.ymin, bb.zmax],
+        [bb.xmin, bb.ymax, bb.zmax], [bb.xmax, bb.ymax, bb.zmax],
+    ])
+
     # --- Steps 2+: Cut each hole ---
     for i, (hole, note) in enumerate(ordered):
         sketch = hole.sketch_geometry
@@ -488,10 +497,12 @@ def _build_stepwise(
         is_through = hole.type == FeatureType.THROUGH_HOLE
 
         if is_through:
-            # Through holes: extend WAY past both sides to guarantee
-            # full penetration regardless of profile approximation
-            cut_length = h_depth * 4
-            cut_start = center - h_dir * cut_length / 2
+            # Project all bbox corners onto the hole axis to find the
+            # full extent of the solid in that direction, then span it
+            proj = bbox_corners @ h_dir
+            cut_start = center + h_dir * (float(proj.min()) - float(center @ h_dir) - 1)
+            cut_end = center + h_dir * (float(proj.max()) - float(center @ h_dir) + 1)
+            cut_length = float(np.linalg.norm(cut_end - cut_start))
         else:
             cut_start = center - h_dir * (h_depth / 2)
             cut_length = h_depth

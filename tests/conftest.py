@@ -172,7 +172,7 @@ sys.path.insert(0, '.')
 with open(r'{tmp_in.name}', 'rb') as f:
     features, cleaned = pickle.load(f)
 from mesh2param.pipeline.export_cadquery import export_cadquery
-result = export_cadquery(features, cleaned)
+result = export_cadquery(features, cleaned, use_llm=False)
 # Clear the solid (not picklable), keep tessellated data
 result.solid = None
 with open(r'{tmp_out.name}', 'wb') as f:

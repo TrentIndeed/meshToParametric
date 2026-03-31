@@ -410,15 +410,28 @@ def _build_stepwise(
     script_lines = ["import cadquery as cq", ""]
 
     # --- Step 0: Sketch (2D profile wire) ---
-    # Build just the wire (no extrusion) for the sketch visual
-    sketch_wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    sketch_wp = sketch_wp.polyline(profiles[0]).close()
+    # Store the profile points as vertices and edge pairs as "faces"
+    # for the viz layer to draw as lines (not a tessellated solid).
+    axes = [0, 1, 2]
+    axes.remove(primary_axis)
+    ax_u, ax_v = axes
 
-    # Tessellate the wire as a thin extruded sheet for visualization
-    sketch_solid = sketch_wp.extrude(0.5)  # paper-thin for visibility
-    v, f = _tessellate_solid(sketch_solid)
+    sketch_verts = np.zeros((len(profiles[0]), 3))
+    for pi, (u, v_coord) in enumerate(profiles[0]):
+        sketch_verts[pi, ax_u] = u
+        sketch_verts[pi, ax_v] = v_coord
+        sketch_verts[pi, primary_axis] = extrude_start
+
+    # Edge connectivity: each edge is stored as a degenerate triangle (v0, v1, v0)
+    # so the viz layer can render it as wireframe
+    n_pts = len(profiles[0])
+    sketch_faces = np.array(
+        [[(i, (i + 1) % n_pts, i)] for i in range(n_pts)],
+        dtype=np.int64,
+    ).reshape(-1, 3)
+
     steps.append(ConstructionStep(
-        name="Sketch Profile", tess_vertices=v, tess_faces=f, volume=0.0,
+        name="Sketch Profile", tess_vertices=sketch_verts, tess_faces=sketch_faces, volume=0.0,
     ))
     script_lines.append(f"# Step 1: Sketch profile on {plane_name} plane")
     script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
@@ -637,22 +650,59 @@ def _simplify_profile(
     points: list[tuple[float, float]],
     tolerance: float = 0.1,
 ) -> list[tuple[float, float]]:
-    """Remove near-duplicate consecutive points from a 2D profile."""
+    """Simplify a 2D profile to only its corner vertices.
+
+    Removes points that are collinear with their neighbors (on straight
+    edges), keeping only vertices where the direction changes significantly.
+    Also snaps coordinates to clean values.
+    """
     if len(points) < 3:
         return points
-    result = [points[0]]
+
+    # Step 1: Remove near-duplicate consecutive points
+    deduped = [points[0]]
     for p in points[1:]:
-        dx = p[0] - result[-1][0]
-        dy = p[1] - result[-1][1]
+        dx = p[0] - deduped[-1][0]
+        dy = p[1] - deduped[-1][1]
         if (dx * dx + dy * dy) > tolerance * tolerance:
-            result.append(p)
-    # Also check closing distance (last point vs first)
-    if len(result) > 2:
-        dx = result[-1][0] - result[0][0]
-        dy = result[-1][1] - result[0][1]
+            deduped.append(p)
+    # Check closing duplicate
+    if len(deduped) > 2:
+        dx = deduped[-1][0] - deduped[0][0]
+        dy = deduped[-1][1] - deduped[0][1]
         if (dx * dx + dy * dy) < tolerance * tolerance:
-            result = result[:-1]
-    return result
+            deduped = deduped[:-1]
+
+    if len(deduped) < 3:
+        return deduped
+
+    # Step 2: Keep only corners (points where direction changes > 3°)
+    pts = deduped
+    corners = []
+    n = len(pts)
+    for i in range(n):
+        p0 = pts[(i - 1) % n]
+        p1 = pts[i]
+        p2 = pts[(i + 1) % n]
+        v1 = (p1[0] - p0[0], p1[1] - p0[1])
+        v2 = (p2[0] - p1[0], p2[1] - p1[1])
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        dot = v1[0] * v2[0] + v1[1] * v2[1]
+        angle = abs(np.degrees(np.arctan2(cross, dot)))
+        if angle > 10.0:
+            corners.append(p1)
+
+    if len(corners) < 3:
+        return deduped
+
+    # Step 3: Snap coordinates to clean values (nearest 0.1mm)
+    snapped = []
+    for x, y in corners:
+        sx = round(x * 10) / 10
+        sy = round(y * 10) / 10
+        snapped.append((sx, sy))
+
+    return snapped
 
 
 def _build_solid(

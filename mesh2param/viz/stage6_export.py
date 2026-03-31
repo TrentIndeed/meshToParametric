@@ -432,4 +432,67 @@ class Stage6CadQueryViz(BaseVisualizer):
         p.close()
         return img
 
+    def construction_gif(
+        self,
+        cq_result,
+        original_mesh: pv.PolyData | None = None,
+        save_path: str | Path | None = None,
+        frame_duration_ms: int = 1200,
+        final_hold_ms: int = 3000,
+    ) -> str | None:
+        """Render an animated GIF of the construction process.
+
+        Each frame shows the solid after one feature operation, with
+        Fusion 360-style rendering. The final frame (original mesh
+        comparison) holds longer.
+        """
+        from PIL import Image
+
+        steps = getattr(cq_result, "construction_steps", [])
+        if not steps:
+            return None
+
+        frames: list[Image.Image] = []
+        durations: list[int] = []
+
+        # Render each construction step
+        for i, step in enumerate(steps):
+            if step.tess_faces is None or len(step.tess_faces) == 0:
+                continue
+            img = self._render_single_panel(
+                step.tess_vertices, step.tess_faces,
+                f"Step {i + 1}/{len(steps)}: {step.name}",
+                f"{step.volume:,.0f} mm\u00B3",
+            )
+            frames.append(Image.fromarray(img))
+            durations.append(frame_duration_ms)
+
+        # Final frame: original mesh
+        if original_mesh is not None:
+            verts = np.array(original_mesh.points)
+            faces = original_mesh.faces.reshape(-1, 4)[:, 1:]
+            vol_err = cq_result.volume_error_pct
+            img = self._render_single_panel(
+                verts, faces,
+                "Complete — Original Mesh",
+                f"Volume error: {vol_err:.1f}%",
+            )
+            frames.append(Image.fromarray(img))
+            durations.append(final_hold_ms)
+
+        if not frames:
+            return None
+
+        if save_path:
+            save_path = str(save_path)
+            frames[0].save(
+                save_path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=durations,
+                loop=0,
+            )
+            return save_path
+        return None
+
 

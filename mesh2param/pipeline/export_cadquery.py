@@ -488,8 +488,10 @@ def _build_stepwise(
         is_through = hole.type == FeatureType.THROUGH_HOLE
 
         if is_through:
-            cut_start = center - h_dir * (h_depth / 2 + h_depth * 0.5)
-            cut_length = h_depth * 2
+            # Through holes: extend WAY past both sides to guarantee
+            # full penetration regardless of profile approximation
+            cut_length = h_depth * 4
+            cut_start = center - h_dir * cut_length / 2
         else:
             cut_start = center - h_dir * (h_depth / 2)
             cut_length = h_depth

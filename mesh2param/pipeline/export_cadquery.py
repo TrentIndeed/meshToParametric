@@ -385,10 +385,17 @@ def _build_stepwise(
     holes: list[Feature],
     build_order: BuildPlan | None = None,
 ) -> tuple[object, str, list[ConstructionStep]]:
-    """Build the solid step-by-step, tessellating at each stage.
+    """Build a clean CAD solid from scratch, step by step.
+
+    Steps:
+      0. Sketch — 2D profile wire on the workplane
+      1. Extrude — sweep the sketch into a solid
+      2+. Cut holes — one per step
+
+    Each step is tessellated for the visual slideshow. The resulting
+    solid is clean B-rep geometry (no mesh triangles).
 
     Returns (final_solid, script, construction_steps).
-    Each step captures the solid state for the visual slideshow.
     """
     import cadquery as cq
 
@@ -402,11 +409,26 @@ def _build_stepwise(
     steps: list[ConstructionStep] = []
     script_lines = ["import cadquery as cq", ""]
 
-    # Step 1: Extrude base profile
+    # --- Step 0: Sketch (2D profile wire) ---
+    # Build just the wire (no extrusion) for the sketch visual
+    sketch_wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
+    sketch_wp = sketch_wp.polyline(profiles[0]).close()
+
+    # Tessellate the wire as a thin extruded sheet for visualization
+    sketch_solid = sketch_wp.extrude(0.5)  # paper-thin for visibility
+    v, f = _tessellate_solid(sketch_solid)
+    steps.append(ConstructionStep(
+        name="Sketch Profile", tess_vertices=v, tess_faces=f, volume=0.0,
+    ))
+    script_lines.append(f"# Step 1: Sketch profile on {plane_name} plane")
+    script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
+    script_lines.append(f"result = result.polyline(profile).close()")
+
+    # --- Step 1: Extrude base profile ---
     wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
     wp = wp.polyline(profiles[0]).close().extrude(depth)
 
-    # Union additional profiles
+    # Union additional profiles (small pads around hole locations)
     for profile in profiles[1:]:
         try:
             extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
@@ -415,14 +437,13 @@ def _build_stepwise(
         except Exception:
             pass
 
-    script_lines.append(f"# Step 1: Extrude base profile on {plane_name}")
-    script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
-    script_lines.append(f"result = result.polyline(profile).close().extrude({depth})")
+    script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
+    script_lines.append(f"result = result.extrude({depth})")
 
     v, f = _tessellate_solid(wp)
     vol = abs(float(wp.val().Volume())) if wp else 0
     steps.append(ConstructionStep(
-        name="Base Extrusion", tess_vertices=v, tess_faces=f, volume=vol,
+        name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
 
     # Reorder holes
@@ -440,7 +461,7 @@ def _build_stepwise(
     else:
         ordered = [(h, "") for h in holes]
 
-    # Steps 2+: Cut each hole
+    # --- Steps 2+: Cut each hole ---
     for i, (hole, note) in enumerate(ordered):
         sketch = hole.sketch_geometry
         if sketch.get("type") != "circle":
@@ -478,7 +499,8 @@ def _build_stepwise(
                 name=hole_name, tess_vertices=v, tess_faces=f, volume=vol,
             ))
 
-            script_lines.append(f"# Step {len(steps)}: Cut {hole_name}")
+            step_num = len(steps) + 1
+            script_lines.append(f"# Step {step_num}: Cut {hole_name}")
             script_lines.append(
                 f"h{i} = cq.Plane(origin=cq.Vector({cut_start[0]:.4f}, "
                 f"{cut_start[1]:.4f}, {cut_start[2]:.4f}), "
@@ -845,7 +867,7 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
         import os
 
         shape = solid.val().wrapped
-        BRepMesh_IncrementalMesh(shape, 0.1, False, 0.1, True)
+        BRepMesh_IncrementalMesh(shape, 0.05, False, 0.05, True)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
         tmp_path = tmp.name

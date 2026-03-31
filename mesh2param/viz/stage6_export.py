@@ -308,16 +308,19 @@ class Stage6CadQueryViz(BaseVisualizer):
 
         steps = getattr(cq_result, "construction_steps", [])
 
-        # Build list of (label, sub_label, tess_verts, tess_faces) for each panel
+        # Build list of (label, sub_label, tess_verts, tess_faces, is_sketch)
         panels = []
         for i, step in enumerate(steps):
             if step.tess_faces is None or len(step.tess_faces) == 0:
                 continue
+            is_sketch = "sketch" in step.name.lower()
+            vol_text = "2D Profile" if is_sketch else f"{step.volume:,.0f} mm\u00B3"
             panels.append((
                 f"Step {i + 1}: {step.name}",
-                f"{step.volume:,.0f} mm\u00B3",
+                vol_text,
                 step.tess_vertices,
                 step.tess_faces,
+                is_sketch,
             ))
 
         # Add original mesh as final panel
@@ -330,6 +333,7 @@ class Stage6CadQueryViz(BaseVisualizer):
                 f"Volume error: {vol_err:.1f}%",
                 verts_orig,
                 faces_orig,
+                False,
             ))
 
         if not panels:
@@ -337,8 +341,9 @@ class Stage6CadQueryViz(BaseVisualizer):
 
         # Render each panel to an image buffer
         panel_images = []
-        for label, sub_label, verts, faces in panels:
-            img = self._render_single_panel(verts, faces, label, sub_label)
+        for label, sub_label, verts, faces, is_sketch in panels:
+            img = self._render_single_panel(verts, faces, label, sub_label,
+                                            is_sketch=is_sketch)
             panel_images.append(img)
 
         # Composite into a grid using matplotlib
@@ -386,8 +391,13 @@ class Stage6CadQueryViz(BaseVisualizer):
         faces: np.ndarray,
         label: str,
         sub_label: str,
+        is_sketch: bool = False,
     ) -> np.ndarray:
-        """Render a single construction step to an image array."""
+        """Render a single construction step to an image array.
+
+        If is_sketch=True, renders as a flat profile with XYZ axis grid
+        (Fusion 360 sketch mode).
+        """
         pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
         mesh = pv.PolyData(verts.copy(), pv_faces)
         mesh.compute_normals(cell_normals=True, point_normals=True, inplace=True)
@@ -395,27 +405,36 @@ class Stage6CadQueryViz(BaseVisualizer):
         p = pv.Plotter(off_screen=True, window_size=(800, 800))
         p.set_background(self._BG_BOTTOM, top=self._BG_TOP)
 
-        try:
+        if is_sketch:
+            # Fusion 360 sketch mode: XYZ origin axes + grid + wireframe profile
+            self._add_origin_axes(p, verts)
             p.add_mesh(
-                mesh,
-                color=self._BODY_COLOR,
-                pbr=True,
-                metallic=self._BODY_METALLIC,
-                roughness=self._BODY_ROUGHNESS,
-                show_edges=True,
-                edge_color=self._EDGE_COLOR,
-                line_width=self._EDGE_WIDTH,
+                mesh, color="#3498DB", style="wireframe",
+                line_width=3, opacity=1.0,
             )
-        except Exception:
-            p.add_mesh(
-                mesh,
-                color=self._BODY_COLOR,
-                show_edges=True,
-                edge_color=self._EDGE_COLOR,
-                line_width=self._EDGE_WIDTH,
-                specular=0.6,
-                specular_power=30,
-            )
+        else:
+            # Solid body rendering
+            try:
+                p.add_mesh(
+                    mesh,
+                    color=self._BODY_COLOR,
+                    pbr=True,
+                    metallic=self._BODY_METALLIC,
+                    roughness=self._BODY_ROUGHNESS,
+                    show_edges=True,
+                    edge_color=self._EDGE_COLOR,
+                    line_width=self._EDGE_WIDTH,
+                )
+            except Exception:
+                p.add_mesh(
+                    mesh,
+                    color=self._BODY_COLOR,
+                    show_edges=True,
+                    edge_color=self._EDGE_COLOR,
+                    line_width=self._EDGE_WIDTH,
+                    specular=0.6,
+                    specular_power=30,
+                )
 
         p.add_text(label, position="upper_left", font_size=14,
                    color=self._LABEL_COLOR, font="arial")
@@ -431,6 +450,49 @@ class Stage6CadQueryViz(BaseVisualizer):
         img = p.screenshot(return_img=True)
         p.close()
         return img
+
+    def _add_origin_axes(self, plotter, verts: np.ndarray):
+        """Add Fusion 360-style XYZ origin axes and a grid plane."""
+        center = verts.mean(axis=0)
+        extent = max(verts.max(axis=0) - verts.min(axis=0)) * 0.7
+
+        # Grid lines on the sketch plane (XZ for this bracket)
+        grid_color = "#CBD5E1"
+        n_lines = 8
+        for i in range(-n_lines, n_lines + 1):
+            offset = i * extent / n_lines
+            # Horizontal grid lines (along X)
+            p1 = [center[0] - extent, center[1], center[2] + offset]
+            p2 = [center[0] + extent, center[1], center[2] + offset]
+            line = pv.Line(p1, p2)
+            plotter.add_mesh(line, color=grid_color, line_width=0.5, opacity=0.3)
+            # Vertical grid lines (along Z)
+            p3 = [center[0] + offset, center[1], center[2] - extent]
+            p4 = [center[0] + offset, center[1], center[2] + extent]
+            line2 = pv.Line(p3, p4)
+            plotter.add_mesh(line2, color=grid_color, line_width=0.5, opacity=0.3)
+
+        # X axis (red)
+        ax_len = extent * 1.2
+        x_line = pv.Line(
+            [center[0] - ax_len, center[1], center[2]],
+            [center[0] + ax_len, center[1], center[2]],
+        )
+        plotter.add_mesh(x_line, color="#E74C3C", line_width=2)
+
+        # Y axis (green)
+        y_line = pv.Line(
+            [center[0], center[1] - ax_len * 0.3, center[2]],
+            [center[0], center[1] + ax_len * 0.3, center[2]],
+        )
+        plotter.add_mesh(y_line, color="#2ECC71", line_width=2)
+
+        # Z axis (blue)
+        z_line = pv.Line(
+            [center[0], center[1], center[2] - ax_len],
+            [center[0], center[1], center[2] + ax_len],
+        )
+        plotter.add_mesh(z_line, color="#3498DB", line_width=2)
 
     def construction_gif(
         self,
@@ -459,10 +521,13 @@ class Stage6CadQueryViz(BaseVisualizer):
         for i, step in enumerate(steps):
             if step.tess_faces is None or len(step.tess_faces) == 0:
                 continue
+            is_sketch = "sketch" in step.name.lower()
+            vol_text = "2D Profile" if is_sketch else f"{step.volume:,.0f} mm\u00B3"
             img = self._render_single_panel(
                 step.tess_vertices, step.tess_faces,
                 f"Step {i + 1}/{len(steps)}: {step.name}",
-                f"{step.volume:,.0f} mm\u00B3",
+                vol_text,
+                is_sketch=is_sketch,
             )
             frames.append(Image.fromarray(img))
             durations.append(frame_duration_ms)

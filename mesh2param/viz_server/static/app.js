@@ -184,7 +184,7 @@ function populateUI(statusData) {
     item.onclick = () => loadStep(i);
     list.appendChild(item);
 
-    // Timeline step
+    // Timeline step — thumbnail rendered async
     const tStep = document.createElement('div');
     tStep.className = 'timeline-step';
     tStep.innerHTML = `
@@ -193,7 +193,79 @@ function populateUI(statusData) {
     `;
     tStep.onclick = () => loadStep(i);
     timeline.appendChild(tStep);
+
+    // Generate thumbnail in background
+    renderThumbnail(i).then(dataUrl => {
+      if (dataUrl) {
+        tStep.style.backgroundImage = `url(${dataUrl})`;
+        tStep.style.backgroundSize = 'cover';
+        tStep.style.backgroundPosition = 'center';
+        tStep.querySelector('.step-num').style.display = 'none';
+      }
+    });
   });
+}
+
+// ── Thumbnail renderer (offscreen) ──
+const thumbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+thumbRenderer.setSize(160, 112);
+thumbRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+async function renderThumbnail(stepIndex) {
+  try {
+    const res = await fetch(`/api/step/${stepIndex}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const thumbScene = new THREE.Scene();
+    thumbScene.background = new THREE.Color(0x161B22);
+
+    // Lights
+    thumbScene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const light = new THREE.DirectionalLight(0xffffff, 0.9);
+    light.position.set(150, 200, 100);
+    thumbScene.add(light);
+
+    const verts = new Float32Array(data.vertices);
+
+    if (data.is_sketch) {
+      const points = [];
+      const numPts = verts.length / 3;
+      for (let i = 0; i < numPts; i++) {
+        const next = (i + 1) % numPts;
+        points.push(
+          new THREE.Vector3(verts[i*3], verts[i*3+1], verts[i*3+2]),
+          new THREE.Vector3(verts[next*3], verts[next*3+1], verts[next*3+2]),
+        );
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      thumbScene.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x58A6FF })));
+    } else {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+      geo.setIndex(data.faces);
+      geo.computeVertexNormals();
+      const mat = new THREE.MeshStandardMaterial({ color: 0xB0B8C0, metalness: 0.4, roughness: 0.35 });
+      thumbScene.add(new THREE.Mesh(geo, mat));
+      thumbScene.add(new THREE.LineSegments(
+        new THREE.EdgesGeometry(geo, 25),
+        new THREE.LineBasicMaterial({ color: 0x30363D }),
+      ));
+    }
+
+    // Fit camera to content
+    const box = new THREE.Box3().setFromObject(thumbScene);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3()).length();
+    const thumbCam = new THREE.PerspectiveCamera(45, 160 / 112, 0.1, 5000);
+    thumbCam.position.set(center.x + size * 0.8, center.y + size * 0.6, center.z + size * 0.8);
+    thumbCam.lookAt(center);
+
+    thumbRenderer.render(thumbScene, thumbCam);
+    return thumbRenderer.domElement.toDataURL('image/png');
+  } catch (e) {
+    return null;
+  }
 }
 
 // ── File Upload ──

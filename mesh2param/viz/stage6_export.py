@@ -308,7 +308,7 @@ class Stage6CadQueryViz(BaseVisualizer):
 
         steps = getattr(cq_result, "construction_steps", [])
 
-        # Build list of (label, sub_label, tess_verts, tess_faces, is_sketch)
+        # Build list of (label, sub_label, verts, faces, is_sketch, is_original_mesh)
         panels = []
         for i, step in enumerate(steps):
             if step.tess_faces is None or len(step.tess_faces) == 0:
@@ -321,26 +321,28 @@ class Stage6CadQueryViz(BaseVisualizer):
                 step.tess_vertices,
                 step.tess_faces,
                 is_sketch,
+                False,
             ))
 
-        # Add original mesh as final panel
+        # Add original mesh as final panel — flat shading with visible triangles
         if original_mesh is not None:
             verts_orig = np.array(original_mesh.points)
             faces_orig = original_mesh.faces.reshape(-1, 4)[:, 1:]
             vol_err = cq_result.volume_error_pct
             panels.append((
-                "Original Mesh",
+                "Original Mesh (input)",
                 f"Volume error: {vol_err:.1f}%",
                 verts_orig,
                 faces_orig,
                 False,
+                True,
             ))
 
         if not panels:
             return None
 
         # Compute fixed bounding box from all panels for consistent camera
-        all_verts = np.concatenate([v for _, _, v, _, _ in panels])
+        all_verts = np.concatenate([v for _, _, v, _, _, _ in panels])
         fixed_bounds = (
             all_verts.min(axis=0) - 5,
             all_verts.max(axis=0) + 5,
@@ -348,9 +350,10 @@ class Stage6CadQueryViz(BaseVisualizer):
 
         # Render each panel to an image buffer
         panel_images = []
-        for label, sub_label, verts, faces, is_sketch in panels:
+        for label, sub_label, verts, faces, is_sketch, is_orig in panels:
             img = self._render_single_panel(verts, faces, label, sub_label,
                                             is_sketch=is_sketch,
+                                            is_original_mesh=is_orig,
                                             fixed_bounds=fixed_bounds)
             panel_images.append(img)
 
@@ -400,6 +403,7 @@ class Stage6CadQueryViz(BaseVisualizer):
         label: str,
         sub_label: str,
         is_sketch: bool = False,
+        is_original_mesh: bool = False,
         fixed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
         camera_angle: int = 0,
     ) -> np.ndarray:
@@ -417,7 +421,20 @@ class Stage6CadQueryViz(BaseVisualizer):
         ])
         self._add_origin_axes(p, ref_verts)
 
-        if is_sketch:
+        if is_original_mesh:
+            # Show the raw mesh with ALL triangle edges visible
+            # so it's clearly different from the clean CAD solid
+            pv_faces = np.column_stack([np.full(len(faces), 3), faces]).ravel()
+            mesh = pv.PolyData(verts.copy(), pv_faces)
+            p.add_mesh(
+                mesh,
+                color="#A0AEC0",
+                show_edges=True,
+                edge_color="#4A5568",
+                line_width=1,
+                opacity=0.95,
+            )
+        elif is_sketch:
             # Draw the profile as a closed polyline
             n_pts = len(verts)
             line_pts = []
@@ -619,8 +636,9 @@ class Stage6CadQueryViz(BaseVisualizer):
                 vol_err = cq_result.volume_error_pct
                 img = self._render_single_panel(
                     verts, faces,
-                    f"[{angle_labels[angle_idx]}]  Original Mesh",
+                    f"[{angle_labels[angle_idx]}]  Original Mesh (input)",
                     f"Volume error: {vol_err:.1f}%",
+                    is_original_mesh=True,
                     fixed_bounds=fixed_bounds,
                     camera_angle=angle_idx,
                 )

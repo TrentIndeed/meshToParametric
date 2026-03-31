@@ -494,9 +494,9 @@ class Stage6CadQueryViz(BaseVisualizer):
     _CAMERA_ANGLES = [
         # angle 0: front-right isometric (default)
         (0.5, 0.7, 0.5),
-        # angle 1: bottom-right (see underside + blind holes)
-        (0.5, -0.6, 0.5),
-        # angle 2: bottom-up angled
+        # angle 1: back-left isometric (see other side + through holes)
+        (-0.5, 0.7, -0.5),
+        # angle 2: bottom-up angled (see underside + blind holes)
         (0.4, -0.8, 0.4),
     ]
 
@@ -592,7 +592,7 @@ class Stage6CadQueryViz(BaseVisualizer):
         all_verts = np.concatenate(all_step_verts)
         fixed_bounds = (all_verts.min(axis=0) - 5, all_verts.max(axis=0) + 5)
 
-        angle_labels = ["Front-Right", "Bottom-Right", "Bottom-Up"]
+        angle_labels = ["Front-Right", "Back-Left", "Bottom-Up"]
 
         # Loop through all steps 3 times, each from a different camera angle
         for angle_idx in range(3):

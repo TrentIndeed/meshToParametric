@@ -18,7 +18,29 @@ from mesh2param.pipeline.segment import segment_mesh
 from mesh2param.pipeline.topology import build_topology
 
 VISUAL_REPORTS_DIR = os.path.join(os.path.dirname(__file__), "visual_reports")
-BODY1MESH_PATH = Path(__file__).parent.parent / "models" / "Body1Mesh.3mf"
+MODELS_DIR = Path(__file__).parent.parent / "models"
+BODY1MESH_PATH = MODELS_DIR / "Mesh1" / "Body1Mesh.3mf"
+
+
+def discover_model_pairs() -> list[tuple[str, Path, Path]]:
+    """Find all model folders containing a mesh + reference STEP pair.
+
+    Each subfolder of models/ should contain one mesh file (.3mf/.stl/.obj/.ply)
+    and one reference STEP file (.step/.stp). Returns list of (name, mesh_path, step_path).
+    """
+    pairs = []
+    if not MODELS_DIR.is_dir():
+        return pairs
+    mesh_exts = {".3mf", ".stl", ".obj", ".ply"}
+    step_exts = {".step", ".stp"}
+    for folder in sorted(MODELS_DIR.iterdir()):
+        if not folder.is_dir():
+            continue
+        meshes = [f for f in folder.iterdir() if f.suffix.lower() in mesh_exts]
+        steps = [f for f in folder.iterdir() if f.suffix.lower() in step_exts]
+        if meshes and steps:
+            pairs.append((folder.name, meshes[0], steps[0]))
+    return pairs
 
 # Map test module names to stage folder names
 _STAGE_FOLDERS = {

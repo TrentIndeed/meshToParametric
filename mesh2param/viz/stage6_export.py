@@ -401,13 +401,14 @@ class Stage6CadQueryViz(BaseVisualizer):
         sub_label: str,
         is_sketch: bool = False,
         fixed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
+        camera_angle: int = 0,
     ) -> np.ndarray:
         """Render a single construction step to an image array.
 
         All panels use the same camera bounds so sizing stays consistent.
         XYZ origin axes are shown on every panel.
         """
-        p = pv.Plotter(off_screen=True, window_size=(800, 800))
+        p = pv.Plotter(off_screen=True, window_size=(600, 600))
         p.set_background(self._BG_BOTTOM, top=self._BG_TOP)
 
         # XYZ origin axes on every panel
@@ -481,24 +482,39 @@ class Stage6CadQueryViz(BaseVisualizer):
 
         # Fixed camera: use bounds to set consistent view across all panels
         if fixed_bounds is not None:
-            bmin, bmax = fixed_bounds
-            center = (bmin + bmax) / 2
-            size = np.linalg.norm(bmax - bmin)
-            cam_dist = size * 1.8
-            p.camera.focal_point = center.tolist()
-            p.camera.position = (
-                center[0] + cam_dist * 0.5,
-                center[1] + cam_dist * 0.7,
-                center[2] + cam_dist * 0.5,
-            )
-            p.camera.up = (0, 1, 0)
-            p.reset_camera_clipping_range()
+            self._set_camera(p, fixed_bounds, camera_angle)
         else:
             p.camera_position = "iso"
 
         img = p.screenshot(return_img=True)
         p.close()
         return img
+
+    # Three camera angles for the GIF rotation
+    _CAMERA_ANGLES = [
+        # angle 0: front-right isometric (default)
+        (0.5, 0.7, 0.5),
+        # angle 1: front-left isometric
+        (-0.5, 0.7, 0.5),
+        # angle 2: top-down angled
+        (0.3, 1.2, -0.3),
+    ]
+
+    def _set_camera(self, plotter, fixed_bounds, angle_index=0):
+        """Set camera position from fixed bounds and angle index."""
+        bmin, bmax = fixed_bounds
+        center = (bmin + bmax) / 2
+        size = float(np.linalg.norm(bmax - bmin))
+        cam_dist = size * 1.8
+        dx, dy, dz = self._CAMERA_ANGLES[angle_index % len(self._CAMERA_ANGLES)]
+        plotter.camera.focal_point = center.tolist()
+        plotter.camera.position = (
+            center[0] + cam_dist * dx,
+            center[1] + cam_dist * dy,
+            center[2] + cam_dist * dz,
+        )
+        plotter.camera.up = (0, 1, 0)
+        plotter.reset_camera_clipping_range()
 
     def _add_origin_axes(self, plotter, verts: np.ndarray):
         """Add Fusion 360-style XYZ origin axes and a grid plane."""
@@ -576,35 +592,40 @@ class Stage6CadQueryViz(BaseVisualizer):
         all_verts = np.concatenate(all_step_verts)
         fixed_bounds = (all_verts.min(axis=0) - 5, all_verts.max(axis=0) + 5)
 
-        # Render each construction step
-        for i, step in enumerate(steps):
-            if step.tess_faces is None or len(step.tess_faces) == 0:
-                continue
-            is_sketch = "sketch" in step.name.lower()
-            vol_text = "2D Profile" if is_sketch else f"{step.volume:,.0f} mm\u00B3"
-            img = self._render_single_panel(
-                step.tess_vertices, step.tess_faces,
-                f"Step {i + 1}/{len(steps)}: {step.name}",
-                vol_text,
-                is_sketch=is_sketch,
-                fixed_bounds=fixed_bounds,
-            )
-            frames.append(Image.fromarray(img))
-            durations.append(frame_duration_ms)
+        angle_labels = ["Front-Right", "Front-Left", "Top-Down"]
 
-        # Final frame: original mesh
-        if original_mesh is not None:
-            verts = np.array(original_mesh.points)
-            faces = original_mesh.faces.reshape(-1, 4)[:, 1:]
-            vol_err = cq_result.volume_error_pct
-            img = self._render_single_panel(
-                verts, faces,
-                "Complete — Original Mesh",
-                f"Volume error: {vol_err:.1f}%",
-                fixed_bounds=fixed_bounds,
-            )
-            frames.append(Image.fromarray(img))
-            durations.append(final_hold_ms)
+        # Loop through all steps 3 times, each from a different camera angle
+        for angle_idx in range(3):
+            for i, step in enumerate(steps):
+                if step.tess_faces is None or len(step.tess_faces) == 0:
+                    continue
+                is_sketch = "sketch" in step.name.lower()
+                vol_text = "2D Profile" if is_sketch else f"{step.volume:,.0f} mm\u00B3"
+                img = self._render_single_panel(
+                    step.tess_vertices, step.tess_faces,
+                    f"[{angle_labels[angle_idx]}]  Step {i + 1}/{len(steps)}: {step.name}",
+                    vol_text,
+                    is_sketch=is_sketch,
+                    fixed_bounds=fixed_bounds,
+                    camera_angle=angle_idx,
+                )
+                frames.append(Image.fromarray(img))
+                durations.append(frame_duration_ms)
+
+            # Original mesh comparison at the end of each pass
+            if original_mesh is not None:
+                verts = np.array(original_mesh.points)
+                faces = original_mesh.faces.reshape(-1, 4)[:, 1:]
+                vol_err = cq_result.volume_error_pct
+                img = self._render_single_panel(
+                    verts, faces,
+                    f"[{angle_labels[angle_idx]}]  Original Mesh",
+                    f"Volume error: {vol_err:.1f}%",
+                    fixed_bounds=fixed_bounds,
+                    camera_angle=angle_idx,
+                )
+                frames.append(Image.fromarray(img))
+                durations.append(final_hold_ms)
 
         if not frames:
             return None

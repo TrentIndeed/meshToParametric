@@ -1,6 +1,5 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
-import { EdgesGeometry, LineBasicMaterial, LineSegments } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 
 // ── State ──
 let currentStep = -1;

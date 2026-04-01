@@ -4,6 +4,7 @@ import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/exampl
 // ── State ──
 let currentStep = -1;
 let steps = [];
+let currentJobId = null;
 
 // ── Three.js Setup ──
 const container = document.getElementById('viewer');
@@ -86,7 +87,8 @@ scene.add(modelGroup);
 
 // ── Load step geometry ──
 async function loadStep(index) {
-  const res = await fetch(`/api/step/${index}`);
+  const url = currentJobId ? `/api/job/${currentJobId}/step/${index}` : `/api/step/${index}`;
+  const res = await fetch(url);
   if (!res.ok) return;
   const data = await res.json();
 
@@ -224,7 +226,8 @@ thumbRenderer.toneMapping = THREE.ACESFilmicToneMapping;
 
 async function renderThumbnail(stepIndex) {
   try {
-    const res = await fetch(`/api/step/${stepIndex}`);
+    const url = currentJobId ? `/api/job/${currentJobId}/step/${stepIndex}` : `/api/step/${stepIndex}`;
+    const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
 
@@ -300,55 +303,54 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   const form = new FormData();
   form.append('file', file);
 
-  // Poll progress while pipeline runs
-  let pollInterval = null;
-  function startPolling() {
-    pollInterval = setInterval(async () => {
-      try {
-        const pr = await fetch('/api/progress');
-        const pd = await pr.json();
-        progressBar.style.width = pd.progress + '%';
-        if (pd.stage) {
-          loadingText.textContent = pd.stage;
-          progressDetail.textContent = pd.progress + '%';
-        }
-      } catch (e) {}
-    }, 500);
-  }
-
   try {
-    // Show upload progress via XHR (fetch doesn't support upload progress)
+    // Upload file → get job ID
     progressBar.style.width = '5%';
     progressDetail.textContent = 'Uploading...';
 
-    const data = await new Promise((resolve, reject) => {
+    const uploadRes = await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/upload');
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 30);
+          const pct = Math.round((e.loaded / e.total) * 20);
           progressBar.style.width = pct + '%';
           progressDetail.textContent = `Uploading... ${pct}%`;
         }
       };
-      xhr.onload = () => {
-        if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
-        else reject(new Error(xhr.statusText));
-      };
+      xhr.onload = () => resolve(JSON.parse(xhr.responseText));
       xhr.onerror = () => reject(new Error('Upload failed'));
-      // Start polling pipeline progress once upload starts server-side processing
-      startPolling();
       xhr.send(form);
     });
 
-    clearInterval(pollInterval);
+    if (uploadRes.error) {
+      alert(uploadRes.error);
+      loading.classList.remove('show');
+      document.getElementById('status-dot').className = 'status-dot';
+      return;
+    }
+
+    currentJobId = uploadRes.job_id;
+
+    // Poll job progress until done
+    const statusData = await new Promise((resolve, reject) => {
+      const poll = setInterval(async () => {
+        try {
+          const r = await fetch(`/api/job/${currentJobId}/status`);
+          const d = await r.json();
+          progressBar.style.width = d.progress + '%';
+          loadingText.textContent = d.stage || 'Processing...';
+          progressDetail.textContent = d.progress + '%';
+          if (d.status === 'done') { clearInterval(poll); resolve(d); }
+          else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
+        } catch (e) {}
+      }, 500);
+    });
+
     progressBar.style.width = '100%';
     loadingText.textContent = 'Loading viewer...';
-    progressDetail.textContent = '100%';
 
-    if (data.status === 'done') {
-      const statusRes = await fetch('/api/status');
-      const statusData = await statusRes.json();
+    if (statusData.status === 'done') {
 
       // Try AI dimension analysis
       loading.classList.remove('show');
@@ -381,12 +383,10 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       document.getElementById('status-dot').className = 'status-dot';
     }
   } catch (err) {
-    clearInterval(pollInterval);
     alert('Upload failed: ' + err.message);
     document.getElementById('status-dot').className = 'status-dot';
     loading.classList.remove('show');
   } finally {
-    clearInterval(pollInterval);
     e.target.value = '';
   }
 });
@@ -586,6 +586,7 @@ async function autoLoad() {
     const res = await fetch('/api/status');
     const data = await res.json();
     if (data.status === 'done' && data.steps.length > 0) {
+      currentJobId = data.job_id || null;
       finishLoad(data);
     }
   } catch (e) { /* server not ready yet */ }

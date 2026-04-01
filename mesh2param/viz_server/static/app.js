@@ -479,12 +479,28 @@ chatInput.addEventListener('keydown', (e) => {
   }
 });
 
+// ── Panel collapse/expand ──
+window.toggleSidebar = function() {
+  const sidebar = document.getElementById('sidebar');
+  sidebar.classList.toggle('collapsed');
+  document.body.classList.toggle('sidebar-collapsed');
+  setTimeout(handleResize, 250);
+};
+
+window.toggleChat = function() {
+  const chat = document.getElementById('chat-panel');
+  chat.classList.toggle('collapsed');
+  document.body.classList.toggle('chat-collapsed');
+  setTimeout(handleResize, 250);
+};
+
 // ── Resize ──
-window.addEventListener('resize', () => {
+function handleResize() {
   camera.aspect = container.clientWidth / container.clientHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(container.clientWidth, container.clientHeight);
-});
+}
+window.addEventListener('resize', handleResize);
 
 // ── Auto-load if pipeline already ran ──
 async function autoLoad() {

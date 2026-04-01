@@ -69,7 +69,10 @@ _state = {
     "cad_volume": 0.0,
     "progress": 0,
     "progress_stage": "",
+    "generations_used": 0,
 }
+
+FREE_TRIAL_LIMIT = 3
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -80,6 +83,11 @@ async def index():
 @app.get("/landing", response_class=HTMLResponse)
 async def landing():
     return FileResponse(str(STATIC_DIR / "landing.html"))
+
+
+@app.get("/clean", response_class=HTMLResponse)
+async def cleaner():
+    return FileResponse(str(STATIC_DIR / "cleaner.html"))
 
 
 @app.get("/api/status")
@@ -135,6 +143,70 @@ async def waitlist(body: dict):
         db.close()
 
 
+@app.post("/api/clean")
+async def clean_mesh(file: UploadFile = File(...)):
+    """Free mesh cleaner — repair and return cleaned mesh as STL."""
+    import trimesh
+
+    suffix = Path(file.filename).suffix
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    content = await file.read()
+    tmp.write(content)
+    tmp.close()
+
+    try:
+        from mesh2param.pipeline.ingest import ingest_mesh
+        from mesh2param.config import IngestConfig
+
+        cleaned = ingest_mesh(tmp.name, IngestConfig(remesh=False))
+
+        # Export cleaned mesh as STL
+        mesh = trimesh.Trimesh(
+            vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+        )
+        out_tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
+        mesh.export(out_tmp.name)
+        out_tmp.close()
+
+        # Build stats
+        original = trimesh.load(tmp.name)
+        orig_faces = len(original.faces) if hasattr(original, 'faces') else 0
+        orig_verts = len(original.vertices) if hasattr(original, 'vertices') else 0
+
+        return JSONResponse({
+            "status": "ok",
+            "original": {
+                "faces": orig_faces,
+                "vertices": orig_verts,
+                "watertight": bool(getattr(original, 'is_watertight', False)),
+            },
+            "cleaned": {
+                "faces": cleaned.num_faces,
+                "vertices": cleaned.num_vertices,
+                "watertight": cleaned.is_watertight,
+                "bbox": cleaned.bbox.tolist(),
+            },
+            "download_url": f"/api/clean/download/{Path(out_tmp.name).name}",
+            "vertices": cleaned.vertices.flatten().tolist(),
+            "faces": cleaned.faces.flatten().tolist(),
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+@app.get("/api/clean/download/{filename}")
+async def download_cleaned(filename: str):
+    """Download a cleaned mesh file."""
+    tmp_dir = tempfile.gettempdir()
+    path = Path(tmp_dir) / filename
+    if not path.exists() or not filename.endswith(".stl"):
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    return FileResponse(str(path), media_type="application/octet-stream",
+                        filename="cleaned_mesh.stl")
+
+
 @app.get("/api/progress")
 async def progress():
     return {
@@ -164,9 +236,25 @@ async def get_step(index: int):
     }
 
 
+@app.get("/api/trial")
+async def trial_status():
+    """Check free trial usage."""
+    return {
+        "generations_used": _state["generations_used"],
+        "limit": FREE_TRIAL_LIMIT,
+        "remaining": max(0, FREE_TRIAL_LIMIT - _state["generations_used"]),
+    }
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
-    """Upload a mesh file and run the full pipeline."""
+    """Upload a mesh file and run the full pipeline (counts toward trial)."""
+    if _state["generations_used"] >= FREE_TRIAL_LIMIT:
+        return JSONResponse(
+            {"status": "error", "error": "Free trial limit reached (3 generations). Sign up for full access."},
+            status_code=403,
+        )
+
     _state["status"] = "processing"
     _state["error"] = None
     _state["steps"] = []
@@ -273,6 +361,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
     _state["tokens_used"] = 0
     _state["progress"] = 100
     _state["progress_stage"] = "Done"
+    _state["generations_used"] += 1
 
 
 def _estimate_volume(cleaned) -> float:

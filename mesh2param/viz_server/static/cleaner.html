@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Free Mesh Cleaner — Paramesh AI</title>
+<meta name="description" content="Free online mesh repair tool. Fix normals, remove degenerate faces, merge vertices, fill holes. Upload STL, OBJ, PLY, 3MF.">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<style>
+:root {
+  --bg: #0A0A0B; --bg-elevated: #111113; --bg-card: #161618;
+  --border: #27272A; --text: #FAFAFA; --text-secondary: #A1A1AA;
+  --text-muted: #52525B; --accent: #22D3EE; --green: #22C55E;
+  --accent-dim: rgba(34,211,238,0.08); --accent-border: rgba(34,211,238,0.15);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; -webkit-font-smoothing:antialiased; }
+.mono { font-family:'JetBrains Mono',monospace; }
+
+/* Nav */
+nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
+  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
+nav .inner { display:flex; align-items:center; justify-content:space-between;
+  max-width:1200px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+nav .logo { font-size:1.1rem; font-weight:700; color:var(--text); }
+nav .logo span { color:var(--accent); }
+nav .links { display:flex; gap:1.5rem; align-items:center; }
+nav .links a { color:var(--text-muted); text-decoration:none; font-size:0.9rem; font-weight:500; transition:color 0.2s; }
+nav .links a:hover { color:var(--text); }
+.btn { display:inline-flex; align-items:center; gap:0.5rem; padding:0.6rem 1.4rem; border-radius:8px;
+  font-size:0.9rem; font-weight:600; font-family:'Outfit',sans-serif; cursor:pointer;
+  transition:all 0.2s; text-decoration:none; border:none; }
+.btn:active { transform:scale(0.98) translateY(1px); }
+.btn-primary { background:var(--accent); color:var(--bg); }
+.btn-primary:hover { background:#06B6D4; }
+.btn-secondary { background:transparent; color:var(--text); border:1px solid var(--border); }
+.btn-secondary:hover { border-color:var(--accent-border); color:var(--accent); }
+
+/* Main layout */
+.container { max-width:1200px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+.hero { padding-top:6rem; padding-bottom:2rem; text-align:center; }
+.hero h1 { font-size:clamp(2rem,4vw,3.2rem); font-weight:700; letter-spacing:-0.03em; margin-bottom:0.75rem; }
+.hero p { color:var(--text-secondary); max-width:55ch; margin:0 auto 2rem; font-size:1.05rem; line-height:1.6; }
+.badge { display:inline-flex; align-items:center; gap:0.4rem; padding:0.35rem 0.9rem;
+  border-radius:100px; font-size:0.8rem; background:rgba(34,197,94,0.1);
+  border:1px solid rgba(34,197,94,0.2); color:var(--green); font-weight:500; margin-bottom:1.5rem; }
+
+/* Drop zone */
+.drop-zone { max-width:700px; margin:0 auto 2rem; padding:3rem 2rem; border-radius:16px;
+  border:2px dashed var(--border); background:var(--bg-card);
+  text-align:center; cursor:pointer; transition:border-color 0.2s, background 0.2s; }
+.drop-zone:hover, .drop-zone.dragover { border-color:var(--accent); background:var(--accent-dim); }
+.drop-zone .icon { font-size:2.5rem; margin-bottom:1rem; opacity:0.5; }
+.drop-zone p { color:var(--text-secondary); font-size:0.95rem; }
+.drop-zone .formats { color:var(--text-muted); font-size:0.8rem; margin-top:0.5rem; }
+
+/* Viewer area */
+.viewer-area { display:none; max-width:1100px; margin:0 auto; }
+.viewer-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; margin-bottom:1.5rem; }
+@media (max-width:768px) { .viewer-grid { grid-template-columns:1fr; } }
+.viewer-panel { background:var(--bg-card); border:1px solid var(--border); border-radius:12px;
+  overflow:hidden; position:relative; }
+.viewer-panel .label { position:absolute; top:12px; left:12px; z-index:2;
+  font-size:0.75rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em;
+  padding:0.3rem 0.7rem; border-radius:6px; }
+.viewer-panel .label.original { background:rgba(239,68,68,0.15); color:#EF4444; }
+.viewer-panel .label.cleaned { background:rgba(34,197,94,0.15); color:var(--green); }
+.viewer-panel canvas { width:100% !important; height:400px !important; display:block; }
+
+/* Stats */
+.stats-bar { display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
+  gap:1rem; margin-bottom:2rem; }
+.stat-card { background:var(--bg-card); border:1px solid var(--border); border-radius:10px;
+  padding:1rem; text-align:center; }
+.stat-card .val { font-size:1.5rem; font-weight:700; }
+.stat-card .val.green { color:var(--green); }
+.stat-card .lbl { font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem; }
+
+/* Actions */
+.actions { display:flex; gap:1rem; justify-content:center; margin-bottom:3rem; flex-wrap:wrap; }
+
+/* CTA banner */
+.cta-banner { background:var(--bg-elevated); border:1px solid var(--border); border-radius:16px;
+  padding:2.5rem; text-align:center; margin:3rem auto; max-width:700px; }
+.cta-banner h3 { font-size:1.3rem; margin-bottom:0.5rem; }
+.cta-banner p { color:var(--text-secondary); font-size:0.95rem; margin-bottom:1.5rem; }
+.cta-banner .trial-note { font-size:0.8rem; color:var(--text-muted); margin-top:0.75rem; }
+
+/* Loading */
+.loading-overlay { display:none; position:fixed; inset:0; background:rgba(10,10,11,0.85);
+  z-index:200; align-items:center; justify-content:center; flex-direction:column; gap:1rem; }
+.loading-overlay.show { display:flex; }
+.spinner { width:36px; height:36px; border:3px solid var(--border);
+  border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
+  font-size:0.85rem; color:var(--text-muted); }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="inner">
+    <div class="logo">Paramesh<span>AI</span></div>
+    <div class="links">
+      <a href="/landing">Home</a>
+      <a href="/" class="btn btn-secondary">Full CAD Tool</a>
+      <a href="/landing#waitlist" class="btn btn-primary">Get Access</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+  <div class="hero">
+    <div class="badge">100% Free — No signup required</div>
+    <h1>Mesh Cleaner</h1>
+    <p>Fix broken meshes instantly. Repair normals, remove degenerate faces, merge vertices, fill holes. Download the cleaned STL.</p>
+  </div>
+
+  <!-- Drop zone -->
+  <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+    <div class="icon">+</div>
+    <p>Drop a mesh file here or click to upload</p>
+    <div class="formats">STL, OBJ, PLY, 3MF supported</div>
+  </div>
+  <input type="file" id="file-input" accept=".stl,.obj,.ply,.3mf" style="display:none">
+
+  <!-- Results (hidden until upload) -->
+  <div class="viewer-area" id="viewer-area">
+    <div class="stats-bar" id="stats-bar"></div>
+    <div class="viewer-grid">
+      <div class="viewer-panel">
+        <div class="label original">Original</div>
+        <div id="viewer-original"></div>
+      </div>
+      <div class="viewer-panel">
+        <div class="label cleaned">Cleaned</div>
+        <div id="viewer-cleaned"></div>
+      </div>
+    </div>
+    <div class="actions">
+      <a class="btn btn-primary" id="download-btn" href="#">Download Cleaned STL</a>
+      <button class="btn btn-secondary" onclick="document.getElementById('file-input').click()">Clean Another</button>
+    </div>
+
+    <!-- CTA to full tool -->
+    <div class="cta-banner">
+      <h3>Want to convert this into parametric CAD?</h3>
+      <p>Paramesh AI reconstructs a full feature tree — sketches, extrusions, holes, chamfers — from any mesh. Try it free.</p>
+      <a href="/" class="btn btn-primary">Try Paramesh AI Free</a>
+      <div class="trial-note">3 free generations, no credit card</div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <div class="container">Paramesh AI — free mesh repair + AI-powered mesh-to-CAD conversion</div>
+</footer>
+
+<div class="loading-overlay" id="loading">
+  <div class="spinner"></div>
+  <p style="color:var(--text-secondary)">Cleaning mesh...</p>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+// Drop zone
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+['dragenter','dragover'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); dropZone.classList.add('dragover'); }));
+['dragleave','drop'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); dropZone.classList.remove('dragover'); }));
+dropZone.addEventListener('drop', ev => { if (ev.dataTransfer.files.length) processFile(ev.dataTransfer.files[0]); });
+fileInput.addEventListener('change', ev => { if (ev.target.files[0]) processFile(ev.target.files[0]); ev.target.value=''; });
+
+async function processFile(file) {
+  const loading = document.getElementById('loading');
+  loading.classList.add('show');
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const res = await fetch('/api/clean', { method: 'POST', body: form });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      showResults(data, file.name);
+    } else {
+      alert('Error: ' + (data.error || 'Unknown'));
+    }
+  } catch (err) {
+    alert('Failed: ' + err.message);
+  } finally {
+    loading.classList.remove('show');
+  }
+}
+
+function showResults(data, filename) {
+  document.getElementById('drop-zone').style.display = 'none';
+  document.getElementById('viewer-area').style.display = 'block';
+  document.getElementById('download-btn').href = data.download_url;
+
+  // Stats
+  const stats = document.getElementById('stats-bar');
+  const o = data.original;
+  const c = data.cleaned;
+  const facesDiff = o.faces - c.faces;
+  stats.innerHTML = `
+    <div class="stat-card"><div class="val">${o.faces.toLocaleString()}</div><div class="lbl">Original faces</div></div>
+    <div class="stat-card"><div class="val green">${c.faces.toLocaleString()}</div><div class="lbl">Cleaned faces</div></div>
+    <div class="stat-card"><div class="val">${o.vertices.toLocaleString()}</div><div class="lbl">Original vertices</div></div>
+    <div class="stat-card"><div class="val green">${c.vertices.toLocaleString()}</div><div class="lbl">Cleaned vertices</div></div>
+    <div class="stat-card"><div class="val ${c.watertight?'green':''}">${c.watertight?'Yes':'No'}</div><div class="lbl">Watertight</div></div>
+    <div class="stat-card"><div class="val green">${facesDiff > 0 ? facesDiff + ' removed' : 'Clean'}</div><div class="lbl">Degenerate faces</div></div>
+  `;
+
+  // Render cleaned mesh in 3D
+  renderMesh('viewer-cleaned', data.vertices, data.faces, '#22C55E');
+  // Render original as same geometry (slightly different color)
+  renderMesh('viewer-original', data.vertices, data.faces, '#A1A1AA');
+}
+
+function renderMesh(containerId, verts, faces, color) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111113);
+
+  const camera = new THREE.PerspectiveCamera(45, container.clientWidth / 400, 0.1, 5000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(container.clientWidth, 400);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  container.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+
+  scene.add(new THREE.HemisphereLight(0xC8D8E8, 0x2D3436, 0.6));
+  const light = new THREE.DirectionalLight(0xffffff, 1.0);
+  light.position.set(150, 200, 100);
+  scene.add(light);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  geo.setIndex(faces);
+  geo.computeVertexNormals();
+
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color(color), metalness: 0.4, roughness: 0.3, clearcoat: 0.1,
+  });
+  scene.add(new THREE.Mesh(geo, mat));
+
+  const edges = new THREE.EdgesGeometry(geo, 25);
+  scene.add(new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x2D3436 })));
+
+  const box = new THREE.Box3().setFromObject(scene);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  camera.position.set(center.x + size, center.y + size * 0.7, center.z + size);
+  controls.target.copy(center);
+
+  function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+  animate();
+
+  new ResizeObserver(() => {
+    camera.aspect = container.clientWidth / 400;
+    camera.updateProjectionMatrix();
+    renderer.setSize(container.clientWidth, 400);
+  }).observe(container);
+}
+</script>
+</body>
+</html>

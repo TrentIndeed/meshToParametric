@@ -16,4 +16,4 @@ RUN mkdir -p /app/data
 
 EXPOSE 8080
 
-CMD ["uvicorn", "mesh2param.viz_server.app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "uvicorn", "mesh2param.viz_server.app:app", "--host", "0.0.0.0", "--port", "8080"]

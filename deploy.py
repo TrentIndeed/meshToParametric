@@ -23,7 +23,9 @@ import sys
 from dotenv import load_dotenv
 load_dotenv()
 
-DEPLOY_REPO = "https://github.com/TrentIndeed/meshToParametric.git"
+_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+_REPO_BASE = "github.com/TrentIndeed/meshToParametric.git"
+DEPLOY_REPO = f"https://{_GITHUB_TOKEN}@{_REPO_BASE}" if _GITHUB_TOKEN else f"https://{_REPO_BASE}"
 DEPLOY_BRANCH = os.getenv("DEPLOY_BRANCH", "main")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", os.path.expanduser("~/.ssh/id_ed25519"))
 VPS_IP = os.getenv("VPS_IP", "")

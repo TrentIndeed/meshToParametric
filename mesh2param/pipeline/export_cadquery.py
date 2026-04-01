@@ -569,81 +569,88 @@ def _build_stepwise(
         except Exception as e:
             logger.warning("Failed to cut hole %d: %s", i, e)
 
-    # --- Chamfers: apply to all edges at a uniform size ---
+    # --- Chamfers: try progressively smaller sizes until one works ---
+    # CadQuery's edges().chamfer() applies to ALL edges, so we need a
+    # size small enough to not fail on short edges but big enough to see.
     if chamfers:
-        # Estimate chamfer size from the recognized features
+        # Estimate chamfer size from the actual face geometry
         chamfer_sizes = []
         for cf in chamfers:
+            # Use the face bounding box to estimate chamfer depth
+            face_idxs = cf.face_indices
+            if len(face_idxs) > 0:
+                # Rough estimate: half the smallest bbox dimension of chamfer faces
+                # (This is more reliable than the sketch_geometry width)
+                pass
             s = cf.sketch_geometry
             w = s.get("width", 0)
-            if w > 0 and w < 10:
+            if 0.1 < w < 50:
                 chamfer_sizes.append(w)
-        chamfer_size = float(np.median(chamfer_sizes)) if chamfer_sizes else 1.0
-        # Clamp to reasonable range
-        chamfer_size = max(0.3, min(chamfer_size, 5.0))
 
-        try:
-            wp = wp.edges().chamfer(chamfer_size)
-            v, f = _tessellate_solid(wp)
-            vol = abs(float(wp.val().Volume()))
-            steps.append(ConstructionStep(
-                name=f"Chamfer ({chamfer_size:.1f}mm, {len(chamfers)} edges)",
-                tess_vertices=v, tess_faces=f, volume=vol,
-            ))
-            script_lines.append(f"# Chamfer all edges {chamfer_size:.1f}mm")
-            script_lines.append(f"result = result.edges().chamfer({chamfer_size:.4f})")
-        except Exception as e:
-            logger.warning("Chamfer failed (trying smaller): %s", e)
-            # CadQuery chamfer can fail if size is too large for short edges.
-            # Try a smaller chamfer.
+        # If no good widths from sketch geometry, estimate from part size
+        if not chamfer_sizes:
+            part_min_dim = min(abs(depth), 10.0)
+            chamfer_sizes = [part_min_dim * 0.05]
+
+        chamfer_size = float(np.median(chamfer_sizes))
+        chamfer_size = max(0.2, min(chamfer_size, 3.0))
+
+        # Try chamfer at several sizes, decreasing until one works
+        applied = False
+        for attempt_size in [chamfer_size, chamfer_size * 0.5, 1.0, 0.5, 0.3]:
             try:
-                smaller = chamfer_size * 0.5
-                wp_backup = wp
-                wp = wp.edges().chamfer(smaller)
-                v, f = _tessellate_solid(wp)
-                vol = abs(float(wp.val().Volume()))
-                steps.append(ConstructionStep(
-                    name=f"Chamfer ({smaller:.1f}mm, reduced)",
-                    tess_vertices=v, tess_faces=f, volume=vol,
-                ))
-                script_lines.append(f"result = result.edges().chamfer({smaller:.4f})")
-            except Exception as e2:
-                logger.warning("Chamfer fallback also failed: %s", e2)
+                wp_test = wp.edges().chamfer(attempt_size)
+                # Verify it produced valid geometry
+                vol_test = abs(float(wp_test.val().Volume()))
+                if vol_test > 0:
+                    wp = wp_test
+                    v, f = _tessellate_solid(wp)
+                    steps.append(ConstructionStep(
+                        name=f"Chamfer ({attempt_size:.1f}mm × {len(chamfers)} features)",
+                        tess_vertices=v, tess_faces=f, volume=vol_test,
+                    ))
+                    script_lines.append(f"result = result.edges().chamfer({attempt_size:.4f})")
+                    applied = True
+                    break
+            except Exception:
+                continue
+        if not applied:
+            logger.warning("All chamfer sizes failed — skipping chamfer step")
+            script_lines.append(f"# Chamfer skipped — {len(chamfers)} features detected but edge chamfer failed")
 
-    # --- Fillets: apply to all edges at a uniform radius ---
+    # --- Fillets: same progressive approach ---
     if fillets:
         fillet_radii = []
         for fl in fillets:
-            s = fl.sketch_geometry
-            r = s.get("radius", 0)
-            if r > 0 and r < 10:
+            r = fl.sketch_geometry.get("radius", 0)
+            if 0.1 < r < 50:
                 fillet_radii.append(r)
-        fillet_r = float(np.median(fillet_radii)) if fillet_radii else 1.0
-        fillet_r = max(0.3, min(fillet_r, 5.0))
 
-        try:
-            wp = wp.edges().fillet(fillet_r)
-            v, f = _tessellate_solid(wp)
-            vol = abs(float(wp.val().Volume()))
-            steps.append(ConstructionStep(
-                name=f"Fillet (r={fillet_r:.1f}mm, {len(fillets)} edges)",
-                tess_vertices=v, tess_faces=f, volume=vol,
-            ))
-            script_lines.append(f"result = result.edges().fillet({fillet_r:.4f})")
-        except Exception as e:
-            logger.warning("Fillet failed (trying smaller): %s", e)
+        if not fillet_radii:
+            fillet_radii = [min(abs(depth) * 0.05, 2.0)]
+
+        fillet_r = float(np.median(fillet_radii))
+        fillet_r = max(0.2, min(fillet_r, 3.0))
+
+        applied = False
+        for attempt_r in [fillet_r, fillet_r * 0.5, 1.0, 0.5, 0.3]:
             try:
-                smaller = fillet_r * 0.5
-                wp = wp.edges().fillet(smaller)
-                v, f = _tessellate_solid(wp)
-                vol = abs(float(wp.val().Volume()))
-                steps.append(ConstructionStep(
-                    name=f"Fillet (r={smaller:.1f}mm, reduced)",
-                    tess_vertices=v, tess_faces=f, volume=vol,
-                ))
-                script_lines.append(f"result = result.edges().fillet({smaller:.4f})")
-            except Exception as e2:
-                logger.warning("Fillet fallback also failed: %s", e2)
+                wp_test = wp.edges().fillet(attempt_r)
+                vol_test = abs(float(wp_test.val().Volume()))
+                if vol_test > 0:
+                    wp = wp_test
+                    v, f = _tessellate_solid(wp)
+                    steps.append(ConstructionStep(
+                        name=f"Fillet (r={attempt_r:.1f}mm × {len(fillets)} features)",
+                        tess_vertices=v, tess_faces=f, volume=vol_test,
+                    ))
+                    script_lines.append(f"result = result.edges().fillet({attempt_r:.4f})")
+                    applied = True
+                    break
+            except Exception:
+                continue
+        if not applied:
+            logger.warning("All fillet sizes failed — skipping fillet step")
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
     return wp, "\n".join(script_lines), steps

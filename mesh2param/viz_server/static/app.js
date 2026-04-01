@@ -317,12 +317,34 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   }
 
   try {
-    startPolling();
-    const res = await fetch('/api/upload', { method: 'POST', body: form });
+    // Show upload progress via XHR (fetch doesn't support upload progress)
+    progressBar.style.width = '5%';
+    progressDetail.textContent = 'Uploading...';
+
+    const data = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload');
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 30);
+          progressBar.style.width = pct + '%';
+          progressDetail.textContent = `Uploading... ${pct}%`;
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+        else reject(new Error(xhr.statusText));
+      };
+      xhr.onerror = () => reject(new Error('Upload failed'));
+      // Start polling pipeline progress once upload starts server-side processing
+      startPolling();
+      xhr.send(form);
+    });
+
     clearInterval(pollInterval);
     progressBar.style.width = '100%';
     loadingText.textContent = 'Loading viewer...';
-    const data = await res.json();
+    progressDetail.textContent = '100%';
 
     if (data.status === 'done') {
       const statusRes = await fetch('/api/status');

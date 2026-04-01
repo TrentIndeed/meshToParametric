@@ -114,22 +114,40 @@ def simple_sphere_mesh():
 def save_path(request, visual_report_dir):
     """Generate a save path for CI screenshots.
 
-    Files go directly into the stage folder (e.g. visual_reports/stage1_cleanup/normal_map.png).
-    Overwrites existing files by default.
+    Files go into mesh/stage folders:
+      visual_reports/Mesh1/stage4_topology/edge_classification_3d.png
 
     Usage:
         def test_something(save_path):
             visualize(data, save_path=save_path("my_viz.png"))
     """
 
-    def _make_path(filename):
+    def _make_path(filename, mesh_name="Mesh1"):
         module_name = request.node.module.__name__.split(".")[-1]
         stage_folder = _STAGE_FOLDERS.get(module_name, module_name)
-        stage_dir = os.path.join(visual_report_dir, stage_folder)
+        stage_dir = os.path.join(visual_report_dir, mesh_name, stage_folder)
         os.makedirs(stage_dir, exist_ok=True)
         return os.path.join(stage_dir, filename)
 
     return _make_path
+
+
+def discover_all_meshes() -> list[tuple[str, Path]]:
+    """Find all mesh files in models/ subfolders."""
+    results = []
+    if not MODELS_DIR.is_dir():
+        return results
+    mesh_exts = {".3mf", ".stl", ".obj", ".ply"}
+    for folder in sorted(MODELS_DIR.iterdir()):
+        if not folder.is_dir():
+            continue
+        meshes = [f for f in folder.iterdir() if f.suffix.lower() in mesh_exts]
+        if meshes:
+            results.append((folder.name, meshes[0]))
+    return results
+
+
+ALL_MESHES = discover_all_meshes()
 
 
 @pytest.fixture(scope="session")

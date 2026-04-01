@@ -279,37 +279,59 @@ async function renderThumbnail(stepIndex) {
   }
 }
 
-// ── File Upload ──
+// ── File Upload (with dimension analysis before pipeline) ──
+let pendingFile = null;
+
 document.getElementById('file-input').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  pendingFile = file;
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
   loading.classList.add('show');
-  loadingText.textContent = `Processing ${file.name}...`;
+  loadingText.textContent = `Analyzing ${file.name}...`;
   document.getElementById('status-dot').className = 'status-dot processing';
 
+  // First: quick upload to get mesh stats for AI analysis
   const form = new FormData();
   form.append('file', file);
 
   try {
+    // Run the full pipeline (it's fast enough)
     const res = await fetch('/api/upload', { method: 'POST', body: form });
     const data = await res.json();
 
     if (data.status === 'done') {
-      // Fetch status and populate UI
       const statusRes = await fetch('/api/status');
       const statusData = await statusRes.json();
-      populateUI(statusData);
-      document.getElementById('token-count').textContent = statusData.tokens_used;
-      document.getElementById('status-dot').className = 'status-dot done';
-      document.getElementById('btn-onshape').disabled = false;
 
-      // Load the last construction step (final model)
-      if (statusData.steps.length > 0) {
-        await loadStep(statusData.steps.length - 1);
+      // Try AI dimension analysis
+      loading.classList.remove('show');
+      try {
+        const analysisRes = await fetch('/api/chat/analyze-mesh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bbox_min: statusData.bbox_min,
+            bbox_max: statusData.bbox_max,
+            volume: statusData.mesh_volume,
+            num_faces: statusData.num_steps,
+            features: statusData.steps.map(s => ({ type: s.name, depth: 0 })),
+          }),
+        });
+        const analysis = await analysisRes.json();
+
+        if (!analysis.skip) {
+          showDimensionModal(analysis, statusData);
+          return; // Modal will call finishLoad when confirmed
+        }
+      } catch (err) {
+        // AI unavailable, skip dimension review
       }
+
+      // No AI or skipped — load directly
+      finishLoad(statusData);
     } else {
       alert('Pipeline error: ' + (data.error || 'unknown'));
       document.getElementById('status-dot').className = 'status-dot';
@@ -317,9 +339,143 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   } catch (err) {
     alert('Upload failed: ' + err.message);
     document.getElementById('status-dot').className = 'status-dot';
-  } finally {
     loading.classList.remove('show');
+  } finally {
     e.target.value = '';
+  }
+});
+
+let cachedStatusData = null;
+
+function finishLoad(statusData) {
+  cachedStatusData = statusData;
+  populateUI(statusData);
+  document.getElementById('token-count').textContent = statusData.tokens_used;
+  document.getElementById('status-dot').className = 'status-dot done';
+  document.getElementById('btn-onshape').disabled = false;
+
+  // Enable chat
+  document.getElementById('chat-input').disabled = false;
+  document.getElementById('chat-send').disabled = false;
+
+  // Add system message to chat
+  addChatMessage('system', `Model loaded: ${statusData.num_steps} features, ${statusData.mesh_volume.toLocaleString()} mm³`);
+
+  if (statusData.steps.length > 0) {
+    loadStep(statusData.steps.length - 1);
+  }
+}
+
+// ── Dimension Review Modal ──
+function showDimensionModal(analysis, statusData) {
+  cachedStatusData = statusData;
+  const modal = document.getElementById('dim-modal');
+  const rows = document.getElementById('dim-rows');
+  const notes = document.getElementById('dim-notes');
+
+  document.getElementById('dim-part-type').innerHTML = `
+    <div style="font-size:14px;color:var(--accent);margin-bottom:12px">
+      Detected: <strong>${analysis.part_type || 'Unknown'}</strong>
+    </div>`;
+
+  rows.innerHTML = '';
+  const dims = analysis.suggested_dimensions || {};
+  for (const [key, val] of Object.entries(dims)) {
+    if (Array.isArray(val)) {
+      rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value">[${val.join(', ')}] mm</span></div>`;
+    } else {
+      rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value">${val} mm</span></div>`;
+    }
+  }
+
+  notes.textContent = analysis.notes || '';
+  if (analysis.usage) {
+    document.getElementById('token-count').textContent = analysis.usage.calls_used || 0;
+  }
+
+  modal.classList.add('show');
+}
+
+// Called from HTML buttons
+window.skipDimensionReview = function() {
+  document.getElementById('dim-modal').classList.remove('show');
+  if (cachedStatusData) finishLoad(cachedStatusData);
+};
+
+window.confirmDimensionReview = function() {
+  document.getElementById('dim-modal').classList.remove('show');
+  if (cachedStatusData) finishLoad(cachedStatusData);
+  addChatMessage('system', 'Dimensions confirmed by AI analysis');
+};
+
+// ── AI Chat ──
+const chatMessages = document.getElementById('chat-messages');
+const chatInput = document.getElementById('chat-input');
+const chatSend = document.getElementById('chat-send');
+
+function addChatMessage(role, text) {
+  const msg = document.createElement('div');
+  msg.className = `chat-msg ${role}`;
+  msg.textContent = text;
+  chatMessages.appendChild(msg);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+async function sendChatMessage() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+
+  addChatMessage('user', text);
+  chatInput.value = '';
+  chatInput.disabled = true;
+  chatSend.disabled = true;
+
+  // Show typing indicator
+  const typing = document.createElement('div');
+  typing.className = 'chat-typing';
+  typing.textContent = 'Thinking...';
+  chatMessages.appendChild(typing);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+
+  try {
+    const statusRes = await fetch('/api/status');
+    const context = await statusRes.json();
+
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, context }),
+    });
+    const data = await res.json();
+
+    typing.remove();
+    addChatMessage('ai', data.reply);
+
+    // Update token count
+    if (data.usage) {
+      document.getElementById('token-count').textContent = data.usage.calls_used || 0;
+    }
+
+    // Handle feature edits
+    if (data.edit) {
+      addChatMessage('system', `Applying edit: ${JSON.stringify(data.edit)}`);
+      // TODO: re-run pipeline with modified params and refresh viewer
+    }
+  } catch (err) {
+    typing.remove();
+    addChatMessage('ai', `Error: ${err.message}`);
+  } finally {
+    chatInput.disabled = false;
+    chatSend.disabled = false;
+    chatInput.focus();
+  }
+}
+
+chatSend.addEventListener('click', sendChatMessage);
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChatMessage();
   }
 });
 
@@ -336,11 +492,7 @@ async function autoLoad() {
     const res = await fetch('/api/status');
     const data = await res.json();
     if (data.status === 'done' && data.steps.length > 0) {
-      populateUI(data);
-      document.getElementById('token-count').textContent = data.tokens_used;
-      document.getElementById('status-dot').className = 'status-dot done';
-      document.getElementById('btn-onshape').disabled = false;
-      await loadStep(data.steps.length - 1);
+      finishLoad(data);
     }
   } catch (e) { /* server not ready yet */ }
 }

@@ -116,7 +116,7 @@ async def _ssh_exec(ip: str, script: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Deploy mesh2param to Hetzner VPS")
     parser.add_argument("--ip", default=VPS_IP, help="VPS IP address (or set VPS_IP in .env)")
-    parser.add_argument("--domain", default="", help="Domain for HTTPS (e.g., mesh2param.com)")
+    parser.add_argument("--domain", default="parameshai.com", help="Domain for HTTPS")
     parser.add_argument("--auth-secret", default="", help="AUTH_SECRET for production")
     args = parser.parse_args()
 

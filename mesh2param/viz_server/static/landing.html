@@ -583,10 +583,16 @@ const observer = new IntersectionObserver((entries) => {
 document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
 
 // Waitlist
-function handleWaitlist(e) {
+async function handleWaitlist(e) {
   e.preventDefault();
   const email = document.getElementById('waitlist-email').value;
-  // TODO: POST to /api/waitlist
+  try {
+    await fetch('/api/waitlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+  } catch (err) {}
   document.querySelector('.waitlist-form').style.display = 'none';
   document.getElementById('waitlist-success').style.display = 'block';
   return false;

@@ -9,7 +9,7 @@ WORKDIR /app
 COPY . .
 
 RUN pip install --no-cache-dir -e ".[dev]" && \
-    pip install --no-cache-dir cadquery shapely
+    pip install --no-cache-dir cadquery shapely uvicorn fastapi python-multipart python-dotenv sqlalchemy
 
 # Data directory for SQLite
 RUN mkdir -p /app/data

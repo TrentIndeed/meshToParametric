@@ -524,33 +524,66 @@ def _find_fillets_and_chamfers(
     config: RecognizeConfig,
     assigned: set[int],
 ) -> list[tuple[Feature, set[int]]]:
-    """Find fillet and chamfer features from Stage 4 edge classifications.
+    """Find fillet and chamfer features.
 
-    A surface is a fillet feature if it was identified as a fillet candidate
-    (small partial-arc cylinder) in Stage 4. A chamfer feature is a small
-    narrow plane strip identified in Stage 4.
+    Detection strategies:
+    1. Cone surfaces → CHAMFER (countersinks around holes, beveled edges)
+    2. Small narrow plane strips at ~135° to neighbors → CHAMFER (flat bevels)
+    3. Small partial-arc cylinders → FILLET (rounded edges)
+    4. Surfaces adjacent to chamfer/fillet/smooth edges → check type
     """
     results = []
-
-    # Collect region IDs that appear in fillet/chamfer edges
     fillet_rids: set[int] = set()
     chamfer_rids: set[int] = set()
 
+    # Strategy 1: All unassigned CONE surfaces are chamfers
+    # (conical surfaces are countersinks or beveled transitions)
+    for f in fitted:
+        if f.region_id in assigned:
+            continue
+        if f.surface_type == SurfaceType.CONE:
+            chamfer_rids.add(f.region_id)
+
+    # Strategy 2: Small narrow PLANE strips adjacent to chamfer edges
+    # (flat 45° bevels between two larger faces)
     for e in edges:
-        if e.transition_type == TransitionType.FILLET:
+        if e.transition_type == TransitionType.CHAMFER:
             for rid in (e.surface_a_id, e.surface_b_id):
+                if rid in assigned or rid in chamfer_rids:
+                    continue
                 f = fitted_lookup.get(rid)
-                if f and f.surface_type == SurfaceType.CYLINDER and rid not in assigned:
-                    fillet_rids.add(rid)
-        elif e.transition_type == TransitionType.CHAMFER:
-            for rid in (e.surface_a_id, e.surface_b_id):
-                f = fitted_lookup.get(rid)
-                if f and f.surface_type == SurfaceType.PLANE and rid not in assigned:
-                    r = region_lookup.get(rid)
-                    if r and r.num_faces <= 30:
+                r = region_lookup.get(rid)
+                if f is None or r is None:
+                    continue
+                # Small plane strips are chamfer faces
+                if f.surface_type == SurfaceType.PLANE and r.num_faces <= 50:
+                    extent = f.params.get("extent", float("inf"))
+                    if extent < config.chamfer_width_ratio * r.vertices.ptp() * 2:
                         chamfer_rids.add(rid)
 
+    # Strategy 3: Smooth/fillet edges involving small cylinders → FILLET
+    for e in edges:
+        if e.transition_type in (TransitionType.FILLET, TransitionType.SMOOTH):
+            for rid in (e.surface_a_id, e.surface_b_id):
+                if rid in assigned or rid in chamfer_rids:
+                    continue
+                f = fitted_lookup.get(rid)
+                r = region_lookup.get(rid)
+                if f is None or r is None:
+                    continue
+                # Small partial-arc cylinder = fillet
+                if f.surface_type == SurfaceType.CYLINDER:
+                    radius = f.params.get("radius", 0)
+                    bbox_diag = np.linalg.norm(r.vertices.max(0) - r.vertices.min(0))
+                    if radius > 0 and radius < bbox_diag * 0.3:
+                        span = _cylinder_angular_span(f, r)
+                        if span < 200:
+                            fillet_rids.add(rid)
+
+    # Build features
     for rid in fillet_rids:
+        if rid in assigned:
+            continue
         region = region_lookup.get(rid)
         f = fitted_lookup.get(rid)
         if region is None or f is None:
@@ -570,17 +603,24 @@ def _find_fillets_and_chamfers(
         ))
 
     for rid in chamfer_rids:
+        if rid in assigned:
+            continue
         region = region_lookup.get(rid)
         f = fitted_lookup.get(rid)
         if region is None or f is None:
             continue
+        # Determine chamfer width from the surface extent
+        if f.surface_type == SurfaceType.CONE:
+            width = f.params.get("half_angle", 0)
+        else:
+            width = f.params.get("extent", 0)
         results.append((
             Feature(
                 type=FeatureType.CHAMFER,
                 face_indices=region.face_indices.copy(),
                 sketch_geometry={
                     "type": "bevel",
-                    "width": f.params.get("extent", 0),
+                    "width": width,
                 },
                 depth=0.0,
                 operation="REMOVE",

@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 from mesh2param.db.database import init_db
 from mesh2param.api.auth import router as auth_router
+from mesh2param.api.chat import router as chat_router
 from mesh2param.api.settings import router as settings_router
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,9 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# Auth + settings routers
+# Routers
 app.include_router(auth_router)
+app.include_router(chat_router)
 app.include_router(settings_router)
 
 # In-memory state for the current session
@@ -91,6 +93,8 @@ async def status():
         "mesh_volume": round(_state["mesh_volume"], 1),
         "cad_volume": round(_state["cad_volume"], 1),
         "error": _state["error"],
+        "bbox_min": _state.get("bbox_min", [0, 0, 0]),
+        "bbox_max": _state.get("bbox_max", [0, 0, 0]),
     }
 
 
@@ -166,6 +170,8 @@ def _run_pipeline(mesh_path: str):
     _state["features"] = tree
     _state["cleaned"] = cleaned
     _state["mesh_volume"] = _estimate_volume(cleaned)
+    _state["bbox_min"] = cleaned.bbox[0].tolist()
+    _state["bbox_max"] = cleaned.bbox[1].tolist()
 
     # Stage 6: CadQuery export in subprocess (VTK isolation)
     tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)

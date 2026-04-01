@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mesh2param — Mesh to Parametric CAD</title>
+<meta name="description" content="Convert triangulated meshes into fully parametric CAD models with AI-powered feature recognition.">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ── Taste Skill: DESIGN_VARIANCE=8, MOTION_INTENSITY=6, VISUAL_DENSITY=2 ── */
+:root {
+  --bg: #0A0A0B;
+  --bg-elevated: #111113;
+  --bg-card: #161618;
+  --border: #27272A;
+  --text: #FAFAFA;
+  --text-secondary: #A1A1AA;
+  --text-muted: #52525B;
+  --accent: #22D3EE;
+  --accent-dim: rgba(34, 211, 238, 0.08);
+  --accent-border: rgba(34, 211, 238, 0.15);
+  --surface-glass: rgba(255,255,255,0.03);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Outfit', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* ── Typography ── */
+h1, h2, h3 { font-weight: 600; letter-spacing: -0.03em; line-height: 1.1; }
+h1 { font-size: clamp(2.8rem, 6vw, 5rem); }
+h2 { font-size: clamp(2rem, 4vw, 3.2rem); }
+h3 { font-size: 1.25rem; }
+p { color: var(--text-secondary); line-height: 1.7; max-width: 65ch; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+
+/* ── Layout ── */
+.container { max-width: 1200px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 3rem); }
+section { padding: clamp(5rem, 12vh, 10rem) 0; }
+
+/* ── Nav ── */
+nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  padding: 1rem 0;
+  background: rgba(10, 10, 11, 0.8);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+}
+nav .inner {
+  display: flex; align-items: center; justify-content: space-between;
+  max-width: 1200px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 3rem);
+}
+nav .logo {
+  font-size: 1.1rem; font-weight: 700; letter-spacing: -0.02em;
+  color: var(--text);
+}
+nav .logo span { color: var(--accent); }
+nav .links { display: flex; gap: 2rem; align-items: center; }
+nav .links a {
+  color: var(--text-muted); text-decoration: none; font-size: 0.9rem;
+  font-weight: 500; transition: color 0.2s;
+}
+nav .links a:hover { color: var(--text); }
+.btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  padding: 0.65rem 1.5rem; border-radius: 8px; font-size: 0.9rem;
+  font-weight: 600; font-family: 'Outfit', sans-serif;
+  cursor: pointer; transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  text-decoration: none; border: none;
+}
+.btn:active { transform: scale(0.98) translateY(1px); }
+.btn-primary {
+  background: var(--accent); color: var(--bg);
+}
+.btn-primary:hover { background: #06B6D4; }
+.btn-secondary {
+  background: transparent; color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { border-color: var(--accent-border); color: var(--accent); }
+
+/* ── Hero (asymmetric split) ── */
+.hero {
+  min-height: 100dvh; display: flex; align-items: center;
+  padding-top: 5rem;
+  position: relative; overflow: hidden;
+}
+.hero-bg {
+  position: absolute; inset: 0; z-index: 0;
+  /* Video background placeholder — will be replaced with actual video */
+  background: radial-gradient(ellipse at 60% 40%, rgba(34, 211, 238, 0.04) 0%, transparent 60%);
+}
+.hero-bg::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(180deg, var(--bg) 0%, transparent 20%, transparent 80%, var(--bg) 100%);
+}
+.hero .container {
+  display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 4rem;
+  align-items: center; position: relative; z-index: 1;
+}
+.hero-content { padding-left: clamp(0rem, 3vw, 3rem); }
+.hero-badge {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  padding: 0.4rem 1rem; border-radius: 100px; font-size: 0.8rem;
+  background: var(--accent-dim); border: 1px solid var(--accent-border);
+  color: var(--accent); font-weight: 500; margin-bottom: 2rem;
+}
+.hero-badge .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  animation: pulse-dot 2s infinite;
+}
+@keyframes pulse-dot { 50% { opacity: 0.4; } }
+.hero h1 { margin-bottom: 1.5rem; }
+.hero h1 .gradient {
+  background: linear-gradient(135deg, var(--accent), #A78BFA);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.hero p { font-size: 1.15rem; margin-bottom: 2.5rem; }
+.hero-actions { display: flex; gap: 1rem; flex-wrap: wrap; }
+.hero-visual {
+  position: relative; display: flex; align-items: center; justify-content: center;
+}
+.hero-visual .glow {
+  position: absolute; width: 400px; height: 400px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(34,211,238,0.08) 0%, transparent 70%);
+  filter: blur(60px);
+}
+.hero-visual .model-preview {
+  width: 100%; max-width: 500px; aspect-ratio: 1;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; display: flex; align-items: center; justify-content: center;
+  font-size: 0.85rem; color: var(--text-muted);
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset,
+              0 20px 60px rgba(0,0,0,0.5);
+}
+
+/* ── Stats ribbon ── */
+.stats {
+  padding: 3rem 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.stats .inner {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 2rem;
+}
+.stat { text-align: center; }
+.stat .num {
+  font-size: 2.5rem; font-weight: 700; letter-spacing: -0.03em;
+  color: var(--text);
+}
+.stat .label { font-size: 0.85rem; color: var(--text-muted); margin-top: 0.25rem; }
+
+/* ── How It Works (zig-zag) ── */
+.how-it-works .step {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 4rem;
+  align-items: center; margin-bottom: 6rem;
+}
+.how-it-works .step:nth-child(even) { direction: rtl; }
+.how-it-works .step:nth-child(even) > * { direction: ltr; }
+.step-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px; border-radius: 10px;
+  background: var(--accent-dim); border: 1px solid var(--accent-border);
+  color: var(--accent); font-size: 0.85rem; font-weight: 700;
+  margin-bottom: 1rem;
+}
+.step-visual {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 12px; aspect-ratio: 16/10;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); font-size: 0.85rem;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+
+/* ── Comparison chart ── */
+.comparison { overflow-x: auto; }
+.comparison table {
+  width: 100%; border-collapse: collapse; font-size: 0.9rem;
+}
+.comparison th, .comparison td {
+  padding: 1rem 1.5rem; text-align: left; border-bottom: 1px solid var(--border);
+}
+.comparison th {
+  font-weight: 600; color: var(--text); font-size: 0.8rem;
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.comparison td { color: var(--text-secondary); }
+.comparison td:first-child { color: var(--text); font-weight: 500; }
+.comparison .check { color: var(--accent); font-weight: 700; }
+.comparison .dash { color: var(--text-muted); }
+.comparison tr:hover td { background: var(--surface-glass); }
+.comparison thead th:nth-child(2) {
+  color: var(--accent); border-bottom: 2px solid var(--accent);
+}
+
+/* ── FAQ ── */
+.faq-item {
+  border-bottom: 1px solid var(--border); padding: 1.5rem 0;
+}
+.faq-q {
+  font-size: 1.05rem; font-weight: 600; color: var(--text);
+  cursor: pointer; display: flex; justify-content: space-between;
+  align-items: center;
+}
+.faq-q::after { content: '+'; font-size: 1.5rem; color: var(--text-muted); transition: transform 0.2s; }
+.faq-item.open .faq-q::after { transform: rotate(45deg); color: var(--accent); }
+.faq-a {
+  max-height: 0; overflow: hidden; transition: max-height 0.3s ease;
+  color: var(--text-secondary); line-height: 1.7;
+}
+.faq-item.open .faq-a { max-height: 300px; padding-top: 1rem; }
+
+/* ── Waitlist CTA ── */
+.waitlist {
+  text-align: center; padding: 8rem 0;
+}
+.waitlist-form {
+  display: flex; gap: 0.75rem; max-width: 480px; margin: 2rem auto 0;
+}
+.waitlist-form input {
+  flex: 1; padding: 0.75rem 1.25rem; border-radius: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  color: var(--text); font-family: 'Outfit', sans-serif; font-size: 0.95rem;
+  outline: none; transition: border-color 0.2s;
+}
+.waitlist-form input::placeholder { color: var(--text-muted); }
+.waitlist-form input:focus { border-color: var(--accent); }
+.waitlist-success {
+  display: none; color: var(--accent); font-size: 0.95rem;
+  margin-top: 1rem;
+}
+
+/* ── Share ── */
+.share-row {
+  display: flex; gap: 0.75rem; justify-content: center; margin-top: 1.5rem;
+}
+.share-btn {
+  width: 44px; height: 44px; border-radius: 10px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all 0.2s; color: var(--text-muted);
+  text-decoration: none; font-size: 1.1rem;
+}
+.share-btn:hover { border-color: var(--accent-border); color: var(--accent); }
+
+/* ── Footer ── */
+footer {
+  padding: 3rem 0; border-top: 1px solid var(--border);
+  text-align: center; font-size: 0.85rem; color: var(--text-muted);
+}
+
+/* ── Mobile ── */
+@media (max-width: 768px) {
+  .hero .container { grid-template-columns: 1fr; gap: 2rem; }
+  .hero-visual { display: none; }
+  .stats .inner { grid-template-columns: repeat(2, 1fr); }
+  .how-it-works .step { grid-template-columns: 1fr; }
+  .how-it-works .step:nth-child(even) { direction: ltr; }
+  nav .links { gap: 1rem; }
+  nav .links a:not(.btn) { display: none; }
+}
+
+/* ── Fade-in animation ── */
+.fade-in {
+  opacity: 0; transform: translateY(24px);
+  transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.fade-in.visible { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <div class="inner">
+    <div class="logo">mesh2<span>param</span></div>
+    <div class="links">
+      <a href="#how">How It Works</a>
+      <a href="#compare">Compare</a>
+      <a href="#faq">FAQ</a>
+      <a href="/login" class="btn btn-secondary">Sign In</a>
+      <a href="#waitlist" class="btn btn-primary">Join Waitlist</a>
+    </div>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="hero-bg" id="hero-bg">
+    <!-- Video will be injected here -->
+  </div>
+  <div class="container">
+    <div class="hero-content fade-in">
+      <div class="hero-badge"><span class="dot"></span> Now in private beta</div>
+      <h1>Reverse-engineer<br>any mesh into<br><span class="gradient">parametric CAD</span></h1>
+      <p>Drop an STL, OBJ, or 3MF file. Get a fully editable feature tree with sketches, extrusions, holes, chamfers, and fillets — reconstructed from scratch.</p>
+      <div class="hero-actions">
+        <a href="#waitlist" class="btn btn-primary">Join the Waitlist</a>
+        <a href="/" class="btn btn-secondary">Try the Viewer</a>
+      </div>
+    </div>
+    <div class="hero-visual fade-in">
+      <div class="glow"></div>
+      <div class="model-preview">
+        3D model preview will appear here
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Stats -->
+<section class="stats">
+  <div class="inner container">
+    <div class="stat fade-in">
+      <div class="num">6</div>
+      <div class="label">Pipeline stages</div>
+    </div>
+    <div class="stat fade-in">
+      <div class="num">&lt;3%</div>
+      <div class="label">Volume error</div>
+    </div>
+    <div class="stat fade-in">
+      <div class="num">8</div>
+      <div class="label">Feature types detected</div>
+    </div>
+    <div class="stat fade-in">
+      <div class="num mono">STEP</div>
+      <div class="label">Export format</div>
+    </div>
+  </div>
+</section>
+
+<!-- How It Works -->
+<section id="how">
+  <div class="container">
+    <h2 class="fade-in" style="margin-bottom: 4rem;">How it works</h2>
+
+    <div class="how-it-works">
+      <div class="step fade-in">
+        <div>
+          <div class="step-num">1</div>
+          <h3>Upload your mesh</h3>
+          <p style="margin-top:0.75rem">Drop any STL, OBJ, PLY, or 3MF file. The pipeline ingests, repairs topology, fixes normals, and removes degenerate geometry automatically.</p>
+        </div>
+        <div class="step-visual">Stage 1: Mesh Ingestion</div>
+      </div>
+
+      <div class="step fade-in">
+        <div>
+          <div class="step-num">2</div>
+          <h3>AI recognizes features</h3>
+          <p style="margin-top:0.75rem">Surface segmentation, primitive fitting, topology analysis, and pattern matching identify extrusions, holes, pockets, chamfers, and fillets.</p>
+        </div>
+        <div class="step-visual">Stages 2-5: Recognition</div>
+      </div>
+
+      <div class="step fade-in">
+        <div>
+          <div class="step-num">3</div>
+          <h3>Clean CAD model built</h3>
+          <p style="margin-top:0.75rem">A parametric solid is constructed from scratch — sketch profile, extrude, cut holes, apply chamfers. Flat faces, clean edges, proper B-rep geometry.</p>
+        </div>
+        <div class="step-visual">Stage 6: CadQuery Export</div>
+      </div>
+
+      <div class="step fade-in">
+        <div>
+          <div class="step-num">4</div>
+          <h3>Export or edit</h3>
+          <p style="margin-top:0.75rem">Download as STEP, send to Onshape, or use the AI chatbot to modify feature dimensions. The entire feature tree is editable.</p>
+        </div>
+        <div class="step-visual">Web Viewer + AI Chat</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Comparison -->
+<section id="compare" style="background: var(--bg-elevated);">
+  <div class="container">
+    <h2 class="fade-in" style="margin-bottom: 3rem;">How mesh2param compares</h2>
+    <div class="comparison fade-in">
+      <table>
+        <thead>
+          <tr>
+            <th>Capability</th>
+            <th>mesh2param</th>
+            <th>Manual CAD rework</th>
+            <th>Mesh-to-BREP tools</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Feature tree reconstruction</td><td class="check">Yes</td><td class="check">Yes (manual)</td><td class="dash">No</td></tr>
+          <tr><td>Hole detection</td><td class="check">Automatic</td><td>Manual</td><td class="dash">No</td></tr>
+          <tr><td>Chamfer / fillet recognition</td><td class="check">Automatic</td><td>Manual</td><td class="dash">No</td></tr>
+          <tr><td>Sketch + extrude workflow</td><td class="check">Generated</td><td>Drawn by hand</td><td class="dash">N/A</td></tr>
+          <tr><td>AI dimension planning</td><td class="check">Claude-powered</td><td class="dash">No</td><td class="dash">No</td></tr>
+          <tr><td>STEP export</td><td class="check">CadQuery</td><td class="check">Native</td><td>Limited</td></tr>
+          <tr><td>Onshape integration</td><td class="check">REST API</td><td class="check">Manual</td><td class="dash">No</td></tr>
+          <tr><td>Time per part</td><td class="mono" style="color:var(--accent)">~30 sec</td><td>2-8 hours</td><td>N/A</td></tr>
+          <tr><td>Cost</td><td class="mono" style="color:var(--accent)">Free (self-hosted)</td><td>$$$</td><td>$$</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- FAQ -->
+<section id="faq">
+  <div class="container">
+    <h2 class="fade-in" style="margin-bottom: 3rem;">Frequently asked</h2>
+    <div class="faq-list">
+      <div class="faq-item fade-in">
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What file formats are supported?</div>
+        <div class="faq-a">STL, OBJ, PLY, and 3MF. The pipeline repairs topology, fixes normals, and removes degenerate faces before processing.</div>
+      </div>
+      <div class="faq-item fade-in">
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What kinds of parts work best?</div>
+        <div class="faq-a">Prismatic mechanical parts — brackets, mounts, plates, housings. Components with planar faces, cylindrical holes, pockets, bosses, fillets, and chamfers. Freeform/organic geometry is not supported.</div>
+      </div>
+      <div class="faq-item fade-in">
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How accurate is the reconstruction?</div>
+        <div class="faq-a">Typically under 3% volume error compared to the original CAD model. The pipeline detects all major features including through/blind holes, chamfers, and fillets.</div>
+      </div>
+      <div class="faq-item fade-in">
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Does it require an API key?</div>
+        <div class="faq-a">No. AI features use the Claude CLI with OAuth authentication — no API key needed. Your Claude Max or Pro subscription handles the cost. The core pipeline works entirely offline without any AI.</div>
+      </div>
+      <div class="faq-item fade-in">
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I self-host it?</div>
+        <div class="faq-a">Yes. mesh2param is open source. Install with pip, run the web viewer locally, and process meshes on your own hardware. No cloud dependency.</div>
+      </div>
+      <div class="faq-item fade-in">
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How does the AI chatbot work?</div>
+        <div class="faq-a">The right-panel chat sends your message along with the current feature tree context to Claude. It can describe the part, suggest edits ("make hole 1 larger"), and analyze dimensions before the pipeline runs.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Waitlist CTA -->
+<section id="waitlist" class="waitlist">
+  <div class="container">
+    <h2 class="fade-in">Get early access</h2>
+    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">Drop your email. We'll notify you when mesh2param launches publicly.</p>
+    <form class="waitlist-form fade-in" onsubmit="return handleWaitlist(event)">
+      <input type="email" id="waitlist-email" placeholder="you@company.com" required>
+      <button type="submit" class="btn btn-primary">Join</button>
+    </form>
+    <div class="waitlist-success" id="waitlist-success">You're on the list. We'll be in touch.</div>
+
+    <!-- Share -->
+    <div class="share-row fade-in">
+      <a class="share-btn" href="https://twitter.com/intent/tweet?text=mesh2param%20converts%20STL%20meshes%20into%20parametric%20CAD%20models%20with%20AI-powered%20feature%20recognition.&url=" target="_blank" title="Share on X">𝕏</a>
+      <a class="share-btn" href="https://www.linkedin.com/sharing/share-offsite/?url=" target="_blank" title="Share on LinkedIn">in</a>
+      <button class="share-btn" onclick="copyLink()" title="Copy link">🔗</button>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="container">
+    mesh2param &mdash; open source mesh-to-parametric pipeline
+  </div>
+</footer>
+
+<script>
+// Fade-in on scroll
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
+}, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+
+// Waitlist
+function handleWaitlist(e) {
+  e.preventDefault();
+  const email = document.getElementById('waitlist-email').value;
+  // TODO: POST to /api/waitlist
+  document.querySelector('.waitlist-form').style.display = 'none';
+  document.getElementById('waitlist-success').style.display = 'block';
+  return false;
+}
+
+// Copy link
+function copyLink() {
+  navigator.clipboard.writeText(window.location.href);
+  const btn = event.target.closest('.share-btn');
+  btn.textContent = '✓';
+  setTimeout(() => btn.textContent = '🔗', 2000);
+}
+</script>
+</body>
+</html>

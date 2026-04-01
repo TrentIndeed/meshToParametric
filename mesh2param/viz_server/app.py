@@ -77,6 +77,11 @@ async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+@app.get("/landing", response_class=HTMLResponse)
+async def landing():
+    return FileResponse(str(STATIC_DIR / "landing.html"))
+
+
 @app.get("/api/status")
 async def status():
     steps_info = []

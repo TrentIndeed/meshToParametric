@@ -302,8 +302,8 @@ footer {
   .btn { padding: 0.6rem 1rem; font-size: 0.85rem; }
   .waitlist-form { flex-direction: column; }
   .waitlist-form input, .waitlist-form .btn { width: 100%; }
-  .scroll-anim .text-overlay { left: 1rem !important; right: 1rem !important; max-width: none; padding: 1.5rem; }
-  .scroll-anim .overlay-right { right: 1rem !important; left: 1rem !important; }
+  .scroll-anim .text-overlay { width: 95% !important; padding: 1.2rem; }
+  .scroll-anim .gear-video { max-width: 90%; }
   section { padding: clamp(3rem, 8vh, 6rem) 0; }
 }
 /* Pricing grid */
@@ -320,28 +320,32 @@ footer {
 
 /* ── Scroll animation section ── */
 .scroll-anim {
-  position: relative; height: 300vh; /* 3x viewport for scroll distance */
+  position: relative; height: 400vh; /* 4x viewport: enter + 3 slides + exit */
 }
 .scroll-anim .sticky {
   position: sticky; top: 0; height: 100vh;
-  display: flex; align-items: center; justify-content: center;
-  overflow: hidden;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; overflow: hidden;
 }
-.scroll-anim .frame-img {
-  width: 100%; max-width: 960px; border-radius: 12px;
+.scroll-anim .gear-video {
+  width: 100%; max-width: 700px; border-radius: 16px;
   box-shadow: 0 20px 80px rgba(0,0,0,0.6);
+  margin-bottom: 2rem;
 }
 .scroll-anim .text-overlay {
-  position: absolute; z-index: 2;
-  padding: 2rem 3rem; border-radius: 12px;
-  background: rgba(10,10,11,0.75); backdrop-filter: blur(12px);
+  position: absolute; z-index: 2; bottom: 8%;
+  padding: 1.5rem 2.5rem; border-radius: 12px;
+  background: rgba(10,10,11,0.8); backdrop-filter: blur(16px);
   border: 1px solid var(--border);
-  max-width: 420px; transition: opacity 0.3s;
+  max-width: 520px; width: 90%;
+  text-align: center; left: 50%; transform: translateX(-50%);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+.scroll-anim .text-overlay.hidden {
+  opacity: 0; transform: translateX(-50%) translateY(20px);
 }
 .scroll-anim .text-overlay h3 { margin-bottom: 0.5rem; }
-.scroll-anim .text-overlay p { font-size: 0.95rem; }
-.scroll-anim .overlay-left { left: 5%; top: 50%; transform: translateY(-50%); }
-.scroll-anim .overlay-right { right: 5%; top: 50%; transform: translateY(-50%); }
+.scroll-anim .text-overlay p { font-size: 0.95rem; margin: 0 auto; }
 
 /* ── Fade-in animation ── */
 .fade-in {
@@ -416,19 +420,21 @@ footer {
   </div>
 </section>
 
-<!-- Scroll Animation: Frame-by-frame reveal -->
+<!-- Scroll Animation: Video gear with text slides -->
 <section class="scroll-anim" id="scroll-anim">
   <div class="sticky">
-    <img class="frame-img" id="scroll-frame" src="/static/scroll-frames/frame-00.jpg" alt="Construction animation">
-    <div class="text-overlay overlay-left" id="scroll-text-0">
+    <video class="gear-video" id="gear-video" muted loop playsinline preload="auto">
+      <source src="/static/hero.mp4" type="video/mp4">
+    </video>
+    <div class="text-overlay hidden" id="scroll-text-0">
       <h3>Intelligent segmentation</h3>
       <p>Clusters mesh faces into regions belonging to analytic surfaces — planes, cylinders, cones, spheres.</p>
     </div>
-    <div class="text-overlay overlay-right" id="scroll-text-1" style="opacity:0">
+    <div class="text-overlay hidden" id="scroll-text-1">
       <h3>Feature recognition</h3>
       <p>Identifies extrusions, through-holes, blind holes, chamfers, and fillets from the surface topology graph.</p>
     </div>
-    <div class="text-overlay overlay-left" id="scroll-text-2" style="opacity:0">
+    <div class="text-overlay hidden" id="scroll-text-2">
       <h3>Parametric reconstruction</h3>
       <p>Builds a clean solid from scratch — sketch, extrude, cut — with proper engineering dimensions.</p>
     </div>
@@ -683,41 +689,50 @@ footer {
 </footer>
 
 <script>
-// ── Scroll animation: preload frames and tie to scroll ──
-const TOTAL_FRAMES = 20;
-const scrollFrames = [];
-// Preload all frames
-for (let i = 0; i < TOTAL_FRAMES; i++) {
-  const img = new Image();
-  img.src = `/static/scroll-frames/frame-${String(i).padStart(2, '0')}.jpg`;
-  scrollFrames.push(img);
-}
-
+// ── Scroll animation: video + text slides ──
+const gearVideo = document.getElementById('gear-video');
 const scrollSection = document.getElementById('scroll-anim');
-const scrollImg = document.getElementById('scroll-frame');
-const textOverlays = [
+const textSlides = [
   document.getElementById('scroll-text-0'),
   document.getElementById('scroll-text-1'),
   document.getElementById('scroll-text-2'),
 ];
+let videoStarted = false;
 
 window.addEventListener('scroll', () => {
-  if (!scrollSection || !scrollImg) return;
+  if (!scrollSection || !gearVideo) return;
   const rect = scrollSection.getBoundingClientRect();
   const sectionHeight = scrollSection.offsetHeight - window.innerHeight;
   const scrolled = -rect.top;
   const progress = Math.max(0, Math.min(1, scrolled / sectionHeight));
 
-  // Map progress to frame index
-  const frameIdx = Math.min(TOTAL_FRAMES - 1, Math.floor(progress * TOTAL_FRAMES));
-  if (scrollFrames[frameIdx] && scrollFrames[frameIdx].complete) {
-    scrollImg.src = scrollFrames[frameIdx].src;
+  // Start video when section enters viewport
+  if (rect.top < window.innerHeight && rect.bottom > 0) {
+    if (!videoStarted) {
+      gearVideo.play().catch(() => {});
+      videoStarted = true;
+    }
+  } else {
+    if (videoStarted) {
+      gearVideo.pause();
+      videoStarted = false;
+    }
   }
 
-  // Show text overlays at different scroll positions
-  const section = Math.floor(progress * 3);
-  textOverlays.forEach((el, i) => {
-    if (el) el.style.opacity = (i === section && progress > 0.02) ? '1' : '0';
+  // Progress 0-0.1: entering (no text)
+  // Progress 0.1-0.35: slide 0
+  // Progress 0.35-0.6: slide 1
+  // Progress 0.6-0.85: slide 2
+  // Progress 0.85-1.0: exiting (no text)
+  const ranges = [[0.1, 0.35], [0.35, 0.6], [0.6, 0.85]];
+  textSlides.forEach((el, i) => {
+    if (!el) return;
+    const [start, end] = ranges[i];
+    if (progress >= start && progress < end) {
+      el.classList.remove('hidden');
+    } else {
+      el.classList.add('hidden');
+    }
   });
 }, { passive: true });
 

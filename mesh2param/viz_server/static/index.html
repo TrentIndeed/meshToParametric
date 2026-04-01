@@ -292,6 +292,22 @@ body {
 /* Hidden file input */
 #file-input { display: none; }
 
+/* ── Mobile: hide sidebars, stack controls ── */
+@media (max-width: 768px) {
+  #sidebar { display: none; }
+  #chat-panel { display: none; }
+  #viewer { left: 0 !important; right: 0 !important; bottom: 140px; }
+  #timeline { height: 60px; bottom: 52px; }
+  .timeline-step { width: 50px; height: 36px; }
+  #actions { bottom: 0; left: 0; right: 0; transform: none;
+    background: var(--bg-secondary); padding: 8px 12px; gap: 6px;
+    border-top: 1px solid var(--border); justify-content: center; }
+  .action-btn { padding: 6px 14px; font-size: 12px; }
+  #topbar .menu-btn { display: none; }
+  #topbar .tokens { font-size: 10px; }
+  #chat-input-row { display: none; }
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

@@ -99,6 +99,22 @@ nav .links a:hover { color:var(--text); }
 
 footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
   font-size:0.85rem; color:var(--text-muted); }
+
+/* Mobile */
+@media (max-width: 768px) {
+  .viewer-grid { grid-template-columns: 1fr; }
+  .viewer-panel canvas { height: 280px !important; }
+  .stats-bar { grid-template-columns: repeat(2, 1fr); }
+  #resize-panel div[style*="grid-template-columns:1fr 1fr 1fr auto"] {
+    grid-template-columns: 1fr 1fr !important; }
+  nav .links a:not(.btn) { display: none; }
+  nav .links { gap: 0.5rem; }
+  .btn { padding: 0.55rem 1rem; font-size: 0.85rem; }
+  .hero h1 { font-size: 1.8rem; }
+  .cta-banner { padding: 1.5rem; }
+  .actions { flex-direction: column; align-items: stretch; }
+  .actions .btn { justify-content: center; }
+}
 </style>
 </head>
 <body>

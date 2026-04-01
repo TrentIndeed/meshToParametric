@@ -190,7 +190,7 @@ function populateUI(statusData) {
     item.className = 'feature-item';
     item.innerHTML = `
       <div class="icon ${iconInfo.cls}"><i class="${iconInfo.icon}"></i></div>
-      <div>
+      <div class="texts">
         <div class="name">${step.name}</div>
         <div class="detail">${step.volume > 0 ? step.volume.toLocaleString() + ' mm³' : '2D'}</div>
       </div>
@@ -479,20 +479,52 @@ chatInput.addEventListener('keydown', (e) => {
   }
 });
 
-// ── Panel collapse/expand ──
-window.toggleSidebar = function() {
-  const sidebar = document.getElementById('sidebar');
-  sidebar.classList.toggle('collapsed');
-  document.body.classList.toggle('sidebar-collapsed');
-  setTimeout(handleResize, 250);
-};
+// ── Drag-to-resize panels ──
+function setupResize(handleId, side) {
+  const handle = document.getElementById(handleId);
+  if (!handle) return;
+  let dragging = false;
 
-window.toggleChat = function() {
-  const chat = document.getElementById('chat-panel');
-  chat.classList.toggle('collapsed');
-  document.body.classList.toggle('chat-collapsed');
-  setTimeout(handleResize, 250);
-};
+  handle.addEventListener('mousedown', (e) => {
+    dragging = true;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const sidebar = document.getElementById('sidebar');
+    const chat = document.getElementById('chat-panel');
+    const viewer = document.getElementById('viewer');
+    const resizeLeft = document.getElementById('resize-left');
+    const resizeRight = document.getElementById('resize-right');
+
+    if (side === 'left') {
+      const w = Math.max(48, Math.min(400, e.clientX));
+      sidebar.style.width = w + 'px';
+      viewer.style.left = w + 'px';
+      resizeLeft.style.left = w + 'px';
+    } else {
+      const w = Math.max(0, Math.min(500, window.innerWidth - e.clientX));
+      chat.style.width = w + 'px';
+      viewer.style.right = w + 'px';
+      resizeRight.style.right = w + 'px';
+    }
+    handleResize();
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  });
+}
+setupResize('resize-left', 'left');
+setupResize('resize-right', 'right');
 
 // ── Resize ──
 function handleResize() {

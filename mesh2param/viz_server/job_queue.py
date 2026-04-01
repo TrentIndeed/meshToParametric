@@ -180,16 +180,18 @@ with open(r'{tmp_out.name}', 'wb') as f:
         job.progress = 100
         job.progress_stage = "Done"
 
-        # Compute token cost
+        # Compute token cost — tuned so 2×Mesh1 + 1×Mesh2 ≈ 100 free tokens
         from mesh2param.models.feature import FeatureType
-        cost = max(1, cleaned.num_faces // 100)
+        cost = max(1, cleaned.num_faces // 150)  # base: face complexity
         for feat in tree.features:
             if feat.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
                 cost += 2
             elif feat.type in (FeatureType.CHAMFER, FeatureType.FILLET):
-                cost += 3
+                cost += 2
             elif feat.type in (FeatureType.POCKET, FeatureType.BOSS, FeatureType.SLOT):
                 cost += 3
+        # Round to nearest 5
+        cost = max(5, round(cost / 5) * 5)
         job.token_cost = cost
         self._tokens_spent += cost
 

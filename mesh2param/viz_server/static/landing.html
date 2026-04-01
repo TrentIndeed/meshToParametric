@@ -283,6 +283,13 @@ footer {
   .how-it-works .step:nth-child(even) { direction: ltr; }
   nav .links { gap: 1rem; }
   nav .links a:not(.btn) { display: none; }
+  #pricing + section { padding: 3rem 0; }
+}
+@media (max-width: 900px) {
+  #pricing div[style*="grid-template-columns:repeat(4"] { grid-template-columns: repeat(2, 1fr) !important; }
+}
+@media (max-width: 550px) {
+  #pricing div[style*="grid-template-columns:repeat(4"] { grid-template-columns: 1fr !important; }
 }
 
 /* ── Scroll animation section ── */
@@ -327,8 +334,10 @@ footer {
     <div class="logo">Paramesh<span>AI</span></div>
     <div class="links">
       <a href="#how">How It Works</a>
+      <a href="#pricing">Pricing</a>
       <a href="#compare">Compare</a>
       <a href="#faq">FAQ</a>
+      <a href="/clean">Free Tools</a>
       <a href="/login" class="btn btn-secondary">Sign In</a>
       <a href="#waitlist" class="btn btn-primary">Join Waitlist</a>
     </div>
@@ -496,6 +505,81 @@ footer {
         </tbody>
       </table>
     </div>
+  </div>
+</section>
+
+<!-- Pricing -->
+<section id="pricing" style="padding: 6rem 0;">
+  <div class="container">
+    <h2 class="fade-in" style="margin-bottom: 0.75rem;">Simple, token-based pricing</h2>
+    <p class="fade-in" style="margin-bottom: 3rem; text-align:center;">Pay for what you use. Simple parts cost fewer tokens. Complex parts with many features cost more.</p>
+
+    <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:1.25rem; max-width:1000px; margin:0 auto;" class="fade-in">
+      <!-- Free -->
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Free</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$0</div>
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">forever</div>
+        <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
+          100 tokens<br>
+          10 MB upload limit<br>
+          Mesh cleaner (unlimited)<br>
+          Mesh resize (unlimited)<br>
+          Community support
+        </div>
+        <a href="/clean" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Get Started</a>
+      </div>
+
+      <!-- Starter -->
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Starter</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$9</div>
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
+        <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
+          1,000 tokens/mo<br>
+          50 MB upload limit<br>
+          STEP export<br>
+          AI dimension planner<br>
+          Email support
+        </div>
+        <a href="#waitlist" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
+      </div>
+
+      <!-- Pro -->
+      <div style="background:var(--bg-card); border:2px solid var(--accent); border-radius:14px; padding:2rem 1.5rem; position:relative; display:flex; flex-direction:column;">
+        <div style="position:absolute; top:-12px; left:50%; transform:translateX(-50%); background:var(--accent); color:var(--bg); font-size:0.7rem; font-weight:700; padding:0.25rem 0.75rem; border-radius:100px; text-transform:uppercase; letter-spacing:0.05em;">Most Popular</div>
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Pro</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$29</div>
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
+        <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
+          5,000 tokens/mo<br>
+          200 MB upload limit<br>
+          STEP + Onshape export<br>
+          AI chatbot + planner<br>
+          Priority support
+        </div>
+        <a href="#waitlist" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
+      </div>
+
+      <!-- Unlimited -->
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Unlimited</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$79</div>
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
+        <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
+          Unlimited tokens<br>
+          500 MB upload limit<br>
+          All export formats<br>
+          Full AI suite<br>
+          Dedicated support
+        </div>
+        <a href="#waitlist" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Contact Us</a>
+      </div>
+    </div>
+
+    <p class="fade-in" style="text-align:center; margin-top:2rem; font-size:0.85rem; color:var(--text-muted);">
+      Token cost depends on mesh complexity: ~5 tokens for a simple plate, ~30 for a bracket with holes, ~50+ for parts with chamfers and fillets.
+    </p>
   </div>
 </section>
 

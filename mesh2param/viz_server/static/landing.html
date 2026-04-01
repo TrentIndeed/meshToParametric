@@ -276,20 +276,35 @@ footer {
 
 /* ── Mobile ── */
 @media (max-width: 768px) {
-  .hero .container { grid-template-columns: 1fr; gap: 2rem; }
+  .hero .container { grid-template-columns: 1fr; gap: 1.5rem; }
   .hero-visual { display: none; }
+  .hero-content { padding-left: 0; }
+  .hero h1 { font-size: 2.4rem; }
+  .hero p { font-size: 1rem; }
+  .hero-actions { flex-direction: column; }
+  .hero-actions .btn { width: 100%; justify-content: center; padding: 0.85rem 1.5rem; font-size: 1rem; }
   .stats .inner { grid-template-columns: repeat(2, 1fr); }
   .how-it-works .step { grid-template-columns: 1fr; }
   .how-it-works .step:nth-child(even) { direction: ltr; }
-  nav .links { gap: 1rem; }
+  nav .links { gap: 0.5rem; }
   nav .links a:not(.btn) { display: none; }
-  #pricing + section { padding: 3rem 0; }
+  .btn { padding: 0.6rem 1rem; font-size: 0.85rem; }
+  .waitlist-form { flex-direction: column; }
+  .waitlist-form input, .waitlist-form .btn { width: 100%; }
+  .scroll-anim .text-overlay { left: 1rem !important; right: 1rem !important; max-width: none; padding: 1.5rem; }
+  .scroll-anim .overlay-right { right: 1rem !important; left: 1rem !important; }
+  section { padding: clamp(3rem, 8vh, 6rem) 0; }
 }
+/* Pricing grid */
+.pricing-grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:1.25rem; max-width:1000px; margin:0 auto; }
+.free-tools-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; max-width:800px; }
+
 @media (max-width: 900px) {
-  #pricing div[style*="grid-template-columns:repeat(4"] { grid-template-columns: repeat(2, 1fr) !important; }
+  .pricing-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 550px) {
-  #pricing div[style*="grid-template-columns:repeat(4"] { grid-template-columns: 1fr !important; }
+  .pricing-grid { grid-template-columns: 1fr; }
+  .free-tools-grid { grid-template-columns: 1fr; }
 }
 
 /* ── Scroll animation section ── */
@@ -461,7 +476,7 @@ footer {
   <div class="container">
     <h2 class="fade-in" style="margin-bottom: 1rem;">Start free, upgrade when ready</h2>
     <p class="fade-in" style="margin-bottom: 3rem;">No credit card. No signup for the cleaner. Try Paramesh AI with 3 free generations.</p>
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; max-width:800px;">
+    <div class="free-tools-grid">
       <div class="fade-in" style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:2rem;">
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--green); font-weight:600; margin-bottom:1rem;">Free Forever</div>
         <h3 style="margin-bottom:0.75rem;">Mesh Cleaner</h3>
@@ -514,7 +529,7 @@ footer {
     <h2 class="fade-in" style="margin-bottom: 0.75rem;">Simple, token-based pricing</h2>
     <p class="fade-in" style="margin-bottom: 3rem; text-align:center;">Pay for what you use. Simple parts cost fewer tokens. Complex parts with many features cost more.</p>
 
-    <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:1.25rem; max-width:1000px; margin:0 auto;" class="fade-in">
+    <div class="pricing-grid fade-in">
       <!-- Free -->
       <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Free</div>

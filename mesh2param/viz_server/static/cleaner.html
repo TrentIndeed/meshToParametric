@@ -142,6 +142,32 @@ footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
         <div id="viewer-cleaned"></div>
       </div>
     </div>
+    <!-- Resize controls -->
+    <div id="resize-panel" style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:1.5rem; margin-bottom:1.5rem; max-width:700px; margin-left:auto; margin-right:auto;">
+      <h3 style="font-size:1rem; margin-bottom:1rem;">Resize Mesh</h3>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:0.75rem; align-items:end;">
+        <div>
+          <label style="font-size:0.75rem; color:var(--text-muted); display:block; margin-bottom:0.3rem;">Width (X) mm</label>
+          <input id="dim-x" type="number" step="0.1" style="width:100%; padding:0.5rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:0.9rem;">
+        </div>
+        <div>
+          <label style="font-size:0.75rem; color:var(--text-muted); display:block; margin-bottom:0.3rem;">Height (Y) mm</label>
+          <input id="dim-y" type="number" step="0.1" style="width:100%; padding:0.5rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:0.9rem;">
+        </div>
+        <div>
+          <label style="font-size:0.75rem; color:var(--text-muted); display:block; margin-bottom:0.3rem;">Depth (Z) mm</label>
+          <input id="dim-z" type="number" step="0.1" style="width:100%; padding:0.5rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:0.9rem;">
+        </div>
+        <button class="btn btn-primary" onclick="applyResize()" style="white-space:nowrap;">Apply</button>
+      </div>
+      <div style="margin-top:0.75rem; display:flex; gap:0.5rem; align-items:center;">
+        <label style="font-size:0.75rem; color:var(--text-muted);">Or scale uniformly:</label>
+        <input id="scale-factor" type="number" step="0.1" value="1.0" min="0.01" style="width:80px; padding:0.4rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:0.85rem;">
+        <span style="font-size:0.75rem; color:var(--text-muted);">×</span>
+        <button class="btn btn-secondary" onclick="applyScale()" style="padding:0.4rem 1rem; font-size:0.85rem;">Scale</button>
+      </div>
+    </div>
+
     <div class="actions">
       <a class="btn btn-primary" id="download-btn" href="#">Download Cleaned STL</a>
       <button class="btn btn-secondary" onclick="document.getElementById('file-input').click()">Clean Another</button>
@@ -201,10 +227,70 @@ async function processFile(file) {
   }
 }
 
+// Current mesh data for resize operations
+let currentVerts = null;
+let currentFaces = null;
+
+window.applyResize = async function() {
+  if (!currentVerts) return;
+  const x = parseFloat(document.getElementById('dim-x').value) || null;
+  const y = parseFloat(document.getElementById('dim-y').value) || null;
+  const z = parseFloat(document.getElementById('dim-z').value) || null;
+  if (!x && !y && !z) return;
+
+  const res = await fetch('/api/clean/resize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ vertices: currentVerts, faces: currentFaces, target_width: x, target_height: y, target_depth: z }),
+  });
+  const data = await res.json();
+  if (data.status === 'ok') {
+    currentVerts = data.vertices;
+    currentFaces = data.faces;
+    document.getElementById('download-btn').href = data.download_url;
+    document.getElementById('dim-x').value = data.dimensions[0].toFixed(1);
+    document.getElementById('dim-y').value = data.dimensions[1].toFixed(1);
+    document.getElementById('dim-z').value = data.dimensions[2].toFixed(1);
+    renderMesh('viewer-cleaned', data.vertices, data.faces, '#22C55E');
+  }
+};
+
+window.applyScale = async function() {
+  if (!currentVerts) return;
+  const scale = parseFloat(document.getElementById('scale-factor').value) || 1.0;
+  if (scale === 1.0) return;
+
+  const res = await fetch('/api/clean/resize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ vertices: currentVerts, faces: currentFaces, scale }),
+  });
+  const data = await res.json();
+  if (data.status === 'ok') {
+    currentVerts = data.vertices;
+    currentFaces = data.faces;
+    document.getElementById('download-btn').href = data.download_url;
+    document.getElementById('dim-x').value = data.dimensions[0].toFixed(1);
+    document.getElementById('dim-y').value = data.dimensions[1].toFixed(1);
+    document.getElementById('dim-z').value = data.dimensions[2].toFixed(1);
+    document.getElementById('scale-factor').value = '1.0';
+    renderMesh('viewer-cleaned', data.vertices, data.faces, '#22C55E');
+  }
+};
+
 function showResults(data, filename) {
+  currentVerts = data.vertices;
+  currentFaces = data.faces;
   document.getElementById('drop-zone').style.display = 'none';
   document.getElementById('viewer-area').style.display = 'block';
   document.getElementById('download-btn').href = data.download_url;
+
+  // Populate dimension fields from bbox
+  const bbox = data.cleaned.bbox;
+  const dims = [bbox[1][0]-bbox[0][0], bbox[1][1]-bbox[0][1], bbox[1][2]-bbox[0][2]];
+  document.getElementById('dim-x').value = dims[0].toFixed(1);
+  document.getElementById('dim-y').value = dims[1].toFixed(1);
+  document.getElementById('dim-z').value = dims[2].toFixed(1);
 
   // Stats
   const stats = document.getElementById('stats-bar');

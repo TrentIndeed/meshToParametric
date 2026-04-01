@@ -69,10 +69,41 @@ _state = {
     "cad_volume": 0.0,
     "progress": 0,
     "progress_stage": "",
-    "generations_used": 0,
+    "tokens_spent": 0,
 }
 
-FREE_TRIAL_LIMIT = 3
+# Token budgets per plan
+PLAN_TOKENS = {
+    "free": 100,
+    "starter": 1000,
+    "pro": 5000,
+    "unlimited": float("inf"),
+}
+
+# Max upload file size per plan (MB)
+PLAN_UPLOAD_MB = {
+    "free": 10,
+    "starter": 50,
+    "pro": 200,
+    "unlimited": 500,
+}
+
+
+def _compute_token_cost(cleaned, tree) -> int:
+    """Compute token cost based on mesh complexity + features."""
+    cost = 0
+    # Base: face count / 100
+    cost += max(1, cleaned.num_faces // 100)
+    # Features: holes=2, chamfers/fillets=3, pockets/bosses=3
+    from mesh2param.models.feature import FeatureType
+    for f in tree.features:
+        if f.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
+            cost += 2
+        elif f.type in (FeatureType.CHAMFER, FeatureType.FILLET):
+            cost += 3
+        elif f.type in (FeatureType.POCKET, FeatureType.BOSS, FeatureType.SLOT):
+            cost += 3
+    return cost
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -196,6 +227,56 @@ async def clean_mesh(file: UploadFile = File(...)):
         Path(tmp.name).unlink(missing_ok=True)
 
 
+@app.post("/api/clean/resize")
+async def resize_mesh(body: dict):
+    """Resize a cleaned mesh by scale factor or target dimensions."""
+    import trimesh
+
+    vertices = body.get("vertices", [])
+    faces = body.get("faces", [])
+    scale = body.get("scale", 1.0)
+    target_width = body.get("target_width")
+    target_height = body.get("target_height")
+    target_depth = body.get("target_depth")
+
+    if not vertices or not faces:
+        return JSONResponse({"error": "No geometry"}, status_code=400)
+
+    import numpy as np
+    verts = np.array(vertices, dtype=np.float64).reshape(-1, 3)
+    fcs = np.array(faces, dtype=np.int64).reshape(-1, 3)
+
+    # Compute current dimensions
+    bbox_size = verts.max(axis=0) - verts.min(axis=0)
+
+    # If target dimensions given, compute scale per axis
+    if target_width or target_height or target_depth:
+        sx = target_width / bbox_size[0] if target_width and bbox_size[0] > 0 else 1.0
+        sy = target_height / bbox_size[1] if target_height and bbox_size[1] > 0 else 1.0
+        sz = target_depth / bbox_size[2] if target_depth and bbox_size[2] > 0 else 1.0
+        center = (verts.max(axis=0) + verts.min(axis=0)) / 2
+        verts = (verts - center) * np.array([sx, sy, sz]) + center
+    elif scale != 1.0:
+        center = (verts.max(axis=0) + verts.min(axis=0)) / 2
+        verts = (verts - center) * scale + center
+
+    new_size = verts.max(axis=0) - verts.min(axis=0)
+
+    # Export resized STL
+    mesh = trimesh.Trimesh(vertices=verts, faces=fcs, process=False)
+    out_tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
+    mesh.export(out_tmp.name)
+    out_tmp.close()
+
+    return {
+        "status": "ok",
+        "dimensions": new_size.tolist(),
+        "vertices": verts.flatten().tolist(),
+        "faces": fcs.flatten().tolist(),
+        "download_url": f"/api/clean/download/{Path(out_tmp.name).name}",
+    }
+
+
 @app.get("/api/clean/download/{filename}")
 async def download_cleaned(filename: str):
     """Download a cleaned mesh file."""
@@ -236,33 +317,47 @@ async def get_step(index: int):
     }
 
 
-@app.get("/api/trial")
-async def trial_status():
-    """Check free trial usage."""
+@app.get("/api/usage")
+async def usage_status():
+    """Check token usage and plan limits."""
+    plan = "free"  # TODO: read from user session
+    limit = PLAN_TOKENS.get(plan, 100)
+    upload_mb = PLAN_UPLOAD_MB.get(plan, 10)
     return {
-        "generations_used": _state["generations_used"],
-        "limit": FREE_TRIAL_LIMIT,
-        "remaining": max(0, FREE_TRIAL_LIMIT - _state["generations_used"]),
+        "plan": plan,
+        "tokens_spent": _state["tokens_spent"],
+        "tokens_limit": limit if limit != float("inf") else -1,
+        "tokens_remaining": max(0, limit - _state["tokens_spent"]) if limit != float("inf") else -1,
+        "upload_limit_mb": upload_mb,
     }
 
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
-    """Upload a mesh file and run the full pipeline (counts toward trial)."""
-    if _state["generations_used"] >= FREE_TRIAL_LIMIT:
+    """Upload a mesh file and run the full pipeline (costs tokens)."""
+    plan = "free"  # TODO: read from user session
+    limit = PLAN_TOKENS.get(plan, 100)
+    if _state["tokens_spent"] >= limit:
         return JSONResponse(
-            {"status": "error", "error": "Free trial limit reached (3 generations). Sign up for full access."},
+            {"status": "error", "error": f"Token limit reached ({int(limit)} tokens on {plan} plan). Upgrade for more."},
             status_code=403,
         )
 
+    # Check file size
+    content = await file.read()
+    max_bytes = PLAN_UPLOAD_MB.get(plan, 10) * 1024 * 1024
+    if len(content) > max_bytes:
+        return JSONResponse(
+            {"status": "error", "error": f"File too large ({len(content)//1024//1024}MB). {plan} plan allows {PLAN_UPLOAD_MB[plan]}MB."},
+            status_code=413,
+        )
     _state["status"] = "processing"
     _state["error"] = None
     _state["steps"] = []
 
-    # Save uploaded file to temp
+    # Save uploaded file to temp (already read above for size check)
     suffix = Path(file.filename).suffix
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    content = await file.read()
     tmp.write(content)
     tmp.close()
 
@@ -358,10 +453,13 @@ with open(r'{tmp_out.name}', 'wb') as f:
 
     _state["steps"] = result.construction_steps
     _state["cad_volume"] = result.cad_volume
-    _state["tokens_used"] = 0
     _state["progress"] = 100
     _state["progress_stage"] = "Done"
-    _state["generations_used"] += 1
+
+    # Charge tokens based on complexity
+    token_cost = _compute_token_cost(cleaned, tree)
+    _state["tokens_spent"] += token_cost
+    _state["tokens_used"] = _state["tokens_spent"]
 
 
 def _estimate_volume(cleaned) -> float:

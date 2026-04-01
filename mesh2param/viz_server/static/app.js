@@ -289,17 +289,39 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
+  const progressBar = document.getElementById('progress-bar');
+  const progressDetail = document.getElementById('progress-detail');
   loading.classList.add('show');
-  loadingText.textContent = `Analyzing ${file.name}...`;
+  loadingText.textContent = `Uploading ${file.name}...`;
+  progressBar.style.width = '0%';
+  progressDetail.textContent = '';
   document.getElementById('status-dot').className = 'status-dot processing';
 
-  // First: quick upload to get mesh stats for AI analysis
   const form = new FormData();
   form.append('file', file);
 
+  // Poll progress while pipeline runs
+  let pollInterval = null;
+  function startPolling() {
+    pollInterval = setInterval(async () => {
+      try {
+        const pr = await fetch('/api/progress');
+        const pd = await pr.json();
+        progressBar.style.width = pd.progress + '%';
+        if (pd.stage) {
+          loadingText.textContent = pd.stage;
+          progressDetail.textContent = pd.progress + '%';
+        }
+      } catch (e) {}
+    }, 500);
+  }
+
   try {
-    // Run the full pipeline (it's fast enough)
+    startPolling();
     const res = await fetch('/api/upload', { method: 'POST', body: form });
+    clearInterval(pollInterval);
+    progressBar.style.width = '100%';
+    loadingText.textContent = 'Loading viewer...';
     const data = await res.json();
 
     if (data.status === 'done') {
@@ -337,10 +359,12 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       document.getElementById('status-dot').className = 'status-dot';
     }
   } catch (err) {
+    clearInterval(pollInterval);
     alert('Upload failed: ' + err.message);
     document.getElementById('status-dot').className = 'status-dot';
     loading.classList.remove('show');
   } finally {
+    clearInterval(pollInterval);
     e.target.value = '';
   }
 });

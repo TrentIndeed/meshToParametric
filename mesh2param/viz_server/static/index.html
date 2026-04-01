@@ -277,6 +277,17 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 #loading p { color: var(--text-secondary); font-size: 14px; }
+#progress-bar-container {
+  width: 300px; height: 6px; background: var(--border); border-radius: 3px;
+  overflow: hidden;
+}
+#progress-bar {
+  height: 100%; width: 0%; background: var(--accent);
+  border-radius: 3px; transition: width 0.3s ease;
+}
+#progress-detail {
+  font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;
+}
 
 /* Hidden file input */
 #file-input { display: none; }
@@ -363,10 +374,14 @@ body {
   <!-- Populated by JS -->
 </div>
 
-<!-- Loading Overlay -->
+<!-- Loading Overlay with progress bar -->
 <div id="loading">
   <div class="spinner"></div>
   <p id="loading-text">Processing mesh...</p>
+  <div id="progress-bar-container">
+    <div id="progress-bar"></div>
+  </div>
+  <p id="progress-detail"></p>
 </div>
 
 <script type="importmap">

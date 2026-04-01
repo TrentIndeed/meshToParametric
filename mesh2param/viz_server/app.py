@@ -67,6 +67,8 @@ _state = {
     "error": None,
     "mesh_volume": 0.0,
     "cad_volume": 0.0,
+    "progress": 0,
+    "progress_stage": "",
 }
 
 
@@ -95,6 +97,15 @@ async def status():
         "error": _state["error"],
         "bbox_min": _state.get("bbox_min", [0, 0, 0]),
         "bbox_max": _state.get("bbox_max", [0, 0, 0]),
+    }
+
+
+@app.get("/api/progress")
+async def progress():
+    return {
+        "progress": _state["progress"],
+        "stage": _state["progress_stage"],
+        "status": _state["status"],
     }
 
 
@@ -161,10 +172,24 @@ def _run_pipeline(mesh_path: str):
     from mesh2param.pipeline.recognize import recognize_features
 
     # Stages 1-5 run in the main process (no CadQuery VTK conflict)
+    _state["progress"] = 10
+    _state["progress_stage"] = "Ingesting mesh..."
     cleaned = ingest_mesh(mesh_path, IngestConfig(remesh=False))
+
+    _state["progress"] = 25
+    _state["progress_stage"] = "Segmenting surfaces..."
     regions = segment_mesh(cleaned, SegmentConfig())
+
+    _state["progress"] = 40
+    _state["progress_stage"] = "Fitting primitives..."
     fitted = fit_surfaces(regions, cleaned, FitConfig())
+
+    _state["progress"] = 55
+    _state["progress_stage"] = "Building topology..."
     graph, edges = build_topology(regions, fitted, cleaned, TopologyConfig())
+
+    _state["progress"] = 65
+    _state["progress_stage"] = "Recognizing features..."
     tree = recognize_features(regions, fitted, graph, edges, cleaned, RecognizeConfig())
 
     _state["features"] = tree
@@ -172,6 +197,9 @@ def _run_pipeline(mesh_path: str):
     _state["mesh_volume"] = _estimate_volume(cleaned)
     _state["bbox_min"] = cleaned.bbox[0].tolist()
     _state["bbox_max"] = cleaned.bbox[1].tolist()
+
+    _state["progress"] = 75
+    _state["progress_stage"] = "Building CAD model..."
 
     # Stage 6: CadQuery export in subprocess (VTK isolation)
     tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
@@ -208,6 +236,8 @@ with open(r'{tmp_out.name}', 'wb') as f:
     _state["steps"] = result.construction_steps
     _state["cad_volume"] = result.cad_volume
     _state["tokens_used"] = 0
+    _state["progress"] = 100
+    _state["progress_stage"] = "Done"
 
 
 def _estimate_volume(cleaned) -> float:

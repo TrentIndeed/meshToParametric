@@ -66,11 +66,11 @@ app.include_router(settings_router)
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
-
-@app.get("/landing", response_class=HTMLResponse)
-async def landing():
     return FileResponse(str(STATIC_DIR / "landing.html"))
+
+@app.get("/app", response_class=HTMLResponse)
+async def viewer():
+    return FileResponse(str(STATIC_DIR / "index.html"))
 
 @app.get("/clean", response_class=HTMLResponse)
 async def cleaner():

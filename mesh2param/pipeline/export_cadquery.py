@@ -91,9 +91,8 @@ def export_cadquery(
     extrude_dir = np.array(base_feature.direction)
     depth = base_feature.depth
 
-    profiles, extrude_start, hole_features = _extract_profile_and_holes(
-        feature_tree, cleaned, extrude_dir,
-    )
+    profiles, extrude_start, hole_features, chamfer_features, fillet_features = \
+        _extract_profile_and_holes(feature_tree, cleaned, extrude_dir)
 
     if profiles is None or len(profiles) == 0:
         logger.error("Failed to extract base profile from mesh")
@@ -105,12 +104,14 @@ def export_cadquery(
         build_order = _llm_plan_build_order(feature_tree, cleaned)
 
     # Build the CadQuery solid step-by-step:
-    # 1. Extrude base profile (no holes)
-    # 2. Cut each hole one at a time
-    # Each step is tessellated for the construction slideshow.
+    # 1. Sketch profile
+    # 2. Extrude base
+    # 3+. Cut holes
+    # N+. Apply chamfers and fillets
     solid, script, steps = _build_stepwise(
         profiles, depth, extrude_dir, extrude_start,
-        hole_features, build_order=build_order,
+        hole_features, chamfer_features, fillet_features,
+        build_order=build_order,
     )
 
     # Compute CAD volume
@@ -241,8 +242,16 @@ def _extract_profile_and_holes(
         f for f in feature_tree.features
         if f.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE)
     ]
+    chamfers = [
+        f for f in feature_tree.features
+        if f.type == FeatureType.CHAMFER
+    ]
+    fillets = [
+        f for f in feature_tree.features
+        if f.type == FeatureType.FILLET
+    ]
 
-    return best_profiles, extrude_start, holes
+    return best_profiles, extrude_start, holes, chamfers, fillets
 
 
 def _polygon_area(pts: list[tuple[float, float]]) -> float:
@@ -383,6 +392,8 @@ def _build_stepwise(
     extrude_dir: np.ndarray,
     extrude_start: float,
     holes: list[Feature],
+    chamfers: list[Feature] | None = None,
+    fillets: list[Feature] | None = None,
     build_order: BuildPlan | None = None,
 ) -> tuple[object, str, list[ConstructionStep]]:
     """Build a clean CAD solid from scratch, step by step.
@@ -391,6 +402,8 @@ def _build_stepwise(
       0. Sketch — 2D profile wire on the workplane
       1. Extrude — sweep the sketch into a solid
       2+. Cut holes — one per step
+      N+. Apply chamfers (on all edges at once)
+      N+1. Apply fillets (on all edges at once)
 
     Each step is tessellated for the visual slideshow. The resulting
     solid is clean B-rep geometry (no mesh triangles).
@@ -555,6 +568,82 @@ def _build_stepwise(
             )
         except Exception as e:
             logger.warning("Failed to cut hole %d: %s", i, e)
+
+    # --- Chamfers: apply to all edges at a uniform size ---
+    if chamfers:
+        # Estimate chamfer size from the recognized features
+        chamfer_sizes = []
+        for cf in chamfers:
+            s = cf.sketch_geometry
+            w = s.get("width", 0)
+            if w > 0 and w < 10:
+                chamfer_sizes.append(w)
+        chamfer_size = float(np.median(chamfer_sizes)) if chamfer_sizes else 1.0
+        # Clamp to reasonable range
+        chamfer_size = max(0.3, min(chamfer_size, 5.0))
+
+        try:
+            wp = wp.edges().chamfer(chamfer_size)
+            v, f = _tessellate_solid(wp)
+            vol = abs(float(wp.val().Volume()))
+            steps.append(ConstructionStep(
+                name=f"Chamfer ({chamfer_size:.1f}mm, {len(chamfers)} edges)",
+                tess_vertices=v, tess_faces=f, volume=vol,
+            ))
+            script_lines.append(f"# Chamfer all edges {chamfer_size:.1f}mm")
+            script_lines.append(f"result = result.edges().chamfer({chamfer_size:.4f})")
+        except Exception as e:
+            logger.warning("Chamfer failed (trying smaller): %s", e)
+            # CadQuery chamfer can fail if size is too large for short edges.
+            # Try a smaller chamfer.
+            try:
+                smaller = chamfer_size * 0.5
+                wp_backup = wp
+                wp = wp.edges().chamfer(smaller)
+                v, f = _tessellate_solid(wp)
+                vol = abs(float(wp.val().Volume()))
+                steps.append(ConstructionStep(
+                    name=f"Chamfer ({smaller:.1f}mm, reduced)",
+                    tess_vertices=v, tess_faces=f, volume=vol,
+                ))
+                script_lines.append(f"result = result.edges().chamfer({smaller:.4f})")
+            except Exception as e2:
+                logger.warning("Chamfer fallback also failed: %s", e2)
+
+    # --- Fillets: apply to all edges at a uniform radius ---
+    if fillets:
+        fillet_radii = []
+        for fl in fillets:
+            s = fl.sketch_geometry
+            r = s.get("radius", 0)
+            if r > 0 and r < 10:
+                fillet_radii.append(r)
+        fillet_r = float(np.median(fillet_radii)) if fillet_radii else 1.0
+        fillet_r = max(0.3, min(fillet_r, 5.0))
+
+        try:
+            wp = wp.edges().fillet(fillet_r)
+            v, f = _tessellate_solid(wp)
+            vol = abs(float(wp.val().Volume()))
+            steps.append(ConstructionStep(
+                name=f"Fillet (r={fillet_r:.1f}mm, {len(fillets)} edges)",
+                tess_vertices=v, tess_faces=f, volume=vol,
+            ))
+            script_lines.append(f"result = result.edges().fillet({fillet_r:.4f})")
+        except Exception as e:
+            logger.warning("Fillet failed (trying smaller): %s", e)
+            try:
+                smaller = fillet_r * 0.5
+                wp = wp.edges().fillet(smaller)
+                v, f = _tessellate_solid(wp)
+                vol = abs(float(wp.val().Volume()))
+                steps.append(ConstructionStep(
+                    name=f"Fillet (r={smaller:.1f}mm, reduced)",
+                    tess_vertices=v, tess_faces=f, volume=vol,
+                ))
+                script_lines.append(f"result = result.edges().fillet({smaller:.4f})")
+            except Exception as e2:
+                logger.warning("Fillet fallback also failed: %s", e2)
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
     return wp, "\n".join(script_lines), steps

@@ -223,14 +223,39 @@ async def progress_legacy():
 
 @app.get("/api/usage")
 async def usage_status():
+    import time as _time
     plan = "free"
     limit = PLAN_TOKENS.get(plan, 100)
+    now = _time.time()
+
+    # Compute daily/weekly/monthly usage from job history
+    day_ago = now - 86400
+    week_ago = now - 604800
+    month_ago = now - 2592000
+    daily = weekly = monthly = 0
+    total_jobs = 0
+
+    with queue._lock:
+        for job in queue._jobs.values():
+            if job.status == "done":
+                total_jobs += 1
+                if job.created_at >= month_ago:
+                    monthly += job.token_cost
+                if job.created_at >= week_ago:
+                    weekly += job.token_cost
+                if job.created_at >= day_ago:
+                    daily += job.token_cost
+
     return {
         "plan": plan,
         "tokens_spent": queue.tokens_spent,
         "tokens_limit": limit if limit != float("inf") else -1,
         "tokens_remaining": max(0, limit - queue.tokens_spent) if limit != float("inf") else -1,
         "upload_limit_mb": PLAN_UPLOAD_MB.get(plan, 10),
+        "daily": daily,
+        "weekly": weekly,
+        "monthly": monthly,
+        "total_jobs": total_jobs,
     }
 
 

@@ -518,6 +518,46 @@ async function sendChatMessage() {
 }
 
 chatSend.addEventListener('click', sendChatMessage);
+
+// ── Settings modal ──
+window.openSettings = async function() {
+  const modal = document.getElementById('settings-modal');
+  modal.classList.add('show');
+
+  try {
+    const res = await fetch('/api/usage');
+    const u = await res.json();
+
+    const limit = u.tokens_limit > 0 ? u.tokens_limit : 100;
+
+    // Plan badge
+    document.getElementById('settings-plan-badge').textContent = u.plan.charAt(0).toUpperCase() + u.plan.slice(1);
+    document.getElementById('settings-plan-name').textContent = u.plan.charAt(0).toUpperCase() + u.plan.slice(1);
+    document.getElementById('settings-upload').textContent = u.upload_limit_mb + ' MB';
+    document.getElementById('settings-jobs').textContent = u.total_jobs;
+
+    // Session (daily)
+    fillBar('bar-session', 'num-session', 'lim-session', u.daily, limit);
+    // Week
+    fillBar('bar-week', 'num-week', 'lim-week', u.weekly, limit);
+    // Month
+    fillBar('bar-month', 'num-month', 'lim-month', u.monthly, limit);
+  } catch (e) {}
+};
+
+function fillBar(barId, numId, limId, spent, limit) {
+  const pct = Math.min(100, (spent / limit) * 100);
+  const bar = document.getElementById(barId);
+  bar.style.width = pct + '%';
+  bar.className = 'usage-bar-fill ' + (pct < 60 ? 'green' : pct < 85 ? 'yellow' : 'red');
+  document.getElementById(numId).textContent = spent;
+  document.getElementById(limId).textContent = '/ ' + limit;
+}
+
+// Close settings on backdrop click
+document.getElementById('settings-modal').addEventListener('click', function(e) {
+  if (e.target === this) this.classList.remove('show');
+});
 chatInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();

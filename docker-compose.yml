@@ -1,0 +1,11 @@
+services:
+  mesh2param:
+    build: .
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - AUTH_SECRET=${AUTH_SECRET:-change-me-in-production}
+      - DATABASE_URL=sqlite:////app/data/mesh2param.db
+    restart: unless-stopped

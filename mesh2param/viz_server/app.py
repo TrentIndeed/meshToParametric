@@ -105,6 +105,36 @@ async def status():
     }
 
 
+@app.post("/api/waitlist")
+async def waitlist(body: dict):
+    """Save a waitlist email to the database."""
+    from mesh2param.db.database import get_db, SessionLocal, Base, engine
+    from sqlalchemy import Column, Integer, String, DateTime
+    from datetime import datetime
+
+    email = body.get("email", "").strip().lower()
+    if not email or "@" not in email:
+        return JSONResponse({"error": "Valid email required"}, status_code=400)
+
+    db = SessionLocal()
+    try:
+        # Check if already on waitlist (use raw SQL since model may not exist yet)
+        from sqlalchemy import text
+        engine.execute(text(
+            "CREATE TABLE IF NOT EXISTS waitlist (id INTEGER PRIMARY KEY, email TEXT UNIQUE, created_at TEXT)"
+        ))
+        try:
+            engine.execute(
+                text("INSERT INTO waitlist (email, created_at) VALUES (:e, :t)"),
+                {"e": email, "t": datetime.utcnow().isoformat()},
+            )
+        except Exception:
+            pass  # duplicate email, ignore
+        return {"status": "ok", "message": "You're on the list"}
+    finally:
+        db.close()
+
+
 @app.get("/api/progress")
 async def progress():
     return {

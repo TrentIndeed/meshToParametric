@@ -460,12 +460,25 @@ body {
 
 <!-- Action Buttons -->
 <div id="actions">
-  <button class="action-btn primary" onclick="document.getElementById('file-input').click()">
+  <button class="action-btn primary" id="btn-upload" onclick="document.getElementById('file-input').click()">
     <i class="ri-upload-2-line"></i> Upload File
+  </button>
+  <button class="action-btn primary" id="btn-analyze" style="display:none">
+    <i class="ri-sparkling-line"></i> Analyze & Build
   </button>
   <button class="action-btn secondary" id="btn-onshape" disabled>
     <i class="ri-send-plane-line"></i> Send to Onshape
   </button>
+</div>
+<!-- Preview info bar -->
+<div id="preview-bar" style="display:none; position:fixed; bottom:88px; left:50%; transform:translateX(-50%);
+  background:var(--bg-secondary); border:1px solid var(--border); border-radius:10px; padding:8px 16px;
+  font-size:12px; color:var(--text-secondary); z-index:60; display:flex; gap:16px; align-items:center;
+  font-family:'JetBrains Mono',monospace;">
+  <span id="preview-faces"></span>
+  <span id="preview-dims"></span>
+  <span id="preview-complexity"></span>
+  <span id="preview-tokens" style="color:var(--accent)"></span>
 </div>
 <input type="file" id="file-input" accept=".stl,.obj,.ply,.3mf">
 

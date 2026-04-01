@@ -95,6 +95,81 @@ async def terms():
 
 # ── Job-based pipeline ──
 
+@app.post("/api/preview")
+async def preview_mesh(file: UploadFile = File(...)):
+    """Upload a mesh and return raw geometry for 3D preview (no pipeline).
+
+    Also returns complexity estimate and token cost prediction.
+    """
+    import trimesh
+
+    content = await file.read()
+    suffix = Path(file.filename).suffix
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.write(content)
+    tmp.close()
+
+    try:
+        from mesh2param.pipeline.ingest import ingest_mesh
+        from mesh2param.config import IngestConfig
+
+        cleaned = ingest_mesh(tmp.name, IngestConfig(remesh=False))
+
+        # Estimate complexity and token cost
+        face_count = cleaned.num_faces
+        bbox = cleaned.bbox
+        dims = (bbox[1] - bbox[0]).tolist()
+        volume = 0.0
+        try:
+            m = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces, process=False)
+            if m.is_watertight:
+                volume = abs(float(m.volume))
+        except Exception:
+            pass
+
+        # Rough token estimate (before feature recognition)
+        estimated_tokens = max(5, round((face_count // 150 + face_count // 200) / 5) * 5)
+        complexity = "Simple" if face_count < 500 else "Medium" if face_count < 2000 else "Complex"
+
+        return {
+            "status": "ok",
+            "filename": file.filename,
+            "temp_path": tmp.name,  # kept for pipeline run
+            "faces": face_count,
+            "vertices": cleaned.num_vertices,
+            "watertight": cleaned.is_watertight,
+            "dimensions": [round(d, 1) for d in dims],
+            "volume": round(volume, 1),
+            "complexity": complexity,
+            "estimated_tokens": estimated_tokens,
+            "mesh_vertices": cleaned.vertices.flatten().tolist(),
+            "mesh_faces": cleaned.faces.flatten().tolist(),
+        }
+    except Exception as e:
+        Path(tmp.name).unlink(missing_ok=True)
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+@app.post("/api/run-pipeline")
+async def run_pipeline(body: dict):
+    """Run the full pipeline on a previously previewed mesh. Takes temp_path from /api/preview."""
+    plan = "free"
+    limit = PLAN_TOKENS.get(plan, 100)
+    if queue.tokens_spent >= limit:
+        return JSONResponse(
+            {"status": "error", "error": f"Token limit reached ({int(limit)} on {plan} plan)."},
+            status_code=403,
+        )
+
+    temp_path = body.get("temp_path", "")
+    filename = body.get("filename", "mesh.stl")
+    if not temp_path or not Path(temp_path).exists():
+        return JSONResponse({"status": "error", "error": "No mesh to process. Upload first."}, status_code=400)
+
+    job_id = queue.submit(filename, temp_path)
+    return {"status": "queued", "job_id": job_id}
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     """Submit a mesh for pipeline processing. Returns a job ID to poll."""

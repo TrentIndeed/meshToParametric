@@ -282,13 +282,13 @@ async function renderThumbnail(stepIndex) {
   }
 }
 
-// ── File Upload (with dimension analysis before pipeline) ──
+// ── File Upload: two-step flow (preview mesh → analyze & build) ──
 let pendingFile = null;
+let pendingTempPath = null;
 
 document.getElementById('file-input').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  pendingFile = file;
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
@@ -298,24 +298,19 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   loadingText.textContent = `Uploading ${file.name}...`;
   progressBar.style.width = '0%';
   progressDetail.textContent = '';
-  document.getElementById('status-dot').className = 'status-dot processing';
 
   const form = new FormData();
   form.append('file', file);
 
   try {
-    // Upload file → get job ID
-    progressBar.style.width = '5%';
-    progressDetail.textContent = 'Uploading...';
-
-    const uploadRes = await new Promise((resolve, reject) => {
+    // Step 1: Upload and preview the raw mesh
+    const previewRes = await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/api/upload');
+      xhr.open('POST', '/api/preview');
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 20);
-          progressBar.style.width = pct + '%';
-          progressDetail.textContent = `Uploading... ${pct}%`;
+          progressBar.style.width = Math.round((e.loaded / e.total) * 50) + '%';
+          progressDetail.textContent = 'Uploading...';
         }
       };
       xhr.onload = () => resolve(JSON.parse(xhr.responseText));
@@ -323,16 +318,90 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       xhr.send(form);
     });
 
-    if (uploadRes.error) {
-      alert(uploadRes.error);
-      loading.classList.remove('show');
-      document.getElementById('status-dot').className = 'status-dot';
+    loading.classList.remove('show');
+
+    if (previewRes.error) {
+      alert(previewRes.error);
       return;
     }
 
-    currentJobId = uploadRes.job_id;
+    // Show the raw mesh in the 3D viewer
+    pendingTempPath = previewRes.temp_path;
+    pendingFile = file;
+    _showRawMesh(previewRes);
 
-    // Poll job progress until done
+    // Show preview info bar + analyze button
+    document.getElementById('preview-bar').style.display = 'flex';
+    document.getElementById('preview-faces').textContent = previewRes.faces.toLocaleString() + ' faces';
+    document.getElementById('preview-dims').textContent = previewRes.dimensions.map(d => d + 'mm').join(' × ');
+    document.getElementById('preview-complexity').textContent = previewRes.complexity;
+    document.getElementById('preview-tokens').textContent = '~' + previewRes.estimated_tokens + ' tokens';
+    document.getElementById('btn-analyze').style.display = '';
+    document.getElementById('btn-upload').style.display = 'none';
+    document.getElementById('empty-state').style.display = 'none';
+
+  } catch (err) {
+    alert('Upload failed: ' + err.message);
+    loading.classList.remove('show');
+  } finally {
+    e.target.value = '';
+  }
+});
+
+// Show raw mesh triangles in the viewer (before pipeline)
+function _showRawMesh(previewRes) {
+  while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
+
+  const verts = new Float32Array(previewRes.mesh_vertices);
+  const faces = previewRes.mesh_faces;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+  geo.setIndex(faces);
+  geo.computeVertexNormals();
+
+  // Wireframe look — show this is a raw mesh, not a CAD model
+  const mat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
+  modelGroup.add(new THREE.Mesh(geo, mat));
+  modelGroup.add(new THREE.LineSegments(
+    new THREE.WireframeGeometry(geo),
+    new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
+  ));
+
+  const box = new THREE.Box3().setFromObject(modelGroup);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  camera.position.set(center.x + size, center.y + size * 0.7, center.z + size);
+  controls.target.copy(center);
+  controls.update();
+}
+
+// Analyze & Build button handler
+document.getElementById('btn-analyze').addEventListener('click', async () => {
+  if (!pendingTempPath) return;
+
+  const loading = document.getElementById('loading');
+  const loadingText = document.getElementById('loading-text');
+  const progressBar = document.getElementById('progress-bar');
+  const progressDetail = document.getElementById('progress-detail');
+  loading.classList.add('show');
+  loadingText.textContent = 'Running pipeline...';
+  progressBar.style.width = '0%';
+  progressDetail.textContent = '';
+  document.getElementById('status-dot').className = 'status-dot processing';
+
+  try {
+    // Submit pipeline job
+    const res = await fetch('/api/run-pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ temp_path: pendingTempPath, filename: pendingFile?.name || 'mesh' }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); loading.classList.remove('show'); return; }
+
+    currentJobId = data.job_id;
+
+    // Poll progress
     const statusData = await new Promise((resolve, reject) => {
       const poll = setInterval(async () => {
         try {
@@ -348,7 +417,13 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     });
 
     progressBar.style.width = '100%';
-    loadingText.textContent = 'Loading viewer...';
+    loadingText.textContent = 'Loading model...';
+
+    // Hide preview bar, show upload button again
+    document.getElementById('preview-bar').style.display = 'none';
+    document.getElementById('btn-analyze').style.display = 'none';
+    document.getElementById('btn-upload').style.display = '';
+    pendingTempPath = null;
 
     if (statusData.status === 'done') {
 

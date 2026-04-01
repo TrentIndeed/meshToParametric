@@ -4,7 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Paramesh AI — Mesh to Parametric CAD</title>
-<meta name="description" content="Convert triangulated meshes into fully parametric CAD models with AI-powered feature recognition.">
+<meta name="description" content="Convert triangulated meshes into fully parametric CAD models with AI-powered feature recognition. Free mesh cleaner + 3 free CAD generations.">
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta property="og:title" content="Paramesh AI — Mesh to Parametric CAD">
+<meta property="og:description" content="Reverse-engineer STL/OBJ/3MF files into editable CAD models with AI-powered feature recognition. Free mesh cleaner included.">
+<meta property="og:image" content="https://parameshai.com/static/og-image.png">
+<meta property="og:url" content="https://parameshai.com">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Paramesh AI — Mesh to Parametric CAD">
+<meta name="twitter:description" content="Reverse-engineer meshes into editable CAD models. AI-powered feature recognition.">
+<meta name="twitter:image" content="https://parameshai.com/static/og-image.png">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 /* ── Taste Skill: DESIGN_VARIANCE=8, MOTION_INTENSITY=6, VISUAL_DENSITY=2 ── */
@@ -426,6 +437,15 @@ footer {
   </div>
 </section>
 
+<!-- Before/After -->
+<section style="padding: 5rem 0;">
+  <div class="container" style="text-align:center;">
+    <h2 class="fade-in" style="margin-bottom: 0.75rem;">Mesh in, parametric CAD out</h2>
+    <p class="fade-in" style="margin: 0 auto 2.5rem; text-align:center;">The original reference STEP (left) compared to what Paramesh AI reconstructs from just the mesh (right). 0.2% volume error.</p>
+    <img class="fade-in" src="/static/before-after.jpg" alt="Before: reference STEP model. After: Paramesh AI reconstructed CAD model with 0.2% volume error." style="width:100%; max-width:900px; border-radius:12px; border:1px solid var(--border); box-shadow: 0 20px 60px rgba(0,0,0,0.4);">
+  </div>
+</section>
+
 <!-- How It Works -->
 <section id="how">
   <div class="container">
@@ -654,7 +674,13 @@ footer {
 <!-- Footer -->
 <footer>
   <div class="container">
-    Paramesh AI &mdash; open source mesh-to-parametric pipeline
+    <div style="margin-bottom:0.75rem;">Paramesh AI &mdash; mesh-to-parametric CAD conversion</div>
+    <div style="display:flex; gap:1.5rem; justify-content:center; font-size:0.8rem;">
+      <a href="/privacy" style="color:var(--text-muted); text-decoration:none;">Privacy</a>
+      <a href="/terms" style="color:var(--text-muted); text-decoration:none;">Terms</a>
+      <a href="/clean" style="color:var(--text-muted); text-decoration:none;">Free Tools</a>
+      <a href="https://github.com/TrentIndeed/meshToParametric" style="color:var(--text-muted); text-decoration:none;">GitHub</a>
+    </div>
   </div>
 </footer>
 

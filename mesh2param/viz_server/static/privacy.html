@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy Policy — Paramesh AI</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --text:#FAFAFA; --muted:#A1A1AA; --border:#27272A; --accent:#22D3EE; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; line-height:1.8; }
+.container { max-width:720px; margin:0 auto; padding:4rem clamp(1.5rem,4vw,3rem); }
+h1 { font-size:2rem; margin-bottom:0.5rem; }
+h2 { font-size:1.2rem; margin:2rem 0 0.5rem; color:var(--accent); }
+p, li { color:var(--muted); margin-bottom:1rem; }
+ul { padding-left:1.5rem; }
+a { color:var(--accent); }
+.back { display:inline-block; margin-bottom:2rem; color:var(--muted); text-decoration:none; font-size:0.9rem; }
+.back:hover { color:var(--text); }
+.updated { font-size:0.85rem; color:var(--muted); margin-bottom:2rem; }
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/landing" class="back">← Back to Paramesh AI</a>
+<h1>Privacy Policy</h1>
+<p class="updated">Last updated: April 2026</p>
+
+<h2>What we collect</h2>
+<p>When you create an account, we store your username and hashed password. When you join the waitlist, we store your email address. When you upload a mesh file, we process it in memory and do not permanently store your files.</p>
+
+<h2>How we use it</h2>
+<ul>
+<li>Account credentials: to authenticate you</li>
+<li>Waitlist emails: to notify you about product updates</li>
+<li>Uploaded meshes: processed in real-time, deleted after the pipeline completes</li>
+<li>Usage metrics: token counts and job history to enforce plan limits</li>
+</ul>
+
+<h2>AI processing</h2>
+<p>If you use AI features (chatbot, dimension planner), your feature tree data (not raw mesh geometry) is sent to Claude via the Claude CLI. This is governed by Anthropic's privacy policy. No mesh data is sent to any third party.</p>
+
+<h2>Data storage</h2>
+<p>All data is stored in a SQLite database on the server. Passwords are hashed with SHA-256. We do not sell or share your data with third parties.</p>
+
+<h2>Cookies</h2>
+<p>We use a session token cookie for authentication. No tracking cookies or analytics scripts.</p>
+
+<h2>Your rights</h2>
+<p>You can delete your account and all associated data at any time from Settings. You can request data export by contacting us.</p>
+
+<h2>Contact</h2>
+<p>Questions about privacy? Email us at the address on our GitHub repository.</p>
+</div>
+</body>
+</html>

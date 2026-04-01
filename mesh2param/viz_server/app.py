@@ -76,6 +76,22 @@ async def landing():
 async def cleaner():
     return FileResponse(str(STATIC_DIR / "cleaner.html"))
 
+@app.get("/robots.txt")
+async def robots():
+    return FileResponse(str(STATIC_DIR / "robots.txt"), media_type="text/plain")
+
+@app.get("/sitemap.xml")
+async def sitemap():
+    return FileResponse(str(STATIC_DIR / "sitemap.xml"), media_type="application/xml")
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    return FileResponse(str(STATIC_DIR / "privacy.html"))
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms():
+    return FileResponse(str(STATIC_DIR / "terms.html"))
+
 
 # ── Job-based pipeline ──
 

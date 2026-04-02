@@ -337,36 +337,44 @@ def _extract_profile_and_holes(
                 except Exception:
                     continue
             else:
-                # No connected slice found. Fallback: use the convex hull of
-                # all outer polygons as the outer boundary, and treat the gap
-                # between them as the inner cutout.
+                # No connected slice found. Fallback: use the part bounding
+                # box as the outer boundary and the gap between the split
+                # polygons as the inner cutout.
                 from shapely.geometry import Polygon as SPoly, MultiPolygon
                 from shapely.ops import unary_union
+
+                # Outer boundary = part bbox in the profile plane
+                u_min = float(cleaned.bbox[0][ax_u])
+                u_max = float(cleaned.bbox[1][ax_u])
+                v_min = float(cleaned.bbox[0][ax_v])
+                v_max = float(cleaned.bbox[1][ax_v])
+                bbox_profile = [
+                    (u_min, v_min), (u_max, v_min),
+                    (u_max, v_max), (u_min, v_max),
+                ]
+                bbox_poly = SPoly(bbox_profile)
+
                 outer_polys = [SPoly(p) for p in best_profiles if _polygon_area(p) > total_area * 0.1]
                 valid = [p for p in outer_polys if p.is_valid]
                 if len(valid) >= 2:
                     merged = unary_union(valid)
-                    hull = merged.convex_hull
-                    hull_coords = list(hull.exterior.coords)[:-1]
-                    hull_profile = _simplify_profile(hull_coords, tolerance=0.1)
-                    if len(hull_profile) >= 3:
-                        # Inner cutout = hull minus the actual solid parts
-                        diff = hull.difference(merged)
-                        combined = [hull_profile]
-                        geoms = [diff] if diff.geom_type == 'Polygon' else (list(diff.geoms) if hasattr(diff, 'geoms') else [])
-                        for geom in geoms:
-                            if geom.geom_type != 'Polygon' or geom.area < 1.0:
-                                continue
-                            coords = list(geom.exterior.coords)[:-1]
-                            simplified = _simplify_profile(coords, tolerance=0.1)
-                            if len(simplified) >= 3:
-                                combined.append(simplified)
-                        combined.sort(key=lambda pts: -_polygon_area(pts))
-                        best_profiles = combined
-                        logger.info(
-                            "Used convex hull + difference for split frame (%d profiles)",
-                            len(combined),
-                        )
+                    # Inner cutout = bbox minus the solid parts
+                    diff = bbox_poly.difference(merged)
+                    combined = [bbox_profile]
+                    geoms = [diff] if diff.geom_type == 'Polygon' else (list(diff.geoms) if hasattr(diff, 'geoms') else [])
+                    for geom in geoms:
+                        if geom.geom_type != 'Polygon' or geom.area < 1.0:
+                            continue
+                        coords = list(geom.exterior.coords)[:-1]
+                        simplified = _simplify_profile(coords, tolerance=0.1)
+                        if len(simplified) >= 3:
+                            combined.append(simplified)
+                    combined.sort(key=lambda pts: -_polygon_area(pts))
+                    best_profiles = combined
+                    logger.info(
+                        "Used bbox + difference for split frame (%d profiles)",
+                        len(combined),
+                    )
 
     if not best_profiles:
         return None, extrude_start, []

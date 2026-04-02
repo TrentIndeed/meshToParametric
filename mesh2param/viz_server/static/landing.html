@@ -329,13 +329,13 @@ footer {
   align-items: center; overflow: hidden;
   max-width: 1200px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 3rem);
 }
-/* Video on the right */
+/* Video on the right — zoomed to fill more width */
 .scroll-anim .gear-frame {
-  width: 100%; height: auto; max-height: 80vh;
-  object-fit: cover; border-radius: 12px;
-  /* Fade all edges into the dark background */
-  mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 100%);
-  -webkit-mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 100%);
+  width: 130%; height: auto; max-height: 90vh;
+  margin-left: -15%;
+  object-fit: cover; border-radius: 0;
+  mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 95%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 95%);
 }
 /* Card on the left */
 .scroll-anim .text-card {

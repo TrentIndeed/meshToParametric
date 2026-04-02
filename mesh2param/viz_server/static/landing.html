@@ -320,8 +320,8 @@ footer {
 /* ── Scroll animation section ── */
 /* ── Scroll animation: split layout — card left, video right ── */
 .scroll-anim {
-  position: relative; height: 350vh;
-  margin-top: -2rem;
+  position: relative; height: 300vh;
+  margin-top: -4rem;
 }
 .scroll-anim .sticky {
   position: sticky; top: 0; height: 100vh;
@@ -355,23 +355,26 @@ footer {
 .scroll-anim .text-overlay h3 { margin-bottom: 0.5rem; font-size: 1.2rem; }
 .scroll-anim .text-overlay p { font-size: 0.95rem; }
 
-/* Mobile: video on top filling screen, card overlaid at bottom */
+/* Mobile: video fills background, card centered on top */
 @media (max-width: 768px) {
+  .scroll-anim { margin-top: -2rem; height: 280vh; }
   .scroll-anim .sticky {
     grid-template-columns: 1fr;
-    grid-template-rows: 1fr auto;
+    grid-template-rows: 1fr;
     padding: 0;
+    position: sticky; top: 0;
   }
   .scroll-anim .gear-frame {
-    width: 100vw; max-height: 70vh;
-    border-radius: 0;
-    order: -1;  /* video on top */
-    mask-image: linear-gradient(180deg, black 40%, transparent 90%);
-    -webkit-mask-image: linear-gradient(180deg, black 40%, transparent 90%);
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; border-radius: 0; opacity: 0.5;
+    mask-image: radial-gradient(ellipse 90% 70% at center, black 30%, transparent 85%);
+    -webkit-mask-image: radial-gradient(ellipse 90% 70% at center, black 30%, transparent 85%);
   }
   .scroll-anim .text-card {
-    padding: 0 1.5rem; margin-top: -8rem;
+    padding: 0 1.5rem;
     position: relative; z-index: 2;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
   }
   .scroll-anim .text-overlay { max-width: none; }
 }
@@ -742,11 +745,12 @@ const textSlides = [
 window.addEventListener('scroll', () => {
   if (!scrollSection || !scrollImg) return;
   const rect = scrollSection.getBoundingClientRect();
-  const sectionHeight = scrollSection.offsetHeight - window.innerHeight;
-  const scrolled = -rect.top;
-  const progress = Math.max(0, Math.min(1, scrolled / sectionHeight));
+  const sectionHeight = scrollSection.offsetHeight;
+  // Start frames as soon as section top reaches bottom of viewport
+  const entered = window.innerHeight - rect.top;
+  const progress = Math.max(0, Math.min(1, entered / sectionHeight));
 
-  // Map scroll progress to frame index
+  // Map scroll progress to frame index — starts immediately on enter
   const frameIdx = Math.min(TOTAL_FRAMES - 1, Math.floor(progress * TOTAL_FRAMES));
   if (scrollFrames[frameIdx] && scrollFrames[frameIdx].complete) {
     scrollImg.src = scrollFrames[frameIdx].src;

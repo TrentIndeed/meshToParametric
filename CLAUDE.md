@@ -1,4 +1,4 @@
-# mesh2param
+# Paramesh AI
 
 ## Project Overview
 Python pipeline that converts triangulated mesh files (STL/OBJ/PLY/3MF) of prismatic mechanical parts into fully parametric CAD models with a reconstructed feature tree. Two export paths: Onshape REST API + FeatureScript, or CadQuery STEP files (offline). Web UI with Three.js viewer and AI chatbot.
@@ -34,6 +34,7 @@ pytest                                    # all tests
 python run_visuals.py                     # visual reports
 python run_visuals.py --stage 4 5 6       # specific stages
 pytest tests/test_step_comparison.py -v   # STEP comparison
+pytest tests/test_all_meshes.py -v        # all 5 meshes
 ```
 
 ## Package Structure
@@ -42,14 +43,14 @@ mesh2param/
   pipeline/      — stage modules: ingest.py, segment.py, fit.py, topology.py, recognize.py, export_onshape.py, export_cadquery.py
   models/        — dataclasses: mesh.py, region.py, surface.py, feature.py, tree.py
   viz/           — visualization per stage (PyVista 3D + matplotlib 2D)
-  viz_server/    — FastAPI + Three.js web UI (app.py, static/index.html, static/app.js)
-  db/            — SQLite database models (database.py: User, MeshJob, JobStep)
+  viz_server/    — FastAPI + Three.js web UI (app.py, job_queue.py, static/)
+  db/            — SQLite database models (database.py: User, MeshJob, JobStep, WaitlistEntry, SupportTicket)
   api/           — REST endpoints (auth.py, chat.py, settings.py)
   onshape/       — API wrapper: client.py, auth.py, feature_builder.py
   ai.py          — Claude CLI wrapper with injection protection + budget caps
   config.py      — Pydantic settings (IngestConfig, SegmentConfig, FitConfig, TopologyConfig, RecognizeConfig, ExportConfig)
-tests/           — pytest suite with fixtures per stage + STEP comparison
-models/          — mesh + reference STEP pairs (models/Mesh1/, models/Mesh2/, ...)
+tests/           — pytest suite with fixtures per stage + STEP comparison + all-mesh parametric tests
+models/          — mesh + reference STEP pairs (models/Mesh1/ through models/Mesh5/)
 ```
 
 ## Pipeline Stages
@@ -64,26 +65,52 @@ models/          — mesh + reference STEP pairs (models/Mesh1/, models/Mesh2/, 
 
 ## Web UI (viz_server)
 - FastAPI backend at `mesh2param/viz_server/app.py`
+- Job queue at `mesh2param/viz_server/job_queue.py` — concurrent users, per-job state
 - Three.js frontend at `mesh2param/viz_server/static/`
-- Endpoints: `POST /api/upload`, `GET /api/status`, `GET /api/step/{index}`, `POST /api/chat`, `POST /api/chat/analyze-mesh`
+- Endpoints: `POST /api/preview`, `POST /api/run-pipeline`, `GET /api/job/{id}/status`, `GET /api/job/{id}/step/{i}`, `POST /api/chat`, `POST /api/chat/analyze-mesh`
 - Left sidebar: Feature tree with typed icons
 - Center: 3D orbit viewer with XYZ grid, MeshPhysicalMaterial, studio lighting
 - Right sidebar: AI chatbot — describe parts, suggest edits, analyze dimensions
 - Bottom: Timeline with 3D-rendered thumbnails per step
 - Dimension review modal: AI suggests clean dimensions after upload, before pipeline runs
+- Complexity meter: scores 0-100, rejects meshes >10K faces
+- AI thinking process: streams stage-by-stage reasoning to chat during pipeline
 - Runs CadQuery in subprocess to avoid VTK conflicts with Three.js
 
+## Pages
+- `/` — Landing page (public) with video hero, scroll animation, pricing, FAQ, waitlist
+- `/app` — CAD viewer tool (requires login)
+- `/clean` — Free mesh cleaner + resize (requires login)
+- `/home` — Signed-in home page with tool picker + usage bar
+- `/learn` — 20 SEO guide pages (server-rendered from JSON)
+- `/learn/{slug}` — Individual guide with FAQ schema markup
+- `/changelog` — What's New + Roadmap + Git History tabs
+- `/contact` — Support form → DB + email notification
+- `/login` — Sign in / Sign up with cookie auth
+- `/privacy`, `/terms` — Legal pages
+- `/sitemap.xml` — Dynamic sitemap (28 pages)
+- `/robots.txt` — Crawler instructions
+
 ## Auth (from operatorDashboard)
-- `db/database.py` — User, MeshJob, JobStep models (SQLite)
+- `db/database.py` — User, MeshJob, JobStep, WaitlistEntry, SupportTicket models (SQLite)
 - `api/auth.py` — signup, login, verify (SHA-256 + AUTH_SECRET)
 - `api/settings.py` — change password, delete account (cascades to jobs)
+- Per-IP token tracking prevents free trial abuse (100 tokens + 10 jobs per IP)
 - Database auto-creates `data/mesh2param.db` on first startup
 
 ## AI Integration (ai.py + api/chat.py)
 - Claude CLI wrapper using OAuth (no API key)
 - Three features: chatbot, dimension planner, build order optimizer
+- AI support bot widget on landing + cleaner pages
 - Security: system prefix, prompt sanitization, 8K prompt cap, 4K response cap, 20 calls/session, 5s rate limit
 - Falls back gracefully when CLI unavailable
+
+## Token Pricing
+- Free: 100 tokens, 10MB uploads, mesh cleaner unlimited
+- Starter $9/mo: 1,000 tokens, 50MB
+- Pro $29/mo: 5,000 tokens, 200MB, Onshape + AI chat
+- Unlimited $79/mo: unlimited tokens, 500MB
+- Cost: ~20 tokens/simple bracket, ~55 tokens/complex mount
 
 ## Key Libraries
 trimesh, cadquery, pyvista, matplotlib, numpy, scipy, scikit-learn, networkx, fastapi, sqlalchemy, three.js, pydantic
@@ -96,3 +123,4 @@ trimesh, cadquery, pyvista, matplotlib, numpy, scipy, scikit-learn, networkx, fa
 - CadQuery imported lazily (subprocess) to avoid VTK conflicts with PyVista
 - Model pairs in `models/` auto-discovered for STEP comparison tests
 - Font: OpenAI Sans throughout the web UI
+- Deployment: Docker + Caddy on Hetzner VPS (port 8081)

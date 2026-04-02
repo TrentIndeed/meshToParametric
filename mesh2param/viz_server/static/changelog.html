@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Changelog & Roadmap — Paramesh AI</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
+  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; --green:#22C55E; --purple:#BC8CFF; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; }
+.container { max-width:760px; margin:0 auto; padding:4rem clamp(1.5rem,4vw,3rem); }
+nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
+  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
+nav .inner { display:flex; align-items:center; justify-content:space-between;
+  max-width:760px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+nav .logo { font-size:1.1rem; font-weight:700; }
+nav .logo span { color:var(--accent); }
+nav a { color:var(--dim); text-decoration:none; font-size:0.9rem; }
+nav a:hover { color:var(--text); }
+
+h1 { font-size:2rem; font-weight:700; letter-spacing:-0.03em; margin-bottom:0.5rem; padding-top:5rem; }
+.subtitle { color:var(--muted); margin-bottom:3rem; font-size:1.05rem; }
+
+/* Tabs */
+.tabs { display:flex; gap:0; border:1px solid var(--border); border-radius:8px; overflow:hidden; margin-bottom:2.5rem; }
+.tab { flex:1; padding:0.6rem; text-align:center; font-size:0.9rem; font-weight:600;
+  cursor:pointer; background:transparent; color:var(--dim); border:none; font-family:inherit; }
+.tab.active { background:var(--accent); color:var(--bg); }
+
+/* Changelog entries */
+.changelog { display:none; }
+.changelog.active { display:block; }
+.entry { border-left:2px solid var(--border); padding:0 0 2.5rem 1.5rem; margin-left:0.5rem; position:relative; }
+.entry:last-child { border-left-color:transparent; }
+.entry::before { content:''; position:absolute; left:-5px; top:4px; width:8px; height:8px;
+  border-radius:50%; background:var(--accent); }
+.entry .date { font-size:0.8rem; color:var(--dim); font-family:'JetBrains Mono',monospace; margin-bottom:0.3rem; }
+.entry h3 { font-size:1rem; margin-bottom:0.5rem; }
+.entry p { color:var(--muted); font-size:0.9rem; line-height:1.6; }
+.entry .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:0.7rem;
+  font-weight:600; text-transform:uppercase; letter-spacing:0.05em; margin-right:0.4rem; }
+.tag-feature { background:rgba(34,211,238,0.1); color:var(--accent); }
+.tag-fix { background:rgba(34,197,94,0.1); color:var(--green); }
+.tag-ui { background:rgba(188,140,255,0.1); color:var(--purple); }
+
+/* Roadmap */
+.roadmap-item { background:var(--bg-card); border:1px solid var(--border); border-radius:10px;
+  padding:1.25rem; margin-bottom:1rem; }
+.roadmap-item .status { font-size:0.75rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0.5rem; }
+.status-planned { color:var(--dim); }
+.status-progress { color:var(--accent); }
+.status-soon { color:var(--green); }
+.roadmap-item h3 { font-size:0.95rem; margin-bottom:0.3rem; }
+.roadmap-item p { font-size:0.85rem; color:var(--muted); }
+
+#git-log { display:none; }
+#git-log.active { display:block; }
+</style>
+</head>
+<body>
+<nav>
+  <div class="inner">
+    <div class="logo">Paramesh<span>AI</span></div>
+    <a href="/">← Home</a>
+  </div>
+</nav>
+
+<div class="container">
+  <h1>Changelog & Roadmap</h1>
+  <p class="subtitle">What's new and what's coming next.</p>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('whats-new')">What's New</button>
+    <button class="tab" onclick="switchTab('roadmap')">Roadmap</button>
+    <button class="tab" onclick="switchTab('git-log')">Git History</button>
+  </div>
+
+  <!-- What's New (curated highlights) -->
+  <div class="changelog active" id="whats-new">
+    <div class="entry">
+      <div class="date">April 2026</div>
+      <h3><span class="tag tag-feature">Feature</span> AI Customer Service Bot</h3>
+      <p>Live AI support widget on every page. Ask questions about features, pricing, or get help with your meshes.</p>
+    </div>
+    <div class="entry">
+      <div class="date">April 2026</div>
+      <h3><span class="tag tag-feature">Feature</span> Token-Based Pricing</h3>
+      <p>Pay for complexity, not flat fees. Simple parts cost ~20 tokens, complex parts ~55. Free tier gets 100 tokens.</p>
+    </div>
+    <div class="entry">
+      <div class="date">April 2026</div>
+      <h3><span class="tag tag-feature">Feature</span> Job Queue for Concurrent Users</h3>
+      <p>Multiple users can upload simultaneously. Each job gets its own ID, progress bar, and isolated state.</p>
+    </div>
+    <div class="entry">
+      <div class="date">April 2026</div>
+      <h3><span class="tag tag-ui">UI</span> Two-Step Upload Flow</h3>
+      <p>Upload shows the raw mesh first with complexity estimate and token cost. Click "Analyze & Build" to run the pipeline.</p>
+    </div>
+    <div class="entry">
+      <div class="date">March 2026</div>
+      <h3><span class="tag tag-feature">Feature</span> Chamfer & Fillet Detection</h3>
+      <p>Stage 5 now recognizes cone surfaces as chamfers and partial-arc cylinders as fillets. 10 chamfers detected on the BottomMount test part.</p>
+    </div>
+    <div class="entry">
+      <div class="date">March 2026</div>
+      <h3><span class="tag tag-feature">Feature</span> CadQuery Solid Reconstruction</h3>
+      <p>Full sketch → extrude → cut holes → chamfer pipeline builds clean B-rep geometry from scratch. Construction slideshow GIF with 3 camera angles.</p>
+    </div>
+    <div class="entry">
+      <div class="date">March 2026</div>
+      <h3><span class="tag tag-feature">Feature</span> 6-Stage Pipeline Complete</h3>
+      <p>All stages implemented: Ingest → Segment → Fit → Topology → Recognize → Export. Tested on 5 mesh models.</p>
+    </div>
+    <div class="entry">
+      <div class="date">March 2026</div>
+      <h3><span class="tag tag-ui">UI</span> Three.js Web Viewer</h3>
+      <p>Interactive 3D CAD viewer with feature tree, AI chatbot, construction timeline with rendered thumbnails, and Fusion 360-style PBR rendering.</p>
+    </div>
+  </div>
+
+  <!-- Roadmap -->
+  <div class="changelog" id="roadmap">
+    <div class="roadmap-item">
+      <div class="status status-soon">Coming Soon</div>
+      <h3>Onshape Live Export</h3>
+      <p>Push your reconstructed model directly to Onshape with full feature tree via REST API.</p>
+    </div>
+    <div class="roadmap-item">
+      <div class="status status-soon">Coming Soon</div>
+      <h3>Fillet Reconstruction in CadQuery</h3>
+      <p>Apply detected fillets as proper edge fillets in the CadQuery solid (not just chamfers).</p>
+    </div>
+    <div class="roadmap-item">
+      <div class="status status-progress">In Progress</div>
+      <h3>Programmatic SEO Pages</h3>
+      <p>20+ learn pages targeting "STL to STEP", "mesh repair", "hole detection" for search engine discovery.</p>
+    </div>
+    <div class="roadmap-item">
+      <div class="status status-planned">Planned</div>
+      <h3>Stripe Billing Integration</h3>
+      <p>Self-serve subscription management for Starter, Pro, and Unlimited plans.</p>
+    </div>
+    <div class="roadmap-item">
+      <div class="status status-planned">Planned</div>
+      <h3>Pocket & Slot Detection</h3>
+      <p>Recognize recessed pockets and elongated slots as distinct features with proper sketches.</p>
+    </div>
+    <div class="roadmap-item">
+      <div class="status status-planned">Planned</div>
+      <h3>Batch Processing API</h3>
+      <p>Upload multiple meshes via REST API and get results asynchronously. For integrating into existing workflows.</p>
+    </div>
+    <div class="roadmap-item">
+      <div class="status status-planned">Planned</div>
+      <h3>Assembly Support</h3>
+      <p>Handle multi-body meshes by separating components and reconstructing each independently.</p>
+    </div>
+  </div>
+
+  <!-- Git History (loaded dynamically) -->
+  <div class="changelog" id="git-log">
+    <p style="color:var(--muted); margin-bottom:1.5rem;">Recent commits from the repository.</p>
+    <div id="git-entries"></div>
+  </div>
+</div>
+
+<script>
+function switchTab(id) {
+  document.querySelectorAll('.changelog').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  event.target.classList.add('active');
+
+  if (id === 'git-log') loadGitLog();
+}
+
+async function loadGitLog() {
+  const container = document.getElementById('git-entries');
+  if (container.children.length > 0) return; // already loaded
+  try {
+    const res = await fetch('/api/changelog');
+    const data = await res.json();
+    container.innerHTML = data.commits.map(c => `
+      <div class="entry">
+        <div class="date">${c.date}</div>
+        <h3>${c.message}</h3>
+        <p style="font-family:'JetBrains Mono',monospace; font-size:0.8rem; color:var(--dim);">${c.hash}</p>
+      </div>
+    `).join('');
+  } catch (e) {
+    container.innerHTML = '<p style="color:var(--dim);">Could not load git history.</p>';
+  }
+}
+</script>
+</body>
+</html>

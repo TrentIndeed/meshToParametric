@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Contact — Paramesh AI</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
+  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; --green:#22C55E; --red:#F85149; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; }
+.container { max-width:600px; margin:0 auto; padding:4rem clamp(1.5rem,4vw,3rem); }
+nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
+  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
+nav .inner { display:flex; align-items:center; justify-content:space-between;
+  max-width:600px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+nav .logo { font-size:1.1rem; font-weight:700; }
+nav .logo span { color:var(--accent); }
+nav a { color:var(--dim); text-decoration:none; font-size:0.9rem; }
+
+h1 { font-size:2rem; font-weight:700; letter-spacing:-0.03em; margin-bottom:0.5rem; padding-top:5rem; }
+.subtitle { color:var(--muted); margin-bottom:2.5rem; }
+.field { margin-bottom:1.25rem; }
+.field label { display:block; font-size:0.85rem; color:var(--muted); margin-bottom:0.4rem; font-weight:500; }
+.field input, .field textarea { width:100%; padding:0.75rem 1rem; background:var(--bg-card);
+  border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:inherit;
+  font-size:0.95rem; outline:none; resize:vertical; }
+.field input:focus, .field textarea:focus { border-color:var(--accent); }
+.field textarea { min-height:140px; }
+.btn { width:100%; padding:0.8rem; border:none; border-radius:8px; font-family:inherit;
+  font-size:0.95rem; font-weight:600; cursor:pointer; background:var(--accent); color:var(--bg); }
+.btn:hover { background:#06B6D4; }
+.btn:active { transform:scale(0.98) translateY(1px); }
+.success { display:none; text-align:center; padding:3rem 0; }
+.success h2 { color:var(--green); margin-bottom:0.75rem; }
+.success p { color:var(--muted); }
+.error { color:var(--red); font-size:0.85rem; display:none; margin-bottom:1rem; }
+
+.links { display:flex; gap:1.5rem; margin-top:2.5rem; padding-top:2rem; border-top:1px solid var(--border); }
+.links a { color:var(--muted); text-decoration:none; font-size:0.9rem; display:flex; align-items:center; gap:0.4rem; }
+.links a:hover { color:var(--accent); }
+</style>
+</head>
+<body>
+<nav>
+  <div class="inner">
+    <div class="logo">Paramesh<span>AI</span></div>
+    <a href="/">← Home</a>
+  </div>
+</nav>
+
+<div class="container">
+  <div id="form-section">
+    <h1>Get in touch</h1>
+    <p class="subtitle">Bug report, feature request, or just saying hello — we'll get back to you.</p>
+    <div class="error" id="error"></div>
+    <form onsubmit="return submitForm(event)">
+      <div class="field">
+        <label>Name</label>
+        <input id="name" type="text" required placeholder="Your name">
+      </div>
+      <div class="field">
+        <label>Email</label>
+        <input id="email" type="email" required placeholder="you@company.com">
+      </div>
+      <div class="field">
+        <label>Message</label>
+        <textarea id="message" required placeholder="What can we help with?"></textarea>
+      </div>
+      <button type="submit" class="btn">Send Message</button>
+    </form>
+
+    <div class="links">
+      <a href="https://discord.gg/placeholder" target="_blank">Discord Community</a>
+      <a href="/changelog">Changelog</a>
+      <a href="mailto:trentondragon02@gmail.com">Email directly</a>
+    </div>
+  </div>
+
+  <div class="success" id="success">
+    <h2>Message sent</h2>
+    <p>We'll get back to you shortly. You can also reach us on <a href="https://discord.gg/placeholder" style="color:var(--accent)">Discord</a>.</p>
+  </div>
+</div>
+
+<script>
+async function submitForm(e) {
+  e.preventDefault();
+  const errorEl = document.getElementById('error');
+  errorEl.style.display = 'none';
+
+  const body = {
+    name: document.getElementById('name').value.trim(),
+    email: document.getElementById('email').value.trim(),
+    message: document.getElementById('message').value.trim(),
+  };
+
+  try {
+    const res = await fetch('/api/contact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      document.getElementById('form-section').style.display = 'none';
+      document.getElementById('success').style.display = 'block';
+    } else {
+      errorEl.textContent = data.error || 'Something went wrong';
+      errorEl.style.display = 'block';
+    }
+  } catch (err) {
+    errorEl.textContent = 'Connection failed';
+    errorEl.style.display = 'block';
+  }
+  return false;
+}
+</script>
+</body>
+</html>

@@ -365,11 +365,13 @@ def _extract_profile_and_holes(
                 best_polys = [p for p in best_polys if p.is_valid]
                 if best_polys:
                     merged = unary_union(best_polys)
-                    # Morphological close: buffer out then back in by the same
-                    # amount. This fills small notches (holes near edges) while
-                    # preserving the overall shape including large cutouts.
+                    # Morphological close with mitre joins to preserve sharp
+                    # corners. Buffer outward to fill hole notches, then
+                    # erode back. Mitre join keeps corners sharp instead of
+                    # rounding them.
                     buf_dist = 4.0
-                    merged_clean = merged.buffer(buf_dist).buffer(-buf_dist)
+                    merged_clean = merged.buffer(buf_dist, join_style='mitre', mitre_limit=5.0)
+                    merged_clean = merged_clean.buffer(-buf_dist, join_style='mitre', mitre_limit=5.0)
                     merged_clean = merged_clean.intersection(bbox_poly)
                     if merged_clean.is_empty or not merged_clean.is_valid:
                         merged_clean = merged

@@ -580,24 +580,34 @@ def _build_stepwise(
     steps: list[ConstructionStep] = []
     script_lines = ["import cadquery as cq", ""]
 
-    # --- Step 0: Sketch (2D profile wire) ---
+    # --- Step 0: Sketch (2D profile wires — outer + inner contours) ---
     axes = [0, 1, 2]
     axes.remove(primary_axis)
     ax_u, ax_v = axes
 
-    sketch_verts = np.zeros((len(profiles[0]), 3))
-    for pi, (u, v_coord) in enumerate(profiles[0]):
-        sketch_verts[pi, ax_u] = u
-        sketch_verts[pi, ax_v] = v_coord
-        sketch_verts[pi, primary_axis] = extrude_start
+    all_sketch_verts = []
+    all_sketch_faces = []
+    vert_offset = 0
 
-    # Edge connectivity: each edge is stored as a degenerate triangle (v0, v1, v0)
-    # so the viz layer can render it as wireframe
-    n_pts = len(profiles[0])
-    sketch_faces = np.array(
-        [[(i, (i + 1) % n_pts, i)] for i in range(n_pts)],
-        dtype=np.int64,
-    ).reshape(-1, 3)
+    for profile in profiles:
+        n_pts = len(profile)
+        verts = np.zeros((n_pts, 3))
+        for pi, (u, v_coord) in enumerate(profile):
+            verts[pi, ax_u] = u
+            verts[pi, ax_v] = v_coord
+            verts[pi, primary_axis] = extrude_start
+        # Edge connectivity: degenerate triangles (v0, v1, v0) for wireframe
+        faces = np.array(
+            [[(vert_offset + i, vert_offset + (i + 1) % n_pts, vert_offset + i)]
+             for i in range(n_pts)],
+            dtype=np.int64,
+        ).reshape(-1, 3)
+        all_sketch_verts.append(verts)
+        all_sketch_faces.append(faces)
+        vert_offset += n_pts
+
+    sketch_verts = np.vstack(all_sketch_verts)
+    sketch_faces = np.vstack(all_sketch_faces)
 
     steps.append(ConstructionStep(
         name="Sketch Profile", tess_vertices=sketch_verts, tess_faces=sketch_faces, volume=0.0,

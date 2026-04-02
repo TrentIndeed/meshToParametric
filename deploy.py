@@ -40,14 +40,15 @@ async def deploy(ip: str, domain: str = "", auth_secret: str = ""):
     caddy_block = ""
     if domain:
         caddy_block = f"""
-# Append mesh2param to Caddy config
-# (Don't overwrite — operatorDashboard's config is already there)
-cat >> /etc/caddy/Caddyfile << 'CADDY'
+# Add mesh2param to Caddy config only if not already present
+if ! grep -q '{domain}' /etc/caddy/Caddyfile 2>/dev/null; then
+    cat >> /etc/caddy/Caddyfile << 'CADDY'
 
 {domain} {{
     reverse_proxy localhost:8081
 }}
 CADDY
+fi
 systemctl reload caddy
 """
 

@@ -592,30 +592,43 @@ def _build_stepwise(
             part_min_dim = min(abs(depth), 10.0)
             chamfer_sizes = [part_min_dim * 0.05]
 
-        chamfer_size = float(np.median(chamfer_sizes))
-        chamfer_size = max(0.2, min(chamfer_size, 3.0))
+        # Use minimum width — chamfer all edges conservatively to avoid
+        # failure on short edges near hole intersections
+        chamfer_size = float(min(chamfer_sizes))
+        chamfer_size = max(0.2, min(chamfer_size, 2.0))
 
         # Try chamfer at several sizes, decreasing until one works
         applied = False
+        # Try chamfering only straight edges (not circular hole rims)
+        # If that fails, try top/bottom face edges only, then all edges
+        edge_selectors = [
+            lambda wp, s: wp.edges("|X").chamfer(s),   # edges parallel to X
+            lambda wp, s: wp.edges("|Y").chamfer(s),   # edges parallel to Y
+            lambda wp, s: wp.edges(">Z").chamfer(s),   # top edges
+            lambda wp, s: wp.edges("<Z").chamfer(s),   # bottom edges
+            lambda wp, s: wp.edges().chamfer(s),        # all edges (last resort)
+        ]
         for attempt_size in [chamfer_size, chamfer_size * 0.5, 1.0, 0.5, 0.3]:
-            try:
-                wp_test = wp.edges().chamfer(attempt_size)
-                # Verify it produced valid geometry
-                vol_test = abs(float(wp_test.val().Volume()))
-                if vol_test > 0:
-                    wp = wp_test
-                    v, f = _tessellate_solid(wp)
-                    steps.append(ConstructionStep(
-                        name=f"Chamfer ({attempt_size:.1f}mm × {len(chamfers)} features)",
-                        tess_vertices=v, tess_faces=f, volume=vol_test,
-                    ))
-                    script_lines.append(f"result = result.edges().chamfer({attempt_size:.4f})")
-                    applied = True
-                    break
-            except Exception:
-                continue
+            for selector in edge_selectors:
+                try:
+                    wp_test = selector(wp, attempt_size)
+                    vol_test = abs(float(wp_test.val().Volume()))
+                    if vol_test > 0:
+                        wp = wp_test
+                        v, f = _tessellate_solid(wp)
+                        steps.append(ConstructionStep(
+                            name=f"Chamfer ({attempt_size:.1f}mm × {len(chamfers)} features)",
+                            tess_vertices=v, tess_faces=f, volume=vol_test,
+                        ))
+                        script_lines.append(f"result = result.edges().chamfer({attempt_size:.4f})")
+                        applied = True
+                        break
+                except Exception:
+                    continue
+            if applied:
+                break
         if not applied:
-            logger.warning("All chamfer sizes failed — skipping chamfer step")
+            logger.warning("All chamfer sizes/selectors failed — skipping chamfer step")
             script_lines.append(f"# Chamfer skipped — {len(chamfers)} features detected but edge chamfer failed")
 
     # --- Fillets: same progressive approach ---
@@ -633,24 +646,34 @@ def _build_stepwise(
         fillet_r = max(0.2, min(fillet_r, 3.0))
 
         applied = False
+        edge_selectors = [
+            lambda wp, r: wp.edges("|X").fillet(r),
+            lambda wp, r: wp.edges("|Y").fillet(r),
+            lambda wp, r: wp.edges(">Z").fillet(r),
+            lambda wp, r: wp.edges("<Z").fillet(r),
+            lambda wp, r: wp.edges().fillet(r),
+        ]
         for attempt_r in [fillet_r, fillet_r * 0.5, 1.0, 0.5, 0.3]:
-            try:
-                wp_test = wp.edges().fillet(attempt_r)
-                vol_test = abs(float(wp_test.val().Volume()))
-                if vol_test > 0:
-                    wp = wp_test
-                    v, f = _tessellate_solid(wp)
-                    steps.append(ConstructionStep(
-                        name=f"Fillet (r={attempt_r:.1f}mm × {len(fillets)} features)",
-                        tess_vertices=v, tess_faces=f, volume=vol_test,
-                    ))
-                    script_lines.append(f"result = result.edges().fillet({attempt_r:.4f})")
-                    applied = True
-                    break
-            except Exception:
-                continue
+            for selector in edge_selectors:
+                try:
+                    wp_test = selector(wp, attempt_r)
+                    vol_test = abs(float(wp_test.val().Volume()))
+                    if vol_test > 0:
+                        wp = wp_test
+                        v, f = _tessellate_solid(wp)
+                        steps.append(ConstructionStep(
+                            name=f"Fillet (r={attempt_r:.1f}mm × {len(fillets)} features)",
+                            tess_vertices=v, tess_faces=f, volume=vol_test,
+                        ))
+                        script_lines.append(f"result = result.edges().fillet({attempt_r:.4f})")
+                        applied = True
+                        break
+                except Exception:
+                    continue
+            if applied:
+                break
         if not applied:
-            logger.warning("All fillet sizes failed — skipping fillet step")
+            logger.warning("All fillet sizes/selectors failed — skipping fillet step")
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
     return wp, "\n".join(script_lines), steps

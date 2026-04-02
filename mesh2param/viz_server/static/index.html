@@ -479,15 +479,26 @@ body {
     <i class="ri-send-plane-line"></i> Send to Onshape
   </button>
 </div>
-<!-- Preview info bar -->
+<!-- Preview info bar with complexity meter -->
 <div id="preview-bar" style="display:none; position:fixed; bottom:88px; left:50%; transform:translateX(-50%);
-  background:var(--bg-secondary); border:1px solid var(--border); border-radius:10px; padding:8px 16px;
-  font-size:12px; color:var(--text-secondary); z-index:60; display:flex; gap:16px; align-items:center;
+  background:var(--bg-secondary); border:1px solid var(--border); border-radius:12px; padding:12px 20px;
+  font-size:12px; color:var(--text-secondary); z-index:60; max-width:600px; width:90%;
   font-family:'JetBrains Mono',monospace;">
-  <span id="preview-faces"></span>
-  <span id="preview-dims"></span>
-  <span id="preview-complexity"></span>
-  <span id="preview-tokens" style="color:var(--accent)"></span>
+  <div style="display:flex; gap:16px; align-items:center; margin-bottom:8px;">
+    <span id="preview-faces"></span>
+    <span id="preview-dims"></span>
+    <span id="preview-tokens" style="color:var(--accent)"></span>
+  </div>
+  <!-- Complexity meter -->
+  <div style="display:flex; align-items:center; gap:10px;">
+    <span style="font-size:11px; color:var(--text-muted); min-width:70px;">Complexity</span>
+    <div style="flex:1; height:6px; background:var(--bg-tertiary); border-radius:3px; overflow:hidden;">
+      <div id="complexity-fill" style="height:100%; border-radius:3px; transition:width 0.4s;"></div>
+    </div>
+    <span id="preview-complexity" style="font-size:11px; font-weight:600; min-width:80px; text-align:right;"></span>
+  </div>
+  <div id="preview-warning" style="display:none; margin-top:8px; padding:8px 10px; border-radius:6px;
+    background:rgba(248,81,73,0.08); border:1px solid rgba(248,81,73,0.2); color:#F85149; font-size:11px; font-family:'Outfit',sans-serif;"></div>
 </div>
 <input type="file" id="file-input" accept=".stl,.obj,.ply,.3mf">
 

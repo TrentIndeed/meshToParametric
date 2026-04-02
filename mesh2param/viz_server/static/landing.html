@@ -430,7 +430,7 @@ footer {
 <!-- Scroll Animation: Frame-by-frame gear behind text -->
 <section class="scroll-anim" id="scroll-anim">
   <div class="sticky">
-    <img class="gear-frame" id="scroll-frame" src="/static/scroll-frames/frame-00.jpg" alt="">
+    <img class="gear-frame" id="scroll-frame" src="/static/scroll-frames/frame-000.jpg" alt="">
     <div class="text-overlay overlay-left hidden" id="scroll-text-0">
       <h3>Intelligent segmentation</h3>
       <p>Clusters mesh faces into regions belonging to analytic surfaces — planes, cylinders, cones, spheres.</p>
@@ -698,12 +698,12 @@ footer {
 
 <script>
 // ── Scroll animation: frame-by-frame tied to scroll ──
-const TOTAL_FRAMES = 20;
+const TOTAL_FRAMES = 121;
 const scrollFrames = [];
-// Preload all frames
+// Preload all 121 frames (24fps × 5s)
 for (let i = 0; i < TOTAL_FRAMES; i++) {
   const img = new Image();
-  img.src = `/static/scroll-frames/frame-${String(i).padStart(2, '0')}.jpg`;
+  img.src = `/static/scroll-frames/frame-${String(i).padStart(3, '0')}.jpg`;
   scrollFrames.push(img);
 }
 

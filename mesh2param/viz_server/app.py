@@ -221,21 +221,86 @@ async def preview_mesh(file: UploadFile = File(...)):
         except Exception:
             pass
 
-        # Rough token estimate (before feature recognition)
+        # Complexity analysis
+        import numpy as np
+        normals = cleaned.normals
+        avg_n = normals.mean(axis=0)
+        avg_norm = np.linalg.norm(avg_n)
+        if avg_norm > 1e-15:
+            avg_n /= avg_norm
+        normal_spread = float(1.0 - np.mean(np.abs(normals @ avg_n)))
+
+        # Count approximate surface types by normal clustering
+        unique_dirs = set()
+        for n in normals[::max(1, len(normals)//200)]:
+            snapped = tuple(round(x, 1) for x in n)
+            unique_dirs.add(snapped)
+        approx_surfaces = len(unique_dirs)
+
+        # Aspect ratio (how box-like vs thin/long)
+        sorted_dims = sorted(dims, reverse=True)
+        aspect_ratio = sorted_dims[0] / (sorted_dims[2] + 1e-10)
+
+        # Complexity score 0-100
+        score = 0
+        score += min(30, face_count / 100)        # faces: 0-30
+        score += min(20, approx_surfaces)          # surface variety: 0-20
+        score += min(15, normal_spread * 50)       # normal spread: 0-15
+        score += min(15, aspect_ratio * 2)         # aspect ratio: 0-15
+        score += 0 if cleaned.is_watertight else 10  # non-watertight penalty
+        score += min(10, len(dims) and max(dims) / 50)  # size: 0-10
+        score = min(100, round(score))
+
+        # Classification and limits
+        if score <= 25:
+            complexity = "Simple"
+            difficulty = "low"
+            can_process = True
+            reason = None
+        elif score <= 50:
+            complexity = "Medium"
+            difficulty = "medium"
+            can_process = True
+            reason = None
+        elif score <= 75:
+            complexity = "Complex"
+            difficulty = "high"
+            can_process = True
+            reason = None
+        else:
+            complexity = "Too Complex"
+            difficulty = "extreme"
+            can_process = face_count <= 10000
+            reason = "This mesh has too many surfaces, high curvature variation, or non-prismatic geometry. The tool works best on prismatic mechanical parts (brackets, plates, mounts) with under 5000 faces." if not can_process else None
+
+        # Hard limits
+        if face_count > 10000:
+            can_process = False
+            reason = f"Mesh has {face_count:,} faces (limit: 10,000). Simplify the mesh before uploading."
+        if not cleaned.is_watertight and face_count > 5000:
+            can_process = False
+            reason = f"Non-watertight mesh with {face_count:,} faces. Repair the mesh first using the free cleaner at /clean."
+
         estimated_tokens = max(5, round((face_count // 150 + face_count // 200) / 5) * 5)
-        complexity = "Simple" if face_count < 500 else "Medium" if face_count < 2000 else "Complex"
 
         return {
             "status": "ok",
             "filename": file.filename,
-            "temp_path": tmp.name,  # kept for pipeline run
+            "temp_path": tmp.name,
             "faces": face_count,
             "vertices": cleaned.num_vertices,
             "watertight": cleaned.is_watertight,
             "dimensions": [round(d, 1) for d in dims],
             "volume": round(volume, 1),
             "complexity": complexity,
+            "complexity_score": score,
+            "difficulty": difficulty,
+            "can_process": can_process,
+            "reject_reason": reason,
             "estimated_tokens": estimated_tokens,
+            "approx_surfaces": approx_surfaces,
+            "normal_spread": round(normal_spread, 3),
+            "aspect_ratio": round(aspect_ratio, 1),
             "mesh_vertices": cleaned.vertices.flatten().tolist(),
             "mesh_faces": cleaned.faces.flatten().tolist(),
         }

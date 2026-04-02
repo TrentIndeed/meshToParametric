@@ -335,13 +335,51 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     pendingFile = file;
     _showRawMesh(previewRes);
 
-    // Show preview info bar + analyze button
-    document.getElementById('preview-bar').style.display = 'flex';
+    // Show preview info bar with complexity meter
+    document.getElementById('preview-bar').style.display = 'block';
     document.getElementById('preview-faces').textContent = previewRes.faces.toLocaleString() + ' faces';
     document.getElementById('preview-dims').textContent = previewRes.dimensions.map(d => d + 'mm').join(' × ');
-    document.getElementById('preview-complexity').textContent = previewRes.complexity;
     document.getElementById('preview-tokens').textContent = '~' + previewRes.estimated_tokens + ' tokens';
-    document.getElementById('btn-analyze').style.display = '';
+
+    // Complexity meter
+    const score = previewRes.complexity_score || 0;
+    const fill = document.getElementById('complexity-fill');
+    const label = document.getElementById('preview-complexity');
+    const warning = document.getElementById('preview-warning');
+    fill.style.width = score + '%';
+
+    if (score <= 25) {
+      fill.style.background = '#22C55E';
+      label.textContent = previewRes.complexity;
+      label.style.color = '#22C55E';
+    } else if (score <= 50) {
+      fill.style.background = '#D29922';
+      label.textContent = previewRes.complexity;
+      label.style.color = '#D29922';
+    } else if (score <= 75) {
+      fill.style.background = '#F97316';
+      label.textContent = previewRes.complexity;
+      label.style.color = '#F97316';
+    } else {
+      fill.style.background = '#F85149';
+      label.textContent = previewRes.complexity;
+      label.style.color = '#F85149';
+    }
+
+    // Show warning or block if too complex
+    if (!previewRes.can_process) {
+      warning.style.display = 'block';
+      warning.textContent = previewRes.reject_reason || 'This mesh is too complex for the current pipeline.';
+      document.getElementById('btn-analyze').style.display = 'none';
+      addChatMessage('ai', '⚠️ ' + (previewRes.reject_reason || 'Mesh is too complex to process.'), true);
+    } else {
+      warning.style.display = 'none';
+      document.getElementById('btn-analyze').style.display = '';
+      if (score > 60) {
+        addChatMessage('ai', `⚠️ High complexity (${score}/100). Results may be less accurate for this mesh. Works best on prismatic parts with flat faces and cylindrical holes.`, true);
+      }
+    }
+
     document.getElementById('btn-upload').style.display = 'none';
     document.getElementById('empty-state').style.display = 'none';
 

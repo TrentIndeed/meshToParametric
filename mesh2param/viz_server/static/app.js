@@ -325,6 +325,11 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       return;
     }
 
+    // AI thinking messages about the uploaded mesh
+    addChatMessage('ai', `Loaded ${previewRes.filename || 'mesh'}: ${previewRes.faces.toLocaleString()} faces, ${previewRes.vertices.toLocaleString()} vertices`, true);
+    addChatMessage('ai', `Dimensions: ${previewRes.dimensions.map(d => d + 'mm').join(' × ')}. ${previewRes.watertight ? 'Mesh is watertight.' : 'Mesh has gaps — will repair.'}`, true);
+    addChatMessage('ai', `Complexity: ${previewRes.complexity}. Estimated cost: ~${previewRes.estimated_tokens} tokens. Click "Analyze & Build" to proceed.`, true);
+
     // Show the raw mesh in the 3D viewer
     pendingTempPath = previewRes.temp_path;
     pendingFile = file;
@@ -401,7 +406,21 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
 
     currentJobId = data.job_id;
 
-    // Poll progress
+    // Show AI thinking process in chat as pipeline runs
+    addChatMessage('system', 'Pipeline started — analyzing mesh...');
+    let lastStage = '';
+
+    const thinkingMessages = {
+      'Ingesting mesh...': '🔍 Reading mesh file, checking topology, counting faces...',
+      'Segmenting surfaces...': '🧩 Clustering faces into surface groups using normal angles and curvature...',
+      'Fitting primitives...': '📐 Fitting planes, cylinders, and cones to each surface region via RANSAC...',
+      'Building topology...': '🔗 Building adjacency graph, classifying edges as sharp/fillet/chamfer...',
+      'Recognizing features...': '🏗️ Identifying base extrusion, holes, pockets, chamfers, fillets...',
+      'Building CAD model...': '⚙️ Constructing CadQuery solid: sketch → extrude → cut holes → chamfer...',
+      'Done': '✅ CAD model built successfully!',
+    };
+
+    // Poll progress and stream thinking to chat
     const statusData = await new Promise((resolve, reject) => {
       const poll = setInterval(async () => {
         try {
@@ -410,6 +429,14 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           progressBar.style.width = d.progress + '%';
           loadingText.textContent = d.stage || 'Processing...';
           progressDetail.textContent = d.progress + '%';
+
+          // Add thinking message when stage changes
+          if (d.stage && d.stage !== lastStage) {
+            lastStage = d.stage;
+            const thought = thinkingMessages[d.stage];
+            if (thought) addChatMessage('ai', thought, true);
+          }
+
           if (d.status === 'done') { clearInterval(poll); resolve(d); }
           else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
         } catch (e) {}
@@ -426,6 +453,17 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     pendingTempPath = null;
 
     if (statusData.status === 'done') {
+      // Summary message in chat
+      const holes = statusData.steps.filter(s => s.name.includes('Hole')).length;
+      const chamfers = statusData.steps.filter(s => s.name.includes('Chamfer')).length;
+      const fillets = statusData.steps.filter(s => s.name.includes('Fillet')).length;
+      let summary = `📊 Found ${statusData.num_steps} construction steps: 1 base extrusion`;
+      if (holes > 0) summary += `, ${holes} holes`;
+      if (chamfers > 0) summary += `, ${chamfers} chamfer groups`;
+      if (fillets > 0) summary += `, ${fillets} fillet groups`;
+      summary += `. Volume error: ${((statusData.cad_volume - statusData.mesh_volume) / statusData.mesh_volume * 100).toFixed(1)}%`;
+      addChatMessage('ai', summary);
+      addChatMessage('system', 'Ask me to describe features, resize holes, or modify the model.');
 
       // Try AI dimension analysis
       loading.classList.remove('show');
@@ -534,9 +572,9 @@ const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
 const chatSend = document.getElementById('chat-send');
 
-function addChatMessage(role, text) {
+function addChatMessage(role, text, isThinking = false) {
   const msg = document.createElement('div');
-  msg.className = `chat-msg ${role}`;
+  msg.className = `chat-msg ${role}${isThinking ? ' thinking' : ''}`;
   msg.textContent = text;
   chatMessages.appendChild(msg);
   chatMessages.scrollTop = chatMessages.scrollHeight;

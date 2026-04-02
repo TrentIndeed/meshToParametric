@@ -329,8 +329,10 @@ footer {
   overflow: hidden;
 }
 .scroll-anim .gear-video {
-  width: 100%; max-width: 960px; border-radius: 12px;
-  box-shadow: 0 20px 80px rgba(0,0,0,0.6);
+  width: 110vw; max-width: none; margin-left: -5vw;
+  border-radius: 0;
+  mask-image: linear-gradient(90deg, transparent 0%, var(--bg) 15%, var(--bg) 85%, transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, black 15%, black 85%, transparent 100%);
 }
 .scroll-anim .text-overlay {
   position: absolute; z-index: 2;

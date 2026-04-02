@@ -39,7 +39,8 @@ def segment_mesh(
         config = SegmentConfig()
 
     adjacency = _build_face_adjacency(cleaned.faces)
-    labels = _region_growing(cleaned.normals, adjacency, config)
+    sharp_edges = _detect_sharp_edges(cleaned.normals, adjacency, config)
+    labels = _region_growing(cleaned.normals, adjacency, config, sharp_edges)
     labels = _merge_small_regions(labels, adjacency, cleaned.normals, config.min_region_faces)
     labels = _split_flat_from_curved(labels, cleaned.normals, adjacency)
     # Use a smaller min_faces for the post-split merge so that small flat
@@ -47,6 +48,8 @@ def segment_mesh(
     # re-absorbed into the adjacent cylinder region they were just split from.
     labels = _merge_small_regions(labels, adjacency, cleaned.normals, min(config.min_region_faces, 2))
     labels = _curvature_split(labels, cleaned, adjacency, config)
+    labels = _split_cylinders_from_planes(labels, cleaned, adjacency)
+    labels = _merge_adjacent_cylinder_fragments(labels, cleaned, adjacency)
 
     regions = _build_regions(labels, cleaned, adjacency)
     logger.info("Segmented mesh into %d regions", len(regions))
@@ -80,20 +83,49 @@ def _build_face_adjacency(faces: np.ndarray) -> dict[int, set[int]]:
     return dict(adjacency)
 
 
+def _detect_sharp_edges(
+    normals: np.ndarray,
+    adjacency: dict[int, set[int]],
+    config: SegmentConfig,
+) -> set[tuple[int, int]]:
+    """Find face pairs separated by sharp dihedral angles.
+
+    Returns a set of (face_a, face_b) pairs that should NOT be merged
+    during region growing, because the angle between them indicates a
+    feature boundary (e.g., where a flat face meets a hole wall).
+    """
+    sharp_angle = np.cos(np.radians(config.curved_angle_threshold_deg + 5))
+    sharp_pairs: set[tuple[int, int]] = set()
+
+    for fi, neighbors in adjacency.items():
+        for ni in neighbors:
+            if ni <= fi:
+                continue  # avoid duplicates
+            dot = float(np.dot(normals[fi], normals[ni]))
+            if dot < sharp_angle:
+                sharp_pairs.add((fi, ni))
+                sharp_pairs.add((ni, fi))
+
+    return sharp_pairs
+
+
 def _region_growing(
     normals: np.ndarray,
     adjacency: dict[int, set[int]],
     config: SegmentConfig,
+    sharp_edges: set[tuple[int, int]] | None = None,
 ) -> np.ndarray:
     """Assign each face to a region via flood-fill on normal similarity.
 
     Seeds are chosen as the face with the most unassigned neighbors.
     Growing uses an adaptive angle threshold: tight for planar regions,
-    looser for curved surfaces.
+    looser for curved surfaces. Never crosses sharp edge boundaries.
     """
     n_faces = len(normals)
     labels = np.full(n_faces, -1, dtype=np.int64)
     assigned = np.zeros(n_faces, dtype=bool)
+    if sharp_edges is None:
+        sharp_edges = set()
 
     plane_thresh = np.cos(np.radians(config.plane_angle_threshold_deg))
     curved_thresh = np.cos(np.radians(config.curved_angle_threshold_deg))
@@ -118,22 +150,17 @@ def _region_growing(
                 if assigned[neighbor]:
                     continue
 
-                # Adaptive threshold: use the running average normal of the
-                # region so far to decide the threshold. If the region average
-                # normal is very consistent (low spread), use the tight planar
-                # threshold; otherwise use the curved threshold.
+                # Never cross a sharp edge boundary
+                if (current, neighbor) in sharp_edges:
+                    continue
+
+                # Adaptive threshold
                 avg_normal = np.mean(region_normals, axis=0)
                 avg_normal /= np.linalg.norm(avg_normal) + 1e-15
 
-                # Similarity of the candidate face to the region average
                 dot = np.dot(normals[neighbor], avg_normal)
-
-                # Similarity of the candidate to its specific neighbor in the queue
                 dot_local = np.dot(normals[neighbor], normals[current])
 
-                # Use the stricter planar threshold for the global check,
-                # but also accept if the local neighbor-to-neighbor angle is
-                # within the curved threshold
                 if dot >= plane_thresh or dot_local >= curved_thresh:
                     labels[neighbor] = region_id
                     assigned[neighbor] = True
@@ -358,6 +385,155 @@ def _curvature_split(
             else:
                 labels[region_indices[sub_mask]] = next_label
                 next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+
+    return labels
+
+
+def _split_cylinders_from_planes(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Split cylindrical hole faces out of large planar regions.
+
+    After region growing, small holes near edges often get absorbed into the
+    dominant planar region. This function detects faces within planar regions
+    whose normals deviate significantly from the region's dominant direction,
+    clusters them spatially, and splits each cluster into its own region.
+    """
+    from sklearn.cluster import DBSCAN
+
+    labels = labels.copy()
+    next_label = int(labels.max()) + 1
+
+    for label in np.unique(labels):
+        mask = labels == label
+        face_indices = np.where(mask)[0]
+        if len(face_indices) < 20:
+            continue
+
+        region_normals = cleaned.normals[face_indices]
+        avg_n = region_normals.mean(axis=0)
+        avg_norm = np.linalg.norm(avg_n)
+        if avg_norm < 0.8:
+            continue  # not a planar region
+        avg_n /= avg_norm
+
+        # Find faces that deviate from the dominant normal (potential hole walls).
+        # Use a loose threshold to catch cylindrical faces that tilt away from flat.
+        dots = region_normals @ avg_n
+        deviant_mask = dots < 0.92  # > ~23° from region normal
+        deviant_indices = face_indices[deviant_mask]
+
+        if len(deviant_indices) < 3:
+            continue
+
+        # Cluster deviant faces spatially — each cluster is a potential hole
+        centroids = np.array([
+            cleaned.vertices[cleaned.faces[fi]].mean(axis=0) for fi in deviant_indices
+        ])
+
+        # Adaptive eps based on part size
+        part_size = float((cleaned.bbox[1] - cleaned.bbox[0]).max())
+        eps = max(part_size * 0.05, 5.0)
+
+        clustering = DBSCAN(eps=eps, min_samples=3).fit(centroids)
+
+        for cl_label in set(clustering.labels_):
+            if cl_label == -1:
+                continue
+            cl_mask = clustering.labels_ == cl_label
+            cl_faces = deviant_indices[cl_mask]
+            if len(cl_faces) < 3:
+                continue
+
+            # Assign these faces to a new region
+            for fi in cl_faces:
+                labels[fi] = next_label
+            next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+
+    return labels
+
+
+def _merge_adjacent_cylinder_fragments(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Merge small adjacent regions that together form cylindrical holes.
+
+    After segmentation, hole walls often get split into many tiny regions
+    (2-10 faces each). This function detects spatially clustered small regions
+    with non-planar normals and merges them into unified hole regions.
+    """
+    from sklearn.cluster import DBSCAN
+
+    labels = labels.copy()
+    normals = cleaned.normals
+
+    # Find small regions with non-axis-aligned normals (potential hole fragments)
+    region_info = {}
+    for label in np.unique(labels):
+        face_idx = np.where(labels == label)[0]
+        if len(face_idx) > 30:
+            continue  # skip large regions
+        avg_n = normals[face_idx].mean(axis=0)
+        avg_norm = np.linalg.norm(avg_n)
+        if avg_norm < 0.01:
+            continue
+        avg_n /= avg_norm
+        # Non-planar: average normal not closely aligned with any axis
+        if np.max(np.abs(avg_n)) < 0.85:
+            center = np.mean([
+                cleaned.vertices[cleaned.faces[fi]].mean(axis=0) for fi in face_idx
+            ], axis=0)
+            region_info[label] = {
+                "faces": face_idx,
+                "center": center,
+                "normal": avg_n,
+                "count": len(face_idx),
+            }
+
+    if len(region_info) < 2:
+        return labels
+
+    # Cluster these small regions spatially
+    region_labels = list(region_info.keys())
+    centers = np.array([region_info[l]["center"] for l in region_labels])
+
+    part_size = float((cleaned.bbox[1] - cleaned.bbox[0]).min())  # smallest dim
+    eps = max(part_size * 0.4, 8.0)
+
+    clustering = DBSCAN(eps=eps, min_samples=2).fit(centers)
+
+    next_label = int(labels.max()) + 1
+    for cl in set(clustering.labels_):
+        if cl == -1:
+            continue
+        cl_mask = clustering.labels_ == cl
+        group_labels = [region_labels[i] for i in range(len(region_labels)) if cl_mask[i]]
+
+        # Merge all faces in this spatial cluster into one region
+        if len(group_labels) < 2:
+            continue
+        total_faces = sum(region_info[l]["count"] for l in group_labels)
+        if total_faces < 4:
+            continue
+
+        for l in group_labels:
+            for fi in region_info[l]["faces"]:
+                labels[fi] = next_label
+        next_label += 1
 
     # Renumber contiguously
     unique = np.unique(labels)

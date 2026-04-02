@@ -263,10 +263,25 @@ def _find_holes(
     for f in fitted:
         if f.region_id in assigned:
             continue
-        if f.surface_type != SurfaceType.CYLINDER:
+        if f.surface_type not in (SurfaceType.CYLINDER, SurfaceType.CONE):
             continue
 
         radius = f.params.get("radius", 0)
+        # For cones with small half_angle (<5°), treat as cylinders.
+        # Compute radius from the region's vertex distances to the axis.
+        if f.surface_type == SurfaceType.CONE:
+            half_angle = f.params.get("half_angle", 0)
+            if half_angle > np.radians(45):
+                continue  # wide cone, not a hole
+            region = region_lookup.get(f.region_id)
+            if region is None:
+                continue
+            verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
+            axis_pt = np.array(f.params.get("axis_dir", [0, 0, 1]))
+            # Estimate radius from bbox: smallest two dims averaged / 2
+            bbox_size = verts.max(axis=0) - verts.min(axis=0)
+            sorted_dims = sorted(bbox_size)
+            radius = (sorted_dims[0] + sorted_dims[1]) / 4
         if radius <= 0 or radius > config.hole_max_radius_ratio * bbox_diag:
             continue
 
@@ -281,6 +296,12 @@ def _find_holes(
 
         height = f.params.get("height", 0)
         axis_dir = np.array(f.params.get("axis_dir", [0, 0, 1]))
+
+        # For cones, compute height from region vertex extent along axis
+        if height <= 0 and region is not None:
+            verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
+            proj = verts @ axis_dir
+            height = float(proj.max() - proj.min())
 
         # Snap hole axis to nearest principal direction if close (within 15°)
         # This fixes holes whose fitted axis is slightly off due to mesh noise
@@ -306,7 +327,10 @@ def _find_holes(
                 face_indices=region.face_indices.copy(),
                 sketch_geometry={
                     "type": "circle",
-                    "center": f.params.get("axis_point", [0, 0, 0]),
+                    "center": (
+                        f.params.get("axis_point")
+                        or region.vertices.mean(axis=0).tolist()
+                    ),
                     "radius": radius,
                 },
                 depth=height,
@@ -320,9 +344,9 @@ def _find_holes(
 
 
 def _cylinder_angular_span(fitted: FittedSurface, region: FaceRegion) -> float:
-    """Compute angular span of a cylinder region (degrees)."""
-    axis_point = np.array(fitted.params["axis_point"])
-    axis_dir = np.array(fitted.params["axis_dir"])
+    """Compute angular span of a cylinder/cone region (degrees)."""
+    axis_point = np.array(fitted.params.get("axis_point", fitted.params.get("apex", [0, 0, 0])))
+    axis_dir = np.array(fitted.params.get("axis_dir", [0, 0, 1]))
     axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
 
     vecs = region.vertices - axis_point

@@ -354,27 +354,45 @@ def _extract_profile_and_holes(
                 ]
                 bbox_poly = SPoly(bbox_profile)
 
-                outer_polys = [SPoly(p) for p in best_profiles if _polygon_area(p) > total_area * 0.1]
-                valid = [p for p in outer_polys if p.is_valid]
-                if len(valid) >= 2:
-                    merged = unary_union(valid)
-                    # Inner cutout = bbox minus the solid parts
-                    diff = bbox_poly.difference(merged)
-                    combined = [bbox_profile]
-                    geoms = [diff] if diff.geom_type == 'Polygon' else (list(diff.geoms) if hasattr(diff, 'geoms') else [])
-                    for geom in geoms:
-                        if geom.geom_type != 'Polygon' or geom.area < 1.0:
-                            continue
-                        coords = list(geom.exterior.coords)[:-1]
-                        simplified = _simplify_profile(coords, tolerance=0.1)
-                        if len(simplified) >= 3:
-                            combined.append(simplified)
-                    combined.sort(key=lambda pts: -_polygon_area(pts))
-                    best_profiles = combined
-                    logger.info(
-                        "Used bbox + difference for split frame (%d profiles)",
-                        len(combined),
-                    )
+                # Use the void from the best slice but buffer the solid
+                # polygons outward to fill hole notches and smooth the
+                # frame boundary. The buffer fills indentations from nearby
+                # holes while preserving the actual cutout shape.
+                best_polys = [
+                    SPoly(p).buffer(0) for p in best_profiles
+                    if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
+                ]
+                best_polys = [p for p in best_polys if p.is_valid]
+                if best_polys:
+                    merged = unary_union(best_polys)
+                    # Morphological close: buffer out then back in by the same
+                    # amount. This fills small notches (holes near edges) while
+                    # preserving the overall shape including large cutouts.
+                    buf_dist = 4.0
+                    merged_clean = merged.buffer(buf_dist).buffer(-buf_dist)
+                    merged_clean = merged_clean.intersection(bbox_poly)
+                    if merged_clean.is_empty or not merged_clean.is_valid:
+                        merged_clean = merged
+                    diff = bbox_poly.difference(merged_clean)
+                else:
+                    diff = SPoly()
+                combined = [bbox_profile]
+                geoms = [diff] if diff.geom_type == 'Polygon' else (
+                    list(diff.geoms) if hasattr(diff, 'geoms') else []
+                )
+                for geom in geoms:
+                    if geom.geom_type != 'Polygon' or geom.area < 5.0:
+                        continue
+                    coords = list(geom.exterior.coords)[:-1]
+                    simplified = _simplify_profile(coords, tolerance=0.1)
+                    if len(simplified) >= 3:
+                        combined.append(simplified)
+                combined.sort(key=lambda pts: -_polygon_area(pts))
+                best_profiles = combined
+                logger.info(
+                    "Used bbox + through-void for split frame (%d profiles)",
+                    len(combined),
+                )
 
     if not best_profiles:
         return None, extrude_start, []

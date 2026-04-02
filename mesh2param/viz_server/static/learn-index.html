@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Learn — Mesh to CAD Conversion Guides — Paramesh AI</title>
+<meta name="description" content="Free guides on converting meshes to parametric CAD models. STL to STEP conversion, mesh repair, hole detection, feature recognition, and more.">
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<meta property="og:title" content="Learn — Paramesh AI">
+<meta property="og:description" content="Free guides on mesh to CAD conversion, STL repair, feature recognition.">
+<meta property="og:image" content="https://parameshai.com/static/og-image.png">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
+  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; }
+nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
+  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
+nav .inner { display:flex; align-items:center; justify-content:space-between;
+  max-width:900px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+nav .logo { font-size:1.1rem; font-weight:700; color:var(--text); text-decoration:none; }
+nav .logo span { color:var(--accent); }
+nav a.link { color:var(--dim); text-decoration:none; font-size:0.9rem; }
+.btn { display:inline-flex; padding:0.55rem 1.2rem; border-radius:8px; font-size:0.85rem;
+  font-weight:600; text-decoration:none; background:var(--accent); color:var(--bg); }
+
+.container { max-width:900px; margin:0 auto; padding:5rem clamp(1.5rem,4vw,3rem) 3rem; }
+h1 { font-size:2rem; font-weight:700; letter-spacing:-0.03em; margin-bottom:0.5rem; }
+.subtitle { color:var(--muted); margin-bottom:2.5rem; font-size:1.05rem; }
+
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+@media(max-width:600px) { .grid { grid-template-columns:1fr; } }
+.card { background:var(--bg-card); border:1px solid var(--border); border-radius:10px;
+  padding:1.25rem; text-decoration:none; transition:border-color 0.2s; display:block; }
+.card:hover { border-color:var(--accent); }
+.card h3 { font-size:0.95rem; font-weight:600; color:var(--text); margin-bottom:0.4rem; }
+.card p { font-size:0.85rem; color:var(--dim); line-height:1.5;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+
+footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
+  font-size:0.85rem; color:var(--dim); margin-top:3rem; }
+footer a { color:var(--dim); text-decoration:none; margin:0 0.75rem; }
+</style>
+</head>
+<body>
+<nav>
+  <div class="inner">
+    <a href="/" class="logo">Paramesh<span>AI</span></a>
+    <div style="display:flex;gap:1.5rem;align-items:center;">
+      <a href="/clean" class="link">Free Tools</a>
+      <a href="/app" class="btn">Try Free</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+  <h1>Learn</h1>
+  <p class="subtitle">Free guides on converting meshes to parametric CAD models.</p>
+  <div class="grid">
+    {{CARDS}}
+  </div>
+</div>
+
+<footer>
+  <div class="container">
+    <a href="/">Home</a>
+    <a href="/clean">Free Tools</a>
+    <a href="/changelog">Changelog</a>
+    <a href="/contact">Contact</a>
+    <a href="/privacy">Privacy</a>
+  </div>
+</footer>
+<script src="/static/support-widget.js"></script>
+</body>
+</html>

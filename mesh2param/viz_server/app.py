@@ -88,13 +88,91 @@ async def changelog_page():
 async def contact_page():
     return FileResponse(str(STATIC_DIR / "contact.html"))
 
+# ── Learn pages (programmatic SEO) ──
+
+def _load_learn_data():
+    import json
+    path = STATIC_DIR / "learn-data.json"
+    with open(path) as f:
+        return json.load(f)
+
+def _render_learn_page(entry, all_entries):
+    """Server-render a learn page by replacing template placeholders."""
+    template = (STATIC_DIR / "learn-template.html").read_text(encoding="utf-8")
+
+    # CTA HTML based on type
+    cta_map = {
+        "trial": '<p>Convert your mesh to parametric CAD</p><a href="/app" class="btn btn-primary" style="width:100%;justify-content:center;">Try Free — 3 Generations</a>',
+        "cleaner": '<p>Fix your mesh for free</p><a href="/clean" class="btn btn-primary" style="width:100%;justify-content:center;">Open Mesh Cleaner</a>',
+        "waitlist": '<p>Get notified when this launches</p><a href="/#waitlist" class="btn btn-primary" style="width:100%;justify-content:center;">Join Waitlist</a>',
+    }
+
+    # Related links HTML
+    related_html = ""
+    for slug in entry.get("related", []):
+        rel = next((e for e in all_entries if e["slug"] == slug), None)
+        if rel:
+            related_html += f'<a href="/learn/{rel["slug"]}">{rel["title"]}</a>\n'
+
+    html = template.replace("{{TITLE}}", entry["title"])
+    html = html.replace("{{SLUG}}", entry["slug"])
+    html = html.replace("{{QUESTION}}", entry["question"])
+    html = html.replace("{{TLDR}}", entry["tldr"])
+    html = html.replace("{{BODY}}", entry["body"])
+    html = html.replace("{{RELATED_LINKS}}", related_html)
+    html = html.replace("{{CTA_HTML}}", cta_map.get(entry.get("cta_type", "trial"), cta_map["trial"]))
+    return html
+
+def _render_learn_index(entries):
+    """Server-render the learn index page."""
+    template = (STATIC_DIR / "learn-index.html").read_text(encoding="utf-8")
+    cards = ""
+    for e in entries:
+        cards += f'<a href="/learn/{e["slug"]}" class="card"><h3>{e["title"]}</h3><p>{e["tldr"][:120]}...</p></a>\n'
+    return template.replace("{{CARDS}}", cards)
+
+
+@app.get("/learn", response_class=HTMLResponse)
+async def learn_index():
+    entries = _load_learn_data()
+    return HTMLResponse(_render_learn_index(entries))
+
+@app.get("/learn/{slug}", response_class=HTMLResponse)
+async def learn_page(slug: str):
+    entries = _load_learn_data()
+    entry = next((e for e in entries if e["slug"] == slug), None)
+    if not entry:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return HTMLResponse(_render_learn_page(entry, entries))
+
+
 @app.get("/robots.txt")
 async def robots():
     return FileResponse(str(STATIC_DIR / "robots.txt"), media_type="text/plain")
 
 @app.get("/sitemap.xml")
 async def sitemap():
-    return FileResponse(str(STATIC_DIR / "sitemap.xml"), media_type="application/xml")
+    """Dynamic sitemap including all learn pages."""
+    entries = _load_learn_data()
+    urls = [
+        ("https://parameshai.com/", "1.0"),
+        ("https://parameshai.com/clean", "0.9"),
+        ("https://parameshai.com/app", "0.8"),
+        ("https://parameshai.com/learn", "0.8"),
+        ("https://parameshai.com/changelog", "0.5"),
+        ("https://parameshai.com/contact", "0.4"),
+        ("https://parameshai.com/privacy", "0.2"),
+        ("https://parameshai.com/terms", "0.2"),
+    ]
+    for e in entries:
+        urls.append((f"https://parameshai.com/learn/{e['slug']}", "0.7"))
+
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+    xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    for url, priority in urls:
+        xml += f"  <url><loc>{url}</loc><priority>{priority}</priority></url>\n"
+    xml += "</urlset>"
+    return HTMLResponse(content=xml, media_type="application/xml")
 
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():

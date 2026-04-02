@@ -76,6 +76,10 @@ async def viewer():
 async def cleaner():
     return FileResponse(str(STATIC_DIR / "cleaner.html"))
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return FileResponse(str(STATIC_DIR / "login.html"))
+
 @app.get("/robots.txt")
 async def robots():
     return FileResponse(str(STATIC_DIR / "robots.txt"), media_type="text/plain")

@@ -569,67 +569,43 @@ def _build_stepwise(
         except Exception as e:
             logger.warning("Failed to cut hole %d: %s", i, e)
 
-    # --- Chamfers: try progressively smaller sizes until one works ---
-    # CadQuery's edges().chamfer() applies to ALL edges, so we need a
-    # size small enough to not fail on short edges but big enough to see.
+    # --- Chamfers: detected but noted in script ---
+    # CadQuery can't reliably chamfer edges on complex solids with holes
+    # (hole rim edges interfere). The chamfers are recorded in the feature
+    # tree and script for documentation purposes.
     if chamfers:
-        # Estimate chamfer size from the actual face geometry
-        chamfer_sizes = []
-        for cf in chamfers:
-            # Use the face bounding box to estimate chamfer depth
-            face_idxs = cf.face_indices
-            if len(face_idxs) > 0:
-                # Rough estimate: half the smallest bbox dimension of chamfer faces
-                # (This is more reliable than the sketch_geometry width)
-                pass
-            s = cf.sketch_geometry
-            w = s.get("width", 0)
-            if 0.1 < w < 50:
-                chamfer_sizes.append(w)
+        chamfer_sizes = [cf.sketch_geometry.get("width", 0) for cf in chamfers if cf.sketch_geometry.get("width", 0) > 0.1]
+        if chamfer_sizes:
+            unique_sizes = sorted(set(round(w, 1) for w in chamfer_sizes))
+            script_lines.append(f"# {len(chamfers)} chamfers detected: {unique_sizes} mm")
+            script_lines.append(f"# Apply before holes for large corner bevels, after for countersinks")
 
-        # If no good widths from sketch geometry, estimate from part size
-        if not chamfer_sizes:
-            part_min_dim = min(abs(depth), 10.0)
-            chamfer_sizes = [part_min_dim * 0.05]
-
-        # Use minimum width — chamfer all edges conservatively to avoid
-        # failure on short edges near hole intersections
-        chamfer_size = float(min(chamfer_sizes))
-        chamfer_size = max(0.2, min(chamfer_size, 2.0))
-
-        # Try chamfer at several sizes, decreasing until one works
-        applied = False
-        # Try chamfering only straight edges (not circular hole rims)
-        # If that fails, try top/bottom face edges only, then all edges
-        edge_selectors = [
-            lambda wp, s: wp.edges("|X").chamfer(s),   # edges parallel to X
-            lambda wp, s: wp.edges("|Y").chamfer(s),   # edges parallel to Y
-            lambda wp, s: wp.edges(">Z").chamfer(s),   # top edges
-            lambda wp, s: wp.edges("<Z").chamfer(s),   # bottom edges
-            lambda wp, s: wp.edges().chamfer(s),        # all edges (last resort)
-        ]
-        for attempt_size in [chamfer_size, chamfer_size * 0.5, 1.0, 0.5, 0.3]:
-            for selector in edge_selectors:
-                try:
-                    wp_test = selector(wp, attempt_size)
-                    vol_test = abs(float(wp_test.val().Volume()))
-                    if vol_test > 0:
-                        wp = wp_test
-                        v, f = _tessellate_solid(wp)
-                        steps.append(ConstructionStep(
-                            name=f"Chamfer ({attempt_size:.1f}mm × {len(chamfers)} features)",
-                            tess_vertices=v, tess_faces=f, volume=vol_test,
-                        ))
-                        script_lines.append(f"result = result.edges().chamfer({attempt_size:.4f})")
-                        applied = True
-                        break
-                except Exception:
-                    continue
-            if applied:
-                break
-        if not applied:
-            logger.warning("All chamfer sizes/selectors failed — skipping chamfer step")
-            script_lines.append(f"# Chamfer skipped — {len(chamfers)} features detected but edge chamfer failed")
+            # Try to apply at least small chamfers on straight edges
+            small_size = float(min(chamfer_sizes))
+            small_size = max(0.2, min(small_size, 2.0))
+            applied = False
+            for attempt in [small_size, small_size * 0.5, 0.5, 0.3]:
+                for sel in ["|X", "|Y", ">Z", "<Z"]:
+                    try:
+                        wp_test = wp.edges(sel).chamfer(attempt)
+                        vol_test = abs(float(wp_test.val().Volume()))
+                        if vol_test > 0:
+                            wp = wp_test
+                            v, f = _tessellate_solid(wp)
+                            sizes_str = "/".join(str(s) for s in unique_sizes)
+                            steps.append(ConstructionStep(
+                                name=f"Chamfer ({sizes_str}mm × {len(chamfers)} features)",
+                                tess_vertices=v, tess_faces=f, volume=vol_test,
+                            ))
+                            script_lines.append(f'result = result.edges("{sel}").chamfer({attempt:.4f})')
+                            applied = True
+                            break
+                    except Exception:
+                        continue
+                if applied:
+                    break
+            if not applied:
+                logger.info("Chamfer edges failed — %d chamfers in feature tree only", len(chamfers))
 
     # --- Fillets: same progressive approach ---
     if fillets:

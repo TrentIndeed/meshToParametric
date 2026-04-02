@@ -81,6 +81,15 @@ class JobStep(Base):
     job = relationship("MeshJob", back_populates="steps")
 
 
+# ── Waitlist ──
+
+class WaitlistEntry(Base):
+    __tablename__ = "waitlist"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # ── Helpers ──
 
 def get_db():

@@ -90,6 +90,18 @@ class WaitlistEntry(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+# ── Support Tickets ──
+
+class SupportTicket(Base):
+    __tablename__ = "support_tickets"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    message = Column(Text, nullable=False)
+    status = Column(String, default="open")  # open | replied | closed
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 # ── Helpers ──
 
 def get_db():

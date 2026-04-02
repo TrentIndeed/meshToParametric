@@ -679,7 +679,10 @@ footer {
 <footer>
   <div class="container">
     <div style="margin-bottom:0.75rem;">Paramesh AI &mdash; mesh-to-parametric CAD conversion</div>
-    <div style="display:flex; gap:1.5rem; justify-content:center; font-size:0.8rem;">
+    <div style="display:flex; gap:1.5rem; justify-content:center; flex-wrap:wrap; font-size:0.8rem;">
+      <a href="/changelog" style="color:var(--text-muted); text-decoration:none;">Changelog</a>
+      <a href="/contact" style="color:var(--text-muted); text-decoration:none;">Contact</a>
+      <a href="https://discord.gg/placeholder" style="color:var(--text-muted); text-decoration:none;">Discord</a>
       <a href="/privacy" style="color:var(--text-muted); text-decoration:none;">Privacy</a>
       <a href="/terms" style="color:var(--text-muted); text-decoration:none;">Terms</a>
       <a href="/clean" style="color:var(--text-muted); text-decoration:none;">Free Tools</a>
@@ -766,5 +769,6 @@ function copyLink() {
   setTimeout(() => btn.textContent = '🔗', 2000);
 }
 </script>
+<script src="/static/support-widget.js"></script>
 </body>
 </html>

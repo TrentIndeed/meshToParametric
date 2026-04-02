@@ -80,6 +80,14 @@ async def cleaner():
 async def login_page():
     return FileResponse(str(STATIC_DIR / "login.html"))
 
+@app.get("/changelog", response_class=HTMLResponse)
+async def changelog_page():
+    return FileResponse(str(STATIC_DIR / "changelog.html"))
+
+@app.get("/contact", response_class=HTMLResponse)
+async def contact_page():
+    return FileResponse(str(STATIC_DIR / "contact.html"))
+
 @app.get("/robots.txt")
 async def robots():
     return FileResponse(str(STATIC_DIR / "robots.txt"), media_type="text/plain")
@@ -441,6 +449,130 @@ async def waitlist(body: dict):
         return {"status": "ok", "message": "You're on the list"}
     finally:
         db.close()
+
+
+@app.get("/api/changelog")
+async def changelog_api():
+    """Return recent git commits for the changelog page."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", "--no-merges", "-30", "--format=%H|%ad|%s", "--date=short"],
+            capture_output=True, text=True, timeout=10, cwd=str(Path(__file__).parent.parent.parent),
+        )
+        commits = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                commits.append({"hash": parts[0][:8], "date": parts[1], "message": parts[2]})
+        return {"commits": commits}
+    except Exception:
+        return {"commits": []}
+
+
+@app.post("/api/contact")
+async def contact_form(body: dict):
+    """Save a support ticket and send email notification."""
+    from mesh2param.db.database import SessionLocal, SupportTicket
+    import smtplib
+    from email.mime.text import MIMEText
+
+    name = body.get("name", "").strip()
+    email = body.get("email", "").strip()
+    message = body.get("message", "").strip()
+
+    if not name or not email or not message:
+        return JSONResponse({"error": "All fields required"}, status_code=400)
+
+    # Save to database
+    db = SessionLocal()
+    try:
+        ticket = SupportTicket(name=name, email=email, message=message)
+        db.add(ticket)
+        db.commit()
+    finally:
+        db.close()
+
+    # Try to send email notification (fail silently if SMTP not configured)
+    try:
+        import os
+        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER", "")
+        smtp_pass = os.getenv("SMTP_PASS", "")
+        notify_email = "trentondragon02@gmail.com"
+
+        if smtp_user and smtp_pass:
+            msg = MIMEText(f"From: {name} <{email}>\n\n{message}")
+            msg["Subject"] = f"[Paramesh AI] Support: {name}"
+            msg["From"] = smtp_user
+            msg["To"] = notify_email
+
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, notify_email, msg.as_string())
+    except Exception as e:
+        logger.warning("Email notification failed (SMTP not configured?): %s", e)
+
+    return {"status": "ok", "message": "Message sent"}
+
+
+@app.post("/api/support-chat")
+async def support_chat(body: dict):
+    """AI support chatbot — answers questions about Paramesh AI."""
+    from mesh2param.ai import is_available, call_ai
+
+    message = body.get("message", "").strip()
+    if not message:
+        return {"reply": "Please type a question."}
+
+    if not is_available():
+        # Fallback: simple FAQ responses
+        msg_lower = message.lower()
+        if "price" in msg_lower or "cost" in msg_lower or "token" in msg_lower:
+            return {"reply": "Paramesh AI uses token-based pricing. Free tier gets 100 tokens. Starter is $9/mo (1000 tokens), Pro is $29/mo (5000), Unlimited is $79/mo. Simple parts cost ~20 tokens, complex parts ~55."}
+        elif "format" in msg_lower or "stl" in msg_lower or "file" in msg_lower:
+            return {"reply": "We support STL, OBJ, PLY, and 3MF files. The pipeline repairs topology and fixes normals automatically."}
+        elif "clean" in msg_lower or "repair" in msg_lower:
+            return {"reply": "The free mesh cleaner at /clean repairs normals, removes degenerate faces, merges vertices, and fills holes. No signup needed for cleaning — it's totally free."}
+        elif "onshape" in msg_lower:
+            return {"reply": "Onshape live export is coming soon. Currently you can export as STEP files via CadQuery. The Onshape integration will use the REST API to push your feature tree directly."}
+        else:
+            return {"reply": "I can help with questions about pricing, file formats, features, or troubleshooting. What would you like to know?"}
+
+    prompt = f"""You are the support assistant for Paramesh AI (parameshai.com), a tool that converts
+triangulated mesh files (STL/OBJ/3MF) into parametric CAD models.
+
+Key facts:
+- Free tier: 100 tokens, mesh cleaner unlimited, 10MB upload
+- Starter $9/mo: 1000 tokens, 50MB, STEP export
+- Pro $29/mo: 5000 tokens, 200MB, Onshape + AI chat
+- Unlimited $79/mo: unlimited tokens, 500MB
+- Supported formats: STL, OBJ, PLY, 3MF
+- Pipeline: ingest → segment → fit → topology → recognize → export
+- Features detected: holes, chamfers, fillets, pockets, bosses
+- Export: CadQuery STEP files, Onshape coming soon
+- Free mesh cleaner at /clean (no login for cleaning only)
+- AI chatbot in the app for editing features
+
+Be concise (2-3 sentences). Be helpful and friendly. If you don't know, suggest contacting support at /contact.
+
+User question: {message}"""
+
+    try:
+        reply = call_ai(prompt, timeout=20)
+        # Strip any JSON wrapping
+        if reply.startswith("{"):
+            import json
+            try:
+                data = json.loads(reply)
+                reply = data.get("reply", reply)
+            except Exception:
+                pass
+        return {"reply": reply}
+    except Exception as e:
+        return {"reply": "I'm having trouble connecting right now. Please try /contact to reach us directly."}
 
 
 def run(host: str = "127.0.0.1", port: int = 8080):

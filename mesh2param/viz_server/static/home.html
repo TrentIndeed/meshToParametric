@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Home — Paramesh AI</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
+  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; --green:#22C55E; --purple:#BC8CFF; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; }
+
+nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
+  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
+nav .inner { display:flex; align-items:center; justify-content:space-between;
+  max-width:1000px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+nav .logo { font-size:1.1rem; font-weight:700; color:var(--text); text-decoration:none; }
+nav .logo span { color:var(--accent); }
+nav .right { display:flex; align-items:center; gap:1.5rem; }
+nav .right a { color:var(--dim); text-decoration:none; font-size:0.9rem; }
+nav .right a:hover { color:var(--text); }
+.user-badge { font-size:0.85rem; color:var(--accent); font-weight:600;
+  background:rgba(34,211,238,0.08); padding:0.3rem 0.8rem; border-radius:100px; }
+
+.container { max-width:1000px; margin:0 auto; padding:6rem clamp(1.5rem,4vw,3rem) 3rem; }
+h1 { font-size:clamp(1.8rem,4vw,2.5rem); font-weight:700; letter-spacing:-0.03em; margin-bottom:0.5rem; }
+.subtitle { color:var(--muted); margin-bottom:3rem; font-size:1.05rem; }
+
+.tools-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; margin-bottom:3rem; }
+@media(max-width:600px) { .tools-grid { grid-template-columns:1fr; } }
+
+.tool-card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px;
+  padding:2rem; text-decoration:none; display:flex; flex-direction:column;
+  transition:border-color 0.2s, transform 0.15s; cursor:pointer; }
+.tool-card:hover { border-color:var(--accent); transform:translateY(-2px); }
+.tool-card .icon { width:48px; height:48px; border-radius:12px;
+  display:flex; align-items:center; justify-content:center; font-size:1.5rem; margin-bottom:1rem; }
+.tool-card .icon.cad { background:rgba(34,211,238,0.1); color:var(--accent); }
+.tool-card .icon.clean { background:rgba(34,197,94,0.1); color:var(--green); }
+.tool-card .icon.learn { background:rgba(188,140,255,0.1); color:var(--purple); }
+.tool-card h3 { font-size:1.1rem; font-weight:600; margin-bottom:0.4rem; }
+.tool-card p { color:var(--muted); font-size:0.9rem; line-height:1.5; flex:1; }
+.tool-card .tag { display:inline-block; margin-top:0.75rem; font-size:0.75rem;
+  font-weight:600; text-transform:uppercase; letter-spacing:0.05em;
+  padding:0.2rem 0.6rem; border-radius:4px; }
+.tag-free { background:rgba(34,197,94,0.1); color:var(--green); }
+.tag-tokens { background:rgba(34,211,238,0.1); color:var(--accent); }
+
+/* Usage summary */
+.usage-bar { margin-bottom:3rem; background:var(--bg-card); border:1px solid var(--border);
+  border-radius:12px; padding:1.25rem 1.5rem; }
+.usage-bar .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem; }
+.usage-bar .label { font-size:0.85rem; color:var(--muted); }
+.usage-bar .val { font-size:0.85rem; font-family:'JetBrains Mono',monospace; }
+.bar-bg { height:6px; background:var(--bg); border-radius:3px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:3px; background:var(--accent); transition:width 0.3s; }
+
+/* Quick links */
+.quick-links { display:flex; gap:1.5rem; flex-wrap:wrap; }
+.quick-links a { color:var(--muted); text-decoration:none; font-size:0.9rem; }
+.quick-links a:hover { color:var(--accent); }
+
+footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
+  font-size:0.85rem; color:var(--dim); margin-top:3rem; }
+footer a { color:var(--dim); text-decoration:none; margin:0 0.75rem; }
+</style>
+<script>
+// Auth gate
+(function() {
+  const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
+  if (!token) window.location.href = '/login?next=/home';
+})();
+</script>
+</head>
+<body>
+<nav>
+  <div class="inner">
+    <a href="/home" class="logo">Paramesh<span>AI</span></a>
+    <div class="right">
+      <span class="user-badge" id="user-name">...</span>
+      <a href="/learn">Learn</a>
+      <a href="/changelog">Changelog</a>
+      <a href="#" onclick="document.cookie='paramesh_token=;max-age=0;path=/';document.cookie='paramesh_user=;max-age=0;path=/';window.location='/';return false;">Sign Out</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+  <h1 id="greeting">Welcome back</h1>
+  <p class="subtitle">Pick a tool to get started.</p>
+
+  <!-- Usage bar -->
+  <div class="usage-bar">
+    <div class="top">
+      <span class="label">Tokens used this session</span>
+      <span class="val" id="usage-text">0 / 100</span>
+    </div>
+    <div class="bar-bg"><div class="bar-fill" id="usage-fill" style="width:0%"></div></div>
+  </div>
+
+  <!-- Tool cards -->
+  <div class="tools-grid">
+    <a href="/app" class="tool-card">
+      <div class="icon cad">&#9651;</div>
+      <h3>Mesh to CAD</h3>
+      <p>Upload a mesh file and convert it into a parametric CAD model with a full feature tree. AI-powered feature recognition.</p>
+      <span class="tag tag-tokens">Uses tokens</span>
+    </a>
+    <a href="/clean" class="tool-card">
+      <div class="icon clean">&#10003;</div>
+      <h3>Mesh Cleaner</h3>
+      <p>Fix broken meshes instantly. Repair normals, remove degenerate faces, merge vertices, fill holes. Download cleaned STL.</p>
+      <span class="tag tag-free">Free unlimited</span>
+    </a>
+    <a href="/clean" class="tool-card">
+      <div class="icon clean">&#8596;</div>
+      <h3>Mesh Resize</h3>
+      <p>Scale your mesh to target dimensions or apply a uniform scale factor. Set exact width, height, and depth in mm.</p>
+      <span class="tag tag-free">Free unlimited</span>
+    </a>
+    <a href="/learn" class="tool-card">
+      <div class="icon learn">&#9733;</div>
+      <h3>Learn</h3>
+      <p>Free guides on STL to STEP conversion, mesh repair, feature recognition, and CAD reconstruction.</p>
+      <span class="tag tag-free">Free</span>
+    </a>
+  </div>
+
+  <!-- Quick links -->
+  <div class="quick-links">
+    <a href="/changelog">Changelog</a>
+    <a href="/contact">Contact Support</a>
+    <a href="https://discord.gg/placeholder">Discord</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+  </div>
+</div>
+
+<footer>
+  <a href="/">Landing Page</a>
+  <a href="/learn">Learn</a>
+  <a href="/contact">Contact</a>
+</footer>
+
+<script>
+// Load username from cookie
+const userCookie = document.cookie.split(';').map(c=>c.trim()).find(c=>c.startsWith('paramesh_user='));
+if (userCookie) {
+  const name = userCookie.split('=')[1];
+  document.getElementById('user-name').textContent = name;
+  document.getElementById('greeting').textContent = 'Welcome back, ' + name;
+}
+
+// Load usage
+fetch('/api/usage').then(r=>r.json()).then(u => {
+  const limit = u.tokens_limit > 0 ? u.tokens_limit : 100;
+  const pct = Math.min(100, (u.tokens_spent / limit) * 100);
+  document.getElementById('usage-text').textContent = u.tokens_spent + ' / ' + limit;
+  document.getElementById('usage-fill').style.width = pct + '%';
+  if (pct > 85) document.getElementById('usage-fill').style.background = '#F85149';
+  else if (pct > 60) document.getElementById('usage-fill').style.background = '#D29922';
+});
+</script>
+<script src="/static/support-widget.js"></script>
+</body>
+</html>

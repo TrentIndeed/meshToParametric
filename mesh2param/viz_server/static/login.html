@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign In — Paramesh AI</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
+  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; --red:#F85149; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif;
+  display:flex; align-items:center; justify-content:center; min-height:100dvh; }
+.card { background:var(--bg-card); border:1px solid var(--border); border-radius:16px;
+  padding:2.5rem; width:90%; max-width:380px; }
+.logo { font-size:1.3rem; font-weight:700; text-align:center; margin-bottom:2rem; }
+.logo span { color:var(--accent); }
+.tabs { display:flex; gap:0; margin-bottom:1.5rem; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+.tab { flex:1; padding:0.6rem; text-align:center; font-size:0.9rem; font-weight:600;
+  cursor:pointer; background:transparent; color:var(--dim); border:none; font-family:inherit; transition:all 0.15s; }
+.tab.active { background:var(--accent); color:var(--bg); }
+.field { margin-bottom:1rem; }
+.field label { display:block; font-size:0.8rem; color:var(--muted); margin-bottom:0.35rem; font-weight:500; }
+.field input { width:100%; padding:0.7rem 1rem; background:var(--bg); border:1px solid var(--border);
+  border-radius:8px; color:var(--text); font-family:inherit; font-size:0.95rem; outline:none; transition:border-color 0.2s; }
+.field input:focus { border-color:var(--accent); }
+.btn { width:100%; padding:0.75rem; border:none; border-radius:8px; font-family:inherit;
+  font-size:0.95rem; font-weight:600; cursor:pointer; transition:all 0.15s; }
+.btn:active { transform:scale(0.98) translateY(1px); }
+.btn-primary { background:var(--accent); color:var(--bg); }
+.btn-primary:hover { background:#06B6D4; }
+.error { color:var(--red); font-size:0.85rem; margin-bottom:1rem; display:none; text-align:center; }
+.footer { text-align:center; margin-top:1.5rem; font-size:0.85rem; color:var(--dim); }
+.footer a { color:var(--accent); text-decoration:none; }
+#signup-fields { display:none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">Paramesh<span>AI</span></div>
+  <div class="tabs">
+    <button class="tab active" id="tab-login" onclick="switchTab('login')">Sign In</button>
+    <button class="tab" id="tab-signup" onclick="switchTab('signup')">Sign Up</button>
+  </div>
+  <div class="error" id="error"></div>
+  <form id="auth-form" onsubmit="return handleSubmit(event)">
+    <div class="field">
+      <label>Username</label>
+      <input id="username" type="text" required autocomplete="username">
+    </div>
+    <div class="field" id="email-field" style="display:none">
+      <label>Email (optional)</label>
+      <input id="email" type="email" autocomplete="email">
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input id="password" type="password" required autocomplete="current-password">
+    </div>
+    <button type="submit" class="btn btn-primary" id="submit-btn">Sign In</button>
+  </form>
+  <div class="footer">
+    <a href="/">← Back to Paramesh AI</a>
+  </div>
+</div>
+
+<script>
+let mode = 'login';
+
+function switchTab(m) {
+  mode = m;
+  document.getElementById('tab-login').classList.toggle('active', m === 'login');
+  document.getElementById('tab-signup').classList.toggle('active', m === 'signup');
+  document.getElementById('email-field').style.display = m === 'signup' ? '' : 'none';
+  document.getElementById('submit-btn').textContent = m === 'login' ? 'Sign In' : 'Create Account';
+  document.getElementById('error').style.display = 'none';
+}
+
+async function handleSubmit(e) {
+  e.preventDefault();
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  const email = document.getElementById('email').value.trim();
+  const errorEl = document.getElementById('error');
+  errorEl.style.display = 'none';
+
+  const endpoint = mode === 'login' ? '/auth/login' : '/auth/signup';
+  const body = { username, password };
+  if (mode === 'signup' && email) body.email = email;
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+
+    if (data.token) {
+      // Store token in cookie (30 days)
+      document.cookie = `paramesh_token=${data.token}; path=/; max-age=${30*86400}; SameSite=Lax`;
+      document.cookie = `paramesh_user=${data.username}; path=/; max-age=${30*86400}; SameSite=Lax`;
+      // Redirect to the page they came from, or /app
+      const redirect = new URLSearchParams(window.location.search).get('next') || '/app';
+      window.location.href = redirect;
+    } else {
+      errorEl.textContent = data.detail || data.error || 'Something went wrong';
+      errorEl.style.display = 'block';
+    }
+  } catch (err) {
+    errorEl.textContent = 'Connection failed';
+    errorEl.style.display = 'block';
+  }
+  return false;
+}
+</script>
+</body>
+</html>

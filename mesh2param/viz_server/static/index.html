@@ -497,6 +497,13 @@ body {
   <p id="progress-detail"></p>
 </div>
 
+<script>
+// Auth gate: redirect to login if no token cookie
+(function() {
+  const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
+  if (!token) window.location.href = '/login?next=/app';
+})();
+</script>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>

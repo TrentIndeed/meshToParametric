@@ -10,6 +10,13 @@
 <meta property="og:image" content="https://parameshai.com/static/og-image.png">
 <meta name="description" content="Free online mesh repair tool. Fix normals, remove degenerate faces, merge vertices, fill holes. Upload STL, OBJ, PLY, 3MF.">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+// Auth gate: redirect to login if no token cookie
+(function() {
+  const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
+  if (!token) window.location.href = '/login?next=/clean';
+})();
+</script>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>

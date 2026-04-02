@@ -111,7 +111,7 @@ def export_cadquery(
     solid, script, steps = _build_stepwise(
         profiles, depth, extrude_dir, extrude_start,
         hole_features, chamfer_features, fillet_features,
-        build_order=build_order,
+        build_order=build_order, cleaned=cleaned,
     )
 
     # Compute CAD volume
@@ -395,6 +395,7 @@ def _build_stepwise(
     chamfers: list[Feature] | None = None,
     fillets: list[Feature] | None = None,
     build_order: BuildPlan | None = None,
+    cleaned: object = None,
 ) -> tuple[object, str, list[ConstructionStep]]:
     """Build a clean CAD solid from scratch, step by step.
 
@@ -449,29 +450,29 @@ def _build_stepwise(
     script_lines.append(f"result = result.polyline(profile).close()")
 
     # --- Step 1: Extrude base profile ---
-    # Try extruding; if it lands on the wrong side of the workplane,
-    # flip by extruding in the opposite direction.
-    wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp = wp.polyline(profiles[0]).close().extrude(depth)
+    # Try both directions, keep the one that overlaps with the actual part bbox.
+    part_min = float(cleaned.bbox[0][primary_axis])
+    part_max = float(cleaned.bbox[1][primary_axis])
 
-    # Verify the extrusion went toward the part, not away from it
-    bb = wp.val().BoundingBox()
-    bb_vals = [
-        (bb.xmin, bb.xmax), (bb.ymin, bb.ymax), (bb.zmin, bb.zmax),
-    ]
-    actual_min = bb_vals[primary_axis][0]
-    actual_max = bb_vals[primary_axis][1]
-    expected_max = extrude_start + depth
+    wp_pos = cq.Workplane(plane_name, origin=tuple(origin_3d))
+    wp_pos = wp_pos.polyline(profiles[0]).close().extrude(depth)
+    bb_pos = wp_pos.val().BoundingBox()
+    pos_vals = [(bb_pos.xmin, bb_pos.xmax), (bb_pos.ymin, bb_pos.ymax), (bb_pos.zmin, bb_pos.zmax)]
+    pos_overlap = min(pos_vals[primary_axis][1], part_max) - max(pos_vals[primary_axis][0], part_min)
 
-    if abs(actual_max - expected_max) > depth * 0.5:
-        # Extrusion went the wrong way — flip it
-        logger.info("Flipping extrusion direction (went to %.1f instead of %.1f)",
-                     actual_max, expected_max)
-        wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
-        wp = wp.polyline(profiles[0]).close().extrude(-depth)
+    wp_neg = cq.Workplane(plane_name, origin=tuple(origin_3d))
+    wp_neg = wp_neg.polyline(profiles[0]).close().extrude(-depth)
+    bb_neg = wp_neg.val().BoundingBox()
+    neg_vals = [(bb_neg.xmin, bb_neg.xmax), (bb_neg.ymin, bb_neg.ymax), (bb_neg.zmin, bb_neg.zmax)]
+    neg_overlap = min(neg_vals[primary_axis][1], part_max) - max(neg_vals[primary_axis][0], part_min)
 
-    # Union additional profiles (small pads around hole locations)
-    extrude_sign = depth if abs(actual_max - expected_max) <= depth * 0.5 else -depth
+    if neg_overlap > pos_overlap:
+        wp = wp_neg
+        extrude_sign = -depth
+        logger.info("Using negative extrude (overlap %.1f > %.1f)", neg_overlap, pos_overlap)
+    else:
+        wp = wp_pos
+        extrude_sign = depth
     for profile in profiles[1:]:
         try:
             extra = cq.Workplane(plane_name, origin=tuple(origin_3d))

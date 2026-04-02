@@ -266,6 +266,108 @@ def _extract_profile_and_holes(
     candidates.sort(key=lambda x: x[0])
     best_profiles = candidates[0][1]
 
+    # If the best slice has multiple large outer polygons (frame split by
+    # cutout), find a slice where the frame is one connected piece and
+    # combine: outer boundary from connected slice + inner cutouts from
+    # the best slice. This handles frames/bezels with through-cutouts.
+    if len(best_profiles) > 1:
+        largest_area = max(_polygon_area(p) for p in best_profiles)
+        total_area = sum(_polygon_area(p) for p in best_profiles)
+        if largest_area < total_area * 0.7:
+            # Frame is split — find a connected slice for the outer boundary
+            for alt_frac in [0.9, 0.85, 0.95, 0.1, 0.15, 0.05]:
+                alt_pos = float(all_proj.min()) + extent * alt_frac
+                alt_origin = [0.0, 0.0, 0.0]
+                alt_origin[primary_axis] = alt_pos
+                try:
+                    alt_section = mesh.section(plane_origin=alt_origin, plane_normal=normal)
+                    if alt_section is None:
+                        continue
+                    alt_verts = np.array(alt_section.vertices)
+                    alt_2d, _ = alt_section.to_planar()
+                    alt_polys = alt_2d.polygons_closed
+                    if not alt_polys:
+                        continue
+
+                    alt_areas = sorted([p.area for p in alt_polys], reverse=True)
+                    if alt_areas[0] > total_area * 0.8:
+                        # Get the outer boundary from this connected slice
+                        outer_poly = max(alt_polys, key=lambda p: p.area)
+                        from scipy.spatial import cKDTree as cKDTree2
+                        alt_tree = cKDTree2(alt_2d.vertices)
+                        coords_2d = np.array(outer_poly.exterior.coords)[:-1]
+                        _, indices = alt_tree.query(coords_2d)
+                        matched = alt_verts[indices]
+                        outer_profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched]
+                        outer_profile = _simplify_profile(outer_profile, tolerance=0.1)
+
+                        if len(outer_profile) >= 3:
+                            # Combine: outer from connected slice + inner cutouts
+                            # from best slice (those inside the outer boundary)
+                            from shapely.geometry import Polygon as SPoly, Point as SPoint
+                            outer_shape = SPoly(outer_profile)
+                            combined = [outer_profile]
+                            for p in best_profiles:
+                                centroid = np.mean(p, axis=0)
+                                if outer_shape.contains(SPoint(centroid[0], centroid[1])):
+                                    combined.append(p)
+                            # Also add inner cutouts from the connected slice
+                            for poly in alt_polys:
+                                if poly.area < outer_poly.area * 0.01:
+                                    continue
+                                if poly is outer_poly:
+                                    continue
+                                coords_2d = np.array(poly.exterior.coords)[:-1]
+                                _, indices = alt_tree.query(coords_2d)
+                                matched = alt_verts[indices]
+                                profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched]
+                                profile = _simplify_profile(profile, tolerance=0.1)
+                                if len(profile) >= 3:
+                                    centroid = np.mean(profile, axis=0)
+                                    if outer_shape.contains(SPoint(centroid[0], centroid[1])):
+                                        combined.append(profile)
+
+                            combined.sort(key=lambda pts: -_polygon_area(pts))
+                            best_profiles = combined
+                            logger.info(
+                                "Combined outer from %.0f%% slice + inner cutouts (%d profiles)",
+                                alt_frac * 100, len(combined),
+                            )
+                            break
+                except Exception:
+                    continue
+            else:
+                # No connected slice found. Fallback: use the convex hull of
+                # all outer polygons as the outer boundary, and treat the gap
+                # between them as the inner cutout.
+                from shapely.geometry import Polygon as SPoly, MultiPolygon
+                from shapely.ops import unary_union
+                outer_polys = [SPoly(p) for p in best_profiles if _polygon_area(p) > total_area * 0.1]
+                valid = [p for p in outer_polys if p.is_valid]
+                if len(valid) >= 2:
+                    merged = unary_union(valid)
+                    hull = merged.convex_hull
+                    hull_coords = list(hull.exterior.coords)[:-1]
+                    hull_profile = _simplify_profile(hull_coords, tolerance=0.1)
+                    if len(hull_profile) >= 3:
+                        # Inner cutout = hull minus the actual solid parts
+                        diff = hull.difference(merged)
+                        combined = [hull_profile]
+                        geoms = [diff] if diff.geom_type == 'Polygon' else (list(diff.geoms) if hasattr(diff, 'geoms') else [])
+                        for geom in geoms:
+                            if geom.geom_type != 'Polygon' or geom.area < 1.0:
+                                continue
+                            coords = list(geom.exterior.coords)[:-1]
+                            simplified = _simplify_profile(coords, tolerance=0.1)
+                            if len(simplified) >= 3:
+                                combined.append(simplified)
+                        combined.sort(key=lambda pts: -_polygon_area(pts))
+                        best_profiles = combined
+                        logger.info(
+                            "Used convex hull + difference for split frame (%d profiles)",
+                            len(combined),
+                        )
+
     if not best_profiles:
         return None, extrude_start, []
 

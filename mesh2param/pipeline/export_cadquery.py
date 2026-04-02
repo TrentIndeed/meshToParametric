@@ -979,7 +979,8 @@ def _simplify_profile(
     if len(deduped) < 3:
         return deduped
 
-    # Step 2: Keep only corners (points where direction changes > 3°)
+    # Step 2: Keep corners + curve points (direction change > 2°)
+    # Low threshold preserves gentle arcs while removing straight-edge noise.
     pts = deduped
     corners = []
     n = len(pts)
@@ -992,7 +993,7 @@ def _simplify_profile(
         cross = v1[0] * v2[1] - v1[1] * v2[0]
         dot = v1[0] * v2[0] + v1[1] * v2[1]
         angle = abs(np.degrees(np.arctan2(cross, dot)))
-        if angle > 10.0:
+        if angle > 2.0:
             corners.append(p1)
 
     if len(corners) < 3:

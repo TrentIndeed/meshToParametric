@@ -630,11 +630,22 @@ def _build_stepwise(
     else:
         wp = wp_pos
         extrude_sign = depth
+    # Additional profiles: union outer bodies, cut inner holes.
+    # A profile is "inner" if its centroid falls inside the main profile polygon.
+    from shapely.geometry import Polygon, Point
+    main_poly = Polygon(profiles[0])
     for profile in profiles[1:]:
         try:
+            centroid = np.mean(profile, axis=0)
+            is_inner = main_poly.contains(Point(centroid[0], centroid[1]))
             extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
             extra = extra.polyline(profile).close().extrude(extrude_sign)
-            wp = wp.union(extra)
+            if is_inner:
+                wp = wp.cut(extra)
+                logger.info("Cut inner profile (%d pts) from base", len(profile))
+            else:
+                wp = wp.union(extra)
+                logger.info("Unioned outer profile (%d pts) with base", len(profile))
         except Exception:
             pass
 

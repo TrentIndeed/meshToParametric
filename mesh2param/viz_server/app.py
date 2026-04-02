@@ -428,19 +428,16 @@ async def download_cleaned(filename: str):
 
 @app.post("/api/waitlist")
 async def waitlist(body: dict):
-    from mesh2param.db.database import SessionLocal
-    from sqlalchemy import text
-    from datetime import datetime
+    from mesh2param.db.database import SessionLocal, WaitlistEntry
     email = body.get("email", "").strip().lower()
     if not email or "@" not in email:
         return JSONResponse({"error": "Valid email required"}, status_code=400)
     db = SessionLocal()
     try:
-        with db.bind.connect() as conn:
-            conn.execute(text("CREATE TABLE IF NOT EXISTS waitlist (id INTEGER PRIMARY KEY, email TEXT UNIQUE, created_at TEXT)"))
-            conn.execute(text("INSERT OR IGNORE INTO waitlist (email, created_at) VALUES (:e, :t)"),
-                         {"e": email, "t": datetime.utcnow().isoformat()})
-            conn.commit()
+        existing = db.query(WaitlistEntry).filter(WaitlistEntry.email == email).first()
+        if not existing:
+            db.add(WaitlistEntry(email=email))
+            db.commit()
         return {"status": "ok", "message": "You're on the list"}
     finally:
         db.close()

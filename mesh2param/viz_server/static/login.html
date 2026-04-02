@@ -101,7 +101,7 @@ async function handleSubmit(e) {
       document.cookie = `paramesh_token=${data.token}; path=/; max-age=${30*86400}; SameSite=Lax`;
       document.cookie = `paramesh_user=${data.username}; path=/; max-age=${30*86400}; SameSite=Lax`;
       // Redirect to the page they came from, or /app
-      const redirect = new URLSearchParams(window.location.search).get('next') || '/app';
+      const redirect = new URLSearchParams(window.location.search).get('next') || '/home';
       window.location.href = redirect;
     } else {
       errorEl.textContent = data.detail || data.error || 'Something went wrong';

@@ -68,6 +68,10 @@ app.include_router(settings_router)
 async def index():
     return FileResponse(str(STATIC_DIR / "landing.html"))
 
+@app.get("/home", response_class=HTMLResponse)
+async def home():
+    return FileResponse(str(STATIC_DIR / "home.html"))
+
 @app.get("/app", response_class=HTMLResponse)
 async def viewer():
     return FileResponse(str(STATIC_DIR / "index.html"))

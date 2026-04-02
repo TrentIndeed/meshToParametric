@@ -633,19 +633,19 @@ footer {
     <div class="faq-list">
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What file formats are supported?</div>
-        <div class="faq-a">STL, OBJ, PLY, and 3MF. The pipeline repairs topology, fixes normals, and removes degenerate faces before processing.</div>
+        <div class="faq-a">STL, OBJ, PLY, and 3MF. The pipeline repairs topology, fixes normals, and removes degenerate faces before processing. <a href="/learn/how-to-convert-stl-to-step" style="color:var(--accent)">Learn more about STL to STEP conversion →</a></div>
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What kinds of parts work best?</div>
-        <div class="faq-a">Prismatic mechanical parts — brackets, mounts, plates, housings. Components with planar faces, cylindrical holes, pockets, bosses, fillets, and chamfers. Freeform/organic geometry is not supported.</div>
+        <div class="faq-a">Prismatic mechanical parts — brackets, mounts, plates, housings. Components with planar faces, cylindrical holes, pockets, bosses, fillets, and chamfers. <a href="/learn/reverse-engineer-mesh-to-solid-model" style="color:var(--accent)">Guide: reverse engineering meshes →</a></div>
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How accurate is the reconstruction?</div>
-        <div class="faq-a">Typically under 3% volume error compared to the original CAD model. The pipeline detects all major features including through/blind holes, chamfers, and fillets.</div>
+        <div class="faq-a">Typically under 3% volume error compared to the original CAD model. The pipeline detects all major features including through/blind holes, chamfers, and fillets. <a href="/learn/stl-to-parametric-cad-conversion" style="color:var(--accent)">See accuracy details →</a></div>
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Does it require an API key?</div>
-        <div class="faq-a">No. AI features use the Claude CLI with OAuth authentication — no API key needed. Your Claude Max or Pro subscription handles the cost. The core pipeline works entirely offline without any AI.</div>
+        <div class="faq-a">No. AI features use the Claude CLI with OAuth authentication — no API key needed. Your Claude Max or Pro subscription handles the cost. <a href="/learn/ai-powered-cad-reconstruction" style="color:var(--accent)">How AI is used →</a></div>
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I self-host it?</div>
@@ -653,7 +653,7 @@ footer {
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How does the AI chatbot work?</div>
-        <div class="faq-a">The right-panel chat sends your message along with the current feature tree context to Claude. It can describe the part, suggest edits ("make hole 1 larger"), and analyze dimensions before the pipeline runs.</div>
+        <div class="faq-a">The right-panel chat sends your message along with the current feature tree context to Claude. It can describe the part, suggest edits, and analyze dimensions. <a href="/learn/ai-powered-cad-reconstruction" style="color:var(--accent)">Learn about AI features →</a></div>
       </div>
     </div>
   </div>

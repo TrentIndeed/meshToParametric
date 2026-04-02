@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}} — Paramesh AI</title>
+<meta name="description" content="{{TLDR}}">
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link rel="canonical" href="https://parameshai.com/learn/{{SLUG}}">
+<meta property="og:title" content="{{TITLE}} — Paramesh AI">
+<meta property="og:description" content="{{TLDR}}">
+<meta property="og:url" content="https://parameshai.com/learn/{{SLUG}}">
+<meta property="og:image" content="https://parameshai.com/static/og-image.png">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{TITLE}}">
+<meta name="twitter:description" content="{{TLDR}}">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [{
+    "@type": "Question",
+    "name": "{{QUESTION}}",
+    "acceptedAnswer": {
+      "@type": "Answer",
+      "text": "{{TLDR}}"
+    }
+  }]
+}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
+  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; --green:#22C55E; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; line-height:1.8; }
+nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
+  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
+nav .inner { display:flex; align-items:center; justify-content:space-between;
+  max-width:900px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+nav .logo { font-size:1.1rem; font-weight:700; color:var(--text); text-decoration:none; }
+nav .logo span { color:var(--accent); }
+nav .links { display:flex; gap:1.5rem; align-items:center; }
+nav .links a { color:var(--dim); text-decoration:none; font-size:0.9rem; }
+nav .links a:hover { color:var(--text); }
+.btn { display:inline-flex; padding:0.55rem 1.2rem; border-radius:8px; font-size:0.85rem;
+  font-weight:600; text-decoration:none; border:none; cursor:pointer; }
+.btn-primary { background:var(--accent); color:var(--bg); }
+.btn-secondary { background:transparent; color:var(--text); border:1px solid var(--border); }
+
+.container { max-width:900px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
+.layout { display:grid; grid-template-columns:1fr 280px; gap:3rem; padding-top:6rem; padding-bottom:4rem; }
+@media(max-width:768px) { .layout { grid-template-columns:1fr; } }
+
+/* Article */
+article h1 { font-size:clamp(1.8rem,4vw,2.5rem); font-weight:700; letter-spacing:-0.03em; margin-bottom:1.5rem; line-height:1.15; }
+.tldr { background:var(--bg-card); border:1px solid var(--border); border-left:3px solid var(--accent);
+  border-radius:8px; padding:1.25rem 1.5rem; margin-bottom:2rem; font-size:1rem; color:var(--muted); line-height:1.7; }
+article h2 { font-size:1.3rem; font-weight:600; margin:2rem 0 0.75rem; letter-spacing:-0.02em; }
+article h3 { font-size:1.1rem; font-weight:600; margin:1.5rem 0 0.5rem; }
+article p { color:var(--muted); margin-bottom:1rem; max-width:65ch; }
+article ul, article ol { color:var(--muted); margin-bottom:1rem; padding-left:1.5rem; }
+article li { margin-bottom:0.4rem; }
+article strong { color:var(--text); }
+article code { background:var(--bg-card); padding:2px 6px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:0.85em; }
+article a { color:var(--accent); text-decoration:none; }
+article a:hover { text-decoration:underline; }
+
+/* Sidebar */
+.sidebar .widget { background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; margin-bottom:1.25rem; }
+.sidebar .widget h3 { font-size:0.85rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--dim); margin-bottom:0.75rem; }
+.sidebar .widget a { display:block; color:var(--muted); text-decoration:none; font-size:0.9rem; padding:0.4rem 0; border-bottom:1px solid var(--border); }
+.sidebar .widget a:last-child { border:none; }
+.sidebar .widget a:hover { color:var(--accent); }
+.sidebar .cta { text-align:center; }
+.sidebar .cta p { font-size:0.9rem; color:var(--muted); margin-bottom:1rem; }
+
+/* Breadcrumbs */
+.breadcrumbs { font-size:0.8rem; color:var(--dim); margin-bottom:1.5rem; }
+.breadcrumbs a { color:var(--dim); text-decoration:none; }
+.breadcrumbs a:hover { color:var(--accent); }
+
+footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
+  font-size:0.85rem; color:var(--dim); }
+footer a { color:var(--dim); text-decoration:none; margin:0 0.75rem; }
+</style>
+</head>
+<body>
+<nav>
+  <div class="inner">
+    <a href="/" class="logo">Paramesh<span>AI</span></a>
+    <div class="links">
+      <a href="/learn">Learn</a>
+      <a href="/clean">Free Tools</a>
+      <a href="/app" class="btn btn-primary">Try Free</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+  <div class="layout">
+    <article>
+      <div class="breadcrumbs">
+        <a href="/">Home</a> / <a href="/learn">Learn</a> / {{TITLE}}
+      </div>
+      <h1>{{TITLE}}</h1>
+      <div class="tldr">{{TLDR}}</div>
+      {{BODY}}
+    </article>
+
+    <aside class="sidebar">
+      <div class="widget">
+        <h3>Related Questions</h3>
+        {{RELATED_LINKS}}
+      </div>
+
+      <div class="widget cta">
+        {{CTA_HTML}}
+      </div>
+
+      <div class="widget">
+        <h3>All Topics</h3>
+        <a href="/learn">View all 20 guides →</a>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<footer>
+  <div class="container">
+    <a href="/">Home</a>
+    <a href="/learn">Learn</a>
+    <a href="/clean">Free Tools</a>
+    <a href="/changelog">Changelog</a>
+    <a href="/contact">Contact</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+  </div>
+</footer>
+<script src="/static/support-widget.js"></script>
+</body>
+</html>

@@ -1,0 +1,202 @@
+[
+  {
+    "slug": "how-to-convert-stl-to-step",
+    "title": "How to Convert STL to STEP File",
+    "question": "How do I convert an STL file to a STEP file with a feature tree?",
+    "tldr": "Use Paramesh AI to convert STL to STEP automatically. Upload your STL file, the AI pipeline segments surfaces, recognizes features (holes, chamfers, extrusions), and exports a clean parametric STEP file via CadQuery. The process takes about 30 seconds and produces a fully editable feature tree with under 3% volume error.",
+    "body": "<h2>Why STL to STEP conversion matters</h2><p>STL files are triangulated meshes with no feature intelligence — just raw triangles. STEP files contain B-rep solid geometry with a parametric feature tree that CAD software can edit. Converting between them requires reverse-engineering the original design intent from the mesh data.</p><h2>How Paramesh AI converts STL to STEP</h2><p>The pipeline runs in 6 stages:</p><ol><li><strong>Mesh ingestion</strong> — loads the STL, repairs topology, fixes normals, removes degenerate faces</li><li><strong>Surface segmentation</strong> — clusters faces into regions belonging to analytic surfaces (planes, cylinders, cones)</li><li><strong>Primitive fitting</strong> — fits exact mathematical surfaces using RANSAC and least-squares</li><li><strong>Topology analysis</strong> — builds an adjacency graph, classifies edges as sharp, fillet, or chamfer</li><li><strong>Feature recognition</strong> — identifies base extrusions, through-holes, blind holes, pockets, chamfers</li><li><strong>CadQuery export</strong> — builds a solid from scratch (sketch, extrude, cut holes) and exports STEP</li></ol><h2>Step-by-step instructions</h2><ol><li>Go to <a href='/app'>Paramesh AI</a> and upload your STL file</li><li>The raw mesh appears in the 3D viewer with a complexity estimate</li><li>Click \"Analyze & Build\" to run the pipeline</li><li>Watch the progress bar as each stage completes</li><li>The feature tree populates on the left with each recognized feature</li><li>Click any timeline step to see the model at that construction stage</li><li>Download the STEP file from the export options</li></ol>",
+    "keywords": ["STL to STEP", "convert STL to STEP", "STL STEP conversion", "mesh to solid"],
+    "cta_type": "trial",
+    "related": ["stl-to-parametric-cad-conversion", "reverse-engineer-mesh-to-solid-model", "mesh-to-cadquery-step-export"]
+  },
+  {
+    "slug": "stl-to-parametric-cad-conversion",
+    "title": "STL to Parametric CAD Conversion",
+    "question": "Can I convert an STL mesh into a parametric CAD model with editable features?",
+    "tldr": "Yes. Paramesh AI converts STL meshes into parametric CAD models with a full feature tree — sketches, extrusions, holes, chamfers, and fillets. The output is a clean B-rep solid built from scratch, not a wrapped mesh. You get an editable model with under 3% volume error compared to the original.",
+    "body": "<h2>What is parametric CAD conversion?</h2><p>Parametric conversion goes beyond simple mesh-to-solid wrapping. It reverse-engineers the original design intent: identifying that a circular region is a through-hole, that a flat surface is an extruded sketch, that a beveled edge is a chamfer. The result is a feature tree identical to what a human would create in Fusion 360 or SolidWorks.</p><h2>What features does Paramesh AI detect?</h2><ul><li><strong>Base extrusion</strong> — the primary body shape from a 2D profile</li><li><strong>Through-holes</strong> — cylindrical cuts that pass completely through the part</li><li><strong>Blind holes</strong> — cylindrical cuts that stop partway</li><li><strong>Chamfers</strong> — beveled edges and countersinks</li><li><strong>Fillets</strong> — rounded edges</li><li><strong>Pockets and slots</strong> — recessed features</li></ul><h2>How accurate is it?</h2><p>On tested models, Paramesh AI achieves under 3% volume error compared to the reference STEP file. The bounding box overlap is typically 99%+. Feature count matches within 1-2 features of the original.</p>",
+    "keywords": ["parametric CAD conversion", "STL to parametric", "mesh to feature tree", "reverse engineering CAD"],
+    "cta_type": "trial",
+    "related": ["how-to-convert-stl-to-step", "how-to-get-feature-tree-from-stl", "ai-powered-cad-reconstruction"]
+  },
+  {
+    "slug": "reverse-engineer-mesh-to-solid-model",
+    "title": "Reverse Engineer a Mesh to a Solid Model",
+    "question": "How do I reverse engineer a triangulated mesh into an editable solid model?",
+    "tldr": "Upload your mesh (STL, OBJ, PLY, or 3MF) to Paramesh AI. The pipeline automatically segments surfaces, fits geometric primitives, recognizes manufacturing features, and constructs a parametric solid from scratch. The output is a clean STEP file with a full feature tree — not a tessellated wrapper.",
+    "body": "<h2>The reverse engineering challenge</h2><p>Triangulated meshes from 3D scanning, 3D printing slicers, or mesh-based CAD exports contain no design intelligence. Every face is a flat triangle — there's no concept of \"hole\" or \"chamfer.\" Reverse engineering recovers this intelligence from the geometry alone.</p><h2>Paramesh AI's approach</h2><p>Rather than fitting NURBS surfaces to the mesh (which gives you a surface model, not a parametric one), Paramesh AI takes a manufacturing-first approach:</p><ol><li>Segment the mesh into regions that belong to analytic surfaces</li><li>Fit exact planes, cylinders, cones, and spheres to each region</li><li>Build a topology graph showing how surfaces connect</li><li>Classify edges as sharp, filleted, or chamfered</li><li>Recognize manufacturing features (extrusions, holes, pockets)</li><li>Reconstruct the part using sketch-extrude-cut operations</li></ol><h2>What mesh formats work?</h2><p>Paramesh AI supports STL, OBJ, PLY, and 3MF. The pipeline handles non-watertight meshes, flipped normals, degenerate faces, and duplicate vertices automatically.</p>",
+    "keywords": ["reverse engineer mesh", "mesh to solid model", "3D scan to CAD", "mesh reverse engineering"],
+    "cta_type": "trial",
+    "related": ["convert-3d-scan-to-cad-model", "how-to-convert-stl-to-step", "mesh-segmentation-for-cad"]
+  },
+  {
+    "slug": "convert-3d-scan-to-cad-model",
+    "title": "Convert a 3D Scan to a CAD Model",
+    "question": "How can I convert a 3D scan mesh into an editable CAD model?",
+    "tldr": "Paramesh AI converts 3D scan meshes into parametric CAD models. Upload the scan (STL/OBJ/PLY/3MF), the AI repairs the mesh, identifies geometric features, and builds a clean solid with a feature tree. Works best for prismatic mechanical parts — brackets, mounts, plates, and housings.",
+    "body": "<h2>3D scan to CAD workflow</h2><p>3D scanning produces dense triangulated meshes that are great for visualization but unusable in CAD software for editing or manufacturing. The typical workflow to get an editable model is hours of manual re-modeling in SolidWorks or Fusion 360.</p><h2>Automated conversion with AI</h2><p>Paramesh AI automates this process for prismatic mechanical parts. The pipeline:</p><ol><li>Cleans the scan data — removes noise, fixes normals, fills small holes</li><li>Segments the cleaned mesh into planar, cylindrical, and conical regions</li><li>Recognizes features — bolt holes, mounting holes, chamfers, pockets</li><li>Builds a parametric model from scratch using CadQuery</li></ol><h2>What types of scans work best?</h2><p>The tool works best for machined or sheet metal parts with flat faces and cylindrical holes. It handles parts with 4-10+ features and up to a few thousand faces. Organic or freeform surfaces are not supported.</p>",
+    "keywords": ["3D scan to CAD", "scan to solid model", "mesh scan conversion", "3D scanning CAD"],
+    "cta_type": "trial",
+    "related": ["reverse-engineer-mesh-to-solid-model", "how-to-convert-stl-to-step", "fix-broken-stl-file-online-free"]
+  },
+  {
+    "slug": "mesh-to-brep-conversion-tool",
+    "title": "Mesh to B-Rep Conversion Tool",
+    "question": "Is there a tool that converts a triangulated mesh to B-rep solid geometry?",
+    "tldr": "Paramesh AI converts meshes to B-rep (boundary representation) solids using CadQuery's OCCT kernel. Instead of wrapping the mesh in NURBS, it reconstructs the part from scratch using sketch-extrude-cut operations, producing proper B-rep geometry with flat faces, circular holes, and sharp edges.",
+    "body": "<h2>What is B-rep conversion?</h2><p>B-rep (boundary representation) defines a solid by its bounding faces, edges, and vertices — the native format of CAD kernels like OCCT, Parasolid, and ACIS. Unlike mesh tessellation (triangles), B-rep surfaces are mathematically exact: a cylinder is a true cylinder, not an approximation with 32 flat facets.</p><h2>Why mesh-to-BREP is hard</h2><p>Simple mesh-to-BREP converters just sew the triangles into a shell and try to make it solid. The result is a solid made of thousands of flat triangular faces — technically B-rep but not useful for editing. True conversion requires recognizing the underlying geometry.</p><h2>How Paramesh AI does it</h2><p>The pipeline doesn't convert the mesh directly. It:</p><ol><li>Analyzes the mesh to identify what surfaces exist</li><li>Recognizes manufacturing features</li><li>Builds a new solid using CadQuery (based on OCCT)</li><li>The result has proper analytic faces — true planes, true cylinders, true cones</li></ol>",
+    "keywords": ["mesh to BREP", "mesh to solid conversion", "B-rep from mesh", "boundary representation"],
+    "cta_type": "trial",
+    "related": ["how-to-convert-stl-to-step", "mesh-to-cadquery-step-export", "stl-to-parametric-cad-conversion"]
+  },
+  {
+    "slug": "how-to-get-feature-tree-from-stl",
+    "title": "How to Get a Feature Tree from an STL File",
+    "question": "Can I extract a feature tree from an STL file?",
+    "tldr": "Yes. Paramesh AI's feature recognition pipeline extracts a full feature tree from STL files: base extrusion, through-holes, blind holes, chamfers, fillets, pockets, and slots. Each feature includes its type, dimensions, position, and dependencies. The tree is ordered for sequential CAD reconstruction.",
+    "body": "<h2>What is a feature tree?</h2><p>A feature tree is the ordered list of operations that built a part — like a recipe. \"Extrude this profile 12mm, then cut a 5mm hole here, then chamfer these edges.\" CAD software uses this tree to let you edit individual features without redoing the whole part.</p><h2>Why STL files don't have feature trees</h2><p>STL files store only triangles — the final shape as a mesh. All design history is lost. There's no way to \"undo\" a hole or change a chamfer radius because the file doesn't know those features exist.</p><h2>How Paramesh AI recovers the tree</h2><p>The pipeline works backwards from the mesh:</p><ol><li>Cluster faces into surface groups (segmentation)</li><li>Identify what type of surface each group is (plane, cylinder, cone)</li><li>Map adjacency between surfaces (topology)</li><li>Match patterns to known feature types (recognition)</li><li>Build a dependency DAG and topologically sort</li></ol><p>The result: a feature tree with the base extrusion first, then subtractive features (holes, pockets), then finish features (chamfers, fillets).</p>",
+    "keywords": ["feature tree from STL", "extract features STL", "STL feature recognition", "CAD feature tree"],
+    "cta_type": "trial",
+    "related": ["stl-to-parametric-cad-conversion", "how-to-recognize-features-from-mesh", "ai-powered-cad-reconstruction"]
+  },
+  {
+    "slug": "stl-to-onshape-import-with-features",
+    "title": "STL to Onshape Import with Features",
+    "question": "How do I import an STL into Onshape and get an editable feature tree?",
+    "tldr": "Paramesh AI can generate FeatureScript for Onshape export. Upload your STL, the pipeline recognizes features and generates the API calls to create sketches, extrusions, and hole cuts in Onshape. Currently available in dry-run mode with live Onshape REST API integration coming soon.",
+    "body": "<h2>The Onshape import problem</h2><p>Onshape can import STL files, but they come in as tessellated surfaces — a mesh body with no feature tree. You can't edit dimensions, add fillets, or change hole sizes because Onshape doesn't know what the features are.</p><h2>Paramesh AI's Onshape export</h2><p>The pipeline generates FeatureScript operations for each recognized feature:</p><ul><li>Sketch profiles with dimensions</li><li>Extrude operations with depth and direction</li><li>Hole features with center position and radius</li><li>Chamfer and fillet operations</li></ul><p>Each operation is sequenced in dependency order so the Onshape model builds correctly.</p><h2>Current status</h2><p>The Onshape export currently works in dry-run mode, generating the full API call sequence and validation report. Live REST API integration (creating documents, pushing features) is on the roadmap.</p>",
+    "keywords": ["STL to Onshape", "Onshape import features", "Onshape feature tree", "FeatureScript from mesh"],
+    "cta_type": "waitlist",
+    "related": ["how-to-convert-stl-to-step", "how-to-get-feature-tree-from-stl", "stl-to-parametric-cad-conversion"]
+  },
+  {
+    "slug": "fix-broken-stl-file-online-free",
+    "title": "Fix Broken STL File Online Free",
+    "question": "How can I fix a broken STL file for free online?",
+    "tldr": "Use Paramesh AI's free mesh cleaner at parameshai.com/clean. Upload your broken STL and it automatically fixes normals, removes degenerate faces, merges duplicate vertices, and fills holes. Download the repaired STL instantly. No signup required, no file size limits for basic repair.",
+    "body": "<h2>Common STL problems</h2><ul><li><strong>Flipped normals</strong> — some faces point inward instead of outward</li><li><strong>Degenerate faces</strong> — triangles with zero area (collapsed edges)</li><li><strong>Non-manifold edges</strong> — edges shared by more than 2 faces</li><li><strong>Gaps and holes</strong> — missing faces in the surface</li><li><strong>Duplicate vertices</strong> — overlapping points that should be merged</li></ul><h2>How the free cleaner works</h2><ol><li>Go to <a href='/clean'>parameshai.com/clean</a></li><li>Drop your STL file (or OBJ, PLY, 3MF)</li><li>The cleaner runs automatically — no buttons to click</li><li>See before/after stats: face count, vertex count, watertight check</li><li>Download the cleaned STL</li></ol><h2>What it fixes</h2><p>The cleaner uses trimesh's repair pipeline: normal consistency, degenerate face removal, vertex merging, and hole filling. It handles most common mesh defects from 3D printing slicers, CAD exports, and 3D scanning.</p>",
+    "keywords": ["fix broken STL", "repair STL online", "STL repair free", "fix mesh normals"],
+    "cta_type": "cleaner",
+    "related": ["repair-mesh-normals-online", "remove-degenerate-faces-from-stl", "free-online-mesh-cleaner-tool"]
+  },
+  {
+    "slug": "repair-mesh-normals-online",
+    "title": "Repair Mesh Normals Online",
+    "question": "How do I fix flipped normals in a mesh file?",
+    "tldr": "Upload your mesh to Paramesh AI's free cleaner at parameshai.com/clean. It automatically detects and fixes inconsistent face normals, ensuring all faces point outward. Works with STL, OBJ, PLY, and 3MF files. No signup needed.",
+    "body": "<h2>What are mesh normals?</h2><p>Every triangle face in a mesh has a normal vector indicating which direction it faces — outward or inward. When normals are inconsistent (some faces point in, others out), the mesh appears inside-out in renderers, fails boolean operations, and can't be 3D printed.</p><h2>Why normals break</h2><ul><li>Boolean operations in some CAD tools flip normals on the cut faces</li><li>STL export from certain software doesn't guarantee consistent winding</li><li>Manual mesh editing can accidentally invert faces</li><li>Merging multiple meshes without checking orientation</li></ul><h2>Automatic repair</h2><p>The Paramesh AI cleaner uses trimesh's <code>fix_normals()</code> which propagates consistent winding order across the entire mesh. It's equivalent to \"Recalculate Normals\" in Blender but runs in your browser with no software install.</p>",
+    "keywords": ["repair mesh normals", "fix flipped normals", "mesh normal repair", "STL normals fix"],
+    "cta_type": "cleaner",
+    "related": ["fix-broken-stl-file-online-free", "remove-degenerate-faces-from-stl", "free-online-mesh-cleaner-tool"]
+  },
+  {
+    "slug": "remove-degenerate-faces-from-stl",
+    "title": "Remove Degenerate Faces from STL",
+    "question": "How do I remove degenerate (zero-area) faces from an STL file?",
+    "tldr": "Paramesh AI's free mesh cleaner removes degenerate faces automatically. Upload your STL at parameshai.com/clean — faces with area below a threshold are stripped, duplicate vertices are merged, and the mesh is re-validated. The stats bar shows exactly how many faces were removed.",
+    "body": "<h2>What are degenerate faces?</h2><p>Degenerate faces are triangles with zero or near-zero area. They happen when two or more vertices of a triangle collapse to the same point, creating a \"sliver\" triangle. These cause problems in simulation, 3D printing, and CAD import.</p><h2>Common causes</h2><ul><li>Mesh simplification algorithms that collapse edges too aggressively</li><li>Boolean operations that create slivers at intersection edges</li><li>Floating-point precision errors in CAD-to-mesh conversion</li><li>Mesh healing tools that create tiny faces to fill gaps</li></ul><h2>How the cleaner handles them</h2><p>The pipeline filters out faces with area below <code>min_face_area</code> (default 1e-10 mm). After removal, vertices are re-merged and the mesh is checked for watertightness. The before/after stats show the exact face count change.</p>",
+    "keywords": ["remove degenerate faces", "STL degenerate triangles", "zero area faces mesh", "clean mesh faces"],
+    "cta_type": "cleaner",
+    "related": ["fix-broken-stl-file-online-free", "repair-mesh-normals-online", "free-online-mesh-cleaner-tool"]
+  },
+  {
+    "slug": "detect-holes-in-mesh-automatically",
+    "title": "Detect Holes in a Mesh Automatically",
+    "question": "How can I automatically detect cylindrical holes in a mesh file?",
+    "tldr": "Paramesh AI's feature recognition pipeline detects through-holes and blind holes automatically. It segments cylindrical regions, measures their angular span (full 360 degrees = hole, partial arc = fillet), computes radius and depth, and classifies them as through or blind based on the part's extent along the hole axis.",
+    "body": "<h2>Why hole detection matters</h2><p>Holes are the most common feature in mechanical parts — bolt holes, mounting holes, clearance holes, threaded holes. Detecting them from a mesh is essential for reverse engineering because they need to be recreated as proper cylindrical cuts in the CAD model.</p><h2>How Paramesh AI detects holes</h2><ol><li><strong>Surface segmentation</strong> — clusters mesh faces into regions. Cylindrical regions are identified by fitting a cylinder primitive.</li><li><strong>Angular span check</strong> — measures how much of the 360-degree arc the cylinder covers. Full cylinders are holes; partial arcs are fillets.</li><li><strong>Through vs. blind</strong> — compares the hole's height to the part's extent along the hole axis. If height > 80% of the part thickness, it's a through-hole.</li><li><strong>Radius and position</strong> — extracted from the fitted cylinder parameters for the CadQuery construction.</li></ol>",
+    "keywords": ["detect holes mesh", "automatic hole detection", "find holes STL", "cylindrical hole mesh"],
+    "cta_type": "trial",
+    "related": ["automatic-hole-detection-in-stl", "how-to-recognize-features-from-mesh", "how-to-get-feature-tree-from-stl"]
+  },
+  {
+    "slug": "mesh-to-cadquery-step-export",
+    "title": "Mesh to CadQuery STEP Export",
+    "question": "How do I convert a mesh to a STEP file using CadQuery?",
+    "tldr": "Paramesh AI uses CadQuery to build a parametric solid from your mesh data, then exports it as STEP. The pipeline extracts the 2D profile, extrudes it, cuts holes at detected positions, and applies chamfers. The result is a clean STEP file with analytic faces — not a tessellated mesh wrapped in STEP format.",
+    "body": "<h2>What is CadQuery?</h2><p>CadQuery is a Python CAD scripting library built on OCCT (the OpenCascade kernel). It creates proper B-rep solids programmatically — the same kernel that powers FreeCAD. STEP files exported from CadQuery are fully compatible with SolidWorks, Fusion 360, and Onshape.</p><h2>How the export works</h2><ol><li><strong>Profile extraction</strong> — slices the mesh at multiple cross-sections, takes the largest polygon</li><li><strong>Profile simplification</strong> — reduces the polygon to corner vertices only (removes collinear points)</li><li><strong>Extrusion</strong> — creates a CadQuery Workplane, draws the profile, extrudes to depth</li><li><strong>Hole cutting</strong> — for each detected hole, creates a cylinder at the exact 3D position and subtracts it</li><li><strong>Chamfers</strong> — applies edge chamfers to all edges (progressive size fallback for stability)</li><li><strong>STEP export</strong> — <code>cq.exporters.export(solid, \"output.step\")</code></li></ol>",
+    "keywords": ["mesh to CadQuery", "CadQuery STEP export", "Python CAD mesh", "CadQuery from mesh"],
+    "cta_type": "trial",
+    "related": ["how-to-convert-stl-to-step", "mesh-to-brep-conversion-tool", "stl-to-parametric-cad-conversion"]
+  },
+  {
+    "slug": "ai-powered-cad-reconstruction",
+    "title": "AI-Powered CAD Reconstruction",
+    "question": "Is there an AI tool that can reconstruct a CAD model from a mesh?",
+    "tldr": "Yes. Paramesh AI uses a 6-stage pipeline (not a neural network) to reconstruct parametric CAD models from mesh files. An optional AI layer (Claude CLI) optimizes the construction order and suggests clean engineering dimensions. The core pipeline is deterministic — AI enhances but doesn't replace the geometric algorithms.",
+    "body": "<h2>How AI is used</h2><p>Paramesh AI's core pipeline is algorithmic — RANSAC surface fitting, region growing segmentation, graph-based topology analysis. The \"AI\" components are:</p><ul><li><strong>Build order optimizer</strong> — Claude analyzes the feature list and suggests optimal construction sequence for CadQuery</li><li><strong>Dimension planner</strong> — after upload, AI analyzes mesh dimensions and suggests clean engineering values (round numbers, standard drill sizes)</li><li><strong>AI chatbot</strong> — in the web viewer, ask questions about the model or request feature edits</li></ul><h2>Why not pure neural network?</h2><p>Neural approaches to mesh-to-CAD (like Point2Sequence or DeepCAD) require training data and struggle with out-of-distribution parts. Paramesh AI's algorithmic approach works on any prismatic part without training — it reasons about geometry directly.</p>",
+    "keywords": ["AI CAD reconstruction", "AI mesh to CAD", "machine learning CAD", "AI reverse engineering"],
+    "cta_type": "trial",
+    "related": ["stl-to-parametric-cad-conversion", "how-to-get-feature-tree-from-stl", "how-to-recognize-features-from-mesh"]
+  },
+  {
+    "slug": "convert-obj-to-step-with-holes",
+    "title": "Convert OBJ to STEP with Holes Preserved",
+    "question": "How do I convert an OBJ file to STEP while keeping the holes?",
+    "tldr": "Upload your OBJ to Paramesh AI. The pipeline detects cylindrical holes automatically during feature recognition, then reconstructs them as proper parametric cuts in the STEP output. Through-holes and blind holes are both supported, with radius and depth extracted from the mesh geometry.",
+    "body": "<h2>The OBJ to STEP challenge</h2><p>OBJ files, like STL, are mesh formats with no feature intelligence. Converting to STEP naively gives you a faceted solid where holes are just arrangements of triangles — not actual cylindrical features you can edit.</p><h2>Hole-preserving conversion</h2><p>Paramesh AI's pipeline:</p><ol><li>Loads the OBJ and repairs any mesh issues</li><li>Segments cylindrical regions from the mesh</li><li>Fits exact cylinders (center, axis, radius) to each region</li><li>Classifies as through-hole or blind-hole</li><li>Builds the STEP solid with proper cylindrical cuts at each hole position</li></ol><p>The result: a STEP file where holes are true cylinders you can resize, reposition, or delete in any CAD software.</p>",
+    "keywords": ["OBJ to STEP", "convert OBJ STEP", "OBJ holes STEP", "mesh to STEP holes"],
+    "cta_type": "trial",
+    "related": ["how-to-convert-stl-to-step", "detect-holes-in-mesh-automatically", "3mf-to-parametric-model"]
+  },
+  {
+    "slug": "3mf-to-parametric-model",
+    "title": "3MF to Parametric Model Conversion",
+    "question": "Can I convert a 3MF file to a parametric CAD model?",
+    "tldr": "Yes. Paramesh AI supports 3MF as an input format alongside STL, OBJ, and PLY. Upload your 3MF file, the pipeline processes it identically to STL — segmenting surfaces, recognizing features, and building a parametric STEP file with a full feature tree.",
+    "body": "<h2>What is 3MF?</h2><p>3MF (3D Manufacturing Format) is a modern mesh format designed for 3D printing. It supports colors, materials, and multiple objects in one file. But like STL, it stores geometry as triangulated meshes — no feature tree.</p><h2>3MF advantages for conversion</h2><p>3MF files tend to be higher quality than STL:</p><ul><li>Better vertex precision (no ASCII rounding)</li><li>Guaranteed manifold meshes in most cases</li><li>Smaller file sizes with ZIP compression</li></ul><p>This means Paramesh AI's pipeline starts with cleaner input data, potentially producing more accurate feature recognition.</p>",
+    "keywords": ["3MF to parametric", "3MF to STEP", "3MF CAD conversion", "3MF feature tree"],
+    "cta_type": "trial",
+    "related": ["how-to-convert-stl-to-step", "convert-obj-to-step-with-holes", "stl-to-parametric-cad-conversion"]
+  },
+  {
+    "slug": "how-to-recognize-features-from-mesh",
+    "title": "How to Recognize Features from a Mesh",
+    "question": "How does feature recognition work on mesh files?",
+    "tldr": "Feature recognition on meshes works by first segmenting faces into surface groups, fitting geometric primitives (planes, cylinders, cones), building a topology graph of surface adjacencies, then matching patterns to known feature types. Paramesh AI recognizes extrusions, holes, pockets, bosses, chamfers, and fillets.",
+    "body": "<h2>The feature recognition pipeline</h2><h3>Step 1: Surface segmentation</h3><p>Region-growing with adaptive normal thresholds clusters faces into groups that belong to the same analytic surface. A flat face group becomes a plane; a curved group becomes a cylinder or cone.</p><h3>Step 2: Primitive fitting</h3><p>Each region gets a fitted primitive surface using RANSAC (for robustness) and least-squares refinement (for accuracy). Parameters are snapped to clean engineering values.</p><h3>Step 3: Topology analysis</h3><p>An adjacency graph is built: nodes are surfaces, edges are shared boundaries. Each edge is classified as sharp, fillet, or chamfer based on dihedral angle and surface properties.</p><h3>Step 4: Pattern matching</h3><p>The graph is searched for known feature patterns:</p><ul><li>Large connected plane group = base extrusion</li><li>Full cylinder (360 degrees) adjacent to planes = hole</li><li>Cone surface adjacent to hole = countersink chamfer</li><li>Small narrow plane at 135 degrees = flat chamfer</li><li>Partial-arc cylinder = fillet</li></ul>",
+    "keywords": ["feature recognition mesh", "mesh feature detection", "CAD feature extraction", "recognize features STL"],
+    "cta_type": "trial",
+    "related": ["how-to-get-feature-tree-from-stl", "mesh-segmentation-for-cad", "detect-holes-in-mesh-automatically"]
+  },
+  {
+    "slug": "mesh-segmentation-for-cad",
+    "title": "Mesh Segmentation for CAD Conversion",
+    "question": "How does mesh segmentation work for CAD conversion?",
+    "tldr": "Mesh segmentation for CAD groups mesh faces into regions that each belong to one analytic surface (plane, cylinder, cone, sphere). Paramesh AI uses region-growing with adaptive normal thresholds, curvature-based splitting, and post-processing to handle mixed regions. The result feeds into primitive fitting and feature recognition.",
+    "body": "<h2>Why segmentation matters</h2><p>A mesh is just triangles — thousands of small flat faces. Before you can recognize that something is a \"hole\" or a \"chamfer,\" you need to know which triangles belong to which surface. That's what segmentation does.</p><h2>Paramesh AI's segmentation algorithm</h2><ol><li><strong>Adjacency graph</strong> — build face-to-face connections from shared edges</li><li><strong>Region growing</strong> — flood-fill from seed faces using normal angle thresholds (15 degrees for planes, 30 degrees for curves)</li><li><strong>Small region merging</strong> — absorb tiny regions into their most similar neighbor</li><li><strong>Flat/curved splitting</strong> — detect mixed regions and separate planar faces from curved ones</li><li><strong>Curvature splitting</strong> — use k-means on (normal, curvature) features to split remaining complex regions</li><li><strong>Surface classification</strong> — label each region as PLANE, CYLINDER, CONE, SPHERE, or UNKNOWN using SVD analysis</li></ol>",
+    "keywords": ["mesh segmentation", "surface segmentation CAD", "mesh clustering", "face segmentation mesh"],
+    "cta_type": "trial",
+    "related": ["how-to-recognize-features-from-mesh", "reverse-engineer-mesh-to-solid-model", "stl-to-parametric-cad-conversion"]
+  },
+  {
+    "slug": "automatic-hole-detection-in-stl",
+    "title": "Automatic Hole Detection in STL Files",
+    "question": "Is there a tool that automatically detects holes in STL files?",
+    "tldr": "Yes. Paramesh AI detects through-holes and blind holes in STL files automatically. The pipeline segments cylindrical regions, verifies they span a full 360-degree arc (not a partial fillet), measures radius and depth, and classifies each as through or blind. Tested on parts with 4-10+ holes.",
+    "body": "<h2>How it works</h2><p>Hole detection is part of Stage 5 (Feature Recognition) in the Paramesh AI pipeline. After surface segmentation identifies cylindrical regions and primitive fitting extracts their parameters:</p><ol><li>Check angular span — full cylinders (>270 degrees) are hole candidates, partial arcs are fillets</li><li>Check radius — must be within the configurable <code>hole_max_radius_ratio</code> of the bounding box diagonal</li><li>Classify through vs. blind — compare hole height to part extent along the hole axis (>80% = through)</li><li>Extract sketch geometry — center point, radius, depth for CadQuery reconstruction</li></ol><h2>Accuracy</h2><p>On test models, all through-holes and blind holes are detected correctly. The radius and position match the original CAD model within the mesh resolution.</p>",
+    "keywords": ["automatic hole detection", "detect holes STL", "find holes mesh", "hole recognition mesh"],
+    "cta_type": "trial",
+    "related": ["detect-holes-in-mesh-automatically", "how-to-recognize-features-from-mesh", "how-to-get-feature-tree-from-stl"]
+  },
+  {
+    "slug": "chamfer-detection-from-mesh-file",
+    "title": "Chamfer Detection from Mesh File",
+    "question": "How can I detect chamfers and beveled edges in a mesh file?",
+    "tldr": "Paramesh AI detects chamfers using three strategies: cone surfaces (countersinks around holes), small narrow plane strips at 135-degree dihedral angles (flat bevels), and edge classification from the topology graph. Tested on parts with 10+ chamfers including countersink chamfers around bolt holes.",
+    "body": "<h2>Types of chamfers detected</h2><ul><li><strong>Countersink chamfers</strong> — conical surfaces around holes. Detected as CONE surface type in the segmentation stage.</li><li><strong>Flat bevels</strong> — narrow plane strips meeting adjacent faces at ~135 degrees. Detected via dihedral angle analysis in the topology stage.</li><li><strong>Edge chamfers</strong> — identified by the topology graph's edge classification (CHAMFER type with dihedral angle in the 100-160 degree range).</li></ul><h2>Chamfer reconstruction</h2><p>Detected chamfers are applied in the CadQuery construction as <code>edges().chamfer(size)</code>. The size is estimated from the recognized feature geometry with progressive fallback (tries decreasing sizes if initial chamfer fails on short edges).</p>",
+    "keywords": ["chamfer detection mesh", "detect chamfers STL", "bevel detection mesh", "chamfer recognition"],
+    "cta_type": "trial",
+    "related": ["how-to-recognize-features-from-mesh", "detect-holes-in-mesh-automatically", "how-to-get-feature-tree-from-stl"]
+  },
+  {
+    "slug": "free-online-mesh-cleaner-tool",
+    "title": "Free Online Mesh Cleaner Tool",
+    "question": "Is there a free online tool to clean and repair mesh files?",
+    "tldr": "Yes. Paramesh AI offers a free mesh cleaner at parameshai.com/clean. Upload any STL, OBJ, PLY, or 3MF file. It fixes normals, removes degenerate faces, merges vertices, fills holes, and lets you resize the mesh. Before/after 3D preview with orbit controls. Download the cleaned STL. No signup required for cleaning.",
+    "body": "<h2>What the free cleaner does</h2><ul><li><strong>Fix normals</strong> — ensures all faces point outward consistently</li><li><strong>Remove degenerate faces</strong> — strips zero-area triangles</li><li><strong>Merge vertices</strong> — consolidates duplicate points at the same location</li><li><strong>Fill holes</strong> — patches small gaps in the surface</li><li><strong>Resize</strong> — scale uniformly or set target dimensions in mm</li></ul><h2>Features</h2><ul><li>Before/after 3D viewer with orbit controls</li><li>Stats: face count, vertex count, watertight check</li><li>Supports STL, OBJ, PLY, 3MF</li><li>Download cleaned mesh as STL</li><li>No signup needed, no ads</li></ul><h2>Want more?</h2><p>After cleaning, convert your mesh to a parametric CAD model with Paramesh AI's full pipeline — 3 free generations, no credit card required.</p>",
+    "keywords": ["free mesh cleaner", "online mesh repair", "clean STL free", "mesh repair tool"],
+    "cta_type": "cleaner",
+    "related": ["fix-broken-stl-file-online-free", "repair-mesh-normals-online", "remove-degenerate-faces-from-stl"]
+  }
+]

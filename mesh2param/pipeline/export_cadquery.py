@@ -204,14 +204,15 @@ def _extract_profile_and_holes(
     normal = [0.0, 0.0, 0.0]
     normal[primary_axis] = 1.0
 
-    # Collect profiles from multiple slices and keep the set with the
-    # most total area (captures the widest cross-section).
-    best_profiles: list[list[tuple[float, float]]] = []
-    best_total_area = 0.0
-
-    offsets = [0.05, 0.25, 0.5, 0.75, 0.95]
+    # Collect profiles from multiple slices. Pick the slice whose extruded
+    # volume is closest to the actual mesh volume — this handles tapered parts
+    # better than just picking the largest cross-section.
+    mesh_volume = abs(float(mesh.volume)) if mesh.is_watertight else 0
     extent = float(all_proj.max() - all_proj.min())
 
+    candidates: list[tuple[float, list]] = []  # (vol_error, profiles)
+
+    offsets = [0.05, 0.25, 0.5, 0.75, 0.95]
     for frac in offsets:
         slice_pos = float(all_proj.min()) + extent * frac
         origin = [0.0, 0.0, 0.0]
@@ -228,24 +229,42 @@ def _extract_profile_and_holes(
                 continue
 
             total_area = sum(p.area for p in polygons)
-            if total_area > best_total_area:
-                best_total_area = total_area
-                best_profiles = []
+            if total_area < 1.0:
+                continue
 
-                from scipy.spatial import cKDTree
-                all_2d = s2d.vertices
-                tree_2d = cKDTree(all_2d)
+            from scipy.spatial import cKDTree
+            all_2d = s2d.vertices
+            tree_2d = cKDTree(all_2d)
 
-                for poly in polygons:
-                    coords_2d = np.array(poly.exterior.coords)[:-1]
-                    _, indices = tree_2d.query(coords_2d)
-                    matched_3d = section_verts[indices]
-                    profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched_3d]
-                    profile = _simplify_profile(profile, tolerance=0.1)
-                    if len(profile) >= 3:
-                        best_profiles.append(profile)
+            slice_profiles = []
+            for poly in polygons:
+                coords_2d = np.array(poly.exterior.coords)[:-1]
+                _, indices = tree_2d.query(coords_2d)
+                matched_3d = section_verts[indices]
+                profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched_3d]
+                profile = _simplify_profile(profile, tolerance=0.1)
+                if len(profile) >= 3:
+                    slice_profiles.append(profile)
+
+            if not slice_profiles:
+                continue
+
+            # Score: how close is the extruded volume to the mesh volume?
+            extruded_vol = total_area * extent
+            if mesh_volume > 0:
+                vol_error = abs(extruded_vol - mesh_volume) / mesh_volume
+            else:
+                vol_error = -total_area  # fallback: prefer largest area
+            candidates.append((vol_error, slice_profiles))
         except Exception:
             continue
+
+    if not candidates:
+        return None, extrude_start, [], [], []
+
+    # Pick best candidate
+    candidates.sort(key=lambda x: x[0])
+    best_profiles = candidates[0][1]
 
     if not best_profiles:
         return None, extrude_start, []

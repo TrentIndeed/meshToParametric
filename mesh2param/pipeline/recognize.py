@@ -282,6 +282,17 @@ def _find_holes(
         height = f.params.get("height", 0)
         axis_dir = np.array(f.params.get("axis_dir", [0, 0, 1]))
 
+        # Snap hole axis to nearest principal direction if close (within 15°)
+        # This fixes holes whose fitted axis is slightly off due to mesh noise
+        principal_axes = [
+            np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1]),
+            np.array([-1, 0, 0]), np.array([0, -1, 0]), np.array([0, 0, -1]),
+        ]
+        for pa in principal_axes:
+            if abs(np.dot(axis_dir, pa)) > np.cos(np.radians(15)):
+                axis_dir = pa * np.sign(np.dot(axis_dir, pa))
+                break
+
         # Determine through vs blind: compare hole height to part extent along axis
         part_proj = cleaned.vertices @ axis_dir
         part_extent = float(part_proj.max() - part_proj.min())
@@ -609,20 +620,21 @@ def _find_fillets_and_chamfers(
         f = fitted_lookup.get(rid)
         if region is None or f is None:
             continue
-        # Determine chamfer width from the surface extent
-        if f.surface_type == SurfaceType.CONE:
-            width = f.params.get("half_angle", 0)
-        else:
-            width = f.params.get("extent", 0)
+        # Compute chamfer width from the region's bounding box
+        # For countersink cones, the smallest bbox dimension is the chamfer depth
+        bbox_size = region.vertices.max(axis=0) - region.vertices.min(axis=0)
+        width = float(sorted(bbox_size)[0])  # smallest dimension = chamfer depth
+        if width < 0.1:
+            width = float(sorted(bbox_size)[1])  # fallback to second smallest
         results.append((
             Feature(
                 type=FeatureType.CHAMFER,
                 face_indices=region.face_indices.copy(),
                 sketch_geometry={
                     "type": "bevel",
-                    "width": width,
+                    "width": round(width, 2),
                 },
-                depth=0.0,
+                depth=round(width, 2),
                 operation="REMOVE",
             ),
             {rid},

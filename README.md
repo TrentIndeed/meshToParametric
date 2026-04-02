@@ -1,172 +1,143 @@
-# mesh2param
+# Paramesh AI
 
-Reverse-engineering pipeline that converts triangulated mesh files (STL/OBJ/PLY/3MF) of prismatic mechanical parts into fully parametric CAD models with a reconstructed feature tree. Exports via Onshape REST API, CadQuery STEP files, or the built-in web viewer with AI assistant.
+Reverse-engineering pipeline that converts triangulated mesh files (STL/OBJ/PLY/3MF) of prismatic mechanical parts into fully parametric CAD models. AI-powered feature recognition, construction timeline, and interactive web viewer.
 
-**Target parts:** brackets, mounts, plates — prismatic components with planar faces, cylindrical holes, pockets, bosses, fillets, and chamfers. Not designed for freeform/organic geometry.
+**Live at [parameshai.com](https://parameshai.com)**
+
+**Target parts:** brackets, mounts, plates — prismatic components with planar faces, cylindrical holes, pockets, bosses, fillets, and chamfers.
 
 ## Pipeline
 
 | Stage | Module | Description |
 |-------|--------|-------------|
-| 1 | `ingest.py` | Load mesh, repair topology, fix normals, remove degenerate faces, optional remesh |
-| 2 | `segment.py` | Region-growing segmentation with normal clustering, curvature-based splitting |
-| 3 | `fit.py` | RANSAC + least-squares fitting for plane/cylinder/cone/sphere primitives |
-| 4 | `topology.py` | Surface adjacency graph, dihedral angles, sharp/fillet/chamfer/smooth edge classification |
-| 5 | `recognize.py` | Feature recognition: base extrusion, through/blind holes, pockets, bosses, slots |
-| 6a | `export_onshape.py` | FeatureScript generation + Onshape REST API v6 (dry-run or live) |
-| 6b | `export_cadquery.py` | CadQuery solid reconstruction: sketch → extrude → cut holes → STEP export |
+| 1 | `ingest.py` | Load mesh, repair topology, fix normals, remove degenerate faces |
+| 2 | `segment.py` | Region-growing segmentation with normal clustering, curvature splitting |
+| 3 | `fit.py` | RANSAC + least-squares fitting for plane/cylinder/cone/sphere |
+| 4 | `topology.py` | Surface adjacency graph, dihedral angles, edge classification |
+| 5 | `recognize.py` | Feature recognition: extrusions, holes, pockets, chamfers, fillets |
+| 6a | `export_onshape.py` | FeatureScript generation + Onshape REST API (dry-run or live) |
+| 6b | `export_cadquery.py` | CadQuery solid: sketch → extrude → cut holes → STEP export |
 
-## Web Viewer
+## Web App
 
-Built-in Three.js CAD viewer with feature tree, AI chatbot, construction timeline, and interactive orbit controls.
+Three-panel CAD viewer with AI assistant at [parameshai.com/app](https://parameshai.com/app).
 
-```bash
-# Start the web UI
-python -m mesh2param.viz_server.app
+- **Left**: Feature tree with typed icons (sketch, extrude, hole, chamfer)
+- **Center**: Interactive Three.js 3D viewer with orbit controls, XYZ grid
+- **Right**: AI chatbot — describe parts, suggest edits, analyze dimensions
+- **Bottom**: Timeline with 3D-rendered thumbnails per construction step
+- **Upload flow**: preview mesh → complexity meter → AI thinking process → CAD model
 
-# Open http://127.0.0.1:8080 and upload a mesh file
-```
+### Free Tools
 
-Features:
-- Dark theme with Fusion 360-style 3D viewport (MeshPhysicalMaterial, studio lighting)
-- **Left sidebar**: Feature tree with typed icons (sketch, extrude, hole)
-- **Right sidebar**: AI chatbot — describe parts, suggest edits, analyze dimensions
-- **Bottom timeline**: 3D-rendered thumbnails per construction step, click to switch view
-- **Dimension planner**: AI analyzes mesh after upload, suggests clean engineering dimensions before building
-- Upload File / Send to Onshape action buttons
-- User accounts with signup/login (SQLite + SHA-256 auth)
+- **Mesh Cleaner** ([parameshai.com/clean](https://parameshai.com/clean)) — fix normals, remove degenerate faces, merge vertices, fill holes, resize. No signup required.
+- **Learn** ([parameshai.com/learn](https://parameshai.com/learn)) — 20 SEO guides on mesh-to-CAD conversion
+
+### Pages
+
+| Route | Description |
+|-------|-------------|
+| `/` | Landing page with video hero, pricing, FAQ, waitlist |
+| `/app` | CAD viewer tool (requires login) |
+| `/clean` | Free mesh cleaner (requires login) |
+| `/home` | Signed-in home — tool picker with usage bar |
+| `/learn` | 20 SEO guide pages |
+| `/changelog` | What's New + Roadmap + Git History |
+| `/contact` | Support form (saves to DB + emails) |
+| `/login` | Sign in / Sign up |
+| `/privacy` | Privacy policy |
+| `/terms` | Terms of service |
 
 ## Setup
 
 ```bash
 pip install -e ".[dev]"
+pip install cadquery shapely
 ```
 
-For CadQuery export (offline STEP):
-```bash
-pip install cadquery
-```
-
-For Onshape live export:
-```bash
-export ONSHAPE_ACCESS_KEY=your_access_key
-export ONSHAPE_SECRET_KEY=your_secret_key
-```
-
-For AI features (chatbot, dimension planner, build ordering):
+For AI features:
 ```bash
 npm install -g @anthropic-ai/claude-code
-claude "hello"  # one-time browser auth
+claude "hello"  # one-time auth
 ```
 
-## Usage
+## Running
 
 ```bash
-# Full pipeline via CLI
-mesh2param convert input.stl --onshape-doc "My Document" --onshape-workspace main
-
-# Dry run: output feature tree as JSON
-mesh2param convert input.stl --dry-run --output feature_tree.json
-
-# Inspect a specific pipeline stage
-mesh2param inspect input.stl --stage segment --visualize
-
-# Web viewer with AI assistant
+# Web app
 python -m mesh2param.viz_server.app
+# Open http://127.0.0.1:8080
+
+# CLI
+mesh2param convert input.stl --dry-run --output feature_tree.json
 ```
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest
-
-# Run all tests and generate visual reports
-python run_visuals.py
-
-# Run specific stages
-python run_visuals.py --stage 4 5 6
-
-# Visual tests only (generates PNG/GIF reports)
-python run_visuals.py --visual-only
-
-# STEP comparison tests (auto-discovers model pairs in models/)
-pytest tests/test_step_comparison.py -v
+pytest                                    # all tests
+python run_visuals.py                     # visual reports
+python run_visuals.py --stage 4 5 6       # specific stages
+pytest tests/test_step_comparison.py -v   # STEP comparison
+pytest tests/test_all_meshes.py -v        # all 5 meshes
 ```
 
 ### Model Pairs
 
-Drop a folder into `models/` with a mesh file + reference STEP file to auto-test reconstruction accuracy:
+Drop a folder into `models/` with a mesh + reference STEP to auto-test:
 
 ```
-models/
-  Mesh1/
-    Body1Mesh.3mf    # input mesh
-    Body1Step.step    # reference CAD model
-  Mesh2/
-    bracket.stl
-    bracket.step
+models/Mesh1/Body1Mesh.3mf + Body1Step.step
+models/Mesh2/BottomMount.3mf
+models/Mesh3/Front Plate.3mf
+models/Mesh4/Bottom.3mf
+models/Mesh5/Component3.3mf
 ```
 
-Visual reports are saved to `tests/visual_reports/` organized by stage.
-
-## Project Structure
+## Architecture
 
 ```
 mesh2param/
-  pipeline/      Stage modules (ingest, segment, fit, topology, recognize, export_onshape, export_cadquery)
-  models/        Dataclasses (CleanedMesh, FaceRegion, FittedSurface, Feature, FeatureTree)
-  viz/           Visualization classes per stage (PyVista 3D + matplotlib 2D)
-  viz_server/    FastAPI web UI with Three.js viewer + AI chat
-  db/            SQLite database (User, MeshJob, JobStep models)
-  api/           REST endpoints (auth, chat, settings)
-  onshape/       API wrapper (client, auth, feature_builder)
-  ai.py          Claude CLI wrapper with prompt injection protection
-  config.py      Pydantic settings for all 6 stages
-tests/           Pytest suite with visual + correctness + STEP comparison tests
-models/          Mesh + reference STEP pairs for validation
+  pipeline/      — 6 stage modules (ingest → segment → fit → topology → recognize → export)
+  models/        — dataclasses (CleanedMesh, FaceRegion, FittedSurface, Feature, FeatureTree)
+  viz/           — PyVista 3D + matplotlib 2D visualizations per stage
+  viz_server/    — FastAPI web app + Three.js viewer + job queue
+  db/            — SQLite (User, MeshJob, JobStep, WaitlistEntry, SupportTicket)
+  api/           — REST endpoints (auth, chat, settings)
+  ai.py          — Claude CLI wrapper with injection protection + budget caps
+  config.py      — Pydantic settings for all stages
+tests/           — pytest suite (visual, correctness, STEP comparison, all-mesh)
+models/          — mesh + reference STEP pairs
 ```
+
+## Pricing (Token-Based)
+
+| Plan | Price | Tokens/mo | Upload Limit | Features |
+|------|-------|-----------|-------------|----------|
+| Free | $0 | 100 | 10 MB | Cleaner unlimited, 3-5 CAD conversions |
+| Starter | $9/mo | 1,000 | 50 MB | STEP export, AI dimension planner |
+| Pro | $29/mo | 5,000 | 200 MB | Onshape + AI chat + priority support |
+| Unlimited | $79/mo | Unlimited | 500 MB | Everything |
+
+Token cost: ~20 for a simple bracket, ~55 for a complex mount with chamfers.
+
+## Security
+
+- Per-IP token tracking prevents free trial abuse (100 tokens + 10 jobs per IP)
+- Complexity meter rejects meshes >10,000 faces or non-watertight >5,000 faces
+- AI calls: system prefix, prompt sanitization, 8K cap, 20 calls/session, 5s rate limit
+- Auth: SHA-256 + AUTH_SECRET, token cookies, session management
+- Database: SQLite on Docker volume, survives rebuilds
+
+## Deployment
+
+```bash
+# Deploy to Hetzner VPS (same as operatorDashboard)
+python deploy.py --ip YOUR_VPS_IP --domain parameshai.com
+```
+
+Docker + Caddy on port 8081, alongside operatorDashboard.
 
 ## Key Libraries
 
-- **trimesh** — mesh loading, repair, cross-sections
-- **cadquery** — parametric solid construction and STEP export
-- **PyVista** — 3D visualization and offscreen rendering
-- **Three.js** — web-based interactive 3D viewer with orbit controls
-- **FastAPI** — web UI backend + REST API
-- **SQLAlchemy** — database ORM (SQLite)
-- **numpy / scipy** — numerical computation (SVD, least-squares, RANSAC)
-- **scikit-learn** — k-means clustering for segmentation
-- **networkx** — graph algorithms for topology and feature dependencies
-- **pydantic** — configuration and data validation
-
-## AI Integration
-
-Claude CLI (OAuth, no API key needed) powers three features:
-
-1. **AI Chatbot** — right-side panel in the web UI. Ask "describe this part", "make hole 1 larger", etc. Sends feature tree context with each message.
-2. **Dimension Planner** — after upload, AI analyzes mesh dimensions, identifies part type, suggests clean engineering values (standard drill sizes, round numbers). User confirms before pipeline builds.
-3. **Build Order Optimizer** — sends feature list to Claude for optimal construction sequence. Returns JSON build plan, deterministic code generation unchanged.
-
-Security:
-- System prefix constrains model to JSON-only CAD output
-- Prompt sanitization strips injection patterns
-- 8K prompt cap, 4K response cap
-- 20 calls/session max, 5s rate limit
-- `--max-turns 1` prevents tool use and looping
-
-## Auth
-
-User accounts ported from operatorDashboard:
-- `POST /auth/signup` — create account (username + password)
-- `POST /auth/login` — returns SHA-256 token
-- `GET /auth/verify?token=xxx` — verify token → username
-- `POST /settings/change-password` — change password
-- `POST /settings/delete-account` — delete account + all data
-
-Set `AUTH_SECRET` in `.env` for production (changing it breaks all existing passwords).
-
-## Requirements
-
-- Python 3.11+
-- Linting: ruff
+trimesh, cadquery, pyvista, matplotlib, numpy, scipy, scikit-learn, networkx, fastapi, sqlalchemy, three.js

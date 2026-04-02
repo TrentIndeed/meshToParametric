@@ -329,10 +329,10 @@ footer {
   align-items: center; overflow: hidden;
   max-width: 1200px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 3rem);
 }
-/* Video on the right — zoomed to fill more width */
+/* Scroll animation image on the right */
 .scroll-anim .gear-frame {
-  width: 130%; height: auto; max-height: 90vh;
-  margin-left: -15%;
+  width: 78%; height: auto; max-height: 90vh;
+  margin-left: 10%;
   object-fit: cover; border-radius: 0;
   mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 95%);
   -webkit-mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 95%);
@@ -347,10 +347,10 @@ footer {
   padding: 2rem 2.5rem; border-radius: 12px;
   background: rgba(10,10,11,0.8); backdrop-filter: blur(16px);
   border: 1px solid var(--border);
-  max-width: 480px; transition: opacity 0.4s ease, transform 0.4s ease;
+  max-width: 480px; transition: opacity 0.25s ease-out, transform 0.25s ease-out;
 }
 .scroll-anim .text-overlay.hidden {
-  opacity: 0; transform: translateY(20px); pointer-events: none; position: absolute;
+  opacity: 0; transform: translateY(-12px) scale(0.97); pointer-events: none; position: absolute;
 }
 .scroll-anim .text-overlay h3 { margin-bottom: 0.5rem; font-size: 1.2rem; }
 .scroll-anim .text-overlay p { font-size: 0.95rem; }
@@ -419,7 +419,7 @@ footer {
       <h1>Reverse-engineer<br>any mesh into<br><span class="gradient">parametric CAD</span></h1>
       <p>Drop an STL, OBJ, or 3MF file. Get a fully editable feature tree with sketches, extrusions, holes, chamfers, and fillets — reconstructed from scratch.</p>
       <div class="hero-actions">
-        <a href="/app" class="btn btn-primary">Try Free — 3 Generations</a>
+        <a href="/login?next=/app&mode=signup" class="btn btn-primary">Try Free — 3 Generations</a>
         <a href="/clean" class="btn btn-secondary">Free Mesh Cleaner</a>
       </div>
     </div>
@@ -543,7 +543,7 @@ footer {
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:1rem;">3 Free Generations</div>
         <h3 style="margin-bottom:0.75rem;">Paramesh AI</h3>
         <p style="font-size:0.9rem; margin-bottom:1.5rem;">Full mesh-to-CAD conversion with AI feature recognition, construction timeline, and STEP export.</p>
-        <a href="/app" class="btn btn-primary" style="width:100%; justify-content:center;">Try Paramesh AI</a>
+        <a href="/login?next=/app&mode=signup" class="btn btn-primary" style="width:100%; justify-content:center;">Try Paramesh AI</a>
       </div>
     </div>
   </div>

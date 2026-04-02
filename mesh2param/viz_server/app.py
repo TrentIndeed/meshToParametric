@@ -19,9 +19,14 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Load .env for AUTH_SECRET and other config
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 import numpy as np
 from fastapi import FastAPI, File, Request, UploadFile
@@ -39,8 +44,8 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-PLAN_TOKENS = {"free": 100, "starter": 1000, "pro": 5000, "unlimited": float("inf")}
-PLAN_UPLOAD_MB = {"free": 10, "starter": 50, "pro": 200, "unlimited": 500}
+PLAN_TOKENS = {"free": 100, "starter": 1000, "pro": 5000, "unlimited": float("inf"), "developer": float("inf")}
+PLAN_UPLOAD_MB = {"free": 10, "starter": 50, "pro": 200, "unlimited": 500, "developer": 999}
 
 # ── Per-IP token tracking (prevents free trial abuse) ──
 _ip_tokens: dict[str, int] = {}  # ip → tokens spent
@@ -67,6 +72,23 @@ def _check_ip_limit(ip: str, plan: str = "free") -> tuple[bool, str | None]:
 def _charge_ip(ip: str, cost: int):
     """Record token usage for an IP."""
     _ip_tokens[ip] = _ip_tokens.get(ip, 0) + cost
+
+
+def _get_user_plan(request) -> str:
+    """Get the user's plan from their auth cookie."""
+    token = request.cookies.get("paramesh_token", "")
+    if not token:
+        return "free"
+    try:
+        from mesh2param.api.auth import get_user_plan
+        from mesh2param.db.database import SessionLocal
+        db = SessionLocal()
+        try:
+            return get_user_plan(token, db)
+        finally:
+            db.close()
+    except Exception:
+        return "free"
     _ip_jobs[ip] = _ip_jobs.get(ip, 0) + 1
 
 
@@ -227,8 +249,9 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
     import trimesh
 
     # Check IP limits before processing
+    plan = _get_user_plan(request)
     ip = _get_client_ip(request)
-    ok, reason = _check_ip_limit(ip)
+    ok, reason = _check_ip_limit(ip, plan)
     if not ok:
         return JSONResponse({"status": "error", "error": reason}, status_code=403)
 
@@ -347,7 +370,7 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
 @app.post("/api/run-pipeline")
 async def run_pipeline(request: Request, body: dict):
     """Run the full pipeline on a previously previewed mesh. Takes temp_path from /api/preview."""
-    plan = "free"
+    plan = _get_user_plan(request)
     ip = _get_client_ip(request)
     ok, reason = _check_ip_limit(ip, plan)
     if not ok:
@@ -371,7 +394,7 @@ async def run_pipeline(request: Request, body: dict):
 @app.post("/api/upload")
 async def upload(request: Request, file: UploadFile = File(...)):
     """Submit a mesh for pipeline processing. Returns a job ID to poll."""
-    plan = "free"
+    plan = _get_user_plan(request)
     ip = _get_client_ip(request)
     ok, reason = _check_ip_limit(ip, plan)
     if not ok:
@@ -517,7 +540,7 @@ async def progress_legacy():
 @app.get("/api/usage")
 async def usage_status(request: Request):
     import time as _time
-    plan = "free"
+    plan = _get_user_plan(request)
     limit = PLAN_TOKENS.get(plan, 100)
     ip = _get_client_ip(request)
     now = _time.time()

@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,10 +42,39 @@ STATIC_DIR = Path(__file__).parent / "static"
 PLAN_TOKENS = {"free": 100, "starter": 1000, "pro": 5000, "unlimited": float("inf")}
 PLAN_UPLOAD_MB = {"free": 10, "starter": 50, "pro": 200, "unlimited": 500}
 
+# ── Per-IP token tracking (prevents free trial abuse) ──
+_ip_tokens: dict[str, int] = {}  # ip → tokens spent
+_ip_jobs: dict[str, int] = {}    # ip → job count
+
+def _get_client_ip(request) -> str:
+    """Get real client IP, checking X-Forwarded-For for reverse proxy (Caddy)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _check_ip_limit(ip: str, plan: str = "free") -> tuple[bool, str | None]:
+    """Check if IP has exceeded free tier limits."""
+    limit = PLAN_TOKENS.get(plan, 100)
+    spent = _ip_tokens.get(ip, 0)
+    if spent >= limit:
+        return False, f"Token limit reached for this IP ({spent}/{int(limit)}). Sign up for more."
+    jobs = _ip_jobs.get(ip, 0)
+    if plan == "free" and jobs >= 10:
+        return False, f"Free trial: max 10 jobs per IP. You've used {jobs}. Sign up for unlimited."
+    return True, None
+
+def _charge_ip(ip: str, cost: int):
+    """Record token usage for an IP."""
+    _ip_tokens[ip] = _ip_tokens.get(ip, 0) + cost
+    _ip_jobs[ip] = _ip_jobs.get(ip, 0) + 1
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Charge IP when jobs complete
+    queue.set_on_complete(lambda job: _charge_ip(job.client_ip, job.token_cost) if job.client_ip else None)
     yield
 
 
@@ -190,12 +219,18 @@ async def terms():
 # ── Job-based pipeline ──
 
 @app.post("/api/preview")
-async def preview_mesh(file: UploadFile = File(...)):
+async def preview_mesh(request: Request, file: UploadFile = File(...)):
     """Upload a mesh and return raw geometry for 3D preview (no pipeline).
 
     Also returns complexity estimate and token cost prediction.
     """
     import trimesh
+
+    # Check IP limits before processing
+    ip = _get_client_ip(request)
+    ok, reason = _check_ip_limit(ip)
+    if not ok:
+        return JSONResponse({"status": "error", "error": reason}, status_code=403)
 
     content = await file.read()
     suffix = Path(file.filename).suffix
@@ -310,9 +345,13 @@ async def preview_mesh(file: UploadFile = File(...)):
 
 
 @app.post("/api/run-pipeline")
-async def run_pipeline(body: dict):
+async def run_pipeline(request: Request, body: dict):
     """Run the full pipeline on a previously previewed mesh. Takes temp_path from /api/preview."""
     plan = "free"
+    ip = _get_client_ip(request)
+    ok, reason = _check_ip_limit(ip, plan)
+    if not ok:
+        return JSONResponse({"status": "error", "error": reason}, status_code=403)
     limit = PLAN_TOKENS.get(plan, 100)
     if queue.tokens_spent >= limit:
         return JSONResponse(
@@ -325,14 +364,18 @@ async def run_pipeline(body: dict):
     if not temp_path or not Path(temp_path).exists():
         return JSONResponse({"status": "error", "error": "No mesh to process. Upload first."}, status_code=400)
 
-    job_id = queue.submit(filename, temp_path)
+    job_id = queue.submit(filename, temp_path, client_ip=ip)
     return {"status": "queued", "job_id": job_id}
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(request: Request, file: UploadFile = File(...)):
     """Submit a mesh for pipeline processing. Returns a job ID to poll."""
     plan = "free"
+    ip = _get_client_ip(request)
+    ok, reason = _check_ip_limit(ip, plan)
+    if not ok:
+        return JSONResponse({"status": "error", "error": reason}, status_code=403)
     limit = PLAN_TOKENS.get(plan, 100)
     if queue.tokens_spent >= limit:
         return JSONResponse(
@@ -353,7 +396,7 @@ async def upload(file: UploadFile = File(...)):
     tmp.write(content)
     tmp.close()
 
-    job_id = queue.submit(file.filename, tmp.name)
+    job_id = queue.submit(file.filename, tmp.name, client_ip=ip)
     return {"status": "queued", "job_id": job_id}
 
 
@@ -472,10 +515,11 @@ async def progress_legacy():
 
 
 @app.get("/api/usage")
-async def usage_status():
+async def usage_status(request: Request):
     import time as _time
     plan = "free"
     limit = PLAN_TOKENS.get(plan, 100)
+    ip = _get_client_ip(request)
     now = _time.time()
 
     # Compute daily/weekly/monthly usage from job history
@@ -506,6 +550,8 @@ async def usage_status():
         "weekly": weekly,
         "monthly": monthly,
         "total_jobs": total_jobs,
+        "ip_tokens": _ip_tokens.get(ip, 0),
+        "ip_jobs": _ip_jobs.get(ip, 0),
     }
 
 

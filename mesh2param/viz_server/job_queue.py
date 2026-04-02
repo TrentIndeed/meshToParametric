@@ -28,6 +28,7 @@ class Job:
     id: str
     filename: str
     file_path: str  # temp file path
+    client_ip: str = ""  # for per-IP billing
     status: str = "queued"  # queued | processing | done | error
     progress: int = 0
     progress_stage: str = "Queued"
@@ -54,15 +55,20 @@ class JobQueue:
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
         self._tokens_spent = 0
+        self._on_complete = None  # callback: fn(job) called when job finishes
+
+    def set_on_complete(self, fn):
+        """Set a callback for when a job completes. fn(job) is called."""
+        self._on_complete = fn
 
     @property
     def tokens_spent(self) -> int:
         return self._tokens_spent
 
-    def submit(self, filename: str, file_path: str) -> str:
+    def submit(self, filename: str, file_path: str, client_ip: str = "") -> str:
         """Submit a new job. Returns job ID."""
         job_id = uuid.uuid4().hex[:12]
-        job = Job(id=job_id, filename=filename, file_path=file_path)
+        job = Job(id=job_id, filename=filename, file_path=file_path, client_ip=client_ip)
 
         with self._lock:
             self._jobs[job_id] = job
@@ -196,6 +202,13 @@ with open(r'{tmp_out.name}', 'wb') as f:
         self._tokens_spent += cost
 
         job.status = "done"
+
+        # Notify callback (for per-IP billing)
+        if self._on_complete:
+            try:
+                self._on_complete(job)
+            except Exception:
+                pass
 
     @staticmethod
     def _estimate_volume(cleaned) -> float:

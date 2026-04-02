@@ -489,6 +489,47 @@ def _build_stepwise(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
 
+    # --- Large chamfers BEFORE holes (corner bevels > 2mm) ---
+    # Applied to the clean extrusion before holes are cut.
+    # Select only edges longer than 2× the chamfer size to avoid
+    # failing on short profile segments.
+    if chamfers:
+        chamfer_sizes = [cf.sketch_geometry.get("width", 0) for cf in chamfers if cf.sketch_geometry.get("width", 0) > 0.1]
+        large_chamfers = [w for w in chamfer_sizes if w > 2.0]
+        if large_chamfers:
+            large_size = float(min(large_chamfers))
+            large_size = max(1.0, min(large_size, 10.0))
+            abs_dir = np.abs(extrude_dir)
+            axis_char = ["X", "Y", "Z"][int(np.argmax(abs_dir))]
+            applied_large = False
+
+            # Try each axis direction and size, filtering by edge length
+            for attempt in [large_size, large_size * 0.7, large_size * 0.5, 2.0, 1.5]:
+                for sel in [f"|{axis_char}", "|X", "|Y", "|Z"]:
+                    try:
+                        # Select edges longer than 2× chamfer size
+                        min_len = attempt * 2.5
+                        wp_test = wp.edges(sel).filter(lambda e: e.Length() > min_len).chamfer(attempt)
+                        vol_test = abs(float(wp_test.val().Volume()))
+                        if vol_test > 0:
+                            wp = wp_test
+                            v, f = _tessellate_solid(wp)
+                            steps.append(ConstructionStep(
+                                name=f"Corner Chamfer ({attempt:.1f}mm)",
+                                tess_vertices=v, tess_faces=f, volume=vol_test,
+                            ))
+                            script_lines.append(f'# Large chamfers on long {sel} edges (before holes)')
+                            script_lines.append(f'result = result.edges("{sel}").chamfer({attempt:.4f})')
+                            applied_large = True
+                            break
+                    except Exception:
+                        continue
+                if applied_large:
+                    break
+
+            if not applied_large:
+                logger.info("Large corner chamfers failed — short profile edges prevent it")
+
     # Reorder holes
     if build_order is not None and len(holes) > 0:
         ordered = []
@@ -569,19 +610,12 @@ def _build_stepwise(
         except Exception as e:
             logger.warning("Failed to cut hole %d: %s", i, e)
 
-    # --- Chamfers: detected but noted in script ---
-    # CadQuery can't reliably chamfer edges on complex solids with holes
-    # (hole rim edges interfere). The chamfers are recorded in the feature
-    # tree and script for documentation purposes.
+    # --- Small chamfers AFTER holes (countersinks ≤ 2mm) ---
     if chamfers:
         chamfer_sizes = [cf.sketch_geometry.get("width", 0) for cf in chamfers if cf.sketch_geometry.get("width", 0) > 0.1]
-        if chamfer_sizes:
-            unique_sizes = sorted(set(round(w, 1) for w in chamfer_sizes))
-            script_lines.append(f"# {len(chamfers)} chamfers detected: {unique_sizes} mm")
-            script_lines.append(f"# Apply before holes for large corner bevels, after for countersinks")
-
-            # Try to apply at least small chamfers on straight edges
-            small_size = float(min(chamfer_sizes))
+        small_chamfers = [w for w in chamfer_sizes if w <= 2.0]
+        if small_chamfers:
+            small_size = float(min(small_chamfers))
             small_size = max(0.2, min(small_size, 2.0))
             applied = False
             for attempt in [small_size, small_size * 0.5, 0.5, 0.3]:
@@ -592,9 +626,8 @@ def _build_stepwise(
                         if vol_test > 0:
                             wp = wp_test
                             v, f = _tessellate_solid(wp)
-                            sizes_str = "/".join(str(s) for s in unique_sizes)
                             steps.append(ConstructionStep(
-                                name=f"Chamfer ({sizes_str}mm × {len(chamfers)} features)",
+                                name=f"Edge Chamfer ({attempt:.1f}mm)",
                                 tess_vertices=v, tess_faces=f, volume=vol_test,
                             ))
                             script_lines.append(f'result = result.edges("{sel}").chamfer({attempt:.4f})')
@@ -604,8 +637,6 @@ def _build_stepwise(
                         continue
                 if applied:
                     break
-            if not applied:
-                logger.info("Chamfer edges failed — %d chamfers in feature tree only", len(chamfers))
 
     # --- Fillets: same progressive approach ---
     if fillets:

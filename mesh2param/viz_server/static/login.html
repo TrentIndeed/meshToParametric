@@ -67,6 +67,15 @@ body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,s
 <script>
 let mode = 'login';
 
+// Default to signup if URL has mode=signup or came from free trial link
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('mode') === 'signup') {
+    mode = 'signup';
+    document.addEventListener('DOMContentLoaded', () => switchTab('signup'));
+  }
+})();
+
 function switchTab(m) {
   mode = m;
   document.getElementById('tab-login').classList.toggle('active', m === 'login');

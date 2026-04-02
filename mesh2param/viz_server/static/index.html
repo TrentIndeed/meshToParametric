@@ -521,7 +521,7 @@ body {
 // Auth gate: redirect to login if no token cookie
 (function() {
   const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
-  if (!token) window.location.href = '/login?next=/app';
+  if (!token) window.location.href = '/login?next=/app&mode=signup';
 })();
 </script>
 <script type="importmap">

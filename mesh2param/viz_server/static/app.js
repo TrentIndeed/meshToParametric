@@ -5,6 +5,11 @@ import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/exampl
 let currentStep = -1;
 let steps = [];
 let currentJobId = null;
+// Expose for automation
+Object.defineProperty(window, '_currentJobId', {
+  get() { return currentJobId; },
+  set(v) { currentJobId = v; },
+});
 
 // ── Three.js Setup ──
 const container = document.getElementById('viewer');
@@ -85,6 +90,12 @@ createGrid();
 let modelGroup = new THREE.Group();
 scene.add(modelGroup);
 
+// Expose for automation/testing
+window._camera = camera;
+window._controls = controls;
+window._modelGroup = modelGroup;
+window._THREE = THREE;
+
 // ── Load step geometry ──
 async function loadStep(index) {
   const url = currentJobId ? `/api/job/${currentJobId}/step/${index}` : `/api/step/${index}`;
@@ -132,10 +143,8 @@ async function loadStep(index) {
     mesh.receiveShadow = true;
     modelGroup.add(mesh);
 
-    // Feature edges only (hide internal triangle diagonals)
-    const edgeGeo = new THREE.EdgesGeometry(geo, 25);
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x2D3436, linewidth: 1.5 });
-    modelGroup.add(new THREE.LineSegments(edgeGeo, edgeMat));
+    // Skip wireframe edges entirely for clean CAD look.
+    // PBR material shading defines edges naturally through lighting.
   }
 
   // Center and fit camera on first load
@@ -154,6 +163,8 @@ async function loadStep(index) {
   updateActiveStates();
   document.getElementById('empty-state').style.display = 'none';
 }
+
+window._loadStep = loadStep;
 
 // ── UI Updates ──
 function updateActiveStates() {

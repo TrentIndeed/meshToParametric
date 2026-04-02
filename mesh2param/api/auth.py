@@ -72,5 +72,29 @@ def verify_token(token: str, db: Session = Depends(get_db)):
     users = db.query(User).all()
     for user in users:
         if _make_token(user.username) == token:
-            return {"status": "ok", "username": user.username}
+            return {"status": "ok", "username": user.username, "plan": user.plan or "free"}
     raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# ── Developer accounts ──
+DEVELOPER_USERNAMES = {"123"}
+
+
+def get_user_by_token(token: str, db: Session) -> User | None:
+    """Look up a user by their auth token. Returns None if not found."""
+    for user in db.query(User).all():
+        if _make_token(user.username) == token:
+            return user
+    return None
+
+
+def get_user_plan(token: str, db: Session) -> str:
+    """Return the plan for the user identified by token."""
+    user = get_user_by_token(token, db)
+    if user is None:
+        return "free"
+    # Auto-promote developer accounts
+    if user.username in DEVELOPER_USERNAMES and user.plan != "developer":
+        user.plan = "developer"
+        db.commit()
+    return user.plan or "free"

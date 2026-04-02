@@ -142,7 +142,7 @@ def export_cadquery(
         mesh_volume, cad_volume, volume_error, status,
     )
 
-    return CadQueryResult(
+    result = CadQueryResult(
         solid=solid,
         tess_vertices=tess_verts,
         tess_faces=tess_faces,
@@ -154,6 +154,21 @@ def export_cadquery(
         volume_error_pct=volume_error,
         status=status,
     )
+
+    # Visual verification via LLM (compares CAD result to original mesh)
+    if use_llm and tess_verts is not None:
+        try:
+            verification = _llm_visual_verify(result, cleaned)
+            if verification and not verification.get("pass", True):
+                logger.warning(
+                    "LLM visual verification FAILED: %s",
+                    verification.get("issues", "unknown"),
+                )
+                result.status = "VISUAL_MISMATCH"
+        except Exception as e:
+            logger.info("Visual verification skipped: %s", e)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +294,148 @@ class BuildPlan:
     feature_order: list[int]  # feature indices in construction order
     notes: dict[int, str] = field(default_factory=dict)  # per-feature notes
     strategy: str = ""  # overall construction strategy description
+
+
+def _llm_visual_verify(
+    result: CadQueryResult,
+    cleaned: CleanedMesh,
+) -> dict | None:
+    """Render the CAD result and original mesh, ask Claude to compare them.
+
+    Renders both from 3 angles (top-iso, front, bottom), composites into
+    a comparison image, and sends to Claude for visual QA.
+
+    Returns dict with {"pass": bool, "issues": str, "score": int} or None.
+    """
+    from mesh2param.ai import is_available, call_ai_vision
+
+    if not is_available():
+        return None
+
+    import tempfile
+    import os
+
+    # Render comparison images using matplotlib (no VTK needed)
+    try:
+        img_path = _render_comparison_images(result, cleaned)
+    except Exception as e:
+        logger.info("Could not render comparison images: %s", e)
+        return None
+
+    prompt = """Compare these two 3D models shown side by side from multiple angles.
+
+LEFT = Original mesh (input)
+RIGHT = Reconstructed CAD model (output)
+
+Check for these issues:
+1. Missing features (holes, chamfers, fillets not present in CAD)
+2. Wrong proportions (CAD too thin/thick/wide/narrow)
+3. Hollow surfaces (faces that should be solid appear as wireframe/transparent)
+4. Extra geometry not in the original
+5. Misplaced features (holes in wrong position)
+
+Volume comparison is already done numerically — focus on VISUAL shape match.
+
+Respond with ONLY this JSON:
+{
+  "pass": true/false,
+  "score": 1-10 (10 = perfect match),
+  "issues": "comma-separated list of issues, or 'none'"
+}"""
+
+    try:
+        response = call_ai_vision(prompt, [img_path], timeout=90)
+        # Parse JSON
+        text = response.strip()
+        if text.startswith("```"):
+            text = "\n".join(text.split("\n")[1:])
+        if text.endswith("```"):
+            text = "\n".join(text.split("\n")[:-1])
+
+        import json
+        data = json.loads(text)
+        logger.info(
+            "Visual verification: pass=%s, score=%s, issues=%s",
+            data.get("pass"), data.get("score"), data.get("issues"),
+        )
+        return data
+
+    except Exception as e:
+        logger.info("Visual verification LLM call failed: %s", e)
+        return None
+    finally:
+        try:
+            os.unlink(img_path)
+        except Exception:
+            pass
+
+
+def _render_comparison_images(
+    result: CadQueryResult,
+    cleaned: CleanedMesh,
+) -> str:
+    """Render original mesh and CAD result side by side from 3 angles.
+
+    Uses matplotlib's 3D projection (no VTK/PyVista needed).
+    Returns path to the saved comparison image.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    import tempfile
+
+    final = result.construction_steps[-1] if result.construction_steps else None
+    if final is None or final.tess_vertices is None:
+        raise ValueError("No tessellated CAD result")
+
+    # Camera angles: (elevation, azimuth)
+    angles = [
+        (30, -60, "Top-Iso"),
+        (0, -90, "Front"),
+        (-30, -120, "Bottom-Iso"),
+    ]
+
+    fig, axes = plt.subplots(len(angles), 2, figsize=(14, 5 * len(angles)),
+                             subplot_kw={"projection": "3d"})
+    fig.patch.set_facecolor("#1A1A2E")
+
+    def _plot_mesh(ax, verts, faces, title, elev, azim):
+        ax.set_facecolor("#1A1A2E")
+        tris = verts[faces]
+        pc = Poly3DCollection(tris, alpha=0.9, edgecolor="#2D3436",
+                              linewidth=0.1, facecolor="#8899AA")
+        ax.add_collection3d(pc)
+
+        # Set limits from data
+        mins = verts.min(axis=0)
+        maxs = verts.max(axis=0)
+        center = (mins + maxs) / 2
+        span = (maxs - mins).max() / 2 * 1.2
+        ax.set_xlim(center[0] - span, center[0] + span)
+        ax.set_ylim(center[1] - span, center[1] + span)
+        ax.set_zlim(center[2] - span, center[2] + span)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(title, color="#E2E8F0", fontsize=10, pad=2)
+        ax.set_axis_off()
+
+    for row, (elev, azim, label) in enumerate(angles):
+        # Original mesh (left)
+        _plot_mesh(axes[row, 0], cleaned.vertices, cleaned.faces,
+                   f"Original - {label}", elev, azim)
+        # CAD result (right)
+        _plot_mesh(axes[row, 1], final.tess_vertices, final.tess_faces,
+                   f"CAD - {label}", elev, azim)
+
+    plt.suptitle("Visual Verification: Original vs CAD",
+                 color="#E2E8F0", fontsize=14, y=0.98)
+    plt.tight_layout()
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    fig.savefig(tmp.name, dpi=120, facecolor=fig.get_facecolor(),
+                bbox_inches="tight")
+    plt.close(fig)
+    return tmp.name
 
 
 def _llm_plan_build_order(
@@ -490,46 +647,40 @@ def _build_stepwise(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
 
-    # --- Large chamfers BEFORE holes (corner bevels > 2mm) ---
-    # Applied to the clean extrusion before holes are cut.
-    # Select only edges longer than 2× the chamfer size to avoid
-    # failing on short profile segments.
-    if chamfers:
-        chamfer_sizes = [cf.sketch_geometry.get("width", 0) for cf in chamfers if cf.sketch_geometry.get("width", 0) > 0.1]
-        large_chamfers = [w for w in chamfer_sizes if w > 2.0]
-        if large_chamfers:
-            large_size = float(min(large_chamfers))
-            large_size = max(1.0, min(large_size, 10.0))
-            abs_dir = np.abs(extrude_dir)
-            axis_char = ["X", "Y", "Z"][int(np.argmax(abs_dir))]
-            applied_large = False
-
-            # Try each axis direction and size, filtering by edge length
-            for attempt in [large_size, large_size * 0.7, large_size * 0.5, 2.0, 1.5]:
-                for sel in [f"|{axis_char}", "|X", "|Y", "|Z"]:
-                    try:
-                        # Select edges longer than 2× chamfer size
-                        min_len = attempt * 2.5
-                        wp_test = wp.edges(sel).filter(lambda e: e.Length() > min_len).chamfer(attempt)
-                        vol_test = abs(float(wp_test.val().Volume()))
-                        if vol_test > 0:
-                            wp = wp_test
-                            v, f = _tessellate_solid(wp)
-                            steps.append(ConstructionStep(
-                                name=f"Corner Chamfer ({attempt:.1f}mm)",
-                                tess_vertices=v, tess_faces=f, volume=vol_test,
-                            ))
-                            script_lines.append(f'# Large chamfers on long {sel} edges (before holes)')
-                            script_lines.append(f'result = result.edges("{sel}").chamfer({attempt:.4f})')
-                            applied_large = True
-                            break
-                    except Exception:
-                        continue
-                if applied_large:
+    # --- Chamfers BEFORE holes ---
+    # Detect chamfer faces directly from mesh geometry (diagonal normals),
+    # match each group to CadQuery edges, and apply individually.
+    # This is general-purpose: works for any prismatic part.
+    mesh_chamfers = _detect_mesh_chamfers(cleaned, extrude_dir)
+    for cham in mesh_chamfers:
+        d1 = cham["size"]
+        d2 = cham.get("size2", d1)
+        sel = cham["selector"]
+        label = cham["label"]
+        # Try asymmetric first, then progressively smaller
+        attempts = [(d1, d2), (d1 * 0.8, d2 * 0.8), (d1 * 0.6, d2 * 0.6)]
+        for a1, a2 in attempts:
+            try:
+                min_len = min(a1, a2) * 2.0
+                edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
+                if abs(a1 - a2) / max(a1, a2) < 0.15:
+                    wp_test = edges.chamfer(min(a1, a2))
+                else:
+                    wp_test = edges.chamfer(a1, a2)
+                vol_test = abs(float(wp_test.val().Volume()))
+                if vol_test > 0:
+                    wp = wp_test
+                    v, f = _tessellate_solid(wp)
+                    cham_label = f"{a1:.1f}x{a2:.1f}" if abs(a1-a2) > 0.5 else f"{min(a1,a2):.1f}"
+                    steps.append(ConstructionStep(
+                        name=f"Chamfer {label} ({cham_label}mm)",
+                        tess_vertices=v, tess_faces=f, volume=vol_test,
+                    ))
+                    script_lines.append(f'# Chamfer {label}')
+                    script_lines.append(f'result = result.edges("{sel}").chamfer({a1:.4f}, {a2:.4f})')
                     break
-
-            if not applied_large:
-                logger.info("Large corner chamfers failed — short profile edges prevent it")
+            except Exception:
+                continue
 
     # Reorder holes
     if build_order is not None and len(holes) > 0:
@@ -611,33 +762,7 @@ def _build_stepwise(
         except Exception as e:
             logger.warning("Failed to cut hole %d: %s", i, e)
 
-    # --- Small chamfers AFTER holes (countersinks ≤ 2mm) ---
-    if chamfers:
-        chamfer_sizes = [cf.sketch_geometry.get("width", 0) for cf in chamfers if cf.sketch_geometry.get("width", 0) > 0.1]
-        small_chamfers = [w for w in chamfer_sizes if w <= 2.0]
-        if small_chamfers:
-            small_size = float(min(small_chamfers))
-            small_size = max(0.2, min(small_size, 2.0))
-            applied = False
-            for attempt in [small_size, small_size * 0.5, 0.5, 0.3]:
-                for sel in ["|X", "|Y", ">Z", "<Z"]:
-                    try:
-                        wp_test = wp.edges(sel).chamfer(attempt)
-                        vol_test = abs(float(wp_test.val().Volume()))
-                        if vol_test > 0:
-                            wp = wp_test
-                            v, f = _tessellate_solid(wp)
-                            steps.append(ConstructionStep(
-                                name=f"Edge Chamfer ({attempt:.1f}mm)",
-                                tess_vertices=v, tess_faces=f, volume=vol_test,
-                            ))
-                            script_lines.append(f'result = result.edges("{sel}").chamfer({attempt:.4f})')
-                            applied = True
-                            break
-                    except Exception:
-                        continue
-                if applied:
-                    break
+    # (Small chamfers are now handled by _detect_mesh_chamfers above)
 
     # --- Fillets: same progressive approach ---
     if fillets:
@@ -1066,22 +1191,437 @@ def _build_solid(
 
 
 def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Tessellate a CadQuery solid into vertices and faces for visualization.
+    """Tessellate a CadQuery solid for visualization.
 
-    Uses CadQuery's built-in tessellation which respects flat B-rep faces
-    better than STL export. Flat planar faces get minimal triangles.
+    Uses per-face triangulation: extracts each B-rep face, gets its boundary
+    wire points, and triangulates with Constrained Delaunay (CDT) for planar
+    faces.  This guarantees interior triangles for large flat surfaces that
+    OCCT's BRepMesh otherwise leaves hollow.
+    Curved faces use standard BRepMesh triangulation.
     """
     try:
-        import cadquery as cq
-        tess = solid.val().tessellate(tolerance=1.0, angularTolerance=0.3)
-        verts = np.array([(v.x, v.y, v.z) for v in tess[0]], dtype=np.float64)
-        faces = np.array(tess[1], dtype=np.int64)
-        if len(verts) == 0 or len(faces) == 0:
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE, TopAbs_REVERSED
+        from OCP.TopoDS import TopoDS
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.GeomAbs import GeomAbs_Plane
+        from OCP.TopLoc import TopLoc_Location
+        from OCP.BRepTools import BRepTools_WireExplorer
+        from OCP.GCPnts import GCPnts_UniformDeflection
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from scipy.spatial import Delaunay
+        import shapely.geometry as sg
+
+        shape = solid.val().wrapped
+
+        # First run BRepMesh to get baseline triangulation for curved faces
+        BRepMesh_IncrementalMesh(shape, 0.1, False, 0.5, True)
+
+        all_verts = []
+        all_faces = []
+        vert_offset = 0
+
+        face_exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while face_exp.More():
+            face = TopoDS.Face_s(face_exp.Current())
+            face_exp.Next()
+            adaptor = BRepAdaptor_Surface(face)
+            is_planar = adaptor.GetType() == GeomAbs_Plane
+
+            if is_planar:
+                # Extract face boundary wires and triangulate manually
+                v, f = _triangulate_planar_face(face)
+                if v is not None and len(f) > 0:
+                    all_verts.append(v)
+                    all_faces.append(f + vert_offset)
+                    vert_offset += len(v)
+                    continue
+
+            # Use BRepMesh triangulation for curved faces or fallback
+            loc = TopLoc_Location()
+            tri = BRep_Tool.Triangulation_s(face, loc)
+            if tri is None:
+                continue
+            trsf = loc.Transformation()
+            n_nodes = tri.NbNodes()
+            n_tris = tri.NbTriangles()
+            verts = np.empty((n_nodes, 3), dtype=np.float64)
+            for i in range(1, n_nodes + 1):
+                pt = tri.Node(i).Transformed(trsf)
+                verts[i - 1] = [pt.X(), pt.Y(), pt.Z()]
+            faces = np.empty((n_tris, 3), dtype=np.int64)
+            reversed_face = face.Orientation() == TopAbs_REVERSED
+            for i in range(1, n_tris + 1):
+                t = tri.Triangle(i)
+                i1, i2, i3 = t.Get()
+                if reversed_face:
+                    faces[i - 1] = [i1 - 1, i3 - 1, i2 - 1]
+                else:
+                    faces[i - 1] = [i1 - 1, i2 - 1, i3 - 1]
+            all_verts.append(verts)
+            all_faces.append(faces + vert_offset)
+            vert_offset += n_nodes
+
+        if not all_verts:
             return None, None
-        return verts, faces
+
+        return np.vstack(all_verts), np.vstack(all_faces)
+
     except Exception as e:
-        logger.warning("Tessellation failed: %s", e)
+        logger.warning("Per-face tessellation failed: %s — falling back to STL", e)
+        return _tessellate_solid_stl(solid)
+
+
+def _triangulate_planar_face(face) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Triangulate a planar B-rep face using its boundary wire + Delaunay.
+
+    Extracts outer wire + hole wires, projects to 2D (the face's plane),
+    runs constrained Delaunay, filters out triangles outside the boundary,
+    and maps back to 3D.
+    """
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_WIRE, TopAbs_REVERSED
+    from OCP.TopoDS import TopoDS
+    from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.GCPnts import GCPnts_UniformDeflection
+    from OCP.BRep import BRep_Tool
+    from scipy.spatial import Delaunay
+    try:
+        import shapely.geometry as sg
+    except ImportError:
         return None, None
+
+    adaptor = BRepAdaptor_Surface(face)
+    plane = adaptor.Plane()
+    origin = plane.Location()
+    ax = plane.Position()
+    dx = ax.XDirection()
+    dy = ax.YDirection()
+
+    ox, oy, oz = origin.X(), origin.Y(), origin.Z()
+    dxx, dxy, dxz = dx.X(), dx.Y(), dx.Z()
+    dyx, dyy, dyz = dy.X(), dy.Y(), dy.Z()
+
+    def to_2d(pt3d):
+        rx, ry, rz = pt3d[0] - ox, pt3d[1] - oy, pt3d[2] - oz
+        return (rx * dxx + ry * dxy + rz * dxz,
+                rx * dyx + ry * dyy + rz * dyz)
+
+    def to_3d(u, v):
+        return np.array([ox + u * dxx + v * dyx,
+                         oy + u * dxy + v * dyy,
+                         oz + u * dxz + v * dyz])
+
+    # Collect wires — careful about edge orientation within the wire
+    from OCP.TopAbs import TopAbs_FORWARD
+    wires_3d = []
+    wire_exp = TopExp_Explorer(face, TopAbs_WIRE)
+    while wire_exp.More():
+        wire = TopoDS.Wire_s(wire_exp.Current())
+        wire_exp.Next()
+        pts_3d = []
+        edge_exp = BRepTools_WireExplorer(wire)
+        while edge_exp.More():
+            edge = TopoDS.Edge_s(edge_exp.Current())
+            edge_exp.Next()
+            curve = BRepAdaptor_Curve(edge)
+            discretizer = GCPnts_UniformDeflection(curve, 0.5, True)
+            if not discretizer.IsDone():
+                continue
+            edge_pts = []
+            for j in range(1, discretizer.NbPoints() + 1):
+                p = discretizer.Value(j)
+                edge_pts.append([p.X(), p.Y(), p.Z()])
+            # BRepAdaptor_Curve always parametrizes in the edge's natural direction.
+            # If the edge is reversed in the wire, we need to flip the points.
+            if edge.Orientation() != TopAbs_FORWARD:
+                edge_pts = edge_pts[::-1]
+            # Skip the last point to avoid duplicating the shared vertex
+            # with the next edge
+            pts_3d.extend(edge_pts[:-1] if len(edge_pts) > 1 else edge_pts)
+        if len(pts_3d) >= 3:
+            wires_3d.append(np.array(pts_3d))
+
+    if not wires_3d:
+        return None, None
+
+    # Project all wires to 2D
+    wires_2d = []
+    for w in wires_3d:
+        pts2 = np.array([to_2d(p) for p in w])
+        wires_2d.append(pts2)
+
+    # Identify outer wire (largest area polygon)
+    polys = []
+    for pts2 in wires_2d:
+        ring = np.vstack([pts2, pts2[0:1]])  # close
+        polys.append(sg.Polygon(ring))
+
+    outer_idx = max(range(len(polys)), key=lambda i: abs(polys[i].area))
+    outer_poly = polys[outer_idx]
+    if not outer_poly.is_valid:
+        outer_poly = outer_poly.buffer(0)
+
+    hole_polys = [polys[i] for i in range(len(polys)) if i != outer_idx]
+
+    # Build shapely polygon with holes for point-in-polygon tests
+    try:
+        holes_coords = [list(hp.exterior.coords) for hp in hole_polys if hp.is_valid]
+        boundary = sg.Polygon(outer_poly.exterior.coords, holes=holes_coords)
+        if not boundary.is_valid:
+            boundary = boundary.buffer(0)
+    except Exception:
+        boundary = outer_poly
+
+    # Collect all boundary points for Delaunay
+    all_pts_2d = []
+    for pts2 in wires_2d:
+        all_pts_2d.extend(pts2.tolist())
+
+    # Add interior grid points for better triangulation of large faces
+    bounds = boundary.bounds  # (minx, miny, maxx, maxy)
+    dx_span = bounds[2] - bounds[0]
+    dy_span = bounds[3] - bounds[1]
+    grid_step = max(dx_span, dy_span) / 20.0  # ~20 divisions
+    if grid_step > 0.1:
+        xs = np.arange(bounds[0] + grid_step, bounds[2], grid_step)
+        ys = np.arange(bounds[1] + grid_step, bounds[3], grid_step)
+        for x in xs:
+            for y in ys:
+                pt = sg.Point(x, y)
+                if boundary.contains(pt):
+                    all_pts_2d.append([x, y])
+
+    pts_2d = np.array(all_pts_2d)
+    if len(pts_2d) < 3:
+        return None, None
+
+    # Remove near-duplicate points
+    from scipy.spatial import cKDTree
+    tree = cKDTree(pts_2d)
+    pairs = tree.query_pairs(r=1e-6)
+    remove = set()
+    for i, j in pairs:
+        remove.add(max(i, j))
+    keep = sorted(set(range(len(pts_2d))) - remove)
+    pts_2d = pts_2d[keep]
+
+    if len(pts_2d) < 3:
+        return None, None
+
+    # Delaunay triangulation
+    tri = Delaunay(pts_2d)
+    faces = tri.simplices
+
+    # Filter: keep only triangles whose centroid is inside the boundary
+    centroids = pts_2d[faces].mean(axis=1)
+    keep_mask = np.array([
+        boundary.contains(sg.Point(c[0], c[1])) for c in centroids
+    ])
+    faces = faces[keep_mask]
+
+    if len(faces) == 0:
+        return None, None
+
+    # Map back to 3D
+    verts_3d = np.array([to_3d(u, v) for u, v in pts_2d])
+
+    # Compute the face outward normal from the plane
+    nz = ax.Direction()
+    face_normal = np.array([nz.X(), nz.Y(), nz.Z()])
+    reversed_face = face.Orientation() == TopAbs_REVERSED
+    if reversed_face:
+        face_normal = -face_normal
+
+    # Ensure all triangles have normals consistent with the face normal.
+    # Compute triangle normals and flip any that point the wrong way.
+    v0 = verts_3d[faces[:, 0]]
+    v1 = verts_3d[faces[:, 1]]
+    v2 = verts_3d[faces[:, 2]]
+    tri_normals = np.cross(v1 - v0, v2 - v0)
+    dots = np.einsum('ij,j->i', tri_normals, face_normal)
+    flip_mask = dots < 0
+    faces[flip_mask] = faces[flip_mask][:, ::-1]
+
+    return verts_3d, faces
+
+
+def _tessellate_solid_stl(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Fallback: tessellate via STL export."""
+    try:
+        import cadquery as cq
+        import tempfile
+        import os
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            cq.exporters.export(solid, tmp_path, exportType="STL",
+                                tolerance=0.01, angularTolerance=0.05)
+            mesh = trimesh.load(tmp_path)
+            if hasattr(mesh, 'geometry'):
+                mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+            return np.array(mesh.vertices, dtype=np.float64), np.array(mesh.faces, dtype=np.int64)
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        logger.warning("STL tessellation failed: %s", e)
+        return None, None
+
+
+def _detect_mesh_chamfers(
+    cleaned: CleanedMesh, extrude_dir: np.ndarray,
+) -> list[dict]:
+    """Detect all chamfer edges from the mesh by analyzing diagonal-normal faces.
+
+    General-purpose: works on any prismatic part. Clusters diagonal faces by
+    normal direction, computes the chamfer size from each cluster's face width,
+    and determines the correct CadQuery edge selector by analyzing which two
+    principal faces each chamfer sits between.
+
+    Returns a list of dicts: [{"size": mm, "selector": "|Y and <Z", "label": "bottom Y"}, ...]
+    """
+    from sklearn.cluster import DBSCAN
+
+    normals = cleaned.normals
+    ext = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
+    bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+
+    # Find faces whose normal is NOT axis-aligned (diagonal → chamfer face).
+    # A chamfer face sits between two principal faces, so its normal has
+    # significant components in exactly 2 principal directions.
+    abs_normals = np.abs(normals)
+    # Sort each row: chamfer faces have 2 large and 1 small component
+    sorted_abs = np.sort(abs_normals, axis=1)
+    # Two largest > 0.3, smallest < 0.3
+    diagonal_mask = (sorted_abs[:, 1] > 0.3) & (sorted_abs[:, 2] > 0.3) & (sorted_abs[:, 0] < 0.3)
+
+    if diagonal_mask.sum() < 5:
+        return []
+
+    diag_indices = np.where(diagonal_mask)[0]
+    diag_normals = normals[diag_indices]
+
+    # Cluster by normal direction — each cluster = one chamfer edge group
+    clustering = DBSCAN(eps=0.25, min_samples=3).fit(diag_normals)
+    labels = clustering.labels_
+
+    results = []
+    for label in set(labels):
+        if label == -1:
+            continue
+        cluster_idx = diag_indices[labels == label]
+        if len(cluster_idx) < 20:
+            continue  # skip tiny clusters (transition artifacts, not real chamfers)
+
+        avg_normal = normals[cluster_idx].mean(axis=0)
+        avg_normal /= (np.linalg.norm(avg_normal) + 1e-15)
+
+        # Determine which two principal faces this chamfer sits between.
+        abs_avg = np.abs(avg_normal)
+        edge_axis_idx = int(np.argmin(abs_avg))  # axis the edge is parallel to
+        edge_axis = ["X", "Y", "Z"][edge_axis_idx]
+
+        # The two face axes (the ones with large normal components)
+        face_axes = sorted([i for i in range(3) if i != edge_axis_idx],
+                           key=lambda i: abs_avg[i])
+
+        # Determine top/bottom: which side of the extrude direction?
+        ext_axis_idx = int(np.argmax(np.abs(ext)))
+        ext_component = avg_normal[ext_axis_idx]
+        ext_char = ["X", "Y", "Z"][ext_axis_idx]
+
+        if abs(ext_component) > 0.2:
+            face_filter = f"<{ext_char}" if ext_component < 0 else f">{ext_char}"
+            selector = f"|{edge_axis} and {face_filter}"
+            side_label = "bottom" if ext_component < 0 else "top"
+        else:
+            # Chamfer between two side faces — profile shape, skip.
+            continue
+
+        # Compute chamfer dimensions from a cross-section at the edge
+        # midpoint. Measures both the inset into the flat face (d1) and
+        # the inset up the side face (d2) for asymmetric chamfer support.
+        verts = cleaned.vertices[cleaned.faces[cluster_idx].flatten()]
+
+        side_axis_idx = [i for i in range(3) if i != edge_axis_idx and i != ext_axis_idx][0]
+        side_sign = np.sign(avg_normal[side_axis_idx])
+
+        # Measure chamfer dimensions from the chamfer face geometry.
+        #
+        # d2 (inset into side face / along extrude dir) is measured reliably
+        # from the per-face extent along the extrude axis — the 90th percentile
+        # of per-face max values gives the chamfer boundary without outliers.
+        #
+        # d1 (inset into flat face) is computed from d2 and the chamfer angle,
+        # since direct vertex measurement is unreliable due to sparse tessellation.
+        face_ext_vals = []
+        for fi in cluster_idx:
+            tri_v = cleaned.vertices[cleaned.faces[fi]]
+            if ext_component < 0:
+                face_ext_vals.append(float(tri_v[:, ext_axis_idx].max()))
+            else:
+                face_ext_vals.append(float(tri_v[:, ext_axis_idx].min()))
+        face_ext_vals = np.array(face_ext_vals)
+
+        ext_boundary = float(cleaned.bbox[0][ext_axis_idx]) if ext_component < 0 else float(cleaned.bbox[1][ext_axis_idx])
+        if ext_component < 0:
+            d2 = float(np.percentile(face_ext_vals, 90)) - ext_boundary
+        else:
+            d2 = ext_boundary - float(np.percentile(face_ext_vals, 10))
+
+        # Compute d1 from the chamfer face angle.
+        # The normal [nx, ny, nz] tells us the angle: d1/d2 = |n_side|/|n_ext|
+        n_side = abs(avg_normal[side_axis_idx])
+        n_ext = abs(avg_normal[ext_axis_idx])
+        d1 = d2 * n_side / max(n_ext, 0.01)
+
+        if d1 < 0.3 or d2 < 0.3:
+            continue
+
+        chamfer_d1 = float(d1)
+        chamfer_d2 = float(d2)
+
+        label_str = f"{side_label} {edge_axis}"
+        logger.info(
+            "Chamfer group: %d faces, normal=[%.2f,%.2f,%.2f], "
+            "d1=%.1f d2=%.1f, edge=|%s, selector='%s'",
+            len(cluster_idx), *avg_normal, chamfer_d1, chamfer_d2,
+            edge_axis, selector,
+        )
+        results.append({
+            "size": float(chamfer_d1),
+            "size2": float(chamfer_d2),
+            "selector": selector,
+            "label": label_str,
+            "face_count": len(cluster_idx),
+        })
+
+    # If multiple chamfers share the same selector, average their sizes
+    # (they should be the same chamfer on parallel edges)
+    by_selector: dict[str, list[dict]] = {}
+    for r in results:
+        by_selector.setdefault(r["selector"], []).append(r)
+
+    merged = []
+    for sel, group in by_selector.items():
+        if len(group) > 1:
+            avg_d1 = float(np.mean([g["size"] for g in group]))
+            avg_d2 = float(np.mean([g["size2"] for g in group]))
+            merged.append({
+                "size": avg_d1, "size2": avg_d2,
+                "selector": sel, "label": group[0]["label"],
+                "face_count": sum(g["face_count"] for g in group),
+            })
+        else:
+            merged.append(group[0])
+
+    merged.sort(key=lambda x: -x["size"])
+    return merged
 
 
 def _estimate_mesh_volume(cleaned: CleanedMesh) -> float:

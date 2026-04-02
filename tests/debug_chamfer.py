@@ -1,5 +1,5 @@
-"""Debug large chamfers on Mesh2."""
-import pickle, sys
+"""Debug: try large chamfer on clean extrusion (before holes)."""
+import sys
 sys.path.insert(0, ".")
 import cadquery as cq
 import numpy as np
@@ -22,36 +22,29 @@ extrude_dir = np.array(tree.features[0].direction)
 depth = tree.features[0].depth
 profiles, start, holes, chamfers, fillets = _extract_profile_and_holes(tree, cleaned, extrude_dir)
 
-# Build solid with holes
+print("Profile:", len(profiles[0]), "points")
+
+# Build JUST the extrusion, no holes
 wp = cq.Workplane("XY", origin=(0, 0, start))
 wp = wp.polyline(profiles[0]).close().extrude(-depth)
+print("Extrusion vol:", round(wp.val().Volume()))
 
-for h in holes:
-    s = h.sketch_geometry
-    if s.get("type") != "circle":
-        continue
-    c = np.array(s["center"], dtype=float)
-    r = float(s["radius"])
-    hd = np.array(h.direction, dtype=float)
-    hd = hd / (np.linalg.norm(hd) + 1e-15)
-    bb2 = wp.val().BoundingBox()
-    corners = np.array([[bb2.xmin, bb2.ymin, bb2.zmin], [bb2.xmax, bb2.ymax, bb2.zmax]])
-    proj = corners @ hd
-    cs = c + hd * (float(proj.min()) - float(c @ hd) - 1)
-    ce = c + hd * (float(proj.max()) - float(c @ hd) + 1)
-    cl = float(np.linalg.norm(ce - cs))
-    try:
-        wp = wp.cut(cq.Workplane(cq.Plane(origin=cq.Vector(*cs), normal=cq.Vector(*hd))).circle(r).extrude(cl))
-    except Exception:
-        pass
+# Count edges
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopAbs import TopAbs_EDGE
+exp = TopExp_Explorer(wp.val().wrapped, TopAbs_EDGE)
+n = 0
+while exp.More():
+    n += 1
+    exp.Next()
+print("Edges:", n)
 
-print("After holes:", round(wp.val().Volume()))
-
-# Try large chamfer on different edge selectors
-for size in [4.9, 4.0, 3.0, 2.0]:
-    for sel in ["|Z", "|X", "|Y"]:
+# Try chamfer on clean extrusion
+for sel in ["|Z", "|X", "|Y"]:
+    for size in [4.9, 4.0, 3.0, 2.0, 1.0]:
         try:
             test = wp.edges(sel).chamfer(size)
-            print("edges('" + sel + "').chamfer(" + str(size) + "): OK vol=" + str(round(test.val().Volume())))
-        except Exception:
-            print("edges('" + sel + "').chamfer(" + str(size) + "): FAIL")
+            print("CLEAN edges('" + sel + "').chamfer(" + str(size) + "): OK vol=" + str(round(test.val().Volume())))
+            break
+        except Exception as e:
+            print("CLEAN edges('" + sel + "').chamfer(" + str(size) + "): FAIL - " + str(e)[:60])

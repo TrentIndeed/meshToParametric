@@ -302,7 +302,7 @@ footer {
   .btn { padding: 0.6rem 1rem; font-size: 0.85rem; }
   .waitlist-form { flex-direction: column; }
   .waitlist-form input, .waitlist-form .btn { width: 100%; }
-  .scroll-anim .text-overlay { max-width: none; padding: 1.5rem; }
+  .scroll-anim .text-overlay { max-width: none; padding: 1.25rem 1.5rem; }
   section { padding: clamp(3rem, 8vh, 6rem) 0; }
 }
 /* Pricing grid */
@@ -320,7 +320,8 @@ footer {
 /* ── Scroll animation section ── */
 /* ── Scroll animation: split layout — card left, video right ── */
 .scroll-anim {
-  position: relative; height: 400vh;
+  position: relative; height: 350vh;
+  margin-top: -2rem;
 }
 .scroll-anim .sticky {
   position: sticky; top: 0; height: 100vh;
@@ -331,13 +332,16 @@ footer {
 /* Video on the right */
 .scroll-anim .gear-frame {
   width: 100%; height: auto; max-height: 80vh;
-  object-fit: cover; border-radius: 16px;
-  mask-image: linear-gradient(180deg, black 70%, transparent 100%);
-  -webkit-mask-image: linear-gradient(180deg, black 70%, transparent 100%);
+  object-fit: cover; border-radius: 12px;
+  /* Fade all edges into the dark background */
+  mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 100%);
 }
 /* Card on the left */
 .scroll-anim .text-card {
   padding-right: 3rem;
+  position: relative;
+  min-height: 200px;
 }
 .scroll-anim .text-overlay {
   padding: 2rem 2.5rem; border-radius: 12px;
@@ -350,10 +354,26 @@ footer {
 }
 .scroll-anim .text-overlay h3 { margin-bottom: 0.5rem; font-size: 1.2rem; }
 .scroll-anim .text-overlay p { font-size: 0.95rem; }
+
+/* Mobile: video on top filling screen, card overlaid at bottom */
 @media (max-width: 768px) {
-  .scroll-anim .sticky { grid-template-columns: 1fr; }
-  .scroll-anim .text-card { padding-right: 0; margin-bottom: 1rem; }
-  .scroll-anim .gear-frame { max-height: 40vh; }
+  .scroll-anim .sticky {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+    padding: 0;
+  }
+  .scroll-anim .gear-frame {
+    width: 100vw; max-height: 70vh;
+    border-radius: 0;
+    order: -1;  /* video on top */
+    mask-image: linear-gradient(180deg, black 40%, transparent 90%);
+    -webkit-mask-image: linear-gradient(180deg, black 40%, transparent 90%);
+  }
+  .scroll-anim .text-card {
+    padding: 0 1.5rem; margin-top: -8rem;
+    position: relative; z-index: 2;
+  }
+  .scroll-anim .text-overlay { max-width: none; }
 }
 
 /* ── Fade-in animation ── */
@@ -732,8 +752,8 @@ window.addEventListener('scroll', () => {
     scrollImg.src = scrollFrames[frameIdx].src;
   }
 
-  // Show one text card at a time based on scroll progress
-  const ranges = [[0.05, 0.33], [0.33, 0.66], [0.66, 0.95]];
+  // Show one text card at a time — start early so card is visible on enter
+  const ranges = [[0.0, 0.3], [0.3, 0.6], [0.6, 0.9]];
   textSlides.forEach((el, i) => {
     if (!el) return;
     const [start, end] = ranges[i];

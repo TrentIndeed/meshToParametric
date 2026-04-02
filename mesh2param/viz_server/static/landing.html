@@ -347,35 +347,42 @@ footer {
   padding: 2rem 2.5rem; border-radius: 12px;
   background: rgba(10,10,11,0.8); backdrop-filter: blur(16px);
   border: 1px solid var(--border);
-  max-width: 480px; transition: opacity 0.25s ease-out, transform 0.25s ease-out;
+  max-width: 480px;
+  transition: opacity 0.5s ease, transform 0.4s ease;
 }
 .scroll-anim .text-overlay.hidden {
-  opacity: 0; transform: translateY(-12px) scale(0.97); pointer-events: none; position: absolute;
+  opacity: 0; transform: translateY(16px); pointer-events: none; position: absolute;
 }
 .scroll-anim .text-overlay h3 { margin-bottom: 0.5rem; font-size: 1.2rem; }
 .scroll-anim .text-overlay p { font-size: 0.95rem; }
 
-/* Mobile: video fills background, card centered on top */
+/* Mobile: frame at top, card at bottom — stacked vertically */
 @media (max-width: 768px) {
   .scroll-anim { margin-top: -2rem; height: 280vh; }
   .scroll-anim .sticky {
     grid-template-columns: 1fr;
-    grid-template-rows: 1fr;
+    grid-template-rows: 45% 1fr;
     padding: 0;
     position: sticky; top: 0;
+    height: 100vh;
   }
   .scroll-anim .gear-frame {
-    position: absolute; inset: 20% 20%; width: 60%; height: 60%;
-    object-fit: contain; border-radius: 0; opacity: 0.75;
-    margin: auto;
-    mask-image: radial-gradient(ellipse 85% 70% at center, black 35%, transparent 90%);
-    -webkit-mask-image: radial-gradient(ellipse 85% 70% at center, black 35%, transparent 90%);
+    position: relative; width: 100%; height: 100%;
+    object-fit: contain; border-radius: 0; opacity: 1;
+    margin: 0; grid-row: 1;
+    mask-image: linear-gradient(to bottom, black 60%, transparent 100%),
+                linear-gradient(to right, transparent 0%, black 8%, black 92%, transparent 100%);
+    mask-composite: intersect;
+    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%),
+                        linear-gradient(to right, transparent 0%, black 8%, black 92%, transparent 100%);
+    -webkit-mask-composite: source-in;
   }
   .scroll-anim .text-card {
     padding: 0 1.5rem;
     position: relative; z-index: 2;
-    display: flex; align-items: center; justify-content: center;
-    min-height: 100vh;
+    grid-row: 2;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 1rem;
   }
   .scroll-anim .text-overlay { max-width: none; }
 }
@@ -749,13 +756,11 @@ window.addEventListener('scroll', () => {
   const sectionHeight = scrollSection.offsetHeight;
   const vh = window.innerHeight;
 
-  // Progress starts when section top reaches 20% from viewport top,
-  // ends when section bottom reaches 20% from viewport bottom.
-  // This keeps frames playing only while the section is actually visible.
-  const startOffset = vh * 0.2;
-  const endOffset = vh * 0.2;
-  const entered = (vh - rect.top) - startOffset;
-  const scrollRange = sectionHeight - startOffset - endOffset;
+  // Progress: frames start when section enters viewport (top of section
+  // reaches bottom of screen) and end when section leaves viewport
+  // (bottom of section reaches top of screen). No early cutoff.
+  const entered = vh - rect.top;
+  const scrollRange = sectionHeight + vh;
   const progress = Math.max(0, Math.min(1, entered / scrollRange));
 
   // Map scroll progress to frame index
@@ -764,10 +769,9 @@ window.addEventListener('scroll', () => {
     scrollImg.src = scrollFrames[frameIdx].src;
   }
 
-  // Text cards: transition later so text is readable at center of viewport.
-  // Each card gets ~30% of scroll, offset by 15% so card 1 appears when
-  // the section is actually centered.
-  const ranges = [[0.15, 0.42], [0.42, 0.68], [0.68, 0.95]];
+  // Text cards: spaced evenly across the middle of the scroll range.
+  // Starts after 20% (section is visible) and ends at 85% (before exit).
+  const ranges = [[0.20, 0.42], [0.42, 0.64], [0.64, 0.85]];
   textSlides.forEach((el, i) => {
     if (!el) return;
     const [start, end] = ranges[i];

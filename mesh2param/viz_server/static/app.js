@@ -448,22 +448,21 @@ function _showRawMesh(previewRes) {
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Start camera far away, upper-left
-  const startPos = {
-    x: center.x - size * 2.5,
-    y: center.y + size * 1.5,
-    z: center.z + size * 2.5,
-  };
-  camera.position.set(startPos.x, startPos.y, startPos.z);
+  // Start camera slightly far, upper-left
+  camera.position.set(
+    center.x + size * 1.8,
+    center.y - size * 1.2,
+    center.z + size * 1.5,
+  );
   controls.target.copy(center);
   controls.update();
 
-  // Animate to top-right isometric after a brief delay
+  // Gentle zoom to a comfortable viewing distance
   requestAnimationFrame(() => {
     animateCamera(
-      { x: center.x + size * 0.8, y: center.y - size * 0.5, z: center.z + size * 0.7 },
+      { x: center.x + size * 0.9, y: center.y - size * 0.6, z: center.z + size * 0.8 },
       center,
-      2.0,
+      1.2,
     );
   });
 }
@@ -553,8 +552,9 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       addChatMessage('ai', summary);
       addChatMessage('system', 'Ask me to describe features, resize holes, or modify the model.');
 
-      // Try AI dimension analysis
-      loading.classList.remove('show');
+      // Try AI dimension analysis — keep loading visible with status
+      loadingText.textContent = 'Analyzing dimensions...';
+      progressBar.style.width = '100%';
       try {
         const analysisRes = await fetch('/api/chat/analyze-mesh', {
           method: 'POST',
@@ -570,6 +570,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
         const analysis = await analysisRes.json();
 
         if (!analysis.skip) {
+          loading.classList.remove('show');
           showDimensionModal(analysis, statusData);
           return; // Modal will call finishLoad when confirmed
         }
@@ -587,11 +588,13 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             },
             notes: 'Dimensions from bounding box. AI analysis unavailable.',
           };
+          loading.classList.remove('show');
           showDimensionModal(basicAnalysis, statusData);
           return;
         }
       }
 
+      loading.classList.remove('show');
       // No dimensions available — load directly
       finishLoad(statusData);
     } else {
@@ -624,7 +627,17 @@ function finishLoad(statusData) {
   addChatMessage('system', `Model loaded: ${statusData.num_steps} features, ${statusData.mesh_volume.toLocaleString()} mm³`);
 
   if (statusData.steps.length > 0) {
-    loadStep(statusData.steps.length - 1);
+    loadStep(statusData.steps.length - 1).then(() => {
+      // Slight rotation animation when final CAD model appears
+      const box = new THREE.Box3().setFromObject(modelGroup);
+      const c = box.getCenter(new THREE.Vector3());
+      const s = box.getSize(new THREE.Vector3()).length();
+      animateCamera(
+        { x: c.x + s * 0.7, y: c.y - s * 0.45, z: c.z + s * 0.65 },
+        c,
+        1.5,
+      );
+    });
   }
 }
 

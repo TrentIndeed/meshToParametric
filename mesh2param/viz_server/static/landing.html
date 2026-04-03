@@ -370,10 +370,12 @@ footer {
     height: 100vh;
   }
   .scroll-anim .gear-frame {
+    order: -1; /* frame above card */
     width: 80%; height: auto;
     max-height: 32vh;
     object-fit: contain; border-radius: 0; opacity: 1;
     flex-shrink: 0;
+    margin: 0 auto;
     mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 80%);
     -webkit-mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 80%);
   }

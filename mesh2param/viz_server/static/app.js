@@ -56,16 +56,22 @@ const rim = new THREE.DirectionalLight(0xFFFFFF, 0.3);
 rim.position.set(-50, -80, 150);
 scene.add(rim);
 
-const bottom = new THREE.DirectionalLight(0x445566, 0.15);
-bottom.position.set(0, -200, 0);
+const bottom = new THREE.DirectionalLight(0x667788, 0.4);
+bottom.position.set(0, -200, 50);
 scene.add(bottom);
+
+const ambient = new THREE.AmbientLight(0x334455, 0.3);
+scene.add(ambient);
 
 // ── Grid + Axes ──
 function createGrid() {
   const gridSize = 300;
   const divisions = 30;
   const grid = new THREE.GridHelper(gridSize, divisions, 0x1E293B, 0x161B22);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.4;
   grid.position.y = -0.1;
+  grid.renderOrder = -2;
   scene.add(grid);
 
   // XYZ axes
@@ -80,8 +86,10 @@ function createGrid() {
       new THREE.Vector3(0, 0, 0),
       new THREE.Vector3(...dir),
     ]);
-    const mat = new THREE.LineBasicMaterial({ color, linewidth: 2, transparent: true, opacity: 0.6 });
-    scene.add(new THREE.Line(geo, mat));
+    const mat = new THREE.LineBasicMaterial({ color, linewidth: 1, transparent: true, opacity: 0.25, depthTest: false });
+    const line = new THREE.Line(geo, mat);
+    line.renderOrder = -1; // render behind model
+    scene.add(line);
   });
 }
 createGrid();
@@ -99,19 +107,43 @@ window._THREE = THREE;
 // ── Load step geometry ──
 async function loadStep(index) {
   const url = currentJobId ? `/api/job/${currentJobId}/step/${index}` : `/api/step/${index}`;
-  const res = await fetch(url);
-  if (!res.ok) return;
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    console.error('Failed to fetch step', index, e);
+    return;
+  }
+  if (!res.ok) {
+    console.error('Step fetch error', index, res.status);
+    return;
+  }
   const data = await res.json();
+  if (data.error) {
+    console.error('Step data error', index, data.error);
+    return;
+  }
+  if (!data.vertices || data.vertices.length === 0) {
+    console.warn('Step has no geometry', index);
+    return;
+  }
 
-  // Clear previous model
-  while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
+  // Clear previous model — dispose geometry/materials to free GPU memory
+  while (modelGroup.children.length) {
+    const child = modelGroup.children[0];
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+      else child.material.dispose();
+    }
+    modelGroup.remove(child);
+  }
 
   const verts = new Float32Array(data.vertices);
   const indices = data.faces;
 
   if (data.is_sketch) {
-    // Draw as lines
-    // Use face indices for edge segments (each degenerate tri = one edge)
+    // Draw as lines using face indices (each degenerate tri = one edge)
     const points = [];
     for (let f = 0; f < indices.length; f += 3) {
       const a = indices[f], b = indices[f + 1];
@@ -142,12 +174,9 @@ async function loadStep(index) {
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     modelGroup.add(mesh);
-
-    // Skip wireframe edges entirely for clean CAD look.
-    // PBR material shading defines edges naturally through lighting.
   }
 
-  // Center and fit camera on first load
+  // Center camera on content — refit on every step change
   const box = new THREE.Box3().setFromObject(modelGroup);
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3()).length();
@@ -235,22 +264,37 @@ function populateUI(statusData) {
     tStep.onclick = () => loadStep(i);
     timeline.appendChild(tStep);
 
-    // Generate thumbnail in background
-    renderThumbnail(i).then(dataUrl => {
-      if (dataUrl) {
-        tStep.style.backgroundImage = `url(${dataUrl})`;
-        tStep.style.backgroundSize = 'cover';
-        tStep.style.backgroundPosition = 'center';
-        tStep.querySelector('.step-num').style.display = 'none';
-      }
-    });
+    // Queue thumbnail for sequential rendering
+    thumbQueue.push({ index: i, element: tStep });
   });
+
+  // Render thumbnails sequentially to avoid WebGL race conditions
+  renderThumbQueue();
 }
 
-// ── Thumbnail renderer (offscreen) ──
+// ── Thumbnail renderer (offscreen, serialized) ──
 const thumbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 thumbRenderer.setSize(160, 112);
 thumbRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+let thumbQueue = [];
+let thumbRendering = false;
+
+async function renderThumbQueue() {
+  if (thumbRendering) return;
+  thumbRendering = true;
+  while (thumbQueue.length > 0) {
+    const { index, element } = thumbQueue.shift();
+    const dataUrl = await renderThumbnail(index);
+    if (dataUrl && element) {
+      element.style.backgroundImage = `url(${dataUrl})`;
+      element.style.backgroundSize = 'cover';
+      element.style.backgroundPosition = 'center';
+      const num = element.querySelector('.step-num');
+      if (num) num.style.display = 'none';
+    }
+  }
+  thumbRendering = false;
+}
 
 async function renderThumbnail(stepIndex) {
   try {
@@ -258,6 +302,7 @@ async function renderThumbnail(stepIndex) {
     const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
+    if (!data.vertices || data.vertices.length === 0) return null;
 
     const thumbScene = new THREE.Scene();
     thumbScene.background = new THREE.Color(0x161B22);
@@ -269,15 +314,16 @@ async function renderThumbnail(stepIndex) {
     thumbScene.add(light);
 
     const verts = new Float32Array(data.vertices);
+    const indices = data.faces;
 
     if (data.is_sketch) {
+      // Use face indices for edge segments (same as main viewer)
       const points = [];
-      const numPts = verts.length / 3;
-      for (let i = 0; i < numPts; i++) {
-        const next = (i + 1) % numPts;
+      for (let f = 0; f < indices.length; f += 3) {
+        const a = indices[f], b = indices[f + 1];
         points.push(
-          new THREE.Vector3(verts[i*3], verts[i*3+1], verts[i*3+2]),
-          new THREE.Vector3(verts[next*3], verts[next*3+1], verts[next*3+2]),
+          new THREE.Vector3(verts[a*3], verts[a*3+1], verts[a*3+2]),
+          new THREE.Vector3(verts[b*3], verts[b*3+1], verts[b*3+2]),
         );
       }
       const geo = new THREE.BufferGeometry().setFromPoints(points);
@@ -285,7 +331,7 @@ async function renderThumbnail(stepIndex) {
     } else {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-      geo.setIndex(data.faces);
+      geo.setIndex(indices);
       geo.computeVertexNormals();
       const mat = new THREE.MeshStandardMaterial({ color: 0xB0B8C0, metalness: 0.4, roughness: 0.35 });
       thumbScene.add(new THREE.Mesh(geo, mat));
@@ -299,6 +345,7 @@ async function renderThumbnail(stepIndex) {
     const box = new THREE.Box3().setFromObject(thumbScene);
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3()).length();
+    if (size < 0.001) return null; // degenerate geometry
     const thumbCam = new THREE.PerspectiveCamera(45, 160 / 112, 0.1, 5000);
     thumbCam.position.set(center.x + size * 0.8, center.y + size * 0.6, center.z + size * 0.8);
     thumbCam.lookAt(center);
@@ -306,6 +353,7 @@ async function renderThumbnail(stepIndex) {
     thumbRenderer.render(thumbScene, thumbCam);
     return thumbRenderer.domElement.toDataURL('image/png');
   } catch (e) {
+    console.warn('Thumbnail render failed for step', stepIndex, e);
     return null;
   }
 }
@@ -448,19 +496,19 @@ function _showRawMesh(previewRes) {
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Start camera slightly far, upper-left
+  // Start camera from upper-right, far away
   camera.position.set(
-    center.x + size * 1.8,
-    center.y - size * 1.2,
-    center.z + size * 1.5,
+    center.x + size * 2.0,
+    center.y - size * 0.8,
+    center.z + size * 2.0,
   );
   controls.target.copy(center);
   controls.update();
 
-  // Gentle zoom to a comfortable viewing distance
+  // Gentle zoom to a comfortable top-right viewing angle
   requestAnimationFrame(() => {
     animateCamera(
-      { x: center.x + size * 0.9, y: center.y - size * 0.6, z: center.z + size * 0.8 },
+      { x: center.x + size * 0.8, y: center.y - size * 0.5, z: center.z + size * 0.9 },
       center,
       1.2,
     );

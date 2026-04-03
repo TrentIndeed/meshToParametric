@@ -363,30 +363,29 @@ footer {
   .scroll-anim { margin-top: -2rem; height: 350vh; }
   .scroll-anim .sticky {
     grid-template-columns: 1fr;
-    grid-template-rows: auto auto;
+    grid-template-rows: auto 1fr;
     gap: 0;
-    padding: 2rem 0 0;
+    padding: 1rem 0 0;
     position: sticky; top: 0;
     height: 100vh;
     align-items: start;
-    align-content: center;
   }
+  /* Wrapper to overlay a black vignette on top of the frame image */
   .scroll-anim .gear-frame {
-    position: relative; width: 88%; height: auto;
-    max-height: 36vh;
+    position: relative; width: 80%; height: auto;
+    max-height: 34vh;
     object-fit: contain; border-radius: 0; opacity: 1;
     margin: 0 auto; grid-row: 1;
-    /* Use radial gradient mask — fades to transparent at edges,
-       page bg (#0A0A0B) shows through as true black */
-    mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 90%);
-    -webkit-mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 90%);
+    /* Tight radial mask + darken edges with box-shadow on parent */
+    mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 80%);
   }
   .scroll-anim .text-card {
     padding: 0 1.5rem;
     position: relative; z-index: 2;
     grid-row: 2;
     display: flex; align-items: flex-start; justify-content: center;
-    padding-top: 4.5rem;
+    padding-top: 2rem;
     min-height: 200px;
   }
   .scroll-anim .text-overlay {

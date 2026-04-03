@@ -63,7 +63,7 @@ const bottom = new THREE.DirectionalLight(0x8899AA, 0.5);
 bottom.position.set(0, -200, 50);
 scene.add(bottom);
 
-// ── Grid (subtle, at origin) ──
+// ── Grid + Origin axes in the 3D scene ──
 function createGrid() {
   const gridSize = 300;
   const divisions = 30;
@@ -71,6 +71,14 @@ function createGrid() {
   grid.material.transparent = true;
   grid.material.opacity = 0.6;
   scene.add(grid);
+
+  // Origin axes — short, thin, in the scene but subtle
+  const axLen = 40;
+  [[axLen,0,0, 0xF85149],[0,axLen,0, 0x3FB950],[0,0,axLen, 0x58A6FF]].forEach(([x,y,z,c]) => {
+    const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(x,y,z)]);
+    const m = new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: 0.5 });
+    scene.add(new THREE.Line(g, m));
+  });
 }
 createGrid();
 
@@ -505,15 +513,15 @@ function _showRawMesh(previewRes) {
   modelGroup.position.sub(center);
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Start camera upper-right, well above model
-  camera.position.set(size * 1.5, size * 1.5, size * 1.5);
+  // Start camera well above and to the right
+  camera.position.set(size * 1.2, size * 1.6, size * 1.2);
   controls.target.set(0, 0, 0);
   controls.update();
 
-  // Gentle zoom to comfortable viewing angle — always above
+  // Gentle zoom — end position keeps camera clearly above model
   requestAnimationFrame(() => {
     animateCamera(
-      { x: size * 0.9, y: size * 0.9, z: size * 0.9 },
+      { x: size * 0.7, y: size * 1.0, z: size * 0.7 },
       { x: 0, y: 0, z: 0 },
       1.2,
     );

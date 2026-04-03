@@ -72,7 +72,10 @@ DATABASE_URL=sqlite:////app/data/mesh2param.db
 ENVEOF
 
 # Build and deploy (port 8081, doesn't conflict with operator on 8000/3000)
+# --build rebuilds the image, container restarts and clears in-memory jobs
 docker compose up -d --build
+
+echo "NOTE: Container restart clears in-memory job data. User accounts persist in SQLite."
 
 {caddy_block}
 

@@ -586,15 +586,15 @@ footer {
           </tr>
         </thead>
         <tbody>
-          <tr><td>Feature tree reconstruction</td><td class="check">Yes</td><td class="check">Yes (manual)</td><td class="dash">No</td></tr>
+          <tr><td>Time per part</td><td class="mono" style="color:var(--accent)">Under 60 sec</td><td>2-8 hours</td><td class="dash">N/A</td></tr>
+          <tr><td>Cost per part</td><td class="mono" style="color:var(--accent)">From $0.33</td><td>$50-150/hr</td><td>$$</td></tr>
+          <tr><td>Parametric output</td><td class="check">Full feature tree</td><td class="check">Yes (manual)</td><td class="dash">Dumb solid</td></tr>
+          <tr><td>Learning curve</td><td class="check">Upload and go</td><td>6-12 months</td><td>Moderate</td></tr>
           <tr><td>Hole detection</td><td class="check">Automatic</td><td>Manual</td><td class="dash">No</td></tr>
           <tr><td>Chamfer / fillet recognition</td><td class="check">Automatic</td><td>Manual</td><td class="dash">No</td></tr>
-          <tr><td>Sketch + extrude workflow</td><td class="check">Generated</td><td>Drawn by hand</td><td class="dash">N/A</td></tr>
           <tr><td>AI dimension planning</td><td class="check">Claude-powered</td><td class="dash">No</td><td class="dash">No</td></tr>
           <tr><td>STEP export</td><td class="check">CadQuery</td><td class="check">Native</td><td>Limited</td></tr>
           <tr><td>Onshape integration</td><td class="check">REST API</td><td class="check">Manual</td><td class="dash">No</td></tr>
-          <tr><td>Time per part</td><td class="mono" style="color:var(--accent)">~30 sec</td><td>2-8 hours</td><td>N/A</td></tr>
-          <tr><td>Cost</td><td class="mono" style="color:var(--accent)">Free (self-hosted)</td><td>$$$</td><td>$$</td></tr>
         </tbody>
       </table>
     </div>
@@ -604,8 +604,8 @@ footer {
 <!-- Pricing -->
 <section id="pricing" style="padding: 6rem 0;">
   <div class="container">
-    <h2 class="fade-in" style="margin-bottom: 0.75rem;">Simple, token-based pricing</h2>
-    <p class="fade-in" style="margin-bottom: 3rem; text-align:center;">Pay for what you use. Simple parts cost fewer tokens. Complex parts with many features cost more.</p>
+    <h2 class="fade-in" style="margin-bottom: 0.75rem;">Simple, per-part pricing</h2>
+    <p class="fade-in" style="margin-bottom: 3rem; text-align:center;">No tokens, no credits. Just upload parts. Simple plans that scale with your workflow.</p>
 
     <div class="pricing-grid fade-in">
       <!-- Free -->
@@ -614,24 +614,24 @@ footer {
         <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$0</div>
         <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">forever</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          100 tokens<br>
-          10 MB upload limit<br>
+          3 parts/month<br>
+          5 MB upload limit<br>
           Mesh cleaner (unlimited)<br>
-          Mesh resize (unlimited)<br>
+          STEP export<br>
           Community support
         </div>
-        <a href="/clean" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Get Started</a>
+        <a href="/login?next=/app&mode=signup" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Get Started</a>
       </div>
 
-      <!-- Starter -->
+      <!-- Maker -->
       <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
-        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Starter</div>
-        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$9</div>
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Maker</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$19</div>
         <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          1,000 tokens/mo<br>
+          30 parts/month<br>
           50 MB upload limit<br>
-          STEP export<br>
+          STEP + Onshape export<br>
           AI dimension planner<br>
           Email support
         </div>
@@ -642,36 +642,36 @@ footer {
       <div style="background:var(--bg-card); border:2px solid var(--accent); border-radius:14px; padding:2rem 1.5rem; position:relative; display:flex; flex-direction:column;">
         <div style="position:absolute; top:-12px; left:50%; transform:translateX(-50%); background:var(--accent); color:var(--bg); font-size:0.7rem; font-weight:700; padding:0.25rem 0.75rem; border-radius:100px; text-transform:uppercase; letter-spacing:0.05em;">Most Popular</div>
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Pro</div>
-        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$29</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$49</div>
         <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          5,000 tokens/mo<br>
+          150 parts/month<br>
           200 MB upload limit<br>
-          STEP + Onshape export<br>
+          All export formats<br>
           AI chatbot + planner<br>
           Priority support
         </div>
         <a href="#waitlist" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
       </div>
 
-      <!-- Unlimited -->
+      <!-- Team -->
       <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
-        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Unlimited</div>
-        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$79</div>
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Team</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$149</div>
         <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          Unlimited tokens<br>
+          Unlimited parts<br>
           500 MB upload limit<br>
-          All export formats<br>
+          API access + batch export<br>
           Full AI suite<br>
-          Dedicated support
+          Dedicated Slack support
         </div>
         <a href="#waitlist" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Contact Us</a>
       </div>
     </div>
 
     <p class="fade-in" style="text-align:center; margin-top:2rem; font-size:0.85rem; color:var(--text-muted);">
-      Token cost depends on mesh complexity: ~5 tokens for a simple plate, ~30 for a bracket with holes, ~50+ for parts with chamfers and fillets.
+      All plans include mesh cleaner, feature tree viewer, and construction timeline. Pro plan: ~$0.33/part.
     </p>
   </div>
 </section>

@@ -274,179 +274,116 @@ def _extract_profile_and_holes(
         largest_area = max(_polygon_area(p) for p in best_profiles)
         total_area = sum(_polygon_area(p) for p in best_profiles)
         if largest_area < total_area * 0.7:
-            # Frame is split — find a connected slice for the outer boundary
-            for alt_frac in [0.9, 0.85, 0.95, 0.1, 0.15, 0.05]:
-                alt_pos = float(all_proj.min()) + extent * alt_frac
-                alt_origin = [0.0, 0.0, 0.0]
-                alt_origin[primary_axis] = alt_pos
+            # Frame is split — find a nearby slice where the frame is one
+            # connected piece but total area is similar (not a filled cutout).
+            from shapely.geometry import Polygon as SPoly, MultiPolygon
+            from shapely.ops import unary_union
+
+            # Search from near-center outward for a connected slice
+            outer_profile_found = None
+            for edge_frac in [0.65, 0.60, 0.70, 0.55, 0.75, 0.40, 0.35]:
+                edge_pos = float(all_proj.min()) + extent * edge_frac
+                edge_origin = [0.0, 0.0, 0.0]
+                edge_origin[primary_axis] = edge_pos
                 try:
-                    alt_section = mesh.section(plane_origin=alt_origin, plane_normal=normal)
-                    if alt_section is None:
+                    edge_section = mesh.section(
+                        plane_origin=edge_origin, plane_normal=normal,
+                    )
+                    if edge_section is None:
                         continue
-                    alt_verts = np.array(alt_section.vertices)
-                    alt_2d, _ = alt_section.to_planar()
-                    alt_polys = alt_2d.polygons_closed
-                    if not alt_polys:
+                    edge_2d, _ = edge_section.to_planar()
+                    edge_polys = edge_2d.polygons_closed
+                    if len(edge_polys) == 0:
                         continue
-
-                    alt_areas = sorted([p.area for p in alt_polys], reverse=True)
-                    if alt_areas[0] > total_area * 0.8:
-                        # Get the outer boundary from this connected slice
-                        outer_poly = max(alt_polys, key=lambda p: p.area)
-                        from scipy.spatial import cKDTree as cKDTree2
-                        alt_tree = cKDTree2(alt_2d.vertices)
+                    edge_areas = sorted([p.area for p in edge_polys], reverse=True)
+                    edge_total = sum(edge_areas)
+                    # Connected: one polygon dominates AND total area similar
+                    if edge_areas[0] > edge_total * 0.85 and edge_total < total_area * 2.0:
+                        outer_poly = max(edge_polys, key=lambda p: p.area)
+                        from scipy.spatial import cKDTree as cKDTree3
+                        edge_verts = np.array(edge_section.vertices)
+                        edge_tree = cKDTree3(edge_2d.vertices)
                         coords_2d = np.array(outer_poly.exterior.coords)[:-1]
-                        _, indices = alt_tree.query(coords_2d)
-                        matched = alt_verts[indices]
-                        outer_profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched]
-                        outer_profile = _simplify_profile(outer_profile, tolerance=0.1)
-
-                        if len(outer_profile) >= 3:
-                            # Combine: outer from connected slice + inner cutouts
-                            # from best slice (those inside the outer boundary)
-                            from shapely.geometry import Polygon as SPoly, Point as SPoint
-                            outer_shape = SPoly(outer_profile)
-                            combined = [outer_profile]
-                            for p in best_profiles:
-                                centroid = np.mean(p, axis=0)
-                                if outer_shape.contains(SPoint(centroid[0], centroid[1])):
-                                    combined.append(p)
-                            # Also add inner cutouts from the connected slice
-                            for poly in alt_polys:
-                                if poly.area < outer_poly.area * 0.01:
-                                    continue
-                                if poly is outer_poly:
-                                    continue
-                                coords_2d = np.array(poly.exterior.coords)[:-1]
-                                _, indices = alt_tree.query(coords_2d)
-                                matched = alt_verts[indices]
-                                profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched]
-                                profile = _simplify_profile(profile, tolerance=0.1)
-                                if len(profile) >= 3:
-                                    centroid = np.mean(profile, axis=0)
-                                    if outer_shape.contains(SPoint(centroid[0], centroid[1])):
-                                        combined.append(profile)
-
-                            combined.sort(key=lambda pts: -_polygon_area(pts))
-                            best_profiles = combined
-                            logger.info(
-                                "Combined outer from %.0f%% slice + inner cutouts (%d profiles)",
-                                alt_frac * 100, len(combined),
-                            )
-                            break
+                        _, indices = edge_tree.query(coords_2d)
+                        matched = edge_verts[indices]
+                        outer_profile_found = [
+                            (float(p[ax_u]), float(p[ax_v])) for p in matched
+                        ]
+                        outer_profile_found = _simplify_profile(
+                            outer_profile_found, tolerance=0.1,
+                        )
+                        logger.info(
+                            "Found connected slice at %.0f%% (%d pts)",
+                            edge_frac * 100, len(outer_profile_found),
+                        )
+                        break
                 except Exception:
                     continue
-            else:
-                # No connected slice found. Fallback: use the part bounding
-                # box as the outer boundary and the gap between the split
-                # polygons as the inner cutout.
-                from shapely.geometry import Polygon as SPoly, MultiPolygon
-                from shapely.ops import unary_union
 
-                # Outer boundary = part bbox in the profile plane
-                u_min = float(cleaned.bbox[0][ax_u])
-                u_max = float(cleaned.bbox[1][ax_u])
-                v_min = float(cleaned.bbox[0][ax_v])
-                v_max = float(cleaned.bbox[1][ax_v])
-                bbox_profile = [
-                    (u_min, v_min), (u_max, v_min),
-                    (u_max, v_max), (u_min, v_max),
+            # Bbox for fallback
+            u_min = float(cleaned.bbox[0][ax_u])
+            u_max = float(cleaned.bbox[1][ax_u])
+            v_min = float(cleaned.bbox[0][ax_v])
+            v_max = float(cleaned.bbox[1][ax_v])
+            bbox_profile = [
+                (u_min, v_min), (u_max, v_min),
+                (u_max, v_max), (u_min, v_max),
+            ]
+
+            if outer_profile_found and len(outer_profile_found) >= 3:
+                # Use connected outer boundary + mid-height cutouts
+                outer_shape = SPoly(outer_profile_found)
+                best_polys = [
+                    SPoly(p).buffer(0) for p in best_profiles
+                    if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
+                    and SPoly(p).is_valid
                 ]
-                bbox_poly = SPoly(bbox_profile)
-
-                # Two-pass approach:
-                # 1. Find a near-edge slice where the frame is one piece
-                #    (tabs connect the halves) — use it for outer boundary
-                # 2. Use the best (mid-height) slice for the cutout shape
-                # This gives a closed frame with the correct inner opening.
-                outer_profile_found = None
-                for edge_frac in [0.92, 0.88, 0.95, 0.08, 0.12, 0.05]:
-                    edge_pos = float(all_proj.min()) + extent * edge_frac
-                    edge_origin = [0.0, 0.0, 0.0]
-                    edge_origin[primary_axis] = edge_pos
-                    try:
-                        edge_section = mesh.section(
-                            plane_origin=edge_origin, plane_normal=normal,
-                        )
-                        if edge_section is None:
-                            continue
-                        edge_2d, _ = edge_section.to_planar()
-                        edge_polys = edge_2d.polygons_closed
-                        if not edge_polys:
-                            continue
-                        # Check if one polygon dominates (frame is connected)
-                        edge_areas = sorted([p.area for p in edge_polys], reverse=True)
-                        if edge_areas[0] > total_area * 0.9:
-                            outer_poly = max(edge_polys, key=lambda p: p.area)
-                            from scipy.spatial import cKDTree as cKDTree3
-                            edge_verts = np.array(edge_section.vertices)
-                            edge_tree = cKDTree3(edge_2d.vertices)
-                            coords_2d = np.array(outer_poly.exterior.coords)[:-1]
-                            _, indices = edge_tree.query(coords_2d)
-                            matched = edge_verts[indices]
-                            outer_profile_found = [(float(p[ax_u]), float(p[ax_v])) for p in matched]
-                            outer_profile_found = _simplify_profile(outer_profile_found, tolerance=0.1)
-                            break
-                    except Exception:
-                        continue
-
-                if outer_profile_found and len(outer_profile_found) >= 3:
-                    # Use connected outer boundary + mid-height cutouts
-                    outer_shape = SPoly(outer_profile_found)
-                    best_polys = [
-                        SPoly(p).buffer(0) for p in best_profiles
-                        if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
-                        and SPoly(p).is_valid
-                    ]
-                    if best_polys:
-                        mid_solid = unary_union(best_polys)
-                        # Cutout = outer boundary minus mid-height solid
-                        diff = outer_shape.difference(mid_solid)
-                        # Morph-close to clean hole notches
-                        if not diff.is_empty:
-                            diff_clean = diff.buffer(-2.0, join_style='mitre', mitre_limit=5.0)
-                            diff_clean = diff_clean.buffer(2.0, join_style='mitre', mitre_limit=5.0)
-                            if not diff_clean.is_empty:
-                                diff = diff_clean
-                    else:
-                        diff = SPoly()
-                    # Replace bbox with the actual outer profile
-                    bbox_profile = outer_profile_found
-                    logger.info("Used connected slice for outer + mid-height cutout")
+                if best_polys:
+                    mid_solid = unary_union(best_polys)
+                    diff = outer_shape.difference(mid_solid)
+                    if not diff.is_empty:
+                        diff_clean = diff.buffer(-2.0, join_style='mitre', mitre_limit=5.0)
+                        diff_clean = diff_clean.buffer(2.0, join_style='mitre', mitre_limit=5.0)
+                        if not diff_clean.is_empty:
+                            diff = diff_clean
                 else:
-                    # Fallback: bbox + morph-close
-                    best_polys = [
-                        SPoly(p).buffer(0) for p in best_profiles
-                        if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
-                        and SPoly(p).is_valid
-                    ]
-                    if best_polys:
-                        merged = unary_union(best_polys)
-                        merged_clean = merged.buffer(4.0, join_style='mitre', mitre_limit=5.0)
-                        merged_clean = merged_clean.buffer(-4.0, join_style='mitre', mitre_limit=5.0)
-                        merged_clean = merged_clean.intersection(bbox_poly)
-                        if merged_clean.is_empty:
-                            merged_clean = merged
-                        diff = bbox_poly.difference(merged_clean)
-                    else:
-                        diff = SPoly()
-                combined = [bbox_profile]
-                geoms = [diff] if diff.geom_type == 'Polygon' else (
-                    list(diff.geoms) if hasattr(diff, 'geoms') else []
-                )
-                for geom in geoms:
-                    if geom.geom_type != 'Polygon' or geom.area < 5.0:
-                        continue
-                    coords = list(geom.exterior.coords)[:-1]
-                    simplified = _simplify_profile(coords, tolerance=0.1)
-                    if len(simplified) >= 3:
-                        combined.append(simplified)
-                combined.sort(key=lambda pts: -_polygon_area(pts))
-                best_profiles = combined
-                logger.info(
-                    "Used bbox + through-void for split frame (%d profiles)",
-                    len(combined),
-                )
+                    diff = SPoly()
+                bbox_profile = outer_profile_found
+                logger.info("Used connected slice for outer + mid-height cutout")
+            else:
+                # Fallback: bbox + morph-close
+                bbox_poly = SPoly(bbox_profile)
+                best_polys = [
+                    SPoly(p).buffer(0) for p in best_profiles
+                    if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
+                    and SPoly(p).is_valid
+                ]
+                if best_polys:
+                    merged = unary_union(best_polys)
+                    merged_clean = merged.buffer(4.0, join_style='mitre', mitre_limit=5.0)
+                    merged_clean = merged_clean.buffer(-4.0, join_style='mitre', mitre_limit=5.0)
+                    merged_clean = merged_clean.intersection(bbox_poly)
+                    if merged_clean.is_empty:
+                        merged_clean = merged
+                    diff = bbox_poly.difference(merged_clean)
+                else:
+                    diff = SPoly()
+                logger.info("Used bbox fallback for split frame")
+
+            # Build profile list: outer boundary + inner cutouts
+            combined = [bbox_profile]
+            geoms = [diff] if diff.geom_type == 'Polygon' else (
+                list(diff.geoms) if hasattr(diff, 'geoms') else []
+            )
+            for geom in geoms:
+                if geom.geom_type != 'Polygon' or geom.area < 5.0:
+                    continue
+                coords = list(geom.exterior.coords)[:-1]
+                simplified = _simplify_profile(coords, tolerance=0.1)
+                if len(simplified) >= 3:
+                    combined.append(simplified)
+            combined.sort(key=lambda pts: -_polygon_area(pts))
+            best_profiles = combined
 
     if not best_profiles:
         return None, extrude_start, []

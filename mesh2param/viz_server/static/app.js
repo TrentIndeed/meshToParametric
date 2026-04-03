@@ -838,18 +838,7 @@ function handleResize() {
 }
 window.addEventListener('resize', handleResize);
 
-// ── Auto-load if pipeline already ran ──
-async function autoLoad() {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    if (data.status === 'done' && data.steps.length > 0) {
-      currentJobId = data.job_id || null;
-      finishLoad(data);
-    }
-  } catch (e) { /* server not ready yet */ }
-}
-autoLoad();
+// App starts with empty state — user uploads a mesh to begin
 
 // ── Animate ──
 // ── Camera animation system ──

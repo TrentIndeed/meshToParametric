@@ -184,10 +184,15 @@ function populateUI(statusData) {
   steps = statusData.steps;
 
   const iconMap = {
-    'Sketch': { cls: 'sketch', icon: 'ri-pencil-line' },
+    'Sketch': { cls: 'sketch', icon: 'ri-pencil-ruler-2-line' },
     'Extrude': { cls: 'extrude', icon: 'ri-box-3-line' },
-    'Through': { cls: 'hole', icon: 'ri-record-circle-line' },
+    'Through': { cls: 'hole', icon: 'ri-checkbox-blank-circle-line' },
     'Blind': { cls: 'hole', icon: 'ri-focus-3-line' },
+    'Chamfer': { cls: 'chamfer', icon: 'ri-corner-up-right-line' },
+    'Fillet': { cls: 'fillet', icon: 'ri-rounded-corner' },
+    'Pocket': { cls: 'pocket', icon: 'ri-checkbox-indeterminate-line' },
+    'Boss': { cls: 'boss', icon: 'ri-add-box-line' },
+    'Slot': { cls: 'slot', icon: 'ri-space' },
     'Original': { cls: 'sketch', icon: 'ri-file-3-line' },
   };
 

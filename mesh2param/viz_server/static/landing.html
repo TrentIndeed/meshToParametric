@@ -337,7 +337,7 @@ footer {
   mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 95%);
   -webkit-mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 95%);
 }
-/* Card on the left */
+/* Card on the left — stacking context for absolute overlays */
 .scroll-anim .text-card {
   padding-right: 3rem;
   position: relative;
@@ -345,13 +345,15 @@ footer {
 }
 .scroll-anim .text-overlay {
   padding: 2rem 2.5rem; border-radius: 12px;
-  background: rgba(10,10,11,0.8); backdrop-filter: blur(16px);
+  background: rgba(10,10,11,0.85);
   border: 1px solid var(--border);
   max-width: 480px;
+  position: absolute; top: 0; left: 0; right: 0;
   transition: opacity 0.6s ease;
+  will-change: opacity;
 }
 .scroll-anim .text-overlay.hidden {
-  opacity: 0; pointer-events: none; position: absolute;
+  opacity: 0; pointer-events: none;
 }
 .scroll-anim .text-overlay h3 { margin-bottom: 0.5rem; font-size: 1.2rem; }
 .scroll-anim .text-overlay p { font-size: 0.95rem; }
@@ -371,19 +373,19 @@ footer {
   }
   .scroll-anim .gear-frame {
     position: relative; width: 92%; height: auto;
-    max-height: 42vh;
+    max-height: 40vh;
     object-fit: contain; border-radius: 0; opacity: 1;
     margin: 0 auto; grid-row: 1;
-    /* Fade all edges to the page bg (#0A0A0B) */
+    /* Fade all 4 edges to page bg */
     mask-image:
-      linear-gradient(to bottom, black 55%, transparent 95%),
-      linear-gradient(to top, black 90%, transparent 100%),
-      linear-gradient(to right, transparent 0%, black 10%, black 90%, transparent 100%);
+      linear-gradient(to bottom, black 50%, transparent 90%),
+      linear-gradient(to top, transparent 0%, black 15%),
+      linear-gradient(to right, transparent 0%, black 12%, black 88%, transparent 100%);
     mask-composite: intersect;
     -webkit-mask-image:
-      linear-gradient(to bottom, black 55%, transparent 95%),
-      linear-gradient(to top, black 90%, transparent 100%),
-      linear-gradient(to right, transparent 0%, black 10%, black 90%, transparent 100%);
+      linear-gradient(to bottom, black 50%, transparent 90%),
+      linear-gradient(to top, transparent 0%, black 15%),
+      linear-gradient(to right, transparent 0%, black 12%, black 88%, transparent 100%);
     -webkit-mask-composite: source-in;
   }
   .scroll-anim .text-card {
@@ -391,9 +393,13 @@ footer {
     position: relative; z-index: 2;
     grid-row: 2;
     display: flex; align-items: flex-start; justify-content: center;
-    padding-top: 0.5rem;
+    padding-top: 1.5rem;
   }
-  .scroll-anim .text-overlay { max-width: none; }
+  .scroll-anim .text-overlay {
+    max-width: none;
+    position: absolute; left: 1.5rem; right: 1.5rem;
+    backdrop-filter: none; /* remove blur on mobile for performance */
+  }
 }
 
 /* ── Fade-in animation ── */
@@ -787,10 +793,8 @@ window.addEventListener('scroll', () => {
     const active = progress >= start && progress < end;
     if (active) {
       el.classList.remove('hidden');
-      el.style.position = 'relative';
     } else {
       el.classList.add('hidden');
-      el.style.position = 'absolute';
     }
   });
 }, { passive: true });

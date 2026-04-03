@@ -63,36 +63,35 @@ scene.add(bottom);
 const ambient = new THREE.AmbientLight(0x334455, 0.3);
 scene.add(ambient);
 
-// ── Grid + Axes ──
+// ── Grid (subtle, at origin) ──
 function createGrid() {
   const gridSize = 300;
   const divisions = 30;
   const grid = new THREE.GridHelper(gridSize, divisions, 0x1E293B, 0x161B22);
   grid.material.transparent = true;
-  grid.material.opacity = 0.4;
-  grid.position.y = -0.1;
+  grid.material.opacity = 0.3;
   grid.renderOrder = -2;
   scene.add(grid);
-
-  // XYZ axes
-  const axLen = gridSize * 0.6;
-  const axes = [
-    { dir: [axLen, 0, 0], color: 0xF85149 },   // X red
-    { dir: [0, axLen, 0], color: 0x3FB950 },    // Y green
-    { dir: [0, 0, axLen], color: 0x58A6FF },    // Z blue
-  ];
-  axes.forEach(({ dir, color }) => {
-    const geo = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(...dir),
-    ]);
-    const mat = new THREE.LineBasicMaterial({ color, linewidth: 1, transparent: true, opacity: 0.25, depthTest: false });
-    const line = new THREE.Line(geo, mat);
-    line.renderOrder = -1; // render behind model
-    scene.add(line);
-  });
 }
 createGrid();
+
+// Small XYZ axis gizmo in the bottom-left corner (rendered separately)
+const axisScene = new THREE.Scene();
+const axisCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+axisCamera.position.set(3, 2, 3);
+axisCamera.lookAt(0, 0, 0);
+const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+axisRenderer.setSize(100, 100);
+axisRenderer.setClearColor(0x000000, 0);
+axisRenderer.domElement.style.cssText = 'position:fixed;bottom:90px;left:10px;z-index:50;pointer-events:none;';
+document.body.appendChild(axisRenderer.domElement);
+
+// Axis lines (short, in gizmo scene)
+[[1,0,0,0xF85149,'X'],[0,1,0,0x3FB950,'Y'],[0,0,1,0x58A6FF,'Z']].forEach(([x,y,z,color,label]) => {
+  const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(x,y,z)]);
+  axisScene.add(new THREE.Line(geo, new THREE.LineBasicMaterial({ color, linewidth: 2 })));
+  // Axis label would need CSS/sprite — skip for now, colors are enough
+});
 
 // ── Model group ──
 let modelGroup = new THREE.Group();
@@ -176,14 +175,15 @@ async function loadStep(index) {
     modelGroup.add(mesh);
   }
 
-  // Center camera on content — refit on every step change
+  // Center model at origin
   const box = new THREE.Box3().setFromObject(modelGroup);
   const center = box.getCenter(new THREE.Vector3());
-  const size = box.getSize(new THREE.Vector3()).length();
+  modelGroup.position.sub(center);
 
-  controls.target.copy(center);
+  const size = box.getSize(new THREE.Vector3()).length();
+  controls.target.set(0, 0, 0);
   if (currentStep <= 0) {
-    camera.position.set(center.x + size, center.y + size * 0.7, center.z + size);
+    camera.position.set(size * 0.8, size * 0.5, size * 0.7);
   }
   controls.update();
 
@@ -492,24 +492,22 @@ function _showRawMesh(previewRes) {
     new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
   ));
 
+  // Center model at origin
   const box = new THREE.Box3().setFromObject(modelGroup);
   const center = box.getCenter(new THREE.Vector3());
+  modelGroup.position.sub(center);
   const size = box.getSize(new THREE.Vector3()).length();
 
   // Start camera from upper-right, far away
-  camera.position.set(
-    center.x + size * 2.0,
-    center.y - size * 0.8,
-    center.z + size * 2.0,
-  );
-  controls.target.copy(center);
+  camera.position.set(size * 1.8, size * 1.0, size * 1.5);
+  controls.target.set(0, 0, 0);
   controls.update();
 
-  // Gentle zoom to a comfortable top-right viewing angle
+  // Gentle zoom to comfortable viewing angle
   requestAnimationFrame(() => {
     animateCamera(
-      { x: center.x + size * 0.8, y: center.y - size * 0.5, z: center.z + size * 0.9 },
-      center,
+      { x: size * 0.8, y: size * 0.5, z: size * 0.7 },
+      { x: 0, y: 0, z: 0 },
       1.2,
     );
   });
@@ -932,5 +930,10 @@ function animate() {
 
   controls.update();
   renderer.render(scene, camera);
+
+  // Sync axis gizmo rotation with main camera
+  axisCamera.position.copy(camera.position).sub(controls.target).normalize().multiplyScalar(5);
+  axisCamera.lookAt(0, 0, 0);
+  axisRenderer.render(axisScene, axisCamera);
 }
 animate();

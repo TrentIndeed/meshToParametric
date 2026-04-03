@@ -37,40 +37,39 @@ controls.dampingFactor = 0.08;
 controls.minDistance = 10;
 controls.maxDistance = 2000;
 
-// ── Studio Lighting (3-point + hemisphere) ──
-const hemi = new THREE.HemisphereLight(0xC8D8E8, 0x2D3436, 0.6);
+// ── Studio Lighting — bright, even illumination ──
+const hemi = new THREE.HemisphereLight(0xE0E8F0, 0x3D4450, 0.8);
 scene.add(hemi);
 
-const key = new THREE.DirectionalLight(0xFFFFFF, 1.2);
-key.position.set(150, 250, 120);
+const ambient = new THREE.AmbientLight(0x556677, 0.5);
+scene.add(ambient);
+
+const key = new THREE.DirectionalLight(0xFFFFFF, 1.4);
+key.position.set(200, 300, 150);
 key.castShadow = true;
 key.shadow.mapSize.width = 1024;
 key.shadow.mapSize.height = 1024;
 scene.add(key);
 
-const fill = new THREE.DirectionalLight(0x8899BB, 0.5);
-fill.position.set(-120, 80, -80);
+const fill = new THREE.DirectionalLight(0x99AACC, 0.7);
+fill.position.set(-150, 100, -100);
 scene.add(fill);
 
-const rim = new THREE.DirectionalLight(0xFFFFFF, 0.3);
-rim.position.set(-50, -80, 150);
-scene.add(rim);
+const back = new THREE.DirectionalLight(0xFFFFFF, 0.4);
+back.position.set(-50, 150, -200);
+scene.add(back);
 
-const bottom = new THREE.DirectionalLight(0x667788, 0.4);
+const bottom = new THREE.DirectionalLight(0x8899AA, 0.5);
 bottom.position.set(0, -200, 50);
 scene.add(bottom);
-
-const ambient = new THREE.AmbientLight(0x334455, 0.3);
-scene.add(ambient);
 
 // ── Grid (subtle, at origin) ──
 function createGrid() {
   const gridSize = 300;
   const divisions = 30;
-  const grid = new THREE.GridHelper(gridSize, divisions, 0x1E293B, 0x161B22);
+  const grid = new THREE.GridHelper(gridSize, divisions, 0x2A3444, 0x1E2830);
   grid.material.transparent = true;
-  grid.material.opacity = 0.3;
-  grid.renderOrder = -2;
+  grid.material.opacity = 0.6;
   scene.add(grid);
 }
 createGrid();
@@ -81,16 +80,24 @@ const axisCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
 axisCamera.position.set(3, 2, 3);
 axisCamera.lookAt(0, 0, 0);
 const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-axisRenderer.setSize(100, 100);
+axisRenderer.setSize(120, 120);
 axisRenderer.setClearColor(0x000000, 0);
-axisRenderer.domElement.style.cssText = 'position:fixed;bottom:90px;left:10px;z-index:50;pointer-events:none;';
+axisRenderer.domElement.style.cssText = 'position:fixed;bottom:90px;left:10px;z-index:50;pointer-events:none;border:1px solid rgba(48,54,61,0.5);border-radius:8px;';
 document.body.appendChild(axisRenderer.domElement);
 
-// Axis lines (short, in gizmo scene)
-[[1,0,0,0xF85149,'X'],[0,1,0,0x3FB950,'Y'],[0,0,1,0x58A6FF,'Z']].forEach(([x,y,z,color,label]) => {
+// Axis lines with cone tips (short, in gizmo scene)
+axisScene.add(new THREE.AmbientLight(0xffffff, 1));
+[[1.2,0,0,0xF85149],[0,1.2,0,0x3FB950],[0,0,1.2,0x58A6FF]].forEach(([x,y,z,color]) => {
   const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(x,y,z)]);
   axisScene.add(new THREE.Line(geo, new THREE.LineBasicMaterial({ color, linewidth: 2 })));
-  // Axis label would need CSS/sprite — skip for now, colors are enough
+  // Arrow tip
+  const coneGeo = new THREE.ConeGeometry(0.08, 0.25, 8);
+  const coneMat = new THREE.MeshBasicMaterial({ color });
+  const cone = new THREE.Mesh(coneGeo, coneMat);
+  cone.position.set(x, y, z);
+  if (x > 0) cone.rotation.z = -Math.PI / 2;
+  else if (z > 0) cone.rotation.x = Math.PI / 2;
+  axisScene.add(cone);
 });
 
 // ── Model group ──
@@ -498,15 +505,15 @@ function _showRawMesh(previewRes) {
   modelGroup.position.sub(center);
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Start camera from upper-right, far away
-  camera.position.set(size * 1.8, size * 1.0, size * 1.5);
+  // Start camera upper-right, well above model
+  camera.position.set(size * 1.5, size * 1.5, size * 1.5);
   controls.target.set(0, 0, 0);
   controls.update();
 
-  // Gentle zoom to comfortable viewing angle
+  // Gentle zoom to comfortable viewing angle — always above
   requestAnimationFrame(() => {
     animateCamera(
-      { x: size * 0.8, y: size * 0.5, z: size * 0.7 },
+      { x: size * 0.9, y: size * 0.9, z: size * 0.9 },
       { x: 0, y: 0, z: 0 },
       1.2,
     );

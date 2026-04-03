@@ -373,19 +373,19 @@ footer {
   }
   .scroll-anim .gear-frame {
     position: relative; width: 92%; height: auto;
-    max-height: 40vh;
+    max-height: 38vh;
     object-fit: contain; border-radius: 0; opacity: 1;
     margin: 0 auto; grid-row: 1;
-    /* Fade all 4 edges to page bg */
+    /* Subtle edge fade — keep most of the image visible, only soften borders */
     mask-image:
-      linear-gradient(to bottom, black 50%, transparent 90%),
-      linear-gradient(to top, transparent 0%, black 15%),
-      linear-gradient(to right, transparent 0%, black 12%, black 88%, transparent 100%);
+      linear-gradient(to bottom, black 75%, transparent 100%),
+      linear-gradient(to top, transparent 0%, black 8%),
+      linear-gradient(to right, transparent 0%, black 6%, black 94%, transparent 100%);
     mask-composite: intersect;
     -webkit-mask-image:
-      linear-gradient(to bottom, black 50%, transparent 90%),
-      linear-gradient(to top, transparent 0%, black 15%),
-      linear-gradient(to right, transparent 0%, black 12%, black 88%, transparent 100%);
+      linear-gradient(to bottom, black 75%, transparent 100%),
+      linear-gradient(to top, transparent 0%, black 8%),
+      linear-gradient(to right, transparent 0%, black 6%, black 94%, transparent 100%);
     -webkit-mask-composite: source-in;
   }
   .scroll-anim .text-card {
@@ -393,12 +393,19 @@ footer {
     position: relative; z-index: 2;
     grid-row: 2;
     display: flex; align-items: flex-start; justify-content: center;
-    padding-top: 1.5rem;
+    padding-top: 3rem;
+    min-height: 180px;
   }
   .scroll-anim .text-overlay {
     max-width: none;
     position: absolute; left: 1.5rem; right: 1.5rem;
-    backdrop-filter: none; /* remove blur on mobile for performance */
+    backdrop-filter: none;
+    /* Visible upward entrance on mobile */
+    transition: opacity 0.5s ease, transform 0.5s ease;
+    transform: translateY(0);
+  }
+  .scroll-anim .text-overlay.hidden {
+    opacity: 0; transform: translateY(24px);
   }
 }
 

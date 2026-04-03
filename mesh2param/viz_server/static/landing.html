@@ -360,7 +360,7 @@ footer {
 
 /* Mobile: frame at top, card directly below — tight stacked layout */
 @media (max-width: 768px) {
-  .scroll-anim { margin-top: -2rem; height: 280vh; }
+  .scroll-anim { margin-top: -2rem; height: 350vh; }
   .scroll-anim .sticky {
     grid-template-columns: 1fr;
     grid-template-rows: auto auto;
@@ -372,40 +372,33 @@ footer {
     align-content: center;
   }
   .scroll-anim .gear-frame {
-    position: relative; width: 92%; height: auto;
-    max-height: 38vh;
+    position: relative; width: 88%; height: auto;
+    max-height: 36vh;
     object-fit: contain; border-radius: 0; opacity: 1;
     margin: 0 auto; grid-row: 1;
-    /* Subtle edge fade — keep most of the image visible, only soften borders */
-    mask-image:
-      linear-gradient(to bottom, black 75%, transparent 100%),
-      linear-gradient(to top, transparent 0%, black 8%),
-      linear-gradient(to right, transparent 0%, black 6%, black 94%, transparent 100%);
-    mask-composite: intersect;
-    -webkit-mask-image:
-      linear-gradient(to bottom, black 75%, transparent 100%),
-      linear-gradient(to top, transparent 0%, black 8%),
-      linear-gradient(to right, transparent 0%, black 6%, black 94%, transparent 100%);
-    -webkit-mask-composite: source-in;
+    /* Use radial gradient mask — fades to transparent at edges,
+       page bg (#0A0A0B) shows through as true black */
+    mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 90%);
+    -webkit-mask-image: radial-gradient(ellipse 85% 80% at center, black 50%, transparent 90%);
   }
   .scroll-anim .text-card {
     padding: 0 1.5rem;
     position: relative; z-index: 2;
     grid-row: 2;
     display: flex; align-items: flex-start; justify-content: center;
-    padding-top: 3rem;
-    min-height: 180px;
+    padding-top: 4.5rem;
+    min-height: 200px;
   }
   .scroll-anim .text-overlay {
     max-width: none;
     position: absolute; left: 1.5rem; right: 1.5rem;
     backdrop-filter: none;
-    /* Visible upward entrance on mobile */
-    transition: opacity 0.5s ease, transform 0.5s ease;
+    /* Visible upward entrance on mobile — slower, more dramatic */
+    transition: opacity 0.7s ease, transform 0.6s ease;
     transform: translateY(0);
   }
   .scroll-anim .text-overlay.hidden {
-    opacity: 0; transform: translateY(24px);
+    opacity: 0; transform: translateY(30px);
   }
 }
 

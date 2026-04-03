@@ -111,13 +111,13 @@ async function loadStep(index) {
 
   if (data.is_sketch) {
     // Draw as lines
+    // Use face indices for edge segments (each degenerate tri = one edge)
     const points = [];
-    const numPts = verts.length / 3;
-    for (let i = 0; i < numPts; i++) {
-      const next = (i + 1) % numPts;
+    for (let f = 0; f < indices.length; f += 3) {
+      const a = indices[f], b = indices[f + 1];
       points.push(
-        new THREE.Vector3(verts[i*3], verts[i*3+1], verts[i*3+2]),
-        new THREE.Vector3(verts[next*3], verts[next*3+1], verts[next*3+2]),
+        new THREE.Vector3(verts[a*3], verts[a*3+1], verts[a*3+2]),
+        new THREE.Vector3(verts[b*3], verts[b*3+1], verts[b*3+2]),
       );
     }
     const geo = new THREE.BufferGeometry().setFromPoints(points);
@@ -594,11 +594,8 @@ function showDimensionModal(analysis, statusData) {
   rows.innerHTML = '';
   const dims = analysis.suggested_dimensions || {};
   for (const [key, val] of Object.entries(dims)) {
-    if (Array.isArray(val)) {
-      rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value">[${val.join(', ')}] mm</span></div>`;
-    } else {
-      rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value">${val} mm</span></div>`;
-    }
+    const displayVal = Array.isArray(val) ? val.join(', ') : val;
+    rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value"><input class="dim-input" type="text" data-key="${key}" value="${displayVal}"> mm</span></div>`;
   }
 
   notes.textContent = analysis.notes || '';
@@ -616,9 +613,14 @@ window.skipDimensionReview = function() {
 };
 
 window.confirmDimensionReview = function() {
+  // Read edited dimension values from inputs
+  const inputs = document.querySelectorAll('#dim-rows .dim-input');
+  const editedDims = {};
+  inputs.forEach(inp => { editedDims[inp.dataset.key] = inp.value.trim(); });
   document.getElementById('dim-modal').classList.remove('show');
   if (cachedStatusData) finishLoad(cachedStatusData);
-  addChatMessage('system', 'Dimensions confirmed by AI analysis');
+  const dimSummary = Object.entries(editedDims).map(([k, v]) => `${k}: ${v} mm`).join(', ');
+  addChatMessage('system', `Dimensions confirmed: ${dimSummary}`);
 };
 
 // ── AI Chat ──

@@ -300,13 +300,14 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
         aspect_ratio = sorted_dims[0] / (sorted_dims[2] + 1e-10)
 
         # Complexity score 0-100
+        # Calibrated so simple prismatic parts (brackets, plates) score 15-30
         score = 0
-        score += min(30, face_count / 100)        # faces: 0-30
-        score += min(20, approx_surfaces)          # surface variety: 0-20
-        score += min(15, normal_spread * 50)       # normal spread: 0-15
-        score += min(15, aspect_ratio * 2)         # aspect ratio: 0-15
+        score += min(15, face_count / 500)         # faces: 0-15 (gentler curve)
+        score += min(15, max(0, approx_surfaces - 6) * 1.5)  # surface variety: 0-15 (6 base dirs free)
+        score += min(15, normal_spread * 30)       # normal spread: 0-15
+        score += min(10, max(0, aspect_ratio - 2) * 1.5)  # aspect ratio: 0-10 (ratio<2 free)
         score += 0 if cleaned.is_watertight else 10  # non-watertight penalty
-        score += min(10, len(dims) and max(dims) / 50)  # size: 0-10
+        score += min(10, len(dims) and max(dims) / 100)  # size: 0-10
         score = min(100, round(score))
 
         # Classification and limits

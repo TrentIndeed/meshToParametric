@@ -292,6 +292,13 @@ body {
 }
 #dim-modal .dim-row .label { color: var(--text-secondary); }
 #dim-modal .dim-row .value { font-family: 'JetBrains Mono', monospace; color: var(--text-primary); }
+#dim-modal .dim-row input.dim-input {
+  font-family: 'JetBrains Mono', monospace; color: var(--text-primary);
+  background: var(--bg-tertiary); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 6px; width: 100px; text-align: right;
+  font-size: 13px; outline: none;
+}
+#dim-modal .dim-row input.dim-input:focus { border-color: var(--accent); }
 #dim-modal .notes {
   margin-top: 12px; padding: 10px; background: var(--bg-tertiary);
   border-radius: 8px; font-size: 12px; color: var(--text-secondary); line-height: 1.5;
@@ -364,7 +371,7 @@ body {
 
 /* ── Loading overlay ── */
 #loading {
-  position: fixed; inset: 0; background: rgba(13,17,23,0.85);
+  position: fixed; top: 0; left: 0; bottom: 0; right: 300px; background: rgba(13,17,23,0.85);
   display: none; align-items: center; justify-content: center;
   z-index: 200; flex-direction: column; gap: 16px;
 }
@@ -395,6 +402,7 @@ body {
 @media (max-width: 768px) {
   #sidebar { transform: translateX(-100%); width: 280px; bottom: 0; z-index: 90; }
   #chat-panel { display: none; }
+  #loading { right: 0; }
   #viewer { left: 0 !important; right: 0 !important; bottom: 140px; }
   #timeline { height: 60px; bottom: 52px; }
   .timeline-step { width: 50px; height: 36px; }
@@ -432,6 +440,7 @@ body {
   <div class="divider"></div>
   <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
   <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
+  <div onclick="alert('Save Project is coming soon!'); document.getElementById('app-menu').classList.remove('show')"><i class="ri-save-3-line"></i> Save Project</div>
   <div class="divider"></div>
   <div onclick="openSettings(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-settings-3-line"></i> Settings</div>
   <a href="/clean"><i class="ri-tools-line"></i> Mesh Cleaner</a>

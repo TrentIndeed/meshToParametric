@@ -358,6 +358,12 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     addChatMessage('ai', `Dimensions: ${previewRes.dimensions.map(d => d + 'mm').join(' × ')}. ${previewRes.watertight ? 'Mesh is watertight.' : 'Mesh has gaps — will repair.'}`, true);
     addChatMessage('ai', `Complexity: ${previewRes.complexity}. Estimated cost: ~${previewRes.estimated_tokens} tokens. Click "Analyze & Build" to proceed.`, true);
 
+    // Reset UI from any previous job
+    document.getElementById('feature-list').innerHTML = '';
+    document.getElementById('timeline').innerHTML = '';
+    currentStep = -1;
+    currentJobId = null;
+
     // Show the raw mesh in the 3D viewer
     pendingTempPath = previewRes.temp_path;
     pendingFile = file;
@@ -442,17 +448,24 @@ function _showRawMesh(previewRes) {
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Start camera far away and slightly left, animate to top-right angle
-  camera.position.set(center.x - size * 3, center.y + size * 2, center.z + size * 3);
+  // Start camera far away, upper-left
+  const startPos = {
+    x: center.x - size * 2.5,
+    y: center.y + size * 1.5,
+    z: center.z + size * 2.5,
+  };
+  camera.position.set(startPos.x, startPos.y, startPos.z);
   controls.target.copy(center);
   controls.update();
 
-  const endPos = {
-    x: center.x + size * 0.8,
-    y: center.y - size * 0.5,
-    z: center.z + size * 0.7,
-  };
-  animateCamera(endPos, center, 1.8);
+  // Animate to top-right isometric after a brief delay
+  requestAnimationFrame(() => {
+    animateCamera(
+      { x: center.x + size * 0.8, y: center.y - size * 0.5, z: center.z + size * 0.7 },
+      center,
+      2.0,
+    );
+  });
 }
 
 // Analyze & Build button handler
@@ -561,10 +574,25 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           return; // Modal will call finishLoad when confirmed
         }
       } catch (err) {
-        // AI unavailable, skip dimension review
+        // AI unavailable — show basic dimension review from bbox
+        if (statusData.bbox_min && statusData.bbox_max) {
+          const dims = [0,1,2].map(i => Math.abs(statusData.bbox_max[i] - statusData.bbox_min[i]));
+          dims.sort((a,b) => b - a);
+          const basicAnalysis = {
+            part_type: 'Prismatic part',
+            suggested_dimensions: {
+              width: Math.round(dims[0] * 10) / 10,
+              height: Math.round(dims[1] * 10) / 10,
+              thickness: Math.round(dims[2] * 10) / 10,
+            },
+            notes: 'Dimensions from bounding box. AI analysis unavailable.',
+          };
+          showDimensionModal(basicAnalysis, statusData);
+          return;
+        }
       }
 
-      // No AI or skipped — load directly
+      // No dimensions available — load directly
       finishLoad(statusData);
     } else {
       alert('Pipeline error: ' + (data.error || 'unknown'));

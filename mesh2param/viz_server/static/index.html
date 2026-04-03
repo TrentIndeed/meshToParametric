@@ -72,7 +72,9 @@ body {
   min-width: 48px; max-width: 400px;
   background: var(--bg-secondary); border-right: 1px solid var(--border);
   overflow-y: auto; overflow-x: hidden; z-index: 50;
+  transition: transform 0.2s ease;
 }
+#sidebar.open { transform: translateX(0) !important; }
 #sidebar .header {
   padding: 12px 16px; font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 1px; color: var(--text-secondary);
@@ -354,7 +356,7 @@ body {
 
 /* ── Mobile: hide sidebars, stack controls ── */
 @media (max-width: 768px) {
-  #sidebar { display: none; }
+  #sidebar { transform: translateX(-100%); width: 280px; bottom: 0; z-index: 90; }
   #chat-panel { display: none; }
   #viewer { left: 0 !important; right: 0 !important; bottom: 140px; }
   #timeline { height: 60px; bottom: 52px; }
@@ -363,7 +365,6 @@ body {
     background: var(--bg-secondary); padding: 8px 12px; gap: 6px;
     border-top: 1px solid var(--border); justify-content: center; }
   .action-btn { padding: 6px 14px; font-size: 12px; }
-  #topbar .menu-btn { display: none; }
   #topbar .tokens { font-size: 10px; }
   #chat-input-row { display: none; }
 }
@@ -379,7 +380,7 @@ body {
 <!-- Top Bar -->
 <div id="topbar">
   <div class="left">
-    <button class="menu-btn"><i class="ri-menu-line"></i></button>
+    <button class="menu-btn" onclick="document.getElementById('sidebar').classList.toggle('open')"><i class="ri-menu-line"></i></button>
     <a href="/home" class="logo" style="text-decoration:none;color:var(--text-primary)">Paramesh<span style="color:var(--accent)">AI</span></a>
   </div>
   <div class="right">

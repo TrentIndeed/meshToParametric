@@ -360,7 +360,7 @@ footer {
 
 /* Mobile: frame at top, card directly below — tight stacked layout */
 @media (max-width: 768px) {
-  .scroll-anim { margin-top: -2rem; height: 350vh; }
+  .scroll-anim { margin-top: -2rem; height: 300vh; }
   .scroll-anim .sticky {
     display: flex; flex-direction: column;
     align-items: center; justify-content: center;
@@ -370,14 +370,14 @@ footer {
     height: 100vh;
   }
   .scroll-anim .gear-frame {
-    order: -1; /* frame above card */
-    width: 80%; height: auto;
-    max-height: 32vh;
+    order: -1;
+    width: 92%; height: auto;
+    max-height: 37vh;
     object-fit: contain; border-radius: 0; opacity: 1;
     flex-shrink: 0;
     margin: 0 auto;
-    mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 80%);
-    -webkit-mask-image: radial-gradient(ellipse 80% 75% at center, black 40%, transparent 80%);
+    mask-image: radial-gradient(ellipse 75% 70% at center, black 35%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse 75% 70% at center, black 35%, transparent 75%);
   }
   .scroll-anim .text-card {
     padding: 0 1.5rem;
@@ -389,13 +389,15 @@ footer {
   .scroll-anim .text-overlay {
     max-width: none;
     position: absolute; left: 1.5rem; right: 1.5rem;
-    backdrop-filter: none;
-    /* Visible upward entrance on mobile — slower, more dramatic */
-    transition: opacity 0.7s ease, transform 0.6s ease;
+    backdrop-filter: blur(12px);
+    background: rgba(10,10,11,0.75);
+    transition: opacity 0.8s ease, transform 0.7s ease, filter 0.8s ease;
     transform: translateY(0);
+    filter: none;
   }
   .scroll-anim .text-overlay.hidden {
-    opacity: 0; transform: translateY(30px);
+    opacity: 0; transform: translateY(28px);
+    filter: blur(6px);
   }
 }
 

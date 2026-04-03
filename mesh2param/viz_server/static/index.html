@@ -53,6 +53,37 @@ body {
   border-radius: 6px; padding: 4px 8px; cursor: pointer; font-size: 16px;
 }
 #topbar .menu-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* App menu dropdown */
+#app-menu {
+  display: none; position: fixed; top: 48px; left: 8px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 10px; padding: 6px 0; z-index: 200;
+  min-width: 220px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+#app-menu.show { display: block; }
+#app-menu > a, #app-menu > div:not(.divider) {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; color: var(--text-primary); font-size: 13px;
+  text-decoration: none; cursor: pointer; transition: background 0.1s;
+}
+#app-menu > a:hover, #app-menu > div:not(.divider):hover {
+  background: var(--bg-tertiary);
+}
+#app-menu > a i, #app-menu > div:not(.divider) i {
+  font-size: 16px; color: var(--text-secondary); width: 20px; text-align: center;
+}
+#app-menu .divider {
+  height: 1px; background: var(--border); margin: 4px 0;
+}
+
+/* Sidebar collapse toggle */
+.sidebar-toggle {
+  margin-left: auto; background: none; border: none;
+  color: var(--text-muted); cursor: pointer; font-size: 16px;
+  padding: 2px 4px; border-radius: 4px;
+}
+.sidebar-toggle:hover { color: var(--accent); background: var(--bg-tertiary); }
 #topbar .right { display: flex; align-items: center; gap: 16px; }
 #topbar .tokens {
   font-family: 'JetBrains Mono', monospace; font-size: 12px;
@@ -386,7 +417,7 @@ body {
 <!-- Top Bar -->
 <div id="topbar">
   <div class="left">
-    <button class="menu-btn" onclick="var s=document.getElementById('sidebar'); if(window.innerWidth<=768){s.classList.toggle('open')}else{s.classList.toggle('closed')}"><i class="ri-menu-line"></i></button>
+    <button class="menu-btn" onclick="document.getElementById('app-menu').classList.toggle('show')"><i class="ri-menu-line"></i></button>
     <a href="/home" class="logo" style="text-decoration:none;color:var(--text-primary)">Paramesh<span style="color:var(--accent)">AI</span></a>
   </div>
   <div class="right">
@@ -395,9 +426,25 @@ body {
   </div>
 </div>
 
+<!-- App Menu Dropdown -->
+<div id="app-menu">
+  <a href="/home"><i class="ri-home-4-line"></i> Home</a>
+  <div class="divider"></div>
+  <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
+  <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
+  <div class="divider"></div>
+  <div onclick="openSettings(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-settings-3-line"></i> Settings</div>
+  <a href="/clean"><i class="ri-tools-line"></i> Mesh Cleaner</a>
+  <div class="divider"></div>
+  <a href="/"><i class="ri-logout-box-r-line"></i> Exit to Landing</a>
+</div>
+
 <!-- Feature Tree Sidebar -->
 <div id="sidebar">
-  <div class="header"><i class="ri-node-tree"></i> <span>Feature Tree</span></div>
+  <div class="header">
+    <i class="ri-node-tree"></i> <span>Feature Tree</span>
+    <button class="sidebar-toggle" onclick="var s=document.getElementById('sidebar'); if(window.innerWidth<=768){s.classList.toggle('open')}else{s.classList.toggle('closed')}" title="Toggle sidebar"><i class="ri-side-bar-line"></i></button>
+  </div>
   <div id="feature-list">
     <!-- Populated by JS -->
   </div>
@@ -530,6 +577,20 @@ body {
   const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
   if (!token) window.location.href = '/login?next=/app&mode=signup';
 })();
+
+// Close app menu when clicking outside
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('app-menu');
+  const btn = document.querySelector('.menu-btn');
+  if (menu.classList.contains('show') && !menu.contains(e.target) && !btn.contains(e.target)) {
+    menu.classList.remove('show');
+  }
+});
+
+// Export STEP stub
+function downloadSTEP() {
+  alert('STEP export coming soon');
+}
 </script>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }

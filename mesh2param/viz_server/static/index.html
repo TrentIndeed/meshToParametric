@@ -74,6 +74,7 @@ body {
   overflow-y: auto; overflow-x: hidden; z-index: 50;
   transition: transform 0.2s ease;
 }
+#sidebar.closed { transform: translateX(-100%); }
 #sidebar.open { transform: translateX(0) !important; }
 #sidebar .header {
   padding: 12px 16px; font-size: 11px; font-weight: 600;
@@ -385,7 +386,7 @@ body {
 <!-- Top Bar -->
 <div id="topbar">
   <div class="left">
-    <button class="menu-btn" onclick="document.getElementById('sidebar').classList.toggle('open')"><i class="ri-menu-line"></i></button>
+    <button class="menu-btn" onclick="var s=document.getElementById('sidebar'); if(window.innerWidth<=768){s.classList.toggle('open')}else{s.classList.toggle('closed')}"><i class="ri-menu-line"></i></button>
     <a href="/home" class="logo" style="text-decoration:none;color:var(--text-primary)">Paramesh<span style="color:var(--accent)">AI</span></a>
   </div>
   <div class="right">

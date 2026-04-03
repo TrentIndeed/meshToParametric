@@ -478,6 +478,69 @@ async def job_step(job_id: str, index: int):
     }
 
 
+@app.get("/api/job/{job_id}/compare")
+async def job_compare(job_id: str, n_slices: int = 7):
+    """Compare original mesh to final CAD solid via cross-section slicing.
+
+    Returns accuracy score (0-100), per-slice IoU data, and a comparison figure.
+    """
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    if job.status != "done":
+        return JSONResponse({"error": f"Job not done (status={job.status})"}, status_code=400)
+    if not job.steps:
+        return JSONResponse({"error": "No construction steps"}, status_code=400)
+    if job.cleaned is None:
+        return JSONResponse({"error": "No cleaned mesh data"}, status_code=400)
+
+    # Use the final construction step as the CAD solid
+    final_step = job.steps[-1]
+    if final_step.tess_vertices is None or final_step.tess_faces is None:
+        return JSONResponse({"error": "Final step has no tessellation"}, status_code=400)
+
+    # Determine extrude direction from the feature tree
+    extrude_dir = np.array([0.0, 0.0, 1.0])
+    if job.features is not None and hasattr(job.features, "features") and job.features.features:
+        extrude_dir = np.array(job.features.features[0].direction, dtype=np.float64)
+
+    from mesh2param.pipeline.compare import compare_slices
+
+    try:
+        result = compare_slices(
+            cleaned=job.cleaned,
+            cad_vertices=final_step.tess_vertices,
+            cad_faces=final_step.tess_faces,
+            extrude_dir=extrude_dir,
+            n_slices=n_slices,
+        )
+    except Exception as e:
+        logger.exception("Compare failed for job %s", job_id)
+        return JSONResponse({"error": f"Comparison failed: {e}"}, status_code=500)
+
+    # Copy figure to static dir so it can be served
+    figure_url = ""
+    if result.get("figure_path") and Path(result["figure_path"]).exists():
+        import shutil
+        compare_dir = STATIC_DIR / "compare"
+        compare_dir.mkdir(exist_ok=True)
+        dest_name = f"compare_{job_id}.png"
+        dest = compare_dir / dest_name
+        shutil.copy2(result["figure_path"], dest)
+        figure_url = f"/static/compare/{dest_name}"
+        # Clean up temp file
+        try:
+            Path(result["figure_path"]).unlink()
+        except Exception:
+            pass
+
+    return {
+        "score": result["score"],
+        "per_slice": result["per_slice"],
+        "figure_url": figure_url,
+    }
+
+
 # ── Legacy endpoints (redirect to latest job) ──
 
 @app.get("/api/status")

@@ -354,51 +354,21 @@ def _extract_profile_and_holes(
                 ]
                 bbox_poly = SPoly(bbox_profile)
 
-                # Two-step approach:
-                # 1. Outer frame = union of solids from ALL heights (fills
-                #    the side walls that only exist at certain Z levels)
-                # 2. Cutout = void from the BEST slice (mid-height), clipped
-                #    to only areas inside the frame outline.
-                #
-                # This gives a closed frame border with the correct cutout.
-                all_solids = []
-                for scan_frac in np.linspace(0.05, 0.95, 9):
-                    scan_pos = float(all_proj.min()) + extent * scan_frac
-                    scan_origin = [0.0, 0.0, 0.0]
-                    scan_origin[primary_axis] = scan_pos
-                    try:
-                        scan_section = mesh.section(
-                            plane_origin=scan_origin, plane_normal=normal,
-                        )
-                        if scan_section is None:
-                            continue
-                        scan_2d, _ = scan_section.to_planar()
-                        for poly in scan_2d.polygons_closed:
-                            if poly.is_valid and poly.area > 5:
-                                all_solids.append(poly.buffer(0))
-                    except Exception:
-                        continue
-
-                if all_solids:
-                    # Frame outline = union of all solids, morph-closed
-                    frame = unary_union(all_solids)
-                    frame_clean = frame.buffer(3.0, join_style='mitre', mitre_limit=5.0)
-                    frame_clean = frame_clean.buffer(-3.0, join_style='mitre', mitre_limit=5.0)
-                    frame_clean = frame_clean.intersection(bbox_poly)
-                    if frame_clean.is_empty:
-                        frame_clean = frame.intersection(bbox_poly)
-
-                    # Cutout from the best (mid-height) slice
-                    best_solid = unary_union([
-                        SPoly(p).buffer(0) for p in best_profiles
-                        if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
-                        and SPoly(p).is_valid
-                    ])
-                    best_void = bbox_poly.difference(best_solid)
-
-                    # The actual profile = frame outline with cutout holes
-                    # Only cut voids that are INSIDE the frame (not at edges)
-                    diff = frame_clean.intersection(best_void)
+                # Use the best slice's solid polygons with morph-close to
+                # fill hole notches. Mitre joins preserve sharp corners.
+                best_polys = [
+                    SPoly(p).buffer(0) for p in best_profiles
+                    if len(p) >= 3 and _polygon_area(p) > total_area * 0.05
+                    and SPoly(p).is_valid
+                ]
+                if best_polys:
+                    merged = unary_union(best_polys)
+                    merged_clean = merged.buffer(4.0, join_style='mitre', mitre_limit=5.0)
+                    merged_clean = merged_clean.buffer(-4.0, join_style='mitre', mitre_limit=5.0)
+                    merged_clean = merged_clean.intersection(bbox_poly)
+                    if merged_clean.is_empty:
+                        merged_clean = merged
+                    diff = bbox_poly.difference(merged_clean)
                 else:
                     diff = SPoly()
                 combined = [bbox_profile]

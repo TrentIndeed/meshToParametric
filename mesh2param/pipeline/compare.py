@@ -35,13 +35,18 @@ def _section_to_polygons(
     mesh: trimesh.Trimesh,
     plane_origin: np.ndarray,
     plane_normal: np.ndarray,
+    ax_u: int = 0,
+    ax_v: int = 2,
 ) -> list:
-    """Slice a mesh at a plane and return a list of shapely polygons.
+    """Slice a mesh at a plane and return shapely polygons.
+
+    Uses trimesh's to_planar() for robust polygon extraction, then
+    re-maps the 2D coordinates to fixed world axes (ax_u, ax_v) so
+    both the original mesh and CAD mesh use the same coordinate frame.
 
     Returns an empty list if the section is empty or fails.
     """
     from shapely.geometry import MultiPolygon, Polygon
-    from shapely.ops import unary_union
     from shapely.validation import make_valid
 
     try:
@@ -52,28 +57,53 @@ def _section_to_polygons(
     if section is None:
         return []
 
+    # Get 3D vertices of the section
+    verts_3d = np.array(section.vertices)
+    if len(verts_3d) == 0:
+        return []
+
     try:
-        # to_planar projects the 3D section onto a 2D coordinate system
-        path2d, to_3d = section.to_planar()
+        path2d, to_3d_matrix = section.to_planar()
     except Exception:
         return []
 
     if path2d is None or len(path2d.entities) == 0:
         return []
 
+    # Build a mapping from 2D path vertices back to 3D vertices
+    verts_2d = np.array(path2d.vertices)
+
+    # Instead of using the arbitrary 2D coordinates from to_planar(),
+    # project the original 3D section vertices onto fixed world axes.
+    # This ensures both meshes share the same coordinate frame.
+    fixed_2d = verts_3d[:, [ax_u, ax_v]]
+
+    # Build index mapping: for each 2D path vertex, find the closest 3D vertex
+    from scipy.spatial import cKDTree
+    tree_3d = cKDTree(verts_3d[:, :3])
+
+    # Reconstruct the 2D path vertices using to_3d_matrix to get back to 3D,
+    # then project onto fixed axes
+    ones = np.ones((len(verts_2d), 1))
+    verts_2d_h = np.hstack([verts_2d, np.zeros((len(verts_2d), 1)), ones])
+    verts_3d_reconstructed = (to_3d_matrix @ verts_2d_h.T).T[:, :3]
+    fixed_coords = verts_3d_reconstructed[:, [ax_u, ax_v]]
+
+    # Replace the path's vertex coordinates with fixed-axis projections
+    path2d.vertices = fixed_coords
+
+    # Now extract polygons — they'll be in the fixed coordinate frame
     polys = []
     try:
-        # path2d.polygons_full gives closed polygons (with holes handled)
         for poly in path2d.polygons_full:
             p = make_valid(poly)
             if p.is_empty:
                 continue
             if isinstance(p, MultiPolygon):
-                polys.extend(p.geoms)
+                polys.extend(g for g in p.geoms if g.area > 0)
             elif isinstance(p, Polygon) and p.area > 0:
                 polys.append(p)
     except Exception:
-        # Fallback: try polygons_closed (simpler, no hole detection)
         try:
             for poly in path2d.polygons_closed:
                 p = make_valid(poly)
@@ -138,9 +168,11 @@ def compare_slices(
     orig_mesh = _make_trimesh(cleaned.vertices, cleaned.faces)
     cad_mesh = _make_trimesh(cad_vertices, cad_faces)
 
-    # Compute extent along extrude direction for both meshes
-    orig_proj = orig_mesh.vertices @ extrude_dir
-    cad_proj = cad_mesh.vertices @ extrude_dir
+    # Compute extent along the PRIMARY AXIS (not the signed extrude direction).
+    # This avoids sign issues when the extrude dir is negative.
+    primary_axis = int(np.argmax(np.abs(extrude_dir)))
+    orig_proj = orig_mesh.vertices[:, primary_axis]
+    cad_proj = cad_mesh.vertices[:, primary_axis]
 
     global_min = min(orig_proj.min(), cad_proj.min())
     global_max = max(orig_proj.max(), cad_proj.max())
@@ -165,10 +197,20 @@ def compare_slices(
     orig_poly_slices = []
     cad_poly_slices = []
 
+    # Determine the two non-extrude axes for consistent 2D projection
+    axes_2d = [i for i in range(3) if i != primary_axis]
+    ax_u, ax_v = axes_2d[0], axes_2d[1]
+
     for h in heights:
-        origin = extrude_dir * h
-        orig_polys = _section_to_polygons(orig_mesh, origin, extrude_dir)
-        cad_polys = _section_to_polygons(cad_mesh, origin, extrude_dir)
+        # Slice plane: perpendicular to the primary axis at height h
+        orig_center = orig_mesh.vertices.mean(axis=0)
+        origin = orig_center.copy()
+        origin[primary_axis] = h
+        # Use axis-aligned normal (avoids sign issues)
+        slice_normal = np.zeros(3)
+        slice_normal[primary_axis] = 1.0
+        orig_polys = _section_to_polygons(orig_mesh, origin, slice_normal, ax_u, ax_v)
+        cad_polys = _section_to_polygons(cad_mesh, origin, slice_normal, ax_u, ax_v)
 
         orig_union = _union_polygons(orig_polys)
         cad_union = _union_polygons(cad_polys)

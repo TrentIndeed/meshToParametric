@@ -2,10 +2,14 @@
 
 Each upload creates a Job with a UUID. A background worker thread
 processes jobs one at a time. Frontend polls by job ID.
+
+Completed jobs are persisted to SQLite so they survive server restarts.
+On startup, completed jobs are loaded from the DB back into memory.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -15,8 +19,11 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,7 @@ class JobQueue:
         self._worker.start()
         self._tokens_spent = 0
         self._on_complete = None  # callback: fn(job) called when job finishes
+        self._db_loaded = False  # True after initial DB load
 
     def set_on_complete(self, fn):
         """Set a callback for when a job completes. fn(job) is called."""
@@ -86,7 +94,11 @@ class JobQueue:
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+        if job is not None:
+            return job
+        # Try loading from DB if not in memory
+        return self._load_single_from_db(job_id)
 
     def _worker_loop(self):
         """Process jobs one at a time."""
@@ -203,12 +215,255 @@ with open(r'{tmp_out.name}', 'wb') as f:
 
         job.status = "done"
 
+        # Persist to SQLite
+        self._save_to_db(job)
+
         # Notify callback (for per-IP billing)
         if self._on_complete:
             try:
                 self._on_complete(job)
             except Exception:
                 pass
+
+    # ── Database persistence ──
+
+    def load_completed_from_db(self):
+        """Load completed jobs from SQLite into memory on startup."""
+        if self._db_loaded:
+            return
+        self._db_loaded = True
+        try:
+            from mesh2param.db.database import SessionLocal, MeshJob as DBMeshJob, JobStep as DBJobStep
+            from mesh2param.pipeline.export_cadquery import ConstructionStep
+            db = SessionLocal()
+            try:
+                db_jobs = (
+                    db.query(DBMeshJob)
+                    .filter(DBMeshJob.status == "done", DBMeshJob.job_uuid.isnot(None))
+                    .order_by(DBMeshJob.created_at.desc())
+                    .limit(MAX_JOBS)
+                    .all()
+                )
+                loaded = 0
+                for db_job in reversed(db_jobs):  # oldest first so OrderedDict order is correct
+                    job_id = db_job.job_uuid
+                    with self._lock:
+                        if job_id in self._jobs:
+                            continue
+
+                    job = Job(
+                        id=job_id,
+                        filename=db_job.filename or "",
+                        file_path="",
+                        status="done",
+                        progress=100,
+                        progress_stage="Done",
+                        mesh_volume=db_job.mesh_volume or 0.0,
+                        cad_volume=db_job.cad_volume or 0.0,
+                        token_cost=db_job.token_cost or 0,
+                        created_at=db_job.created_at.timestamp() if db_job.created_at else time.time(),
+                    )
+
+                    # Restore bbox
+                    try:
+                        job.bbox_min = json.loads(db_job.bbox_min_json) if db_job.bbox_min_json else [0, 0, 0]
+                        job.bbox_max = json.loads(db_job.bbox_max_json) if db_job.bbox_max_json else [0, 0, 0]
+                    except Exception:
+                        pass
+
+                    # Restore construction steps
+                    db_steps = (
+                        db.query(DBJobStep)
+                        .filter(DBJobStep.job_id == db_job.id)
+                        .order_by(DBJobStep.step_index)
+                        .all()
+                    )
+                    steps = []
+                    for db_step in db_steps:
+                        tess_verts = None
+                        tess_faces = None
+                        if db_step.vertices_blob and db_step.vertices_shape:
+                            try:
+                                shape = tuple(int(x) for x in db_step.vertices_shape.split(","))
+                                tess_verts = np.frombuffer(db_step.vertices_blob, dtype=np.float64).reshape(shape)
+                            except Exception:
+                                pass
+                        if db_step.faces_blob and db_step.faces_shape:
+                            try:
+                                shape = tuple(int(x) for x in db_step.faces_shape.split(","))
+                                tess_faces = np.frombuffer(db_step.faces_blob, dtype=np.int64).reshape(shape)
+                            except Exception:
+                                pass
+                        steps.append(ConstructionStep(
+                            name=db_step.name,
+                            tess_vertices=tess_verts if tess_verts is not None else np.array([]),
+                            tess_faces=tess_faces if tess_faces is not None else np.array([]),
+                            volume=db_step.volume or 0.0,
+                        ))
+                    job.steps = steps
+
+                    with self._lock:
+                        self._jobs[job_id] = job
+                    self._tokens_spent += job.token_cost
+                    loaded += 1
+
+                if loaded:
+                    logger.info("Loaded %d completed jobs from database", loaded)
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("Failed to load jobs from database")
+
+    def _save_to_db(self, job: Job):
+        """Persist a completed job to SQLite."""
+        try:
+            from mesh2param.db.database import SessionLocal, MeshJob as DBMeshJob, JobStep as DBJobStep
+            db = SessionLocal()
+            try:
+                # Check if already saved
+                existing = db.query(DBMeshJob).filter(DBMeshJob.job_uuid == job.id).first()
+                if existing:
+                    return
+
+                num_features = 0
+                features_summary = None
+                if job.features and hasattr(job.features, "features"):
+                    num_features = len(job.features.features)
+                    try:
+                        features_summary = json.dumps([
+                            {"type": f.type.value if hasattr(f.type, "value") else str(f.type),
+                             "name": getattr(f, "name", ""),
+                             "params": {k: v for k, v in (getattr(f, "params", {}) or {}).items()
+                                        if isinstance(v, (int, float, str, bool))}}
+                            for f in job.features.features
+                        ])
+                    except Exception:
+                        pass
+
+                db_job = DBMeshJob(
+                    user_id=1,  # default user; TODO: pass actual user from request
+                    job_uuid=job.id,
+                    filename=job.filename,
+                    status=job.status,
+                    error=job.error,
+                    mesh_volume=job.mesh_volume,
+                    cad_volume=job.cad_volume,
+                    num_features=num_features,
+                    num_steps=len(job.steps),
+                    token_cost=job.token_cost,
+                    ai_tokens_used=job.token_cost,
+                    bbox_min_json=json.dumps(job.bbox_min),
+                    bbox_max_json=json.dumps(job.bbox_max),
+                    features_json=features_summary,
+                    completed_at=datetime.utcnow(),
+                )
+                db.add(db_job)
+                db.flush()  # get db_job.id
+
+                for i, step in enumerate(job.steps):
+                    verts_blob = None
+                    verts_shape = None
+                    faces_blob = None
+                    faces_shape = None
+                    if step.tess_vertices is not None and len(step.tess_vertices) > 0:
+                        arr = np.asarray(step.tess_vertices, dtype=np.float64)
+                        verts_blob = arr.tobytes()
+                        verts_shape = ",".join(str(s) for s in arr.shape)
+                    if step.tess_faces is not None and len(step.tess_faces) > 0:
+                        arr = np.asarray(step.tess_faces, dtype=np.int64)
+                        faces_blob = arr.tobytes()
+                        faces_shape = ",".join(str(s) for s in arr.shape)
+
+                    db_step = DBJobStep(
+                        job_id=db_job.id,
+                        step_index=i,
+                        name=step.name,
+                        volume=step.volume,
+                        is_sketch="sketch" in step.name.lower(),
+                        vertices_blob=verts_blob,
+                        vertices_shape=verts_shape,
+                        faces_blob=faces_blob,
+                        faces_shape=faces_shape,
+                    )
+                    db.add(db_step)
+
+                db.commit()
+                logger.info("Saved job %s to database (%d steps)", job.id, len(job.steps))
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("Failed to save job %s to database", job.id)
+
+    def _load_single_from_db(self, job_id: str) -> Job | None:
+        """Try to load a single job from the DB (cache miss)."""
+        try:
+            from mesh2param.db.database import SessionLocal, MeshJob as DBMeshJob, JobStep as DBJobStep
+            from mesh2param.pipeline.export_cadquery import ConstructionStep
+            db = SessionLocal()
+            try:
+                db_job = db.query(DBMeshJob).filter(
+                    DBMeshJob.job_uuid == job_id, DBMeshJob.status == "done"
+                ).first()
+                if db_job is None:
+                    return None
+
+                job = Job(
+                    id=job_id,
+                    filename=db_job.filename or "",
+                    file_path="",
+                    status="done",
+                    progress=100,
+                    progress_stage="Done",
+                    mesh_volume=db_job.mesh_volume or 0.0,
+                    cad_volume=db_job.cad_volume or 0.0,
+                    token_cost=db_job.token_cost or 0,
+                    created_at=db_job.created_at.timestamp() if db_job.created_at else time.time(),
+                )
+                try:
+                    job.bbox_min = json.loads(db_job.bbox_min_json) if db_job.bbox_min_json else [0, 0, 0]
+                    job.bbox_max = json.loads(db_job.bbox_max_json) if db_job.bbox_max_json else [0, 0, 0]
+                except Exception:
+                    pass
+
+                db_steps = (
+                    db.query(DBJobStep)
+                    .filter(DBJobStep.job_id == db_job.id)
+                    .order_by(DBJobStep.step_index)
+                    .all()
+                )
+                steps = []
+                for db_step in db_steps:
+                    tess_verts = None
+                    tess_faces = None
+                    if db_step.vertices_blob and db_step.vertices_shape:
+                        try:
+                            shape = tuple(int(x) for x in db_step.vertices_shape.split(","))
+                            tess_verts = np.frombuffer(db_step.vertices_blob, dtype=np.float64).reshape(shape)
+                        except Exception:
+                            pass
+                    if db_step.faces_blob and db_step.faces_shape:
+                        try:
+                            shape = tuple(int(x) for x in db_step.faces_shape.split(","))
+                            tess_faces = np.frombuffer(db_step.faces_blob, dtype=np.int64).reshape(shape)
+                        except Exception:
+                            pass
+                    steps.append(ConstructionStep(
+                        name=db_step.name,
+                        tess_vertices=tess_verts if tess_verts is not None else np.array([]),
+                        tess_faces=tess_faces if tess_faces is not None else np.array([]),
+                        volume=db_step.volume or 0.0,
+                    ))
+                job.steps = steps
+
+                # Cache in memory
+                with self._lock:
+                    self._jobs[job_id] = job
+                return job
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("Failed to load job %s from database", job_id)
+            return None
 
     @staticmethod
     def _estimate_volume(cleaned) -> float:

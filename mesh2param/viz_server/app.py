@@ -95,6 +95,8 @@ def _get_user_plan(request) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Load completed jobs from DB so they survive restarts
+    queue.load_completed_from_db()
     # Charge IP when jobs complete
     queue.set_on_complete(lambda job: _charge_ip(job.client_ip, job.token_cost) if job.client_ip else None)
     yield

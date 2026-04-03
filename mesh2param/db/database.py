@@ -10,6 +10,7 @@ from pathlib import Path
 
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey,
+    LargeBinary,
     create_engine,
 )
 from sqlalchemy.ext.declarative import declarative_base
@@ -48,7 +49,8 @@ class MeshJob(Base):
     """A single mesh-to-parametric conversion run."""
     __tablename__ = "mesh_jobs"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    job_uuid = Column(String, unique=True, index=True)  # matches Job.id from queue
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     filename = Column(String, nullable=False)
     status = Column(String, default="pending")  # pending | processing | done | error
     error = Column(Text)
@@ -58,6 +60,10 @@ class MeshJob(Base):
     num_features = Column(Integer, default=0)
     num_steps = Column(Integer, default=0)
     ai_tokens_used = Column(Integer, default=0)
+    token_cost = Column(Integer, default=0)
+    bbox_min_json = Column(Text)  # JSON [x, y, z]
+    bbox_max_json = Column(Text)  # JSON [x, y, z]
+    features_json = Column(Text)  # JSON summary of feature tree
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
 
@@ -74,7 +80,12 @@ class JobStep(Base):
     name = Column(String, nullable=False)
     volume = Column(Float, default=0.0)
     is_sketch = Column(Boolean, default=False)
-    # Geometry stored as JSON blobs (vertices/faces arrays)
+    # Geometry stored as binary blobs (numpy .tobytes())
+    vertices_blob = Column(LargeBinary)  # float64 (V, 3) flattened
+    faces_blob = Column(LargeBinary)     # int64 (F, 3) flattened
+    vertices_shape = Column(String)      # "V,3"
+    faces_shape = Column(String)         # "F,3"
+    # Keep legacy columns for backward compat
     vertices_json = Column(Text)
     faces_json = Column(Text)
 
@@ -114,3 +125,48 @@ def get_db():
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _migrate_db()
+
+
+def _migrate_db():
+    """Add columns that may be missing from older DB schemas (idempotent)."""
+    import sqlite3
+
+    # Only applies to SQLite
+    if "sqlite" not in DATABASE_URL:
+        return
+
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        def _add_col(table, col, coltype, default=None):
+            try:
+                dflt = f" DEFAULT {default}" if default is not None else ""
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}{dflt}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # MeshJob new columns
+        _add_col("mesh_jobs", "job_uuid", "TEXT")
+        _add_col("mesh_jobs", "token_cost", "INTEGER", 0)
+        _add_col("mesh_jobs", "bbox_min_json", "TEXT")
+        _add_col("mesh_jobs", "bbox_max_json", "TEXT")
+        _add_col("mesh_jobs", "features_json", "TEXT")
+
+        # JobStep new columns (blob-based tessellation)
+        _add_col("job_steps", "vertices_blob", "BLOB")
+        _add_col("job_steps", "faces_blob", "BLOB")
+        _add_col("job_steps", "vertices_shape", "TEXT")
+        _add_col("job_steps", "faces_shape", "TEXT")
+
+        # Make user_id nullable for anonymous jobs
+        # (SQLite doesn't support ALTER COLUMN, but new rows can have NULL
+        # if the column was added without NOT NULL — the original schema has
+        # nullable=False but create_all won't retroactively enforce it)
+
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # non-fatal — fresh DBs will have all columns from create_all

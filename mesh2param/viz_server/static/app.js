@@ -696,10 +696,17 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       if (holes > 0) summary += `, ${holes} hole${holes > 1 ? 's' : ''}`;
       if (chamfers > 0) summary += `, ${chamfers} chamfer${chamfers > 1 ? 's' : ''}`;
       if (fillets > 0) summary += `, ${fillets} fillet${fillets > 1 ? 's' : ''}`;
-      const accuracy = Math.max(0, 100 - Math.abs((statusData.cad_volume - statusData.mesh_volume) / statusData.mesh_volume * 100));
-      summary += `. Shape accuracy: ${accuracy.toFixed(0)}%`;
       addChatMessage('ai', summary);
       addChatMessage('system', 'Click features in the tree to step through the build. Ask me about dimensions or features.');
+
+      // Run slicer comparison in background and show accuracy
+      if (currentJobId) {
+        fetch(`/api/job/${currentJobId}/compare`).then(r => r.json()).then(comp => {
+          if (comp.score !== undefined) {
+            addChatMessage('ai', `🎯 Cross-section accuracy: ${comp.score.toFixed(0)}% (${comp.per_slice?.length || 0} slices compared)`);
+          }
+        }).catch(() => {}); // silently skip if comparison fails
+      }
 
       // Try AI dimension analysis — keep loading visible with status
       loadingText.textContent = 'Analyzing dimensions...';

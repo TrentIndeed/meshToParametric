@@ -15,7 +15,7 @@ Object.defineProperty(window, '_currentJobId', {
 const container = document.getElementById('viewer');
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(
-  document.documentElement.getAttribute('data-theme') === 'dark' ? 0x0D1117 : 0xE8EAED
+  document.documentElement.getAttribute('data-theme') === 'dark' ? 0x0D1117 : 0xFFFFFF
 );
 
 const camera = new THREE.PerspectiveCamera(
@@ -74,8 +74,8 @@ function createGrid() {
   const divisions = 30;
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   sceneGrid = new THREE.GridHelper(gridSize, divisions,
-    isDark ? 0x222830 : 0xD8DDE3,
-    isDark ? 0x1A1E24 : 0xE4E8EC
+    isDark ? 0x222830 : 0xE0E0E0,
+    isDark ? 0x1A1E24 : 0xEEEEEE
   );
   sceneGrid.material.transparent = true;
   sceneGrid.material.opacity = 0.5;
@@ -116,13 +116,13 @@ window.toggleOriginAxes = function() {
 // ── Theme-aware scene background ──
 function updateSceneBg() {
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-  scene.background = new THREE.Color(isDark ? 0x0D1117 : 0xE8EAED);
+  scene.background = new THREE.Color(isDark ? 0x0D1117 : 0xFFFFFF);
   // Update grid colors
   if (sceneGrid) {
-    sceneGrid.material.color.set(isDark ? 0x222830 : 0xD8DDE3);
+    sceneGrid.material.color.set(isDark ? 0x222830 : 0xE0E0E0);
     if (Array.isArray(sceneGrid.material)) {
-      sceneGrid.material[0].color.set(isDark ? 0x222830 : 0xD8DDE3);
-      sceneGrid.material[1].color.set(isDark ? 0x1A1E24 : 0xE4E8EC);
+      sceneGrid.material[0].color.set(isDark ? 0x222830 : 0xE0E0E0);
+      sceneGrid.material[1].color.set(isDark ? 0x1A1E24 : 0xEEEEEE);
     }
   }
   // Update axis gizmo border
@@ -388,7 +388,7 @@ async function renderThumbnail(stepIndex) {
 
     const thumbScene = new THREE.Scene();
     const thumbIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
-    thumbScene.background = new THREE.Color(thumbIsDark ? 0x161B22 : 0xE0E3E8);
+    thumbScene.background = new THREE.Color(thumbIsDark ? 0x161B22 : 0xF5F5F5);
 
     // Lights
     thumbScene.add(new THREE.AmbientLight(0xffffff, 0.5));
@@ -581,19 +581,13 @@ function _showRawMesh(previewRes) {
   modelGroup.position.sub(center);
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Start camera well above and to the right
-  camera.position.set(size * 1.2, size * 1.6, size * 1.2);
-  controls.target.set(0, 0, 0);
-  controls.update();
-
-  // Gentle zoom — end position keeps camera clearly above model
-  requestAnimationFrame(() => {
-    animateCamera(
-      { x: size * 0.7, y: size * 1.0, z: size * 0.7 },
-      { x: 0, y: 0, z: 0 },
-      1.2,
-    );
-  });
+  // Smooth animation from current camera position to viewing angle
+  // No jump cut — always animate from wherever the camera is now
+  animateCamera(
+    { x: size * 0.8, y: size * 0.9, z: size * 0.8 },
+    { x: 0, y: 0, z: 0 },
+    1.5,
+  );
 }
 
 // Analyze & Build button handler

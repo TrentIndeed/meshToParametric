@@ -1007,21 +1007,20 @@ async function autoLoad() {
     const saved = sessionStorage.getItem('paramesh_preview');
     if (saved) {
         const previewRes = JSON.parse(saved);
-        document.getElementById('empty-state').style.display = 'none';
-        _showRawMesh(previewRes);
-        addChatMessage('ai', `Restored: ${previewRes.filename || 'mesh'} (${previewRes.faces?.toLocaleString() || '?'} faces). Click "Analyze & Build" to process.`, true);
-        // Restore pending state so Analyze & Build works
-        pendingTempPath = previewRes.temp_path;
-        pendingFile = null;
-        document.getElementById('btn-analyze').style.display = '';
-        document.getElementById('btn-upload').style.display = 'none';
-        // Show preview bar
-        const pb = document.getElementById('preview-bar');
-        if (pb) pb.style.display = 'block';
-        return;
+        if (previewRes.mesh_vertices && previewRes.mesh_vertices.length > 0) {
+          document.getElementById('empty-state').style.display = 'none';
+          _showRawMesh(previewRes);
+          addChatMessage('ai', `Restored: ${previewRes.filename || 'mesh'} (${previewRes.faces?.toLocaleString() || '?'} faces). Click "Analyze & Build" to process.`, true);
+          pendingTempPath = previewRes.temp_path;
+          pendingFile = null;
+          document.getElementById('btn-analyze').style.display = '';
+          document.getElementById('btn-upload').style.display = 'none';
+          const pb = document.getElementById('preview-bar');
+          if (pb) pb.style.display = 'block';
+          return; // Stop here — don't load CAD
+        }
     }
-  } catch (e) { /* fall through to CAD load */ }
-
+  } catch (e) { /* preview restore failed, load CAD instead */ }
   // Otherwise load last completed CAD job
   try {
     const res = await fetch('/api/status');

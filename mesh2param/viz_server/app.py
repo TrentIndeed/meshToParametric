@@ -281,36 +281,46 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
         except Exception:
             pass
 
-        # Complexity analysis
+        # Complexity analysis — based on estimated features, not face count
         import numpy as np
         normals = cleaned.normals
-        avg_n = normals.mean(axis=0)
-        avg_norm = np.linalg.norm(avg_n)
-        if avg_norm > 1e-15:
-            avg_n /= avg_norm
-        normal_spread = float(1.0 - np.mean(np.abs(normals @ avg_n)))
 
-        # Count approximate surface types by normal clustering
+        # Count distinct flat surfaces (planes) by clustering normals
+        # Each unique normal direction ≈ one flat face of the part
         unique_dirs = set()
         for n in normals[::max(1, len(normals)//200)]:
             snapped = tuple(round(x, 1) for x in n)
             unique_dirs.add(snapped)
         approx_surfaces = len(unique_dirs)
 
-        # Aspect ratio (how box-like vs thin/long)
+        # Estimate cylindrical features (holes): faces with non-axis-aligned normals
+        abs_normals = np.abs(normals)
+        sorted_abs = np.sort(abs_normals, axis=1)
+        # Cylinder faces have 2 large + 1 small normal component
+        cylindrical = (sorted_abs[:, 1] > 0.3) & (sorted_abs[:, 2] > 0.3) & (sorted_abs[:, 0] < 0.3)
+        cyl_pct = float(cylindrical.sum()) / max(len(normals), 1)
+
+        # Estimate chamfer/fillet faces: diagonal normals (between 2 axes)
+        diagonal = (sorted_abs[:, 1] > 0.3) & (sorted_abs[:, 2] > 0.3)
+        diag_pct = float(diagonal.sum()) / max(len(normals), 1)
+
+        # Estimated feature counts
+        est_flat_sides = min(approx_surfaces, 20)  # capped
+        est_holes = int(cyl_pct * 20)  # rough: 5% cyl faces ≈ 1 hole
+        est_chamfers = int(diag_pct * 10)
+
+        # Complexity score 0-100 based on estimated features
+        score = 0
+        score += min(15, max(0, est_flat_sides - 6) * 2)  # 6 sides = simple box (0 pts)
+        score += min(30, est_holes * 4)                     # each hole adds ~4 pts
+        score += min(20, est_chamfers * 3)                  # each chamfer adds ~3 pts
+        score += 0 if cleaned.is_watertight else 15         # non-watertight penalty
         sorted_dims = sorted(dims, reverse=True)
         aspect_ratio = sorted_dims[0] / (sorted_dims[2] + 1e-10)
-
-        # Complexity score 0-100
-        # Calibrated so simple prismatic parts (brackets, plates) score 15-30
-        score = 0
-        score += min(15, face_count / 500)         # faces: 0-15 (gentler curve)
-        score += min(15, max(0, approx_surfaces - 6) * 1.5)  # surface variety: 0-15 (6 base dirs free)
-        score += min(15, normal_spread * 30)       # normal spread: 0-15
-        score += min(10, max(0, aspect_ratio - 2) * 1.5)  # aspect ratio: 0-10 (ratio<2 free)
-        score += 0 if cleaned.is_watertight else 10  # non-watertight penalty
-        score += min(10, len(dims) and max(dims) / 100)  # size: 0-10
+        score += min(10, max(0, aspect_ratio - 3) * 2)     # very elongated parts
         score = min(100, round(score))
+
+        normal_spread = diag_pct  # for reporting
 
         # Classification and limits
         if score <= 25:
@@ -809,36 +819,44 @@ async def support_chat(body: dict):
     if not message:
         return {"reply": "Please type a question."}
 
+    # Deflect casual/non-problem messages
+    msg_lower = message.lower().strip()
+    casual_patterns = ["hi", "hello", "hey", "sup", "yo", "what's up", "how are you",
+                       "thanks", "thank you", "bye", "goodbye", "lol", "haha", "ok",
+                       "cool", "nice", "test", "testing", "asdf"]
+    if msg_lower in casual_patterns or len(message) < 3:
+        return {"reply": "I'm here to help with specific questions about Paramesh AI — pricing, file formats, or technical issues. What do you need help with?"}
+
     if not is_available():
         # Fallback: simple FAQ responses
-        msg_lower = message.lower()
-        if "price" in msg_lower or "cost" in msg_lower or "token" in msg_lower:
-            return {"reply": "Paramesh AI uses token-based pricing. Free tier gets 100 tokens. Starter is $9/mo (1000 tokens), Pro is $29/mo (5000), Unlimited is $79/mo. Simple parts cost ~20 tokens, complex parts ~55."}
+        if "price" in msg_lower or "cost" in msg_lower or "plan" in msg_lower:
+            return {"reply": "Paramesh AI is currently in private beta. Plans will start from free (3 parts/month) up to Team ($149/mo, unlimited). Join the waitlist for early access pricing."}
         elif "format" in msg_lower or "stl" in msg_lower or "file" in msg_lower:
             return {"reply": "We support STL, OBJ, PLY, and 3MF files. The pipeline repairs topology and fixes normals automatically."}
-        elif "clean" in msg_lower or "repair" in msg_lower:
-            return {"reply": "The free mesh cleaner at /clean repairs normals, removes degenerate faces, merges vertices, and fills holes. No signup needed for cleaning — it's totally free."}
         elif "onshape" in msg_lower:
-            return {"reply": "Onshape live export is coming soon. Currently you can export as STEP files via CadQuery. The Onshape integration will use the REST API to push your feature tree directly."}
+            return {"reply": "Onshape live export is planned. At launch you'll be able to export STEP files and push feature trees to Onshape via the REST API."}
+        elif "waitlist" in msg_lower or "launch" in msg_lower or "when" in msg_lower or "beta" in msg_lower:
+            return {"reply": "Paramesh AI is in private beta. Join the waitlist on our homepage and we'll notify you when access opens up."}
         else:
-            return {"reply": "I can help with questions about pricing, file formats, features, or troubleshooting. What would you like to know?"}
+            return {"reply": "I can help with questions about pricing, file formats, features, or technical issues. If you need more help, reach us at /contact."}
 
     prompt = f"""You are the support assistant for Paramesh AI (parameshai.com), a tool that converts
-triangulated mesh files (STL/OBJ/3MF) into parametric CAD models.
+triangulated mesh files (STL/OBJ/3MF) into parametric CAD models. The product is currently in private beta (waitlist only).
 
 Key facts:
-- Free tier: 100 tokens, mesh cleaner unlimited, 10MB upload
-- Starter $9/mo: 1000 tokens, 50MB, STEP export
-- Pro $29/mo: 5000 tokens, 200MB, Onshape + AI chat
-- Unlimited $79/mo: unlimited tokens, 500MB
+- Currently in private beta — users join the waitlist for access
+- Plans at launch: Free (3 parts/mo), Maker $19/mo (30 parts), Pro $49/mo (150 parts), Team $149/mo (unlimited)
 - Supported formats: STL, OBJ, PLY, 3MF
 - Pipeline: ingest → segment → fit → topology → recognize → export
-- Features detected: holes, chamfers, fillets, pockets, bosses
-- Export: CadQuery STEP files, Onshape coming soon
-- Free mesh cleaner at /clean (no login for cleaning only)
-- AI chatbot in the app for editing features
+- Features detected: holes, chamfers, fillets, pockets, bosses, slots
+- Export: CadQuery STEP files, Onshape integration planned
+- AI-powered dimension planning and feature recognition
 
-Be concise (2-3 sentences). Be helpful and friendly. If you don't know, suggest contacting support at /contact.
+Rules:
+- Only answer questions about Paramesh AI — pricing, formats, features, or technical issues.
+- If the user is just chatting or doesn't have a real question, tell them you're here for support questions and to reach out at /contact for anything else.
+- Be concise (1-2 sentences max). Don't over-explain.
+- If you don't know, suggest /contact.
 
 User question: {message}"""
 

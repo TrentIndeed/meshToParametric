@@ -429,6 +429,41 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
+/* ── Tree items (Origin, Settings, Sketches) ── */
+.tree-section { }
+.tree-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 16px; cursor: pointer; font-size: 13px;
+  color: var(--text-primary); transition: background 0.1s;
+}
+.tree-item:hover { background: var(--bg-tertiary); }
+.tree-item .eye-btn {
+  margin-left: auto; background: none; border: none;
+  color: var(--text-muted); cursor: pointer; font-size: 14px;
+  padding: 2px 4px; border-radius: 4px; opacity: 0;
+  transition: opacity 0.15s;
+}
+.tree-item:hover .eye-btn { opacity: 1; }
+.tree-item .eye-btn:hover { color: var(--accent); background: var(--bg-tertiary); }
+.tree-children {
+  padding-left: 28px; overflow: hidden;
+  transition: max-height 0.2s ease;
+  max-height: 200px;
+}
+.tree-children.collapsed { max-height: 0; padding: 0 0 0 28px; }
+.tree-child {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 16px 4px 8px; font-size: 12px; color: var(--text-secondary);
+}
+.tree-child .tree-label { }
+.tree-child .tree-value {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  color: var(--text-muted);
+}
+.tree-divider {
+  height: 1px; background: var(--border); margin: 4px 12px;
+}
+
 /* ── Light mode feature icon adjustments ── */
 .feature-item .icon.sketch { background: #dbeafe; color: var(--accent); }
 .feature-item .icon.extrude { background: #dcfce7; color: var(--green); }
@@ -515,8 +550,39 @@ body {
     <i class="ri-node-tree"></i> <span>Feature Tree</span>
     <button class="sidebar-toggle" onclick="var s=document.getElementById('sidebar'); if(window.innerWidth<=768){s.classList.toggle('open')}else{s.classList.toggle('closed')}" title="Toggle sidebar"><i class="ri-side-bar-line"></i></button>
   </div>
+
+  <!-- Static tree items (Fusion 360-style) -->
+  <div class="tree-section">
+    <div class="tree-item" onclick="toggleOriginAxes()">
+      <i class="ri-focus-3-line" style="color:var(--text-muted);font-size:14px;width:20px;text-align:center;"></i>
+      <span>Origin</span>
+      <button class="eye-btn" id="origin-eye" onclick="event.stopPropagation(); toggleOriginAxes()" title="Toggle visibility"><i class="ri-eye-off-line"></i></button>
+    </div>
+    <div class="tree-item doc-settings" onclick="this.querySelector('.tree-children').classList.toggle('collapsed')">
+      <i class="ri-file-settings-line" style="color:var(--text-muted);font-size:14px;width:20px;text-align:center;"></i>
+      <span>Document Settings</span>
+      <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
+    </div>
+    <div class="tree-children" id="doc-settings-children">
+      <div class="tree-child"><span class="tree-label">Units</span><span class="tree-value">mm</span></div>
+      <div class="tree-child"><span class="tree-label">Precision</span><span class="tree-value">0.01</span></div>
+    </div>
+  </div>
+
+  <div class="tree-divider"></div>
+
+  <!-- Sketches folder -->
+  <div class="tree-section" id="sketches-folder" style="display:none;">
+    <div class="tree-item folder" onclick="document.getElementById('sketches-list').classList.toggle('collapsed')">
+      <i class="ri-folder-line" style="color:var(--orange);font-size:14px;width:20px;text-align:center;"></i>
+      <span>Sketches</span>
+      <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
+    </div>
+    <div class="tree-children" id="sketches-list"></div>
+  </div>
+
+  <!-- Feature list (populated by JS) -->
   <div id="feature-list">
-    <!-- Populated by JS -->
   </div>
 </div>
 

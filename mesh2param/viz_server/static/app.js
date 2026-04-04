@@ -743,7 +743,7 @@ function finishLoad(statusData) {
   populateUI(statusData);
   document.getElementById('token-count').textContent = statusData.tokens_used;
   document.getElementById('status-dot').className = 'status-dot done';
-  document.getElementById('btn-onshape').disabled = false;
+  document.getElementById('btn-export').disabled = false;
 
   // Enable chat
   document.getElementById('chat-input').disabled = false;
@@ -1001,7 +1001,7 @@ async function autoLoad() {
         populateUI(data);
         cachedStatusData = data;
         document.getElementById('status-dot').className = 'status-dot done';
-        document.getElementById('btn-onshape').disabled = false;
+        document.getElementById('btn-export').disabled = false;
         document.getElementById('chat-input').disabled = false;
         document.getElementById('chat-send').disabled = false;
         loadStep(lastStep);

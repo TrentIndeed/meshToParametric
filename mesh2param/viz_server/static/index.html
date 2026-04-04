@@ -463,6 +463,24 @@ body {
   height: 1px; background: var(--border); margin: 4px 12px;
 }
 
+/* ── Export dropdown ── */
+#export-menu {
+  display: none; position: absolute; bottom: 100%; left: 0;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px 0; min-width: 180px;
+  box-shadow: 0 -4px 16px rgba(0,0,0,0.12); margin-bottom: 6px;
+  z-index: 100;
+}
+#export-menu.show { display: block; }
+#export-menu > div {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; font-size: 13px; color: var(--text-primary);
+  cursor: pointer; transition: background 0.1s;
+}
+#export-menu > div:hover { background: var(--bg-tertiary); }
+#export-menu > div i { font-size: 15px; color: var(--text-secondary); width: 18px; text-align: center; }
+[data-theme="dark"] #export-menu { box-shadow: 0 -4px 16px rgba(0,0,0,0.4); }
+
 /* ── Light mode feature icon adjustments ── */
 .feature-item .icon.sketch { background: #dbeafe; color: var(--accent); }
 .feature-item .icon.extrude { background: #dcfce7; color: var(--green); }
@@ -664,9 +682,17 @@ body {
   <button class="action-btn primary" id="btn-analyze" style="display:none; padding:12px 28px; font-size:15px;">
     <i class="ri-sparkling-line"></i> Analyze & Build
   </button>
-  <button class="action-btn secondary" id="btn-onshape" disabled>
-    <i class="ri-send-plane-line"></i> Send to Onshape
-  </button>
+  <div style="position:relative; display:inline-block;">
+    <button class="action-btn secondary" id="btn-export" disabled onclick="document.getElementById('export-menu').classList.toggle('show')">
+      <i class="ri-download-2-line"></i> Export <i class="ri-arrow-down-s-line" style="font-size:12px;margin-left:2px;"></i>
+    </button>
+    <div id="export-menu">
+      <div onclick="downloadSTEP(); document.getElementById('export-menu').classList.remove('show')"><i class="ri-file-3-line"></i> Download STEP</div>
+      <div onclick="alert('Onshape export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-cloud-line"></i> Push to Onshape</div>
+      <div onclick="alert('IGES export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-file-code-line"></i> Download IGES</div>
+      <div onclick="alert('STL export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-box-3-line"></i> Download STL</div>
+    </div>
+  </div>
 </div>
 <!-- Preview info bar with complexity meter -->
 <div id="preview-bar" style="display:none; position:fixed; bottom:140px; left:50%; transform:translateX(-50%);
@@ -742,12 +768,17 @@ function toggleTheme() {
   if (!token) window.location.href = '/login?next=/app&mode=signup';
 })();
 
-// Close app menu when clicking outside
+// Close menus when clicking outside
 document.addEventListener('click', (e) => {
-  const menu = document.getElementById('app-menu');
-  const btn = document.querySelector('.menu-btn');
-  if (menu.classList.contains('show') && !menu.contains(e.target) && !btn.contains(e.target)) {
-    menu.classList.remove('show');
+  const appMenu = document.getElementById('app-menu');
+  const menuBtn = document.querySelector('.menu-btn');
+  if (appMenu.classList.contains('show') && !appMenu.contains(e.target) && !menuBtn.contains(e.target)) {
+    appMenu.classList.remove('show');
+  }
+  const exportMenu = document.getElementById('export-menu');
+  const exportBtn = document.getElementById('btn-export');
+  if (exportMenu && exportMenu.classList.contains('show') && !exportMenu.contains(e.target) && !exportBtn.contains(e.target)) {
+    exportMenu.classList.remove('show');
   }
 });
 

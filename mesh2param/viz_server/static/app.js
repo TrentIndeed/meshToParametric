@@ -65,8 +65,10 @@ const bottom = new THREE.DirectionalLight(0x8899AA, 0.5);
 bottom.position.set(0, -200, 50);
 scene.add(bottom);
 
-// ── Grid + Origin axes in the 3D scene ──
+// ── Grid + Origin axes ──
 let sceneGrid = null;
+let originAxes = [];
+
 function createGrid() {
   const gridSize = 300;
   const divisions = 30;
@@ -77,17 +79,38 @@ function createGrid() {
   );
   sceneGrid.material.transparent = true;
   sceneGrid.material.opacity = 0.6;
+  sceneGrid.visible = false; // hidden by default
   scene.add(sceneGrid);
 
-  // Origin axes — short, thin, in the scene but subtle
-  const axLen = 40;
-  [[axLen,0,0, 0xF85149],[0,axLen,0, 0x3FB950],[0,0,axLen, 0x58A6FF]].forEach(([x,y,z,c]) => {
-    const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(x,y,z)]);
-    const m = new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: 0.5 });
-    scene.add(new THREE.Line(g, m));
+  // Origin axes — full-length lines through origin
+  const axLen = 500;
+  [[axLen,0,0, 0xF85149],[-axLen,0,0, 0xF85149],
+   [0,axLen,0, 0x3FB950],[0,-axLen,0, 0x3FB950],
+   [0,0,axLen, 0x58A6FF],[0,0,-axLen, 0x58A6FF]].forEach(([x,y,z,c], i) => {
+    if (i % 2 === 1) return; // skip negatives, handle in pairs
+    const posEnd = [[axLen,0,0],[0,axLen,0],[0,0,axLen]][Math.floor(i/2)];
+    const negEnd = [[-axLen,0,0],[0,-axLen,0],[0,0,-axLen]][Math.floor(i/2)];
+    const g = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(...negEnd),
+      new THREE.Vector3(...posEnd),
+    ]);
+    const m = new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: 0.4 });
+    const line = new THREE.Line(g, m);
+    originAxes.push(line);
+    scene.add(line);
   });
 }
 createGrid();
+
+// Toggle functions for menu
+window.toggleGrid = function() {
+  if (sceneGrid) sceneGrid.visible = !sceneGrid.visible;
+  document.getElementById('app-menu').classList.remove('show');
+};
+window.toggleOriginAxes = function() {
+  originAxes.forEach(a => a.visible = !a.visible);
+  document.getElementById('app-menu').classList.remove('show');
+};
 
 // ── Theme-aware scene background ──
 function updateSceneBg() {

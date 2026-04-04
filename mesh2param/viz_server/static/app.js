@@ -247,11 +247,12 @@ async function loadStep(index) {
   modelGroup.position.sub(center);
 
   const size = box.getSize(new THREE.Vector3()).length();
-  controls.target.set(0, 0, 0);
-  if (currentStep <= 0) {
-    camera.position.set(size * 0.8, size * 0.5, size * 0.7);
-  }
-  controls.update();
+  // Smooth camera transition to new model — no jump cuts
+  animateCamera(
+    { x: size * 0.8, y: size * 0.9, z: size * 0.8 },
+    { x: 0, y: 0, z: 0 },
+    1.0,
+  );
 
   // Update UI
   currentStep = index;
@@ -772,17 +773,7 @@ function finishLoad(statusData) {
   addChatMessage('system', `Model loaded: ${statusData.num_steps} features, ${statusData.mesh_volume.toLocaleString()} mm³`);
 
   if (statusData.steps.length > 0) {
-    loadStep(statusData.steps.length - 1).then(() => {
-      // Slight rotation animation when final CAD model appears
-      const box = new THREE.Box3().setFromObject(modelGroup);
-      const c = box.getCenter(new THREE.Vector3());
-      const s = box.getSize(new THREE.Vector3()).length();
-      animateCamera(
-        { x: c.x + s * 0.7, y: c.y - s * 0.45, z: c.z + s * 0.65 },
-        c,
-        1.5,
-      );
-    });
+    loadStep(statusData.steps.length - 1);
   }
 }
 

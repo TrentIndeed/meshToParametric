@@ -250,59 +250,13 @@ async function loadStep(index) {
   const size = bsize.length();
   const height = bsize.y;
 
-  // For step 0 or 1 (sketch/extrude): show full model from above
-  // For feature steps (holes/chamfers): zoom toward the feature area
-  const isFeatureStep = index > 1 && !data.is_sketch;
-
-  if (isFeatureStep && currentJobId) {
-    // Find where the feature is by comparing with previous step's vertices
-    // Use the centroid of vertices that exist in prev but not in current
-    const prevUrl = `/api/job/${currentJobId}/step/${index - 1}`;
-    fetch(prevUrl).then(r => r.ok ? r.json() : null).then(prevData => {
-      if (!prevData || !prevData.vertices || prevData.is_sketch) return;
-
-      // Find approximate center of removed geometry
-      const prevV = new Float32Array(prevData.vertices);
-      const curV = verts;
-      // Simple heuristic: average the vertices from previous step
-      // that are "far" from any current vertex — these are near the hole
-      // For speed, just compute centroid difference
-      let sx = 0, sy = 0, sz = 0, n = prevV.length / 3;
-      for (let i = 0; i < prevV.length; i += 3) {
-        sx += prevV[i]; sy += prevV[i+1]; sz += prevV[i+2];
-      }
-      let cx = 0, cy = 0, cz = 0, m = curV.length / 3;
-      for (let i = 0; i < curV.length; i += 3) {
-        cx += curV[i]; cy += curV[i+1]; cz += curV[i+2];
-      }
-      // The removed geometry's centroid is weighted toward the hole
-      const featureX = (sx/n - cx/m) * n;
-      const featureY = (sy/n - cy/m) * n;
-      const featureZ = (sz/n - cz/m) * n;
-
-      // Zoom toward the feature but keep some distance
-      const fLen = Math.sqrt(featureX*featureX + featureY*featureY + featureZ*featureZ);
-      if (fLen > 0.1) {
-        const fx = featureX / fLen;
-        const fy = featureY / fLen;
-        const fz = featureZ / fLen;
-        const zoomDist = size * 0.4;
-        animateCamera(
-          { x: fx * zoomDist + size * 0.2, y: Math.abs(fy * zoomDist) + size * 0.3, z: fz * zoomDist + size * 0.2 },
-          { x: fx * size * 0.1, y: fy * size * 0.1, z: fz * size * 0.1 },
-          0.8,
-        );
-      }
-    }).catch(() => {});
-  } else {
-    // Full model view for base steps
-    const camY = Math.max(size * 1.2, height * 2.5);
-    animateCamera(
-      { x: size * 0.7, y: camY, z: size * 0.7 },
-      { x: 0, y: 0, z: 0 },
-      1.0,
-    );
-  }
+  // Same comfortable view for all steps — centered, above, consistent
+  const camY = Math.max(size * 1.2, height * 2.5);
+  animateCamera(
+    { x: size * 0.7, y: camY, z: size * 0.7 },
+    { x: 0, y: 0, z: 0 },
+    1.0,
+  );
 
   // Update UI
   currentStep = index;

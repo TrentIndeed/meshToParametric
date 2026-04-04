@@ -110,6 +110,18 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# Prevent Chrome from caching JS/CSS files
+from starlette.middleware.base import BaseHTTPMiddleware
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/") and request.url.path.endswith((".js", ".css")):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+app.add_middleware(NoCacheStaticMiddleware)
+
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(settings_router)

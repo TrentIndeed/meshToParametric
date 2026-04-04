@@ -246,10 +246,13 @@ async function loadStep(index) {
   const center = box.getCenter(new THREE.Vector3());
   modelGroup.position.sub(center);
 
-  const size = box.getSize(new THREE.Vector3()).length();
-  // Smooth camera transition to new model — no jump cuts
+  const bsize = box.getSize(new THREE.Vector3());
+  const size = bsize.length();
+  const height = bsize.y;
+  // Camera well above model — Y = max of 1.2x diagonal or 2x model height
+  const camY = Math.max(size * 1.2, height * 2.5);
   animateCamera(
-    { x: size * 0.8, y: size * 0.9, z: size * 0.8 },
+    { x: size * 0.7, y: camY, z: size * 0.7 },
     { x: 0, y: 0, z: 0 },
     1.0,
   );
@@ -602,10 +605,11 @@ function _showRawMesh(previewRes) {
   modelGroup.position.sub(center);
   const size = box.getSize(new THREE.Vector3()).length();
 
-  // Smooth animation from current camera position to viewing angle
-  // No jump cut — always animate from wherever the camera is now
+  // Smooth animation from current camera position to above-right angle
+  const meshHeight = box.getSize(new THREE.Vector3()).y;
+  const camY = Math.max(size * 1.2, meshHeight * 2.5);
   animateCamera(
-    { x: size * 0.8, y: size * 0.9, z: size * 0.8 },
+    { x: size * 0.7, y: camY, z: size * 0.7 },
     { x: 0, y: 0, z: 0 },
     1.5,
   );

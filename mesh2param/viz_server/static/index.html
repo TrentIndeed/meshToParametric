@@ -439,11 +439,10 @@ body {
 .tree-item:hover { background: var(--bg-tertiary); }
 .tree-item .eye-btn {
   margin-left: auto; background: none; border: none;
-  color: var(--text-muted); cursor: pointer; font-size: 14px;
-  padding: 2px 4px; border-radius: 4px; opacity: 0;
-  transition: opacity 0.15s;
+  color: var(--text-secondary); cursor: pointer; font-size: 14px;
+  padding: 2px 6px; border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
 }
-.tree-item:hover .eye-btn { opacity: 1; }
 .tree-item .eye-btn:hover { color: var(--accent); background: var(--bg-tertiary); }
 .tree-children {
   padding-left: 28px; overflow: hidden;

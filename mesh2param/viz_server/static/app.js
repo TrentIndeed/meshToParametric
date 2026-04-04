@@ -1001,13 +1001,11 @@ function saveViewerState(state) {
 }
 
 async function autoLoad() {
-  const lastState = localStorage.getItem('paramesh_viewer_state') || 'cad';
-
-  // If user was previewing a mesh, try to restore it from sessionStorage
-  if (lastState === 'preview') {
-    try {
-      const saved = sessionStorage.getItem('paramesh_preview');
-      if (saved) {
+  // Always check sessionStorage first — if there's a saved mesh preview,
+  // show it regardless of the localStorage state flag
+  try {
+    const saved = sessionStorage.getItem('paramesh_preview');
+    if (saved) {
         const previewRes = JSON.parse(saved);
         document.getElementById('empty-state').style.display = 'none';
         _showRawMesh(previewRes);
@@ -1021,9 +1019,8 @@ async function autoLoad() {
         const pb = document.getElementById('preview-bar');
         if (pb) pb.style.display = 'block';
         return;
-      }
-    } catch (e) { /* fall through to CAD load */ }
-  }
+    }
+  } catch (e) { /* fall through to CAD load */ }
 
   // Otherwise load last completed CAD job
   try {

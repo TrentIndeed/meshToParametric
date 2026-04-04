@@ -247,17 +247,9 @@ async function loadStep(index) {
   const center = box.getCenter(new THREE.Vector3());
   modelGroup.position.sub(center);
 
-  const bsize = box.getSize(new THREE.Vector3());
-  const size = bsize.length();
-  const height = bsize.y;
-
-  // Same comfortable view for all steps — centered, above, consistent
-  const camY = Math.max(size * 1.2, height * 2.5);
-  animateCamera(
-    { x: size * 0.7, y: camY, z: size * 0.7 },
-    { x: 0, y: 0, z: 0 },
-    1.0,
-  );
+  // Keep camera where it is — don't animate on step clicks or reloads
+  controls.target.set(0, 0, 0);
+  controls.update();
 
   // Update UI
   currentStep = index;
@@ -774,11 +766,9 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       document.getElementById('status-dot').className = 'status-dot';
     }
   } catch (err) {
-    alert('Upload failed: ' + err.message);
+    alert('Pipeline error: ' + err.message);
     document.getElementById('status-dot').className = 'status-dot';
     loading.classList.remove('show');
-  } finally {
-    e.target.value = '';
   }
 });
 
@@ -801,7 +791,18 @@ function finishLoad(statusData) {
   addChatMessage('system', `Model loaded: ${statusData.num_steps} features, ${statusData.mesh_volume.toLocaleString()} mm³`);
 
   if (statusData.steps.length > 0) {
-    loadStep(statusData.steps.length - 1);
+    loadStep(statusData.steps.length - 1).then(() => {
+      // Animate camera only when CAD model first loads
+      const box = new THREE.Box3().setFromObject(modelGroup);
+      const s = box.getSize(new THREE.Vector3());
+      const size = s.length();
+      const camY = Math.max(size * 1.2, s.y * 2.5);
+      animateCamera(
+        { x: size * 0.7, y: camY, z: size * 0.7 },
+        { x: 0, y: 0, z: 0 },
+        1.2,
+      );
+    });
   }
 }
 

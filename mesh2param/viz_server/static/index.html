@@ -10,9 +10,26 @@
 <link href="https://cdn.jsdelivr.net/npm/remixicon@4.1.0/fonts/remixicon.css" rel="stylesheet">
 <style>
 :root {
+  --bg-primary: #F5F5F5;
+  --bg-secondary: #FFFFFF;
+  --bg-tertiary: #EAECEF;
+  --bg-card: #FFFFFF;
+  --border: #D0D7DE;
+  --text-primary: #1F2328;
+  --text-secondary: #656D76;
+  --text-muted: #8B949E;
+  --accent: #0969DA;
+  --accent-glow: #0969DA22;
+  --green: #1A7F37;
+  --orange: #BF8700;
+  --red: #CF222E;
+  --purple: #8250DF;
+}
+[data-theme="dark"] {
   --bg-primary: #0D1117;
   --bg-secondary: #161B22;
   --bg-tertiary: #1C2128;
+  --bg-card: #161B22;
   --border: #30363D;
   --text-primary: #E6EDF3;
   --text-secondary: #8B949E;
@@ -59,7 +76,7 @@ body {
   display: none; position: fixed; top: 48px; left: 8px;
   background: var(--bg-secondary); border: 1px solid var(--border);
   border-radius: 10px; padding: 6px 0; z-index: 200;
-  min-width: 220px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  min-width: 220px; box-shadow: 0 8px 24px rgba(0,0,0,0.12);
 }
 #app-menu.show { display: block; }
 #app-menu > a, #app-menu > div:not(.divider) {
@@ -124,18 +141,11 @@ body {
   background: var(--accent-glow); border-left-color: var(--accent);
 }
 .feature-item .icon {
-  width: 24px; height: 24px; border-radius: 4px;
+  width: 26px; height: 26px; border-radius: 5px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 12px; flex-shrink: 0;
+  flex-shrink: 0;
 }
-.feature-item .icon.sketch { background: #1a3a5c; color: var(--accent); }
-.feature-item .icon.extrude { background: #1a3d1a; color: var(--green); }
-.feature-item .icon.hole { background: #3d1a1a; color: var(--red); }
-.feature-item .icon.chamfer { background: #3d2e1a; color: var(--orange); }
-.feature-item .icon.fillet { background: #2e1a3d; color: var(--purple); }
-.feature-item .icon.pocket { background: #1a2e3d; color: #64B5F6; }
-.feature-item .icon.boss { background: #2e3d1a; color: #AED581; }
-.feature-item .icon.slot { background: #3d1a2e; color: #F48FB1; }
+.feature-item .icon svg { display: block; }
 .feature-item .texts { overflow: hidden; min-width: 0; }
 .feature-item .name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .feature-item .detail {
@@ -222,7 +232,7 @@ body {
 
 /* ── Settings Modal ── */
 #settings-modal {
-  position: fixed; inset: 0; background: rgba(13,17,23,0.9);
+  position: fixed; inset: 0; background: rgba(0,0,0,0.4);
   display: none; align-items: center; justify-content: center; z-index: 300;
 }
 #settings-modal.show { display: flex; }
@@ -272,7 +282,7 @@ body {
 
 /* ── Dimension Review Modal ── */
 #dim-modal {
-  position: fixed; inset: 0; background: rgba(13,17,23,0.9);
+  position: fixed; inset: 0; background: rgba(0,0,0,0.4);
   display: none; align-items: center; justify-content: center;
   z-index: 300;
 }
@@ -371,7 +381,7 @@ body {
 
 /* ── Loading overlay ── */
 #loading {
-  position: fixed; top: 0; left: 0; bottom: 0; right: 300px; background: rgba(13,17,23,0.85);
+  position: fixed; top: 0; left: 0; bottom: 0; right: 300px; background: rgba(245,245,245,0.85);
   display: none; align-items: center; justify-content: center;
   z-index: 200; flex-direction: column; gap: 16px;
 }
@@ -418,6 +428,50 @@ body {
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Light mode feature icon adjustments ── */
+.feature-item .icon.sketch { background: #dbeafe; color: var(--accent); }
+.feature-item .icon.extrude { background: #dcfce7; color: var(--green); }
+.feature-item .icon.hole { background: #fee2e2; color: var(--red); }
+.feature-item .icon.chamfer { background: #fef3c7; color: var(--orange); }
+.feature-item .icon.fillet { background: #f3e8ff; color: var(--purple); }
+.feature-item .icon.pocket { background: #dbeafe; color: #2563EB; }
+.feature-item .icon.boss { background: #dcfce7; color: #4d7c0f; }
+.feature-item .icon.slot { background: #fce7f3; color: #db2777; }
+
+/* ── Dark mode overrides ── */
+[data-theme="dark"] .feature-item .icon.sketch { background: #1a3a5c; color: var(--accent); }
+[data-theme="dark"] .feature-item .icon.extrude { background: #1a3d1a; color: var(--green); }
+[data-theme="dark"] .feature-item .icon.hole { background: #3d1a1a; color: var(--red); }
+[data-theme="dark"] .feature-item .icon.chamfer { background: #3d2e1a; color: var(--orange); }
+[data-theme="dark"] .feature-item .icon.fillet { background: #2e1a3d; color: var(--purple); }
+[data-theme="dark"] .feature-item .icon.pocket { background: #1a2e3d; color: #64B5F6; }
+[data-theme="dark"] .feature-item .icon.boss { background: #2e3d1a; color: #AED581; }
+[data-theme="dark"] .feature-item .icon.slot { background: #3d1a2e; color: #F48FB1; }
+
+[data-theme="dark"] #loading { background: rgba(13,17,23,0.85); }
+[data-theme="dark"] #settings-modal { background: rgba(13,17,23,0.9); }
+[data-theme="dark"] #dim-modal { background: rgba(13,17,23,0.9); }
+[data-theme="dark"] #app-menu { box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+#app-menu { box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
+
+/* Light mode: primary button text */
+.action-btn.primary { color: #fff; }
+[data-theme="dark"] .action-btn.primary { color: #000; }
+.chat-msg.user { color: #fff; }
+[data-theme="dark"] .chat-msg.user { color: #000; }
+#chat-send { color: #fff; }
+[data-theme="dark"] #chat-send { color: #000; }
+#chat-send:hover { background: #2b7de9; }
+[data-theme="dark"] #chat-send:hover { background: #79C0FF; }
+.action-btn.primary:hover { background: #2b7de9; }
+[data-theme="dark"] .action-btn.primary:hover { background: #79C0FF; }
+.plan-badge { color: #fff; }
+[data-theme="dark"] .plan-badge { color: var(--bg-primary); }
+#dim-modal .btn-confirm { color: #fff; }
+[data-theme="dark"] #dim-modal .btn-confirm { color: #000; }
+#dim-modal .btn-confirm:hover { background: #2b7de9; }
+[data-theme="dark"] #dim-modal .btn-confirm:hover { background: #79C0FF; }
 </style>
 </head>
 <body>
@@ -430,6 +484,9 @@ body {
   </div>
   <div class="right">
     <span class="tokens" onclick="openSettings()" style="cursor:pointer" title="Usage & Settings"><i class="ri-sparkling-line"></i> <span id="token-count">0</span> tokens</span>
+    <button onclick="toggleTheme()" class="menu-btn" title="Toggle theme" style="font-size:14px">
+      <i id="theme-icon" class="ri-sun-line"></i>
+    </button>
     <div class="status-dot" id="status-dot"></div>
   </div>
 </div>
@@ -581,6 +638,35 @@ body {
 </div>
 
 <script>
+// Theme toggle
+function toggleTheme() {
+  const html = document.documentElement;
+  const isDark = html.getAttribute('data-theme') === 'dark';
+  if (isDark) {
+    html.removeAttribute('data-theme');
+    localStorage.setItem('theme', 'light');
+    document.getElementById('theme-icon').className = 'ri-sun-line';
+  } else {
+    html.setAttribute('data-theme', 'dark');
+    localStorage.setItem('theme', 'dark');
+    document.getElementById('theme-icon').className = 'ri-moon-line';
+  }
+  // Update Three.js scene background
+  if (window._updateSceneBg) window._updateSceneBg();
+}
+// Load saved theme (default: light)
+(function() {
+  const saved = localStorage.getItem('theme') || 'light';
+  if (saved === 'dark') {
+    document.documentElement.setAttribute('data-theme', 'dark');
+    var icon = document.getElementById('theme-icon');
+    if (icon) icon.className = 'ri-moon-line';
+  } else {
+    // Ensure light mode (remove any stale data-theme)
+    document.documentElement.removeAttribute('data-theme');
+  }
+})();
+
 // Auth gate: redirect to login if no token cookie
 (function() {
   const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));

@@ -14,7 +14,9 @@ Object.defineProperty(window, '_currentJobId', {
 // ── Three.js Setup ──
 const container = document.getElementById('viewer');
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0D1117);
+scene.background = new THREE.Color(
+  document.documentElement.getAttribute('data-theme') === 'dark' ? 0x0D1117 : 0xE8EAED
+);
 
 const camera = new THREE.PerspectiveCamera(
   45, container.clientWidth / container.clientHeight, 0.1, 5000
@@ -64,13 +66,18 @@ bottom.position.set(0, -200, 50);
 scene.add(bottom);
 
 // ── Grid + Origin axes in the 3D scene ──
+let sceneGrid = null;
 function createGrid() {
   const gridSize = 300;
   const divisions = 30;
-  const grid = new THREE.GridHelper(gridSize, divisions, 0x2A3444, 0x1E2830);
-  grid.material.transparent = true;
-  grid.material.opacity = 0.6;
-  scene.add(grid);
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  sceneGrid = new THREE.GridHelper(gridSize, divisions,
+    isDark ? 0x2A3444 : 0xB0B8C0,
+    isDark ? 0x1E2830 : 0xCDD5DC
+  );
+  sceneGrid.material.transparent = true;
+  sceneGrid.material.opacity = 0.6;
+  scene.add(sceneGrid);
 
   // Origin axes — short, thin, in the scene but subtle
   const axLen = 40;
@@ -82,6 +89,24 @@ function createGrid() {
 }
 createGrid();
 
+// ── Theme-aware scene background ──
+function updateSceneBg() {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  scene.background = new THREE.Color(isDark ? 0x0D1117 : 0xE8EAED);
+  // Update grid colors
+  if (sceneGrid) {
+    sceneGrid.material.color.set(isDark ? 0x2A3444 : 0xB0B8C0);
+    // GridHelper uses two materials internally; update center line color
+    if (Array.isArray(sceneGrid.material)) {
+      sceneGrid.material[0].color.set(isDark ? 0x2A3444 : 0xB0B8C0);
+      sceneGrid.material[1].color.set(isDark ? 0x1E2830 : 0xCDD5DC);
+    }
+  }
+  // Update axis gizmo border
+  axisRenderer.domElement.style.borderColor = isDark ? 'rgba(48,54,61,0.5)' : 'rgba(208,215,222,0.5)';
+}
+window._updateSceneBg = updateSceneBg;
+
 // Small XYZ axis gizmo in the bottom-left corner (rendered separately)
 const axisScene = new THREE.Scene();
 const axisCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
@@ -90,7 +115,8 @@ axisCamera.lookAt(0, 0, 0);
 const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 axisRenderer.setSize(120, 120);
 axisRenderer.setClearColor(0x000000, 0);
-axisRenderer.domElement.style.cssText = 'position:fixed;bottom:90px;left:10px;z-index:50;pointer-events:none;border:1px solid rgba(48,54,61,0.5);border-radius:8px;';
+const axIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
+axisRenderer.domElement.style.cssText = `position:fixed;bottom:90px;left:10px;z-index:50;pointer-events:none;border:1px solid ${axIsDark ? 'rgba(48,54,61,0.5)' : 'rgba(208,215,222,0.5)'};border-radius:8px;`;
 document.body.appendChild(axisRenderer.domElement);
 
 // Axis lines with cone tips (short, in gizmo scene)
@@ -320,7 +346,8 @@ async function renderThumbnail(stepIndex) {
     if (!data.vertices || data.vertices.length === 0) return null;
 
     const thumbScene = new THREE.Scene();
-    thumbScene.background = new THREE.Color(0x161B22);
+    const thumbIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    thumbScene.background = new THREE.Color(thumbIsDark ? 0x161B22 : 0xE0E3E8);
 
     // Lights
     thumbScene.add(new THREE.AmbientLight(0xffffff, 0.5));

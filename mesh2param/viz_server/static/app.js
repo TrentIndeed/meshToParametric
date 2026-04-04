@@ -986,13 +986,8 @@ function saveViewerState(state) {
 async function autoLoad() {
   const lastState = localStorage.getItem('paramesh_viewer_state') || 'cad';
 
-  if (lastState === 'preview') {
-    // Re-show the upload prompt — mesh preview can't persist (temp file gone)
-    // but at least don't load the old CAD model
-    return;
-  }
-
-  // Load last completed CAD job
+  // Always try to load the last completed job — even if the user was
+  // previewing a mesh, showing the last CAD result is better than nothing
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;

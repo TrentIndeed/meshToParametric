@@ -962,7 +962,20 @@ function handleResize() {
 }
 window.addEventListener('resize', handleResize);
 
-// App starts with empty state — user uploads a mesh to begin
+// Auto-load the most recent completed job on page load
+async function autoLoad() {
+  try {
+    const res = await fetch('/api/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.status === 'done' && data.steps && data.steps.length > 0) {
+      currentJobId = data.job_id || null;
+      document.getElementById('empty-state').style.display = 'none';
+      finishLoad(data);
+    }
+  } catch (e) { /* no previous job */ }
+}
+autoLoad();
 
 // ── Animate ──
 // ── Camera animation system ──

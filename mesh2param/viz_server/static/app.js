@@ -1045,11 +1045,8 @@ async function autoLoad() {
     }
   } catch (e) { /* no previous job */ }
 }
-autoLoad();
-
-// ── Animate ──
-// ── Camera animation system ──
-let cameraAnim = null; // { start, end, targetStart, targetEnd, startTime, duration }
+// ── Camera animation system (must be before autoLoad) ──
+let cameraAnim = null;
 
 function animateCamera(endPos, endTarget, duration = 1.5) {
   cameraAnim = {
@@ -1063,6 +1060,8 @@ function animateCamera(endPos, endTarget, duration = 1.5) {
 }
 
 function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+autoLoad();
 
 function animate() {
   requestAnimationFrame(animate);

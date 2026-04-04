@@ -105,8 +105,12 @@ window.toggleGrid = function() {
   document.getElementById('app-menu').classList.remove('show');
 };
 window.toggleOriginAxes = function() {
-  originAxes.forEach(a => a.visible = !a.visible);
-  document.getElementById('app-menu').classList.remove('show');
+  const visible = !originAxes[0]?.visible;
+  originAxes.forEach(a => a.visible = visible);
+  const eye = document.querySelector('#origin-eye i');
+  if (eye) eye.className = visible ? 'ri-eye-line' : 'ri-eye-off-line';
+  const menu = document.getElementById('app-menu');
+  if (menu) menu.classList.remove('show');
 };
 
 // ── Theme-aware scene background ──
@@ -297,12 +301,20 @@ function populateUI(statusData) {
     'Original': S('<path d="M5 2h6l4 4v10a1 1 0 01-1 1H5a1 1 0 01-1-1V3a1 1 0 011-1z"/><polyline points="11,2 11,6 15,6"/><path d="M7 10l2 2 3-4" stroke-width="1.2"/>', 'sketch'),
   };
 
+  // Show sketches folder and clear it
+  const sketchesFolder = document.getElementById('sketches-folder');
+  const sketchesList = document.getElementById('sketches-list');
+  sketchesList.innerHTML = '';
+  let hasSketch = false;
+
   statusData.steps.forEach((step, i) => {
     // Determine icon
     let iconInfo = S('<rect x="3" y="3" width="12" height="12" rx="2"/>', 'extrude');
     for (const [key, val] of Object.entries(iconMap)) {
       if (step.name.includes(key)) { iconInfo = val; break; }
     }
+
+    const isSketch = step.name.toLowerCase().includes('sketch');
 
     // Feature tree item
     const item = document.createElement('div');
@@ -315,7 +327,14 @@ function populateUI(statusData) {
       </div>
     `;
     item.onclick = () => loadStep(i);
-    list.appendChild(item);
+
+    // Put sketches in the sketches folder, features in the main list
+    if (isSketch) {
+      sketchesList.appendChild(item);
+      hasSketch = true;
+    } else {
+      list.appendChild(item);
+    }
 
     // Timeline step — thumbnail rendered async (no text overlay)
     const tStep = document.createElement('div');
@@ -327,6 +346,9 @@ function populateUI(statusData) {
     // Queue thumbnail for sequential rendering
     thumbQueue.push({ index: i, element: tStep });
   });
+
+  // Show sketches folder if there are sketches
+  sketchesFolder.style.display = hasSketch ? '' : 'none';
 
   // Render thumbnails sequentially to avoid WebGL race conditions
   renderThumbQueue();

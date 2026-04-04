@@ -490,6 +490,18 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     addChatMessage('ai', `Dimensions: ${previewRes.dimensions.map(d => d + 'mm').join(' × ')}. ${previewRes.watertight ? 'Mesh is watertight.' : 'Mesh has gaps — will repair.'}`, true);
     addChatMessage('ai', `Complexity: ${previewRes.complexity}. Estimated cost: ~${previewRes.estimated_tokens} tokens. Click "Analyze & Build" to proceed.`, true);
 
+    // Save mesh preview data to sessionStorage for refresh persistence
+    try {
+      sessionStorage.setItem('paramesh_preview', JSON.stringify({
+        mesh_vertices: Array.from(previewRes.mesh_vertices),
+        mesh_faces: previewRes.mesh_faces,
+        filename: previewRes.filename,
+        faces: previewRes.faces,
+        vertices: previewRes.vertices,
+        temp_path: previewRes.temp_path,
+      }));
+    } catch (e) { /* too large for storage */ }
+
     // Reset UI from any previous job
     document.getElementById('feature-list').innerHTML = '';
     document.getElementById('timeline').innerHTML = '';
@@ -740,6 +752,7 @@ let cachedStatusData = null;
 function finishLoad(statusData) {
   cachedStatusData = statusData;
   saveViewerState('cad');
+  sessionStorage.removeItem('paramesh_preview'); // clear preview, CAD is now primary
   populateUI(statusData);
   document.getElementById('token-count').textContent = statusData.tokens_used;
   document.getElementById('status-dot').className = 'status-dot done';
@@ -986,8 +999,25 @@ function saveViewerState(state) {
 async function autoLoad() {
   const lastState = localStorage.getItem('paramesh_viewer_state') || 'cad';
 
-  // Always try to load the last completed job — even if the user was
-  // previewing a mesh, showing the last CAD result is better than nothing
+  // If user was previewing a mesh, try to restore it from sessionStorage
+  if (lastState === 'preview') {
+    try {
+      const saved = sessionStorage.getItem('paramesh_preview');
+      if (saved) {
+        const previewRes = JSON.parse(saved);
+        document.getElementById('empty-state').style.display = 'none';
+        _showRawMesh(previewRes);
+        addChatMessage('ai', `Restored: ${previewRes.filename || 'mesh'} (${previewRes.faces?.toLocaleString() || '?'} faces)`, true);
+        // Restore pending state so Analyze & Build works
+        pendingTempPath = previewRes.temp_path;
+        document.getElementById('btn-analyze').style.display = '';
+        document.getElementById('btn-upload').style.display = 'none';
+        return;
+      }
+    } catch (e) { /* fall through to CAD load */ }
+  }
+
+  // Otherwise load last completed CAD job
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;

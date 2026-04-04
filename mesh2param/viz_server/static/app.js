@@ -646,12 +646,12 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     let lastStage = '';
 
     const thinkingMessages = {
-      'Ingesting mesh...': '🔍 Reading mesh file, checking topology, counting faces...',
-      'Segmenting surfaces...': '🧩 Clustering faces into surface groups using normal angles and curvature...',
-      'Fitting primitives...': '📐 Fitting planes, cylinders, and cones to each surface region via RANSAC...',
-      'Building topology...': '🔗 Building adjacency graph, classifying edges as sharp/fillet/chamfer...',
-      'Recognizing features...': '🏗️ Identifying base extrusion, holes, pockets, chamfers, fillets...',
-      'Building CAD model...': '⚙️ Constructing CadQuery solid: sketch → extrude → cut holes → chamfer...',
+      'Ingesting mesh...': '🔍 Reading mesh file, checking topology...',
+      'Segmenting surfaces...': '🧩 Identifying surface regions — planes, cylinders, cones...',
+      'Fitting primitives...': '📐 Fitting analytic surfaces to each region...',
+      'Building topology...': '🔗 Analyzing edge relationships — sharp, fillet, chamfer...',
+      'Recognizing features...': '🏗️ Detecting features — extrusions, holes, pockets, chamfers...',
+      'Building CAD model...': '⚙️ Building parametric solid: sketch → extrude → cut → chamfer...',
       'Done': '✅ CAD model built successfully!',
     };
 
@@ -692,13 +692,14 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       const holes = statusData.steps.filter(s => s.name.includes('Hole')).length;
       const chamfers = statusData.steps.filter(s => s.name.includes('Chamfer')).length;
       const fillets = statusData.steps.filter(s => s.name.includes('Fillet')).length;
-      let summary = `📊 Found ${statusData.num_steps} construction steps: 1 base extrusion`;
-      if (holes > 0) summary += `, ${holes} holes`;
-      if (chamfers > 0) summary += `, ${chamfers} chamfer groups`;
-      if (fillets > 0) summary += `, ${fillets} fillet groups`;
-      summary += `. Volume error: ${((statusData.cad_volume - statusData.mesh_volume) / statusData.mesh_volume * 100).toFixed(1)}%`;
+      let summary = `📊 Reconstructed with ${statusData.num_steps} features: 1 base extrusion`;
+      if (holes > 0) summary += `, ${holes} hole${holes > 1 ? 's' : ''}`;
+      if (chamfers > 0) summary += `, ${chamfers} chamfer${chamfers > 1 ? 's' : ''}`;
+      if (fillets > 0) summary += `, ${fillets} fillet${fillets > 1 ? 's' : ''}`;
+      const accuracy = Math.max(0, 100 - Math.abs((statusData.cad_volume - statusData.mesh_volume) / statusData.mesh_volume * 100));
+      summary += `. Shape accuracy: ${accuracy.toFixed(0)}%`;
       addChatMessage('ai', summary);
-      addChatMessage('system', 'Ask me to describe features, resize holes, or modify the model.');
+      addChatMessage('system', 'Click features in the tree to step through the build. Ask me about dimensions or features.');
 
       // Try AI dimension analysis — keep loading visible with status
       loadingText.textContent = 'Analyzing dimensions...';

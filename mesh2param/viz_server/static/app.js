@@ -492,15 +492,19 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 
     // Save mesh preview data to sessionStorage for refresh persistence
     try {
-      sessionStorage.setItem('paramesh_preview', JSON.stringify({
+      const previewData = {
         mesh_vertices: Array.from(previewRes.mesh_vertices),
         mesh_faces: previewRes.mesh_faces,
         filename: previewRes.filename,
         faces: previewRes.faces,
         vertices: previewRes.vertices,
         temp_path: previewRes.temp_path,
-      }));
-    } catch (e) { /* too large for storage */ }
+      };
+      const json = JSON.stringify(previewData);
+      if (json.length < 5_000_000) { // 5MB limit for sessionStorage
+        sessionStorage.setItem('paramesh_preview', json);
+      }
+    } catch (e) { console.warn('Could not save preview to sessionStorage:', e); }
 
     // Reset UI from any previous job
     document.getElementById('feature-list').innerHTML = '';
@@ -1007,11 +1011,15 @@ async function autoLoad() {
         const previewRes = JSON.parse(saved);
         document.getElementById('empty-state').style.display = 'none';
         _showRawMesh(previewRes);
-        addChatMessage('ai', `Restored: ${previewRes.filename || 'mesh'} (${previewRes.faces?.toLocaleString() || '?'} faces)`, true);
+        addChatMessage('ai', `Restored: ${previewRes.filename || 'mesh'} (${previewRes.faces?.toLocaleString() || '?'} faces). Click "Analyze & Build" to process.`, true);
         // Restore pending state so Analyze & Build works
         pendingTempPath = previewRes.temp_path;
+        pendingFile = null;
         document.getElementById('btn-analyze').style.display = '';
         document.getElementById('btn-upload').style.display = 'none';
+        // Show preview bar
+        const pb = document.getElementById('preview-bar');
+        if (pb) pb.style.display = 'block';
         return;
       }
     } catch (e) { /* fall through to CAD load */ }

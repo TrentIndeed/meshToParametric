@@ -74,28 +74,25 @@ function createGrid() {
   const divisions = 30;
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   sceneGrid = new THREE.GridHelper(gridSize, divisions,
-    isDark ? 0x2A3444 : 0xB0B8C0,
-    isDark ? 0x1E2830 : 0xCDD5DC
+    isDark ? 0x222830 : 0xD8DDE3,
+    isDark ? 0x1A1E24 : 0xE4E8EC
   );
   sceneGrid.material.transparent = true;
-  sceneGrid.material.opacity = 0.6;
+  sceneGrid.material.opacity = 0.5;
   sceneGrid.visible = false; // hidden by default
   scene.add(sceneGrid);
 
-  // Origin axes — full-length lines through origin
+  // Origin axes — full-length colored lines through origin (off by default)
   const axLen = 500;
-  [[axLen,0,0, 0xF85149],[-axLen,0,0, 0xF85149],
-   [0,axLen,0, 0x3FB950],[0,-axLen,0, 0x3FB950],
-   [0,0,axLen, 0x58A6FF],[0,0,-axLen, 0x58A6FF]].forEach(([x,y,z,c], i) => {
-    if (i % 2 === 1) return; // skip negatives, handle in pairs
-    const posEnd = [[axLen,0,0],[0,axLen,0],[0,0,axLen]][Math.floor(i/2)];
-    const negEnd = [[-axLen,0,0],[0,-axLen,0],[0,0,-axLen]][Math.floor(i/2)];
+  [[axLen,0,0],[0,axLen,0],[0,0,axLen]].forEach(([x,y,z], i) => {
+    const color = [0xF85149, 0x3FB950, 0x58A6FF][i];
     const g = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(...negEnd),
-      new THREE.Vector3(...posEnd),
+      new THREE.Vector3(-x,-y,-z),
+      new THREE.Vector3(x,y,z),
     ]);
-    const m = new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: 0.4 });
+    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.4 });
     const line = new THREE.Line(g, m);
+    line.visible = false; // off by default
     originAxes.push(line);
     scene.add(line);
   });
@@ -118,11 +115,10 @@ function updateSceneBg() {
   scene.background = new THREE.Color(isDark ? 0x0D1117 : 0xE8EAED);
   // Update grid colors
   if (sceneGrid) {
-    sceneGrid.material.color.set(isDark ? 0x2A3444 : 0xB0B8C0);
-    // GridHelper uses two materials internally; update center line color
+    sceneGrid.material.color.set(isDark ? 0x222830 : 0xD8DDE3);
     if (Array.isArray(sceneGrid.material)) {
-      sceneGrid.material[0].color.set(isDark ? 0x2A3444 : 0xB0B8C0);
-      sceneGrid.material[1].color.set(isDark ? 0x1E2830 : 0xCDD5DC);
+      sceneGrid.material[0].color.set(isDark ? 0x222830 : 0xD8DDE3);
+      sceneGrid.material[1].color.set(isDark ? 0x1A1E24 : 0xE4E8EC);
     }
   }
   // Update axis gizmo border

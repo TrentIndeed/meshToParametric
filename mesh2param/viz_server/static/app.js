@@ -241,7 +241,8 @@ async function loadStep(index) {
     modelGroup.add(mesh);
   }
 
-  // Center model at origin
+  // Center model at origin — reset position first to avoid cumulative drift
+  modelGroup.position.set(0, 0, 0);
   const box = new THREE.Box3().setFromObject(modelGroup);
   const center = box.getCenter(new THREE.Vector3());
   modelGroup.position.sub(center);
@@ -271,7 +272,7 @@ async function loadStep(index) {
     toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;color:var(--text-primary);z-index:100;opacity:0;transition:opacity 0.3s;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.1);';
     document.body.appendChild(toast);
   }
-  toast.textContent = `Step ${index + 1}: ${data.name}`;
+  toast.textContent = `Step ${index + 1}/${steps.length}: ${data.name} (${Math.round(verts.length/3)} verts)`;
   toast.style.opacity = '1';
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 1500);
@@ -613,7 +614,8 @@ function _showRawMesh(previewRes) {
     new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
   ));
 
-  // Center model at origin
+  // Center model at origin — reset position first to avoid cumulative drift
+  modelGroup.position.set(0, 0, 0);
   const box = new THREE.Box3().setFromObject(modelGroup);
   const center = box.getCenter(new THREE.Vector3());
   modelGroup.position.sub(center);

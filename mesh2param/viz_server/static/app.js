@@ -5,6 +5,8 @@ import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/exampl
 let currentStep = -1;
 let steps = [];
 let currentJobId = null;
+// Check if we should restore a mesh preview (set before anything loads)
+const _hasPreviewToRestore = !!sessionStorage.getItem('paramesh_preview');
 // Expose for automation
 Object.defineProperty(window, '_currentJobId', {
   get() { return currentJobId; },
@@ -1001,27 +1003,25 @@ function saveViewerState(state) {
 }
 
 async function autoLoad() {
-  // Always check sessionStorage first — if there's a saved mesh preview,
-  // show it regardless of the localStorage state flag
-  try {
-    const saved = sessionStorage.getItem('paramesh_preview');
-    if (saved) {
-        const previewRes = JSON.parse(saved);
-        if (previewRes.mesh_vertices && previewRes.mesh_vertices.length > 0) {
-          document.getElementById('empty-state').style.display = 'none';
-          _showRawMesh(previewRes);
-          addChatMessage('ai', `Restored: ${previewRes.filename || 'mesh'} (${previewRes.faces?.toLocaleString() || '?'} faces). Click "Analyze & Build" to process.`, true);
-          pendingTempPath = previewRes.temp_path;
-          pendingFile = null;
-          document.getElementById('btn-analyze').style.display = '';
-          document.getElementById('btn-upload').style.display = 'none';
-          const pb = document.getElementById('preview-bar');
-          if (pb) pb.style.display = 'block';
-          return; // Stop here — don't load CAD
-        }
+  // Check sessionStorage for a saved mesh preview
+  const saved = sessionStorage.getItem('paramesh_preview');
+  if (saved) {
+    try {
+      const previewRes = JSON.parse(saved);
+      if (previewRes.mesh_vertices && previewRes.mesh_vertices.length > 0) {
+        document.getElementById('empty-state').style.display = 'none';
+        _showRawMesh(previewRes);
+        pendingTempPath = previewRes.temp_path;
+        pendingFile = null;
+        document.getElementById('btn-analyze').style.display = '';
+        document.getElementById('btn-upload').style.display = 'none';
+        return; // DONE — skip CAD load entirely
+      }
+    } catch (e) {
+      console.error('Preview restore error:', e);
     }
-  } catch (e) { /* preview restore failed, load CAD instead */ }
-  // Otherwise load last completed CAD job
+  }
+  // No preview — load last completed CAD job
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;

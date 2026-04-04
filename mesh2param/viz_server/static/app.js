@@ -253,6 +253,7 @@ async function loadStep(index) {
 
   // Update UI
   currentStep = index;
+  localStorage.setItem('paramesh_last_step', index.toString());
   updateActiveStates();
   document.getElementById('empty-state').style.display = 'none';
 }
@@ -498,6 +499,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     // Show the raw mesh in the 3D viewer
     pendingTempPath = previewRes.temp_path;
     pendingFile = file;
+    saveViewerState('preview');
     _showRawMesh(previewRes);
 
     // Show preview info bar with complexity meter
@@ -737,6 +739,7 @@ let cachedStatusData = null;
 
 function finishLoad(statusData) {
   cachedStatusData = statusData;
+  saveViewerState('cad');
   populateUI(statusData);
   document.getElementById('token-count').textContent = statusData.tokens_used;
   document.getElementById('status-dot').className = 'status-dot done';
@@ -974,8 +977,22 @@ function handleResize() {
 }
 window.addEventListener('resize', handleResize);
 
-// Auto-load the most recent completed job on page load
+// Save/restore last viewer state across refreshes
+function saveViewerState(state) {
+  // state: 'preview' or 'cad'
+  localStorage.setItem('paramesh_viewer_state', state);
+}
+
 async function autoLoad() {
+  const lastState = localStorage.getItem('paramesh_viewer_state') || 'cad';
+
+  if (lastState === 'preview') {
+    // Re-show the upload prompt — mesh preview can't persist (temp file gone)
+    // but at least don't load the old CAD model
+    return;
+  }
+
+  // Load last completed CAD job
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;
@@ -983,7 +1000,19 @@ async function autoLoad() {
     if (data.status === 'done' && data.steps && data.steps.length > 0) {
       currentJobId = data.job_id || null;
       document.getElementById('empty-state').style.display = 'none';
-      finishLoad(data);
+      // Load the last viewed step (saved in localStorage)
+      const lastStep = parseInt(localStorage.getItem('paramesh_last_step') || '-1');
+      if (lastStep >= 0 && lastStep < data.steps.length) {
+        populateUI(data);
+        cachedStatusData = data;
+        document.getElementById('status-dot').className = 'status-dot done';
+        document.getElementById('btn-onshape').disabled = false;
+        document.getElementById('chat-input').disabled = false;
+        document.getElementById('chat-send').disabled = false;
+        loadStep(lastStep);
+      } else {
+        finishLoad(data);
+      }
     }
   } catch (e) { /* no previous job */ }
 }

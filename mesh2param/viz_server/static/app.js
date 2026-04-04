@@ -239,32 +239,6 @@ async function loadStep(index) {
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     modelGroup.add(mesh);
-
-    // Show the previous step as transparent ghost overlay so the
-    // difference (new hole/feature) is clearly visible
-    if (index > 1 && currentJobId) {
-      const prevUrl = `/api/job/${currentJobId}/step/${index - 1}`;
-      fetch(prevUrl).then(r => r.ok ? r.json() : null).then(prevData => {
-        if (!prevData || !prevData.vertices || prevData.vertices.length === 0) return;
-        if (prevData.is_sketch) return;
-        const pv = new Float32Array(prevData.vertices);
-        const pg = new THREE.BufferGeometry();
-        pg.setAttribute('position', new THREE.BufferAttribute(pv, 3));
-        pg.setIndex(prevData.faces);
-        pg.computeVertexNormals();
-        // Center same as main model
-        const pbox = new THREE.Box3().setFromBufferAttribute(pg.attributes.position);
-        const pc = pbox.getCenter(new THREE.Vector3());
-        pg.translate(-pc.x, -pc.y, -pc.z);
-        const ghostMat = new THREE.MeshPhysicalMaterial({
-          color: 0xFF6644, transparent: true, opacity: 0.15,
-          depthWrite: false, side: THREE.DoubleSide,
-        });
-        const ghost = new THREE.Mesh(pg, ghostMat);
-        ghost.name = 'ghost-prev';
-        modelGroup.add(ghost);
-      }).catch(() => {});
-    }
   }
 
   // Center model at origin
@@ -476,13 +450,7 @@ async function renderThumbnail(stepIndex) {
     const size = box.getSize(new THREE.Vector3()).length();
     if (size < 0.001) return null; // degenerate geometry
     const thumbCam = new THREE.PerspectiveCamera(45, 160 / 112, 0.1, 5000);
-    // Rotate camera angle per step so thumbnails look different
-    const angle = (stepIndex * 0.7) + 0.5;
-    thumbCam.position.set(
-      center.x + size * 0.8 * Math.cos(angle),
-      center.y + size * 0.6,
-      center.z + size * 0.8 * Math.sin(angle),
-    );
+    thumbCam.position.set(center.x + size * 0.8, center.y + size * 0.6, center.z + size * 0.8);
     thumbCam.lookAt(center);
 
     thumbRenderer.render(thumbScene, thumbCam);

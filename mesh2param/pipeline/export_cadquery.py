@@ -420,6 +420,101 @@ def _polygon_area(pts: list[tuple[float, float]]) -> float:
     return abs(area) / 2.0
 
 
+def _nudge_hole_into_solid(
+    wp: object,
+    center: np.ndarray,
+    h_dir: np.ndarray,
+    radius: float,
+    is_through: bool,
+    cut_length: float,
+    h_depth: float,
+    bbox_corners: np.ndarray,
+    cq,
+) -> object | None:
+    """Nudge a hole center toward the solid until the cut removes material.
+
+    When a hole's center is outside the extruded solid (e.g., on a
+    flange not captured by the profile), we find the nearest point on
+    the solid's B-rep surface and shift the hole center toward it.
+    This avoids adding pad geometry (which inflates volume) while still
+    producing a functional hole cut.
+
+    Returns the workplane after cutting, or None on failure.
+    """
+    try:
+        from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+        from OCP.gp import gp_Pnt
+
+        # Find the nearest point on the solid surface to the hole center
+        vertex = BRepBuilderAPI_MakeVertex(
+            gp_Pnt(float(center[0]), float(center[1]), float(center[2]))
+        ).Shape()
+        dist_calc = BRepExtrema_DistShapeShape(
+            vertex, wp.val().wrapped,
+        )
+        if not dist_calc.IsDone() or dist_calc.NbSolution() == 0:
+            return None
+
+        nearest_pt = dist_calc.PointOnShape2(1)
+        nearest = np.array([nearest_pt.X(), nearest_pt.Y(), nearest_pt.Z()])
+
+        # Compute the shift vector: from center toward nearest point,
+        # but only in the plane perpendicular to the hole axis.
+        # This preserves the hole direction while moving it sideways.
+        shift = nearest - center
+        along_axis = np.dot(shift, h_dir) * h_dir
+        shift_perp = shift - along_axis  # component perpendicular to axis
+
+        shift_dist = float(np.linalg.norm(shift_perp))
+        if shift_dist < 0.01:
+            # The center is already close to the solid along the
+            # perpendicular; the issue might be along the axis.
+            return None
+
+        # Nudge the center past the nearest point and deep enough that
+        # the full hole circle (center ± radius) is inside the solid.
+        # shift_dist gets us TO the surface; we need radius more to be
+        # fully embedded.
+        nudge_extra = radius + 1.0
+        if shift_dist > 0:
+            nudge_dir = shift_perp / shift_dist
+            nudged_center = center + nudge_dir * (shift_dist + nudge_extra)
+        else:
+            return None
+
+        logger.info(
+            "Nudged hole center by %.1fmm: [%.1f,%.1f,%.1f] -> [%.1f,%.1f,%.1f]",
+            shift_dist, center[0], center[1], center[2],
+            nudged_center[0], nudged_center[1], nudged_center[2],
+        )
+
+        # Recompute cut geometry with nudged center
+        proj = bbox_corners @ h_dir
+        solid_min = float(proj.min())
+        solid_max = float(proj.max())
+        nc_along = float(nudged_center @ h_dir)
+
+        if is_through:
+            new_cut_start = nudged_center + h_dir * (solid_min - nc_along - 1)
+            new_cut_end = nudged_center + h_dir * (solid_max - nc_along + 1)
+            new_cut_length = float(np.linalg.norm(new_cut_end - new_cut_start))
+        else:
+            new_cut_start = nudged_center - h_dir * (h_depth / 2) - h_dir * 1.0
+            new_cut_length = h_depth + 2.0
+
+        hole_plane = cq.Plane(
+            origin=cq.Vector(*new_cut_start.tolist()),
+            normal=cq.Vector(*h_dir.tolist()),
+        )
+        hole_solid = cq.Workplane(hole_plane).circle(radius).extrude(new_cut_length)
+        return wp.cut(hole_solid)
+
+    except Exception as e:
+        logger.warning("Nudge failed: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # CadQuery solid construction
 # ---------------------------------------------------------------------------
@@ -878,16 +973,26 @@ def _build_stepwise(
         h_dir = h_dir / (np.linalg.norm(h_dir) + 1e-15)
         is_through = hole.type == FeatureType.THROUGH_HOLE
 
+        # Project all bbox corners onto the hole axis to find the
+        # full extent of the solid in that direction
+        proj = bbox_corners @ h_dir
+        solid_min_along_axis = float(proj.min())
+        solid_max_along_axis = float(proj.max())
+        center_along_axis = float(center @ h_dir)
+
         if is_through:
-            # Project all bbox corners onto the hole axis to find the
-            # full extent of the solid in that direction, then span it
-            proj = bbox_corners @ h_dir
-            cut_start = center + h_dir * (float(proj.min()) - float(center @ h_dir) - 1)
-            cut_end = center + h_dir * (float(proj.max()) - float(center @ h_dir) + 1)
+            # Span the full solid extent plus margin
+            cut_start = center + h_dir * (solid_min_along_axis - center_along_axis - 1)
+            cut_end = center + h_dir * (solid_max_along_axis - center_along_axis + 1)
             cut_length = float(np.linalg.norm(cut_end - cut_start))
         else:
-            cut_start = center - h_dir * (h_depth / 2)
-            cut_length = h_depth
+            # Blind hole: start from the entry surface and cut inward.
+            # center (axis_point) is at the midpoint of the cylinder.
+            # The entry surface is at center - h_dir * (depth/2),
+            # the bottom is at center + h_dir * (depth/2).
+            # Start the cut slightly outside the entry surface.
+            cut_start = center - h_dir * (h_depth / 2) - h_dir * 1.0
+            cut_length = h_depth + 2.0
 
         hole_name = f"{'Through' if is_through else 'Blind'} Hole (r={radius:.1f})"
         if note:
@@ -899,7 +1004,35 @@ def _build_stepwise(
                 normal=cq.Vector(*h_dir.tolist()),
             )
             hole_solid = cq.Workplane(hole_plane).circle(radius).extrude(cut_length)
-            wp = wp.cut(hole_solid)
+
+            # Try the cut; if it removes little/no material, the hole
+            # center is likely outside the solid (e.g., on a flange/tab
+            # not captured by the profile cross-section).  In that case,
+            # nudge the hole center toward the solid so it intersects.
+            vol_before = abs(float(wp.val().Volume()))
+            wp_test = wp.cut(hole_solid)
+            vol_after = abs(float(wp_test.val().Volume()))
+
+            # Expected hole volume: pi * r^2 * cut_length
+            expected_removal = 3.14159 * radius * radius * cut_length
+            actual_removal = vol_before - vol_after
+            # Trigger nudge if less than 10% of expected volume was removed
+            barely_cut = actual_removal < expected_removal * 0.10
+
+            if barely_cut and cleaned is not None:
+                # Find the nearest point on the solid to the hole center
+                # by projecting the center onto the profile plane and
+                # shifting it inward until the cut succeeds.
+                wp_nudged = _nudge_hole_into_solid(
+                    wp, center, h_dir, radius, is_through,
+                    cut_length, h_depth, bbox_corners, cq,
+                )
+                if wp_nudged is not None:
+                    wp = wp_nudged
+                else:
+                    wp = wp_test
+            else:
+                wp = wp_test
 
             v, f = _tessellate_solid(wp)
             vol = abs(float(wp.val().Volume()))

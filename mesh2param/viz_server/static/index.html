@@ -575,12 +575,12 @@ body {
   <!-- Static tree items (Fusion 360-style) -->
   <div class="tree-section">
     <div class="tree-item" onclick="toggleOriginAxes()">
-      <i class="ri-focus-3-line" style="color:var(--text-muted);font-size:14px;width:20px;text-align:center;"></i>
+      <img src="/static/icons/origin.png" style="width:20px;height:20px;border-radius:50%;">
       <span>Origin</span>
       <button class="eye-btn" id="origin-eye" onclick="event.stopPropagation(); toggleOriginAxes()" title="Toggle visibility"><i class="ri-eye-off-line"></i></button>
     </div>
-    <div class="tree-item doc-settings" onclick="this.querySelector('.tree-children').classList.toggle('collapsed')">
-      <i class="ri-file-settings-line" style="color:var(--text-muted);font-size:14px;width:20px;text-align:center;"></i>
+    <div class="tree-item doc-settings" onclick="document.getElementById('doc-settings-children').classList.toggle('collapsed')">
+      <img src="/static/icons/settingsicon.png" style="width:20px;height:20px;border-radius:50%;">
       <span>Document Settings</span>
       <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
     </div>
@@ -595,7 +595,7 @@ body {
   <!-- Sketches folder -->
   <div class="tree-section" id="sketches-folder" style="display:none;">
     <div class="tree-item folder" onclick="document.getElementById('sketches-list').classList.toggle('collapsed')">
-      <i class="ri-folder-line" style="color:var(--orange);font-size:14px;width:20px;text-align:center;"></i>
+      <img src="/static/icons/sketch.png" style="width:20px;height:20px;border-radius:50%;">
       <span>Sketches</span>
       <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
     </div>

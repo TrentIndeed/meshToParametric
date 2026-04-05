@@ -295,8 +295,8 @@ function populateUI(statusData) {
   const iconMap = {
     // Sketch: grid plane with pencil
     'Sketch': S('<rect x="2" y="5" width="10" height="10" rx="1"/><line x1="2" y1="10" x2="12" y2="10"/><line x1="7" y1="5" x2="7" y2="15"/><path d="M13 2l2.5 2.5-6 6H7V8l6-6z"/>', 'sketch'),
-    // Extrude: rectangle with upward arrow
-    'Extrude': S('<rect x="3" y="8" width="12" height="8" rx="1"/><line x1="9" y1="8" x2="9" y2="2"/><polyline points="6,5 9,2 12,5"/>', 'extrude'),
+    // Extrude: PNG icon
+    'Extrude': { cls: 'extrude', svg: '<img src="/static/icons/extrude.png" style="width:18px;height:18px;border-radius:50%;">' },
     // Through hole: cylinder top-down with arrow through
     'Through': S('<ellipse cx="9" cy="9" rx="5.5" ry="5.5"/><ellipse cx="9" cy="9" rx="2.5" ry="2.5"/><line x1="9" y1="2" x2="9" y2="16" stroke-dasharray="1.5 1.5"/>', 'hole'),
     // Blind hole: cylinder with depth stop

@@ -291,7 +291,7 @@ function populateUI(statusData) {
   steps = statusData.steps;
 
   // PNG icon mapping — icons from /static/icons/
-  const I = (file, cls) => ({ cls, svg: `<img src="/static/icons/${file}" style="width:20px;height:20px;border-radius:50%;">` });
+  const I = (file, cls) => ({ cls, svg: `<img src="/static/icons/${file}" style="width:22px;height:22px;">` });
   const iconMap = {
     'Sketch':   I('sketch.png', 'sketch'),
     'Extrude':  I('extrude.png', 'extrude'),

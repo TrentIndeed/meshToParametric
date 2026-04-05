@@ -404,6 +404,29 @@ def _extract_profile_and_holes(
         if f.type == FeatureType.FILLET
     ]
 
+    # Filter out small inner profiles that are hole cross-sections.
+    # These appear when the slice cuts through holes in the mesh.
+    # Keep only: the outer profile (largest) and large inner cutouts
+    # (like windows/pockets). Remove small circles that match hole sizes.
+    if len(best_profiles) > 1 and holes:
+        hole_radii = set()
+        for h in holes:
+            r = h.sketch_geometry.get("radius", 0) if h.sketch_geometry else 0
+            if r > 0:
+                hole_radii.add(round(r, 1))
+
+        filtered = [best_profiles[0]]  # always keep outer profile
+        for p in best_profiles[1:]:
+            area = abs(_polygon_area(p))
+            # Estimate radius if this were a circle: A = pi*r^2
+            est_radius = (area / 3.14159) ** 0.5 if area > 0 else 0
+            # Skip if this profile matches a hole radius (within 50%)
+            is_hole = any(abs(est_radius - hr) < hr * 0.5 for hr in hole_radii)
+            if is_hole and area < _polygon_area(best_profiles[0]) * 0.05:
+                continue  # skip — this is a hole cross-section
+            filtered.append(p)
+        best_profiles = filtered
+
     return best_profiles, extrude_start, holes, chamfers, fillets
 
 

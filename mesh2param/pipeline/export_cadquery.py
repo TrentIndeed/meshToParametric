@@ -404,6 +404,33 @@ def _extract_profile_and_holes(
         if f.type == FeatureType.FILLET
     ]
 
+    # Smooth the outer profile to fill half-circle indentations from holes.
+    # When the cross-section slice cuts through holes near the boundary,
+    # the outer polygon dips inward around each hole. A morphological
+    # close (buffer out then in) fills these notches.
+    if best_profiles and holes:
+        from shapely.geometry import Polygon as SPolyClean
+        try:
+            outer = SPolyClean(best_profiles[0])
+            if outer.is_valid:
+                # Find the max hole radius for buffer size
+                max_hr = max(
+                    (h.sketch_geometry.get("radius", 0) for h in holes
+                     if h.sketch_geometry),
+                    default=0,
+                )
+                if max_hr > 0:
+                    buf = max_hr * 1.5
+                    smoothed = outer.buffer(buf, join_style='mitre', mitre_limit=5.0)
+                    smoothed = smoothed.buffer(-buf, join_style='mitre', mitre_limit=5.0)
+                    if not smoothed.is_empty and smoothed.is_valid:
+                        coords = list(smoothed.exterior.coords)[:-1]
+                        coords = _simplify_profile(coords, tolerance=0.1)
+                        if len(coords) >= 3:
+                            best_profiles[0] = coords
+        except Exception:
+            pass
+
     # Filter out small inner profiles that are hole cross-sections.
     # These appear when the slice cuts through holes in the mesh.
     # Keep only: the outer profile (largest) and large inner cutouts

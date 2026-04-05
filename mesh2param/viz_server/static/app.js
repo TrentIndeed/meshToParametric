@@ -290,29 +290,23 @@ function populateUI(statusData) {
   timeline.innerHTML = '';
   steps = statusData.steps;
 
-  // Fusion 360-style inline SVG icons (18×18 viewBox, stroke-based)
-  const S = (d, cls) => ({ cls, svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;">${d}</svg>` });
+  // PNG icon mapping — icons from /static/icons/
+  const I = (file, cls) => ({ cls, svg: `<img src="/static/icons/${file}" style="width:20px;height:20px;border-radius:50%;">` });
   const iconMap = {
-    // Sketch: grid plane with pencil
-    'Sketch': S('<rect x="2" y="5" width="10" height="10" rx="1"/><line x1="2" y1="10" x2="12" y2="10"/><line x1="7" y1="5" x2="7" y2="15"/><path d="M13 2l2.5 2.5-6 6H7V8l6-6z"/>', 'sketch'),
-    // Extrude: PNG icon
-    'Extrude': { cls: 'extrude', svg: '<img src="/static/icons/extrude.png" style="width:18px;height:18px;border-radius:50%;">' },
-    // Through hole: cylinder top-down with arrow through
-    'Through': S('<ellipse cx="9" cy="9" rx="5.5" ry="5.5"/><ellipse cx="9" cy="9" rx="2.5" ry="2.5"/><line x1="9" y1="2" x2="9" y2="16" stroke-dasharray="1.5 1.5"/>', 'hole'),
-    // Blind hole: cylinder with depth stop
-    'Blind': S('<ellipse cx="9" cy="5" rx="5" ry="2.5"/><line x1="4" y1="5" x2="4" y2="13"/><line x1="14" y1="5" x2="14" y2="13"/><ellipse cx="9" cy="13" rx="5" ry="2.5"/><line x1="9" y1="5" x2="9" y2="10"/><circle cx="9" cy="10" r="0.8" fill="currentColor" stroke="none"/>', 'hole'),
-    // Chamfer: corner with angled bevel line
-    'Chamfer': S('<polyline points="3,15 3,7 11,7"/><line x1="3" y1="11" x2="7" y2="7" stroke-width="2"/><line x1="3" y1="15" x2="3" y2="11"/><line x1="7" y1="7" x2="11" y2="7"/><line x1="1" y1="13" x2="5" y2="9" stroke-dasharray="1.2 1.2" stroke-width="1"/>', 'chamfer'),
-    // Fillet: corner with radius arc
-    'Fillet': S('<line x1="3" y1="15" x2="3" y2="9"/><line x1="9" y1="7" x2="15" y2="7"/><path d="M3 9 Q3 7 9 7" stroke-width="2"/>', 'fillet'),
-    // Pocket: recessed rectangular cut (top-down view)
-    'Pocket': S('<rect x="2" y="2" width="14" height="14" rx="1.5"/><rect x="5" y="5" width="8" height="8" rx="1"/><line x1="2" y1="2" x2="5" y2="5"/><line x1="16" y1="2" x2="13" y2="5"/><line x1="2" y1="16" x2="5" y2="13"/><line x1="16" y1="16" x2="13" y2="13"/>', 'pocket'),
-    // Boss: raised block with upward offset
-    'Boss': S('<rect x="2" y="10" width="14" height="6" rx="1"/><rect x="5" y="4" width="8" height="6" rx="1"/><line x1="5" y1="10" x2="2" y2="10"/><line x1="13" y1="10" x2="16" y2="10"/>', 'boss'),
-    // Slot: elongated rounded cutout
-    'Slot': S('<rect x="2" y="2" width="14" height="14" rx="1.5"/><rect x="4" y="6.5" width="10" height="5" rx="2.5"/>', 'slot'),
-    // Original mesh file
-    'Original': S('<path d="M5 2h6l4 4v10a1 1 0 01-1 1H5a1 1 0 01-1-1V3a1 1 0 011-1z"/><polyline points="11,2 11,6 15,6"/><path d="M7 10l2 2 3-4" stroke-width="1.2"/>', 'sketch'),
+    'Sketch':   I('sketch.png', 'sketch'),
+    'Extrude':  I('extrude.png', 'extrude'),
+    'Through':  I('hole.png', 'hole'),
+    'Blind':    I('hole.png', 'hole'),
+    'Chamfer':  I('chamfer.png', 'chamfer'),
+    'Fillet':   I('fillet.png', 'fillet'),
+    'Pocket':   I('shell.png', 'pocket'),
+    'Boss':     I('extrude.png', 'boss'),
+    'Slot':     I('shell.png', 'slot'),
+    'Loft':     I('loft.png', 'extrude'),
+    'Revolve':  I('revolve.png', 'extrude'),
+    'Sweep':    I('sweep.png', 'extrude'),
+    'Shell':    I('shell.png', 'pocket'),
+    'Original': I('bodies.png', 'sketch'),
   };
 
   // Show sketches folder and clear it
@@ -339,7 +333,7 @@ function populateUI(statusData) {
 
   statusData.steps.forEach((step, i) => {
     // Determine icon
-    let iconInfo = S('<rect x="3" y="3" width="12" height="12" rx="2"/>', 'extrude');
+    let iconInfo = I('component.png', 'extrude'); // default fallback
     for (const [key, val] of Object.entries(iconMap)) {
       if (step.name.includes(key)) { iconInfo = val; break; }
     }

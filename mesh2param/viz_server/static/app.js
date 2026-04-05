@@ -446,6 +446,16 @@ function populateUI(statusData) {
   // Show sketches folder if there are sketches
   sketchesFolder.style.display = hasSketch ? '' : 'none';
 
+  // Show body folder if there are features
+  const bodyFolder = document.getElementById('body-folder');
+  if (bodyFolder) bodyFolder.style.display = list.children.length > 0 ? '' : 'none';
+
+  // Set component name from filename
+  const compName = document.getElementById('component-name');
+  if (compName && statusData.filename) {
+    compName.textContent = statusData.filename.replace(/\.[^.]+$/, '');
+  }
+
   // Render thumbnails sequentially to avoid WebGL race conditions
   renderThumbQueue();
 }
@@ -1142,7 +1152,16 @@ async function autoLoad() {
         document.getElementById('btn-export').disabled = false;
         document.getElementById('chat-input').disabled = false;
         document.getElementById('chat-send').disabled = false;
-        loadStep(lastStep);
+        loadStep(lastStep).then(() => {
+          // Fit camera to model after autoLoad
+          const box = new THREE.Box3().setFromObject(modelGroup);
+          const s = box.getSize(new THREE.Vector3());
+          const size = s.length();
+          const camY = Math.max(size * 1.2, s.y * 2.5);
+          camera.position.set(size * 0.7, camY, size * 0.7);
+          controls.target.set(0, 0, 0);
+          controls.update();
+        });
       } else {
         finishLoad(data);
       }

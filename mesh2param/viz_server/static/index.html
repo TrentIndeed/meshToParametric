@@ -433,7 +433,9 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-/* ── Tree items (Origin, Settings, Sketches) ── */
+/* ── Tree items (Component, Origin, Settings, Sketches, Body) ── */
+.component-header { font-weight: 600; }
+.component-header span { font-size: 13px; }
 .tree-section { }
 .tree-item {
   display: flex; align-items: center; gap: 8px;
@@ -450,8 +452,8 @@ body {
 .tree-item .eye-btn:hover { color: var(--accent); background: var(--bg-tertiary); }
 .tree-children {
   padding-left: 28px; overflow: hidden;
-  transition: max-height 0.2s ease;
-  max-height: 200px;
+  transition: max-height 0.3s ease;
+  max-height: 5000px;
 }
 .tree-children.collapsed { max-height: 0; padding: 0 0 0 28px; }
 .tree-child {
@@ -572,38 +574,54 @@ body {
     <button class="sidebar-toggle" onclick="var s=document.getElementById('sidebar'); if(window.innerWidth<=768){s.classList.toggle('open')}else{s.classList.toggle('closed')}" title="Toggle sidebar"><i class="ri-side-bar-line"></i></button>
   </div>
 
-  <!-- Static tree items (Fusion 360-style) -->
+  <!-- Component (top-level, like Onshape) -->
   <div class="tree-section">
-    <div class="tree-item" onclick="toggleOriginAxes()">
-      <img src="/static/icons/origin.png" style="width:22px;height:22px;">
-      <span>Origin</span>
-      <button class="eye-btn" id="origin-eye" onclick="event.stopPropagation(); toggleOriginAxes()" title="Toggle visibility"><i class="ri-eye-off-line"></i></button>
-    </div>
-    <div class="tree-item doc-settings" onclick="document.getElementById('doc-settings-children').classList.toggle('collapsed')">
-      <img src="/static/icons/settingsicon.png" style="width:22px;height:22px;">
-      <span>Document Settings</span>
+    <div class="tree-item component-header" onclick="document.getElementById('component-children').classList.toggle('collapsed')">
+      <img src="/static/icons/component.png" style="width:22px;height:22px;">
+      <span id="component-name">Component</span>
       <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
     </div>
-    <div class="tree-children" id="doc-settings-children">
-      <div class="tree-child"><span class="tree-label">Units</span><span class="tree-value">mm</span></div>
-      <div class="tree-child"><span class="tree-label">Precision</span><span class="tree-value">0.01</span></div>
+    <div class="tree-children" id="component-children">
+
+      <!-- Origin -->
+      <div class="tree-item" onclick="toggleOriginAxes()" style="padding-left:28px;">
+        <img src="/static/icons/origin.png" style="width:20px;height:20px;">
+        <span>Origin</span>
+        <button class="eye-btn" id="origin-eye" onclick="event.stopPropagation(); toggleOriginAxes()" title="Toggle visibility"><i class="ri-eye-off-line"></i></button>
+      </div>
+
+      <!-- Document Settings -->
+      <div class="tree-item" onclick="document.getElementById('doc-settings-children').classList.toggle('collapsed')" style="padding-left:28px;">
+        <img src="/static/icons/settingsicon.png" style="width:20px;height:20px;">
+        <span>Document Settings</span>
+        <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
+      </div>
+      <div class="tree-children" id="doc-settings-children" style="padding-left:40px;">
+        <div class="tree-child"><span class="tree-label">Units</span><span class="tree-value">mm</span></div>
+        <div class="tree-child"><span class="tree-label">Precision</span><span class="tree-value">0.01</span></div>
+      </div>
+
+      <!-- Sketches folder -->
+      <div class="tree-section" id="sketches-folder" style="display:none;">
+        <div class="tree-item folder" onclick="document.getElementById('sketches-list').classList.toggle('collapsed')" style="padding-left:28px;">
+          <img src="/static/icons/sketch.png" style="width:20px;height:20px;">
+          <span>Sketches</span>
+          <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
+        </div>
+        <div class="tree-children" id="sketches-list" style="padding-left:40px;"></div>
+      </div>
+
+      <!-- Body (contains all features) -->
+      <div class="tree-section" id="body-folder" style="display:none;">
+        <div class="tree-item folder" onclick="document.getElementById('feature-list').classList.toggle('collapsed')" style="padding-left:28px;">
+          <img src="/static/icons/bodies.png" style="width:20px;height:20px;">
+          <span>Body</span>
+          <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
+        </div>
+        <div class="tree-children" id="feature-list" style="padding-left:40px;"></div>
+      </div>
+
     </div>
-  </div>
-
-  <div class="tree-divider"></div>
-
-  <!-- Sketches folder -->
-  <div class="tree-section" id="sketches-folder" style="display:none;">
-    <div class="tree-item folder" onclick="document.getElementById('sketches-list').classList.toggle('collapsed')">
-      <img src="/static/icons/sketch.png" style="width:22px;height:22px;">
-      <span>Sketches</span>
-      <i class="ri-arrow-down-s-line tree-arrow" style="margin-left:auto;color:var(--text-muted);font-size:14px;"></i>
-    </div>
-    <div class="tree-children" id="sketches-list"></div>
-  </div>
-
-  <!-- Feature list (populated by JS) -->
-  <div id="feature-list">
   </div>
 </div>
 

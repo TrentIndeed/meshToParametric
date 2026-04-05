@@ -321,6 +321,22 @@ function populateUI(statusData) {
   sketchesList.innerHTML = '';
   let hasSketch = false;
 
+  // Add "Original Mesh" button at the start of timeline
+  const meshBtn = document.createElement('div');
+  meshBtn.className = 'timeline-step timeline-special';
+  meshBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">Mesh</span>';
+  meshBtn.title = 'Show original mesh';
+  meshBtn.onclick = () => {
+    if (savedMeshPreview) {
+      _showRawMesh(savedMeshPreview);
+      // Deactivate all steps
+      document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
+      meshBtn.classList.add('active');
+    }
+  };
+  timeline.appendChild(meshBtn);
+
   statusData.steps.forEach((step, i) => {
     // Determine icon
     let iconInfo = S('<rect x="3" y="3" width="12" height="12" rx="2"/>', 'extrude');
@@ -360,6 +376,78 @@ function populateUI(statusData) {
     // Queue thumbnail for sequential rendering
     thumbQueue.push({ index: i, element: tStep });
   });
+
+  // Add "Compare" split-screen button at the end of timeline
+  const compareBtn = document.createElement('div');
+  compareBtn.className = 'timeline-step timeline-special';
+  compareBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">Compare</span>';
+  compareBtn.title = 'Split view: Mesh vs CAD';
+  compareBtn.onclick = () => {
+    if (!savedMeshPreview) return;
+    // Clear and show both mesh + CAD side by side
+    while (modelGroup.children.length) {
+      const child = modelGroup.children[0];
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) child.material.dispose();
+      modelGroup.remove(child);
+    }
+
+    // Mesh on the left (offset -X)
+    const meshVerts = new Float32Array(savedMeshPreview.mesh_vertices);
+    const meshGeo = new THREE.BufferGeometry();
+    meshGeo.setAttribute('position', new THREE.BufferAttribute(meshVerts, 3));
+    meshGeo.setIndex(savedMeshPreview.mesh_faces);
+    meshGeo.computeVertexNormals();
+    const meshMat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
+    const meshObj = new THREE.Mesh(meshGeo, meshMat);
+
+    // CAD on the right (offset +X) — load last step
+    const lastIdx = statusData.steps.length - 1;
+    const cadUrl = currentJobId ? `/api/job/${currentJobId}/step/${lastIdx}` : `/api/step/${lastIdx}`;
+    fetch(cadUrl).then(r => r.json()).then(cadData => {
+      if (!cadData.vertices) return;
+      const cadVerts = new Float32Array(cadData.vertices);
+      const cadGeo = new THREE.BufferGeometry();
+      cadGeo.setAttribute('position', new THREE.BufferAttribute(cadVerts, 3));
+      cadGeo.setIndex(cadData.faces);
+      cadGeo.computeVertexNormals();
+      const cadMat = new THREE.MeshPhysicalMaterial({
+        color: 0xC0C8D0, metalness: 0.5, roughness: 0.28,
+        clearcoat: 0.15, reflectivity: 0.6,
+      });
+      const cadObj = new THREE.Mesh(cadGeo, cadMat);
+
+      // Center both, then offset
+      const meshBox = new THREE.Box3().setFromBufferAttribute(meshGeo.attributes.position);
+      const cadBox = new THREE.Box3().setFromBufferAttribute(cadGeo.attributes.position);
+      const meshCenter = meshBox.getCenter(new THREE.Vector3());
+      const cadCenter = cadBox.getCenter(new THREE.Vector3());
+      const meshSize = meshBox.getSize(new THREE.Vector3()).length();
+      const gap = meshSize * 0.3;
+
+      meshObj.position.set(-gap - meshCenter.x, -meshCenter.y, -meshCenter.z);
+      cadObj.position.set(gap - cadCenter.x, -cadCenter.y, -cadCenter.z);
+
+      modelGroup.add(meshObj);
+      modelGroup.add(cadObj);
+
+      // Add wireframe to mesh side
+      modelGroup.add(new THREE.LineSegments(
+        new THREE.WireframeGeometry(meshGeo),
+        new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
+      ).translateX(-gap - meshCenter.x).translateY(-meshCenter.y).translateZ(-meshCenter.z));
+
+      modelGroup.position.set(0, 0, 0);
+      controls.target.set(0, 0, 0);
+      controls.update();
+
+      // Deactivate all steps
+      document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
+      compareBtn.classList.add('active');
+    }).catch(() => {});
+  };
+  timeline.appendChild(compareBtn);
 
   // Show sketches folder if there are sketches
   sketchesFolder.style.display = hasSketch ? '' : 'none';
@@ -458,6 +546,7 @@ async function renderThumbnail(stepIndex) {
 // ── File Upload: two-step flow (preview mesh → analyze & build) ──
 let pendingFile = null;
 let pendingTempPath = null;
+let savedMeshPreview = null; // saved mesh data for comparison view
 
 document.getElementById('file-input').addEventListener('change', async (e) => {
   const file = e.target.files[0];
@@ -529,6 +618,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     pendingTempPath = previewRes.temp_path;
     pendingFile = file;
     saveViewerState('preview');
+    savedMeshPreview = previewRes;
     _showRawMesh(previewRes);
 
     // Show preview info bar with complexity meter

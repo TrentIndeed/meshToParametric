@@ -3,6 +3,12 @@ import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/exampl
 
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
+// Horizontal scroll on timeline with mouse wheel
+document.getElementById('timeline').addEventListener('wheel', (e) => {
+  e.preventDefault();
+  document.getElementById('timeline').scrollLeft += e.deltaY;
+}, { passive: false });
+
 // ── State ──
 let currentStep = -1;
 let steps = [];
@@ -369,7 +375,7 @@ function populateUI(statusData) {
   meshBtn.title = 'Show original mesh';
   meshBtn.onclick = () => {
     if (savedMeshPreview) {
-      _showRawMesh(savedMeshPreview);
+      _showRawMesh(savedMeshPreview, false);
       // Deactivate all steps
       document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
@@ -852,8 +858,8 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     } else {
       warning.style.display = 'none';
       document.getElementById('btn-analyze').style.display = '';
-      if (score > 60) {
-        addChatMessage('ai', `⚠️ High complexity (${score}/100). Results may be less accurate for this mesh. Works best on prismatic parts with flat faces and cylindrical holes.`, true);
+      if (score > 75) {
+        addChatMessage('ai', `This mesh has high geometric complexity. Results may vary — works best on prismatic parts like brackets, plates, and mounts.`, true);
       }
     }
 
@@ -870,7 +876,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 });
 
 // Show raw mesh triangles in the viewer (before pipeline)
-function _showRawMesh(previewRes) {
+function _showRawMesh(previewRes, animateToFit = true) {
   console.debug('[_showRawMesh] verts:', previewRes.mesh_vertices?.length, 'faces:', previewRes.mesh_faces?.length);
   // Hide feature tree during mesh preview — it shows after pipeline completes
   document.getElementById('sidebar').classList.add('closed');
@@ -905,15 +911,20 @@ function _showRawMesh(previewRes) {
     modelGroup.position.sub(center);
     const size = box.getSize(new THREE.Vector3()).length();
 
-    // Smooth animation from current camera position to above-right angle
-    const meshHeight = box.getSize(new THREE.Vector3()).y;
-    const camY = Math.max(size * 1.2, meshHeight * 2.5);
-    console.debug('[_showRawMesh] centering, bbox size:', size.toFixed(1), 'animating camera');
-    animateCamera(
-      { x: size * 0.7, y: camY, z: size * 0.7 },
-      { x: 0, y: 0, z: 0 },
-      1.5,
-    );
+    // Smooth animation only on first upload, not when clicking Mesh button
+    if (animateToFit) {
+      const meshHeight = box.getSize(new THREE.Vector3()).y;
+      const camY = Math.max(size * 1.2, meshHeight * 2.5);
+      console.debug('[_showRawMesh] centering, bbox size:', size.toFixed(1), 'animating camera');
+      animateCamera(
+        { x: size * 0.7, y: camY, z: size * 0.7 },
+        { x: 0, y: 0, z: 0 },
+        1.5,
+      );
+    } else {
+      controls.target.set(0, 0, 0);
+      controls.update();
+    }
   } catch (e) {
     console.error('[_showRawMesh] bounding box / camera setup failed', e);
   }
@@ -1380,6 +1391,31 @@ async function autoLoad() {
       console.error('[autoLoad] preview restore failed:', e);
     }
   }
+  // Check for a demo job from the landing page (user just signed up after demo)
+  const demoJobCookie = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_demo_job='));
+  if (demoJobCookie) {
+    const demoJobId = demoJobCookie.split('=')[1];
+    console.debug('[autoLoad] found demo job cookie:', demoJobId);
+    // Clear the cookie so it doesn't interfere next time
+    document.cookie = 'paramesh_demo_job=; path=/; max-age=0';
+    try {
+      const demoRes = await fetch('/api/job/' + demoJobId + '/status');
+      if (demoRes.ok) {
+        const demoData = await demoRes.json();
+        if (demoData.status === 'done' && demoData.steps && demoData.steps.length > 0) {
+          console.debug('[autoLoad] loading demo job:', demoJobId);
+          currentJobId = demoJobId;
+          document.getElementById('empty-state').style.display = 'none';
+          document.getElementById('sidebar').classList.remove('closed');
+          finishLoad(demoData);
+          return;
+        }
+      }
+    } catch (e) {
+      console.debug('[autoLoad] demo job load failed:', e.message);
+    }
+  }
+
   // No preview — load last completed CAD job
   console.debug('[autoLoad] no preview found, checking /api/status for last CAD job');
   try {

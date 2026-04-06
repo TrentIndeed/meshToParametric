@@ -48,9 +48,7 @@ PLAN_TOKENS = {"free": 100, "starter": 1000, "pro": 5000, "unlimited": float("in
 PLAN_PARTS = {"free": 3, "payg": 9999, "pro": 30, "team": 100, "developer": 9999}
 PLAN_UPLOAD_MB = {"free": 10, "payg": 50, "starter": 50, "pro": 200, "team": 500, "unlimited": 500, "developer": 999}
 
-# ── Per-IP token tracking (prevents free trial abuse) ──
-_ip_tokens: dict[str, int] = {}  # ip → tokens spent
-_ip_jobs: dict[str, int] = {}    # ip → job count
+# ── Free trial tracking ──
 
 def _get_client_ip(request) -> str:
     """Get real client IP, checking X-Forwarded-For for reverse proxy (Caddy)."""
@@ -59,20 +57,15 @@ def _get_client_ip(request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-def _check_ip_limit(ip: str, plan: str = "free") -> tuple[bool, str | None]:
-    """Check if IP has exceeded free tier limits."""
-    limit = PLAN_TOKENS.get(plan, 100)
-    spent = _ip_tokens.get(ip, 0)
-    if spent >= limit:
-        return False, f"Token limit reached for this IP ({spent}/{int(limit)}). Sign up for more."
-    jobs = _ip_jobs.get(ip, 0)
-    if plan == "free" and jobs >= 10:
-        return False, f"Free trial: max 10 jobs per IP. You've used {jobs}. Sign up for unlimited."
+def _check_free_trial(request) -> tuple[bool, str | None]:
+    """Check if guest user (no auth cookie) has used their 1 free generation."""
+    token = request.cookies.get("paramesh_token", "")
+    if token:
+        return True, None  # logged in, skip free trial check
+    free_used = request.cookies.get("paramesh_free_used", "")
+    if free_used:
+        return False, "Free trial used. Sign up for unlimited conversions — it's free."
     return True, None
-
-def _charge_ip(ip: str, cost: int):
-    """Record token usage for an IP."""
-    _ip_tokens[ip] = _ip_tokens.get(ip, 0) + cost
 
 
 def _get_user_plan(request) -> str:
@@ -106,8 +99,8 @@ async def lifespan(app: FastAPI):
         raise
     # Load completed jobs from DB so they survive restarts
     queue.load_completed_from_db()
-    # Charge IP when jobs complete
-    queue.set_on_complete(lambda job: _charge_ip(job.client_ip, job.token_cost) if job.client_ip else None)
+    # Job completion callback (logging only now — free trial tracked via cookie)
+    queue.set_on_complete(lambda job: logger.info("Job %s completed, tokens=%d", job.id, job.token_cost))
     logger.info("Server startup complete")
     yield
     logger.info("Server shutting down")
@@ -284,11 +277,7 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
     plan = _get_user_plan(request)
     logger.debug("Preview request: filename=%r ip=%s plan=%s", file.filename, ip, plan)
 
-    # Check IP limits before processing
-    ok, reason = _check_ip_limit(ip, plan)
-    if not ok:
-        logger.debug("Preview rejected for ip=%s: %s", ip, reason)
-        return JSONResponse({"status": "error", "error": reason}, status_code=403)
+    # Preview is always free (no limit check — the pipeline run is what counts)
 
     content = await file.read()
     logger.debug("Preview file received: %r size=%d bytes", file.filename, len(content))
@@ -315,46 +304,29 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
         except Exception:
             pass
 
-        # Complexity analysis — based on estimated features, not face count
+        # Complexity analysis — based on face count and geometry
         import numpy as np
-        normals = cleaned.normals
 
-        # Count distinct flat surfaces (planes) by clustering normals
-        # Each unique normal direction ≈ one flat face of the part
-        unique_dirs = set()
-        for n in normals[::max(1, len(normals)//200)]:
-            snapped = tuple(round(x, 1) for x in n)
-            unique_dirs.add(snapped)
-        approx_surfaces = len(unique_dirs)
-
-        # Estimate cylindrical features (holes): faces with non-axis-aligned normals
-        abs_normals = np.abs(normals)
-        sorted_abs = np.sort(abs_normals, axis=1)
-        # Cylinder faces have 2 large + 1 small normal component
-        cylindrical = (sorted_abs[:, 1] > 0.3) & (sorted_abs[:, 2] > 0.3) & (sorted_abs[:, 0] < 0.3)
-        cyl_pct = float(cylindrical.sum()) / max(len(normals), 1)
-
-        # Estimate chamfer/fillet faces: diagonal normals (between 2 axes)
-        diagonal = (sorted_abs[:, 1] > 0.3) & (sorted_abs[:, 2] > 0.3)
-        diag_pct = float(diagonal.sum()) / max(len(normals), 1)
-
-        # Estimated feature counts
-        est_flat_sides = min(approx_surfaces, 20)  # capped
-        est_holes = int(cyl_pct * 20)  # rough: 5% cyl faces ≈ 1 hole
-        est_chamfers = int(diag_pct * 10)
-
-        # Complexity score 0-100 based on estimated features
+        # Complexity scoring: prismatic parts (brackets, plates, mounts)
+        # are what this tool is built for — they should score low.
+        # Only organic/freeform or very dense meshes score high.
         score = 0
-        score += min(15, max(0, est_flat_sides - 6) * 2)  # 6 sides = simple box (0 pts)
-        score += min(30, est_holes * 4)                     # each hole adds ~4 pts
-        score += min(20, est_chamfers * 3)                  # each chamfer adds ~3 pts
-        score += 0 if cleaned.is_watertight else 15         # non-watertight penalty
-        sorted_dims = sorted(dims, reverse=True)
-        aspect_ratio = sorted_dims[0] / (sorted_dims[2] + 1e-10)
-        score += min(10, max(0, aspect_ratio - 3) * 2)     # very elongated parts
+        if face_count <= 3000:
+            score += 10   # normal prismatic part
+        elif face_count <= 6000:
+            score += 35   # moderately complex
+        elif face_count <= 10000:
+            score += 60   # complex
+        else:
+            score += 85   # very complex / likely organic
+
+        # Non-watertight penalty
+        if not cleaned.is_watertight:
+            score += 10
+
         score = min(100, round(score))
 
-        normal_spread = diag_pct  # for reporting
+        normal_spread = 0.0  # not computed in simplified scoring
 
         # Classification and limits
         if score <= 25:
@@ -403,9 +375,9 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
             "can_process": can_process,
             "reject_reason": reason,
             "estimated_tokens": estimated_tokens,
-            "approx_surfaces": approx_surfaces,
+            "face_count": face_count,
             "normal_spread": round(normal_spread, 3),
-            "aspect_ratio": round(aspect_ratio, 1),
+            "aspect_ratio": round(sorted(dims, reverse=True)[0] / (sorted(dims, reverse=True)[2] + 1e-10), 1),
             "mesh_vertices": cleaned.vertices.flatten().tolist(),
             "mesh_faces": cleaned.faces.flatten().tolist(),
         }
@@ -422,15 +394,25 @@ async def run_pipeline(request: Request, body: dict):
     ip = _get_client_ip(request)
     logger.debug("Run-pipeline request: filename=%r ip=%s plan=%s",
                  body.get("filename"), ip, plan)
-    ok, reason = _check_ip_limit(ip, plan)
+    # Check free trial for guest users (1 free generation)
+    ok, reason = _check_free_trial(request)
     if not ok:
         return JSONResponse({"status": "error", "error": reason}, status_code=403)
-    limit = PLAN_TOKENS.get(plan, 100)
-    if queue.tokens_spent >= limit:
-        return JSONResponse(
-            {"status": "error", "error": f"Token limit reached ({int(limit)} on {plan} plan)."},
-            status_code=403,
-        )
+
+    # Check plan limits for logged-in users
+    token = request.cookies.get("paramesh_token", "")
+    if token:
+        parts_limit = PLAN_PARTS.get(plan, 3)
+        # Count jobs this month
+        import time as _time
+        month_ago = _time.time() - 2592000
+        with queue._lock:
+            monthly_jobs = sum(1 for job in queue._jobs.values() if job.status == "done" and job.created_at >= month_ago)
+        if parts_limit < 9999 and monthly_jobs >= parts_limit:
+            return JSONResponse(
+                {"status": "error", "error": f"Monthly limit reached ({monthly_jobs}/{parts_limit} parts on {plan} plan)."},
+                status_code=403,
+            )
 
     temp_path = body.get("temp_path", "")
     filename = body.get("filename", "mesh.stl")
@@ -438,8 +420,13 @@ async def run_pipeline(request: Request, body: dict):
         return JSONResponse({"status": "error", "error": "No mesh to process. Upload first."}, status_code=400)
 
     job_id = queue.submit(filename, temp_path, client_ip=ip)
-    logger.info("Pipeline queued: job_id=%s filename=%r ip=%s", job_id, filename, ip)
-    return {"status": "queued", "job_id": job_id}
+    logger.info("Pipeline queued: job_id=%s filename=%r ip=%s plan=%s", job_id, filename, ip, plan)
+
+    # Set free trial cookie for guest users (marks the 1 free generation as used)
+    response = JSONResponse({"status": "queued", "job_id": job_id})
+    if not token:
+        response.set_cookie("paramesh_free_used", "1", max_age=365*86400, samesite="lax", path="/")
+    return response
 
 
 @app.post("/api/upload")
@@ -448,13 +435,13 @@ async def upload(request: Request, file: UploadFile = File(...)):
     plan = _get_user_plan(request)
     ip = _get_client_ip(request)
     logger.debug("Upload request: filename=%r ip=%s plan=%s", file.filename, ip, plan)
-    ok, reason = _check_ip_limit(ip, plan)
+    ok, reason = _check_free_trial(request)
     if not ok:
         return JSONResponse({"status": "error", "error": reason}, status_code=403)
-    limit = PLAN_TOKENS.get(plan, 100)
-    if queue.tokens_spent >= limit:
+    parts_limit = PLAN_PARTS.get(plan, 3)
+    if parts_limit < 9999 and queue.tokens_spent >= PLAN_TOKENS.get(plan, 100):
         return JSONResponse(
-            {"status": "error", "error": f"Token limit reached ({int(limit)} on {plan} plan)."},
+            {"status": "error", "error": f"Monthly limit reached on {plan} plan."},
             status_code=403,
         )
 

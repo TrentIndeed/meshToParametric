@@ -1603,8 +1603,9 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
 
         shape = solid.val().wrapped
 
-        # First run BRepMesh to get baseline triangulation for curved faces
-        BRepMesh_IncrementalMesh(shape, 0.1, False, 0.5, True)
+        # Use OCCT's BRepMesh for all faces with tight tolerance
+        # (custom Delaunay was leaving gaps on concave planar faces)
+        BRepMesh_IncrementalMesh(shape, 0.05, False, 0.1, True)
 
         all_verts = []
         all_faces = []
@@ -1614,19 +1615,8 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
         while face_exp.More():
             face = TopoDS.Face_s(face_exp.Current())
             face_exp.Next()
-            adaptor = BRepAdaptor_Surface(face)
-            is_planar = adaptor.GetType() == GeomAbs_Plane
 
-            if is_planar:
-                # Extract face boundary wires and triangulate manually
-                v, f = _triangulate_planar_face(face)
-                if v is not None and len(f) > 0:
-                    all_verts.append(v)
-                    all_faces.append(f + vert_offset)
-                    vert_offset += len(v)
-                    continue
-
-            # Use BRepMesh triangulation for curved faces or fallback
+            # Use BRepMesh triangulation for all faces
             loc = TopLoc_Location()
             tri = BRep_Tool.Triangulation_s(face, loc)
             if tri is None:
@@ -1715,7 +1705,7 @@ def _triangulate_planar_face(face) -> tuple[np.ndarray | None, np.ndarray | None
             edge = TopoDS.Edge_s(edge_exp.Current())
             edge_exp.Next()
             curve = BRepAdaptor_Curve(edge)
-            discretizer = GCPnts_UniformDeflection(curve, 0.5, True)
+            discretizer = GCPnts_UniformDeflection(curve, 0.1, True)
             if not discretizer.IsDone():
                 continue
             edge_pts = []
@@ -1803,10 +1793,13 @@ def _triangulate_planar_face(face) -> tuple[np.ndarray | None, np.ndarray | None
     tri = Delaunay(pts_2d)
     faces = tri.simplices
 
-    # Filter: keep only triangles whose centroid is inside the boundary
+    # Filter: keep only triangles whose centroid is inside or on the boundary.
+    # Use a tiny buffer to avoid dropping triangles on thin/narrow faces
+    # where centroids land exactly on the boundary edge.
+    boundary_buffered = boundary.buffer(1e-4)
     centroids = pts_2d[faces].mean(axis=1)
     keep_mask = np.array([
-        boundary.contains(sg.Point(c[0], c[1])) for c in centroids
+        boundary_buffered.contains(sg.Point(c[0], c[1])) for c in centroids
     ])
     faces = faces[keep_mask]
 

@@ -43,6 +43,7 @@ class User(Base):
     stripe_customer_id = Column(String)
     stripe_subscription_id = Column(String)
     subscription_status = Column(String, default="none")
+    referral = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     jobs = relationship("MeshJob", back_populates="user")

@@ -99,7 +99,7 @@ nav .links a:hover { color: var(--text); }
 /* ── Hero (centered, no screenshot) ── */
 .hero {
   min-height: 100dvh; display: flex; align-items: center;
-  padding-top: 5rem;
+  padding-top: 7rem;
   position: relative; overflow: hidden;
 }
 .hero-bg {
@@ -173,7 +173,7 @@ nav .links a:hover { color: var(--text); }
 .hero-waitlist-form input::placeholder { color: var(--text-muted); }
 .hero-waitlist-form .btn { white-space: nowrap; padding: 0.75rem 2rem; font-size: 1rem; }
 .hero-waitlist-label {
-  font-size: 0.8rem; color: var(--text-muted); margin-top: 0.75rem;
+  font-size: 0.8rem; color: var(--text); margin-top: 0.75rem;
   text-align: center;
 }
 
@@ -232,6 +232,27 @@ nav .links a:hover { color: var(--text); }
   display: flex; align-items: center; justify-content: center;
   color: var(--text-muted); font-size: 0.85rem;
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+  overflow: hidden;
+}
+
+/* ── Demo grid (See it work) ── */
+.demo-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.25rem;
+}
+@media (max-width: 900px) { .demo-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 500px) { .demo-grid { grid-template-columns: 1fr; } }
+.demo-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; transition: border-color 0.3s, transform 0.2s;
+}
+.demo-card:hover { border-color: var(--accent-border); transform: translateY(-3px); }
+.demo-visual { aspect-ratio: 4/3; overflow: hidden; background: var(--bg); }
+.demo-visual img, .demo-visual video { width: 100%; height: 100%; object-fit: cover; }
+.demo-label {
+  font-size: 1rem; font-weight: 600; padding: 0.75rem 1rem 0.25rem;
+}
+.demo-meta {
+  font-size: 0.8rem; color: var(--text-muted); padding: 0 1rem 0.75rem;
 }
 
 /* ── Comparison chart ── */
@@ -381,7 +402,7 @@ footer {
   min-height: 160px; flex-shrink: 0;
 }
 .scroll-anim .text-overlay {
-  padding: 2rem 2.5rem; border-radius: 12px;
+  padding: 2.6rem 3.25rem; border-radius: 14px;
   background: rgba(10,10,11,0.85);
   backdrop-filter: blur(12px);
   border: 1px solid var(--border);
@@ -395,13 +416,13 @@ footer {
   transform: translateY(20px);
 }
 .scroll-anim .text-overlay h3 {
-  margin-bottom: 0.5rem; font-size: 1.3rem;
+  margin-bottom: 0.65rem; font-size: 1.7rem;
   transition: color 0.4s ease;
 }
 .scroll-anim .text-overlay:not(.hidden) h3 {
   color: var(--accent);
 }
-.scroll-anim .text-overlay p { font-size: 0.95rem; }
+.scroll-anim .text-overlay p { font-size: 1.25rem; }
 /* Accent highlight on keywords */
 .scroll-anim .text-overlay .kw {
   color: var(--accent); font-weight: 600;
@@ -443,7 +464,7 @@ footer {
 <!-- Nav -->
 <nav>
   <div class="inner">
-    <a href="#" class="logo" style="text-decoration:none;display:flex;align-items:center;gap:8px;" onclick="window.location=document.cookie.includes('paramesh_token')?'/home':'#';return false;"><img src="/static/icon-192.png" alt="" style="width:24px;height:24px;">Paramesh<span>AI</span></a>
+    <a href="#" class="logo" style="text-decoration:none;display:flex;align-items:center;gap:8px;" onclick="window.location=document.cookie.includes('paramesh_token')?'/home':'#';return false;"><img src="/static/icon-192.png" alt="" style="width:48px;height:48px;display:block;position:relative;top:2px;">Paramesh<span>AI</span></a>
     <div class="links">
       <a href="#how">How It Works</a>
       <a href="#pricing">Pricing</a>
@@ -455,59 +476,87 @@ footer {
   </div>
 </nav>
 
-<!-- Hero -->
-<section class="hero">
-  <div class="hero-bg" id="hero-bg">
-    <video autoplay muted loop playsinline preload="auto">
-      <source src="/static/hero.mp4" type="video/mp4">
-    </video>
-  </div>
+<!-- Hero — clean background, clear message, one demo video -->
+<section class="hero" style="background:var(--bg);">
   <div class="container">
     <div class="hero-content fade-in">
       <div class="hero-badge"><span class="dot"></span> Now in private beta</div>
-      <h1>Reverse-engineer<br>any mesh into<br><span class="gradient">parametric CAD</span></h1>
-      <p>Drop an STL, OBJ, or 3MF file. Get a fully editable feature tree with sketches, extrusions, holes, chamfers, and fillets — reconstructed from scratch.</p>
-      <div class="hero-waitlist fade-in">
-        <form class="hero-waitlist-form" onsubmit="return handleWaitlist(event)">
-          <input type="email" id="hero-waitlist-email" placeholder="you@company.com" required>
-          <button type="submit" class="btn btn-primary">Join Waitlist</button>
-        </form>
-        <div class="hero-waitlist-label">Join 200+ engineers on the waitlist. No spam.</div>
+      <h1>Mesh in.<br><span class="gradient">Parametric CAD</span> out.</h1>
+      <p>Upload an STL, OBJ, or 3MF. Get back a fully editable STEP file with a real feature tree — sketches, extrusions, holes, chamfers, fillets — built from scratch in under 60 seconds.</p>
+      <div class="hero-actions">
+        <a href="#waitlist" class="btn btn-primary" style="padding:0.85rem 2rem; font-size:1.05rem;">Get 5 Free Conversions</a>
+        <a href="#see-it-work" class="btn btn-secondary" style="padding:0.85rem 2rem; font-size:1.05rem;">See It Work</a>
+      </div>
+      <div class="hero-waitlist-label" style="margin-top:1rem;">No credit card required.</div>
+    </div>
+    <!-- Hero demo video -->
+    <div style="margin-top:3rem; width:100%; max-width:900px;">
+      <div style="border-radius:14px; overflow:hidden; border:1px solid var(--border); box-shadow: 0 20px 60px rgba(0,0,0,0.5);">
+        <video autoplay muted loop playsinline preload="auto" style="width:100%; display:block;">
+          <source src="/static/hero.mp4" type="video/mp4">
+        </video>
       </div>
     </div>
   </div>
 </section>
 
-<!-- Stats -->
+<!-- Social proof bar -->
 <section class="stats">
   <div class="inner container">
     <div class="stat fade-in">
-      <div class="num">6</div>
-      <div class="label">Pipeline stages</div>
+      <div class="num">&lt;60s</div>
+      <div class="label">Per part conversion</div>
     </div>
     <div class="stat fade-in">
-      <div class="num">&lt;3%</div>
-      <div class="label">Volume error</div>
+      <div class="num">93%</div>
+      <div class="label">Cross-section accuracy</div>
     </div>
     <div class="stat fade-in">
       <div class="num">8</div>
       <div class="label">Feature types detected</div>
     </div>
     <div class="stat fade-in">
-      <div class="num mono">STEP</div>
-      <div class="label">Export format</div>
+      <div class="num mono" style="font-size:1.8rem;">STEP &middot; STL &middot; Onshape</div>
+      <div class="label">Export formats</div>
     </div>
   </div>
 </section>
 
-<!-- App Screenshot Showcase -->
-<section class="screenshot-section">
+<!-- See It Work — real conversions of real parts -->
+<section id="see-it-work" style="padding: clamp(5rem,10vh,8rem) 0;">
   <div class="container">
-    <h2 class="fade-in" style="margin-bottom: 0.5rem; text-align:center;">See the full CAD workspace</h2>
-    <p class="fade-in" style="text-align:center; margin: 0 auto;">Feature tree, 3D viewer, AI chat, and construction timeline — all in one interface.</p>
-    <div class="screenshot-wrapper fade-in">
-      <div class="glow"></div>
-      <img src="/static/hero-screenshot.jpg" alt="Paramesh AI workspace: feature tree, 3D viewer, AI chat, and construction timeline">
+    <h2 class="fade-in" style="margin-bottom: 0.75rem; text-align:center;">See it work on real parts</h2>
+    <p class="fade-in" style="text-align:center; margin: 0 auto 3rem;">Every conversion below is a real mesh processed by Paramesh AI. No hand-tuning, no cleanup.</p>
+
+    <div class="demo-grid fade-in">
+      <div class="demo-card">
+        <div class="demo-visual">
+          <img src="/static/before-after.jpg" alt="L-bracket mesh to CAD conversion" style="width:100%;height:100%;object-fit:cover;">
+        </div>
+        <div class="demo-label">L-Bracket</div>
+        <div class="demo-meta">6 holes, 2 chamfers &middot; 93% accuracy</div>
+      </div>
+      <div class="demo-card">
+        <div class="demo-visual">
+          <img src="/static/step3-cad.jpg" alt="Motor mount mesh to CAD conversion" style="width:100%;height:100%;object-fit:cover;">
+        </div>
+        <div class="demo-label">Motor Mount</div>
+        <div class="demo-meta">8 features &middot; STEP export</div>
+      </div>
+      <div class="demo-card">
+        <div class="demo-visual">
+          <img src="/static/step2-features.jpg" alt="Front plate with feature tree" style="width:100%;height:100%;object-fit:cover;">
+        </div>
+        <div class="demo-label">Front Plate</div>
+        <div class="demo-meta">Window cutout, 4 holes &middot; Full feature tree</div>
+      </div>
+      <div class="demo-card">
+        <div class="demo-visual">
+          <img src="/static/step1-upload.jpg" alt="Mounting plate conversion" style="width:100%;height:100%;object-fit:cover;">
+        </div>
+        <div class="demo-label">Mounting Plate</div>
+        <div class="demo-meta">12 features &middot; Under 45 seconds</div>
+      </div>
     </div>
   </div>
 </section>
@@ -533,55 +582,37 @@ footer {
   </div>
 </section>
 
-<!-- Before/After -->
-<section style="padding: 5rem 0;">
-  <div class="container" style="text-align:center;">
-    <h2 class="fade-in" style="margin-bottom: 0.75rem;">Mesh in, parametric CAD out</h2>
-    <p class="fade-in" style="margin: 0 auto 2.5rem; text-align:center;">The original reference STEP (left) compared to what Paramesh AI reconstructs from just the mesh (right). 0.2% volume error.</p>
-    <img class="fade-in" src="/static/before-after.jpg" alt="Before: reference STEP model. After: Paramesh AI reconstructed CAD model with 0.2% volume error." style="width:100%; max-width:900px; border-radius:12px; border:1px solid var(--border); box-shadow: 0 20px 60px rgba(0,0,0,0.4);">
-  </div>
-</section>
-
-<!-- How It Works -->
-<section id="how">
+<!-- How It Works — 3 steps, scannable -->
+<section id="how" style="background: var(--bg-elevated);">
   <div class="container">
-    <h2 class="fade-in" style="margin-bottom: 4rem;">How it works</h2>
+    <h2 class="fade-in" style="margin-bottom: 3.5rem; text-align:center;">How it works</h2>
 
     <div class="how-it-works">
       <div class="step fade-in">
         <div>
           <div class="step-num">1</div>
           <h3>Upload your mesh</h3>
-          <p style="margin-top:0.75rem">Drop any STL, OBJ, PLY, or 3MF file. The pipeline ingests, repairs topology, fixes normals, and removes degenerate geometry automatically.</p>
+          <p style="margin-top:0.75rem">Drag in any STL, OBJ, PLY, or 3MF. The pipeline repairs topology, fixes normals, and cleans geometry automatically.</p>
         </div>
-        <div class="step-visual">Stage 1: Mesh Ingestion</div>
+        <div class="step-visual"><img src="/static/step1-upload.jpg" alt="Upload a mesh file" style="width:100%;height:100%;object-fit:cover;border-radius:12px;"></div>
       </div>
 
       <div class="step fade-in">
         <div>
           <div class="step-num">2</div>
-          <h3>AI recognizes features</h3>
-          <p style="margin-top:0.75rem">Surface segmentation, primitive fitting, topology analysis, and pattern matching identify extrusions, holes, pockets, chamfers, and fillets.</p>
+          <h3>AI builds your CAD model</h3>
+          <p style="margin-top:0.75rem">Feature recognition detects extrusions, holes, chamfers, and fillets. A parametric solid is constructed from scratch with a full feature tree.</p>
         </div>
-        <div class="step-visual">Stages 2-5: Recognition</div>
+        <div class="step-visual"><img src="/static/step2-features.jpg" alt="AI-built feature tree" style="width:100%;height:100%;object-fit:cover;border-radius:12px;"></div>
       </div>
 
       <div class="step fade-in">
         <div>
           <div class="step-num">3</div>
-          <h3>Clean CAD model built</h3>
-          <p style="margin-top:0.75rem">A parametric solid is constructed from scratch — sketch profile, extrude, cut holes, apply chamfers. Flat faces, clean edges, proper B-rep geometry.</p>
-        </div>
-        <div class="step-visual">Stage 6: CadQuery Export</div>
-      </div>
-
-      <div class="step fade-in">
-        <div>
-          <div class="step-num">4</div>
           <h3>Export or edit</h3>
-          <p style="margin-top:0.75rem">Download as STEP, send to Onshape, or use the AI chatbot to modify feature dimensions. The entire feature tree is editable.</p>
+          <p style="margin-top:0.75rem">Download as STEP, push to Onshape, or use the AI chatbot to modify dimensions. Every feature is editable.</p>
         </div>
-        <div class="step-visual">Web Viewer + AI Chat</div>
+        <div class="step-visual"><img src="/static/step3-cad.jpg" alt="Export STEP or edit in Onshape" style="width:100%;height:100%;object-fit:cover;border-radius:12px;"></div>
       </div>
     </div>
   </div>
@@ -618,6 +649,29 @@ footer {
   </div>
 </section>
 
+<!-- Free Mesh Cleaner -->
+<section style="padding: 5rem 0;">
+  <div class="container" style="text-align:center;">
+    <h2 class="fade-in" style="margin-bottom: 0.75rem;">Free mesh cleaner</h2>
+    <p class="fade-in" style="margin: 0 auto 2rem; max-width:600px;">Fix broken meshes instantly. Repair topology, remove degenerate faces, fill holes, and resize — no signup required.</p>
+    <div class="fade-in" style="display:flex; gap:2rem; justify-content:center; flex-wrap:wrap; margin-bottom:2.5rem;">
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; min-width:160px;">
+        <div style="font-size:1.5rem; font-weight:700; color:var(--accent);">Repair</div>
+        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Fix normals, fill holes, remove degenerates</div>
+      </div>
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; min-width:160px;">
+        <div style="font-size:1.5rem; font-weight:700; color:var(--accent);">Resize</div>
+        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Scale to exact dimensions in mm</div>
+      </div>
+      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; min-width:160px;">
+        <div style="font-size:1.5rem; font-weight:700; color:var(--accent);">Export</div>
+        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Download cleaned STL instantly</div>
+      </div>
+    </div>
+    <a href="/clean" style="display:inline-flex; align-items:center; gap:8px; background:transparent; border:1px solid var(--accent); color:var(--accent); padding:12px 28px; border-radius:10px; font-weight:600; font-size:0.95rem; text-decoration:none; transition:all 0.2s;">Try the free cleaner <span style="font-size:1.1rem;">&rarr;</span></a>
+  </div>
+</section>
+
 <!-- Pricing -->
 <section id="pricing" style="padding: 6rem 0;">
   <div class="container">
@@ -629,66 +683,69 @@ footer {
       <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Free</div>
         <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$0</div>
-        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">forever</div>
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">no signup required</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          3 parts/month<br>
+          Mesh cleaner &amp; resizer<br>
+          Unlimited cleaning<br>
           5 MB upload limit<br>
-          STEP export<br>
-          Feature tree viewer<br>
-          Community support
+          STL export<br>
+          No account needed
         </div>
-        <a href="#waitlist" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
+        <a href="/clean" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Try Free Cleaner</a>
       </div>
 
-      <!-- Maker -->
+      <!-- Pay As You Go -->
       <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
-        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Maker</div>
-        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$19</div>
-        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
+        <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Pay As You Go</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$2</div>
+        <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/part</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          30 parts/month<br>
+          No commitment<br>
           50 MB upload limit<br>
-          STEP + Onshape export<br>
-          AI dimension planner<br>
+          STEP export<br>
+          Feature tree viewer<br>
           Email support
         </div>
-        <a href="#waitlist" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
+        <a href="#waitlist" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
       </div>
 
       <!-- Pro -->
       <div style="background:var(--bg-card); border:2px solid var(--accent); border-radius:14px; padding:2rem 1.5rem; position:relative; display:flex; flex-direction:column;">
         <div style="position:absolute; top:-12px; left:50%; transform:translateX(-50%); background:var(--accent); color:var(--bg); font-size:0.7rem; font-weight:700; padding:0.25rem 0.75rem; border-radius:100px; text-transform:uppercase; letter-spacing:0.05em;">Most Popular</div>
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent); font-weight:600; margin-bottom:0.75rem;">Pro</div>
-        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$49</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$29</div>
         <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          150 parts/month<br>
+          30 conversions/month<br>
           200 MB upload limit<br>
           All export formats<br>
           AI chatbot + planner<br>
           Priority support
         </div>
-        <a href="#waitlist" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:1.5rem;">Join Waitlist</a>
+        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;">Solo engineers, freelancers</div>
+        <a href="#waitlist" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:1rem;">Join Waitlist</a>
       </div>
 
       <!-- Team -->
       <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:2rem 1.5rem; display:flex; flex-direction:column;">
         <div style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-muted); font-weight:600; margin-bottom:0.75rem;">Team</div>
-        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$149</div>
+        <div style="font-size:2.5rem; font-weight:700; letter-spacing:-0.03em;">$79</div>
         <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:1.5rem;">/month</div>
         <div style="flex:1; font-size:0.9rem; color:var(--text-secondary); line-height:2;">
-          Unlimited parts<br>
+          100 conversions/month<br>
+          $1.50/part overage<br>
           500 MB upload limit<br>
           API access + batch export<br>
           Full AI suite<br>
           Dedicated support
         </div>
-        <a href="#waitlist" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1.5rem;">Contact Us</a>
+        <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.5rem;">Small shops, agencies</div>
+        <a href="#waitlist" class="btn btn-secondary" style="width:100%; justify-content:center; margin-top:1rem;">Join Waitlist</a>
       </div>
     </div>
 
     <p class="fade-in" style="text-align:center; margin-top:2rem; font-size:0.85rem; color:var(--text-muted);">
-      All plans include feature tree viewer and construction timeline. Pro plan: ~$0.33/part.
+      All paid plans include feature tree viewer, construction timeline, and Onshape integration.
     </p>
   </div>
 </section>
@@ -729,8 +786,8 @@ footer {
 <!-- Waitlist CTA -->
 <section id="waitlist" class="waitlist">
   <div class="container">
-    <h2 class="fade-in">Get early access</h2>
-    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">Drop your email. We'll notify you when Paramesh AI launches publicly.</p>
+    <h2 class="fade-in">Start converting parts today</h2>
+    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">5 free conversions. No credit card. Join the waitlist for early access.</p>
     <form class="waitlist-form fade-in" onsubmit="return handleWaitlist(event)">
       <input type="email" id="waitlist-email" placeholder="you@company.com" required>
       <button type="submit" class="btn btn-primary">Join</button>
@@ -765,7 +822,6 @@ footer {
 // ── Scroll animation: frame-by-frame tied to scroll ──
 const TOTAL_FRAMES = 121;
 const scrollFrames = [];
-// Preload all 121 frames (24fps × 5s)
 for (let i = 0; i < TOTAL_FRAMES; i++) {
   const img = new Image();
   img.src = `/static/scroll-frames/frame-${String(i).padStart(3, '0')}.jpg`;
@@ -785,32 +841,20 @@ window.addEventListener('scroll', () => {
   const rect = scrollSection.getBoundingClientRect();
   const sectionHeight = scrollSection.offsetHeight;
   const vh = window.innerHeight;
-
-  // Progress: frames start when section enters viewport (top of section
-  // reaches bottom of screen) and end when section leaves viewport
-  // (bottom of section reaches top of screen). No early cutoff.
   const entered = vh - rect.top;
   const scrollRange = sectionHeight + vh;
   const progress = Math.max(0, Math.min(1, entered / scrollRange));
 
-  // Map scroll progress to frame index
   const frameIdx = Math.min(TOTAL_FRAMES - 1, Math.floor(progress * TOTAL_FRAMES));
   if (scrollFrames[frameIdx] && scrollFrames[frameIdx].complete) {
     scrollImg.src = scrollFrames[frameIdx].src;
   }
 
-  // Text cards: spaced evenly across the middle of the scroll range.
-  // Starts after 20% (section is visible) and ends at 85% (before exit).
   const ranges = [[0.20, 0.42], [0.42, 0.64], [0.64, 0.85]];
   textSlides.forEach((el, i) => {
     if (!el) return;
     const [start, end] = ranges[i];
-    const active = progress >= start && progress < end;
-    if (active) {
-      el.classList.remove('hidden');
-    } else {
-      el.classList.add('hidden');
-    }
+    el.classList.toggle('hidden', !(progress >= start && progress < end));
   });
 }, { passive: true });
 

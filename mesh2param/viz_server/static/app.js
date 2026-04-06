@@ -774,7 +774,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     // AI thinking messages about the uploaded mesh
     addChatMessage('ai', `Loaded ${previewRes.filename || 'mesh'}: ${previewRes.faces.toLocaleString()} faces, ${previewRes.vertices.toLocaleString()} vertices`, true);
     addChatMessage('ai', `Dimensions: ${previewRes.dimensions.map(d => d + 'mm').join(' × ')}. ${previewRes.watertight ? 'Mesh is watertight.' : 'Mesh has gaps — will repair.'}`, true);
-    addChatMessage('ai', `Complexity: ${previewRes.complexity}. Estimated cost: ~${previewRes.estimated_tokens} tokens. Click "Analyze & Build" to proceed.`, true);
+    addChatMessage('ai', `Complexity: ${previewRes.complexity}. This will use 1 part conversion. Click "Analyze & Build" to proceed.`, true);
 
     // Save mesh preview data to sessionStorage for refresh persistence
     try {
@@ -810,7 +810,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     document.getElementById('preview-bar').style.display = 'block';
     document.getElementById('preview-faces').textContent = previewRes.faces.toLocaleString() + ' faces';
     document.getElementById('preview-dims').textContent = previewRes.dimensions.map(d => d + 'mm').join(' × ');
-    document.getElementById('preview-tokens').textContent = '~' + previewRes.estimated_tokens + ' tokens';
+    document.getElementById('preview-tokens').textContent = '1 part conversion';
 
     // Complexity meter
     const score = previewRes.complexity_score || 0;
@@ -866,6 +866,8 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 // Show raw mesh triangles in the viewer (before pipeline)
 function _showRawMesh(previewRes) {
   console.debug('[_showRawMesh] verts:', previewRes.mesh_vertices?.length, 'faces:', previewRes.mesh_faces?.length);
+  // Hide feature tree during mesh preview — it shows after pipeline completes
+  document.getElementById('sidebar').classList.add('closed');
   while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
 
   try {
@@ -1085,6 +1087,8 @@ let cachedStatusData = null;
 
 function finishLoad(statusData) {
   console.debug('[finishLoad] state -> cad, steps:', statusData.steps?.length, 'volume:', statusData.mesh_volume, 'tokens:', statusData.tokens_used);
+  // Show feature tree now that pipeline is done
+  document.getElementById('sidebar').classList.remove('closed');
   cachedStatusData = statusData;
   saveViewerState('cad');
   sessionStorage.removeItem('paramesh_preview'); // clear preview, CAD is now primary
@@ -1093,7 +1097,7 @@ function finishLoad(statusData) {
     try { sessionStorage.setItem('paramesh_mesh_compare', JSON.stringify(savedMeshPreview)); } catch (e) { /* too large */ }
   }
   populateUI(statusData);
-  document.getElementById('token-count').textContent = statusData.tokens_used;
+  document.getElementById('token-count').textContent = statusData.parts_used || statusData.tokens_used || 0;
   document.getElementById('status-dot').className = 'status-dot done';
   document.getElementById('btn-export').disabled = false;
   document.getElementById('btn-rerun').style.display = pendingTempPath ? '' : 'none';
@@ -1255,20 +1259,16 @@ window.openSettings = async function() {
     const u = await res.json();
     console.debug('[openSettings] usage loaded, plan:', u.plan, 'daily:', u.daily);
 
-    const limit = u.tokens_limit > 0 ? u.tokens_limit : 100;
+    const limit = u.parts_limit || u.tokens_limit || 30;
+    const partsUsed = u.parts_used || u.monthly || 0;
 
     // Plan badge
     document.getElementById('settings-plan-badge').textContent = u.plan.charAt(0).toUpperCase() + u.plan.slice(1);
     document.getElementById('settings-plan-name').textContent = u.plan.charAt(0).toUpperCase() + u.plan.slice(1);
     document.getElementById('settings-upload').textContent = u.upload_limit_mb + ' MB';
-    document.getElementById('settings-jobs').textContent = u.total_jobs;
 
-    // Session (daily)
-    fillBar('bar-session', 'num-session', 'lim-session', u.daily, limit);
-    // Week
-    fillBar('bar-week', 'num-week', 'lim-week', u.weekly, limit);
-    // Month
-    fillBar('bar-month', 'num-month', 'lim-month', u.monthly, limit);
+    // Parts this month
+    fillBar('bar-month', 'num-month', 'lim-month', partsUsed, limit);
   } catch (e) { console.error('[openSettings] failed to load usage data', e); }
 };
 
@@ -1394,6 +1394,7 @@ async function autoLoad() {
       const lastStep = parseInt(localStorage.getItem('paramesh_last_step') || '-1');
       if (lastStep >= 0 && lastStep < data.steps.length) {
         console.debug('[autoLoad] restoring last step:', lastStep);
+        document.getElementById('sidebar').classList.remove('closed');
         populateUI(data);
         cachedStatusData = data;
         document.getElementById('status-dot').className = 'status-dot done';

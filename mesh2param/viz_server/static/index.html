@@ -61,9 +61,7 @@ body {
 }
 #topbar .left { display: flex; align-items: center; gap: 12px; }
 #topbar .logo {
-  font-size: 15px; font-weight: 700; letter-spacing: 0.5px;
-  background: linear-gradient(135deg, var(--accent), var(--purple));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  font-size: 15px; font-weight: 700; letter-spacing: -0.02em;
 }
 #topbar .menu-btn {
   background: none; border: 1px solid var(--border); color: var(--text-secondary);
@@ -123,7 +121,17 @@ body {
   transition: transform 0.2s ease;
 }
 #sidebar.closed { transform: translateX(-100%); }
+#sidebar.closed ~ #sidebar-tab { display: flex; }
 #sidebar.open { transform: translateX(0) !important; }
+#sidebar-tab {
+  display: none; position: fixed; top: 56px; left: 0; z-index: 51;
+  width: 32px; height: 32px; align-items: center; justify-content: center;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-left: none; border-radius: 0 8px 8px 0;
+  cursor: pointer; color: var(--text-secondary); font-size: 14px;
+  transition: color 0.2s;
+}
+#sidebar-tab:hover { color: var(--accent); }
 #sidebar .header {
   padding: 12px 16px; font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 1px; color: var(--text-secondary);
@@ -538,10 +546,10 @@ body {
 <div id="topbar">
   <div class="left">
     <button class="menu-btn" onclick="document.getElementById('app-menu').classList.toggle('show')"><i class="ri-menu-line"></i></button>
-    <a href="/home" class="logo" style="text-decoration:none;color:var(--text-primary)">Paramesh<span style="color:var(--accent)">AI</span></a>
+    <a href="/home" class="logo" style="text-decoration:none;color:var(--text-primary);display:flex;align-items:center;gap:6px;"><img src="/static/icon-192.png" alt="" style="width:28px;height:28px;display:block;position:relative;top:1px;">Paramesh<span style="color:var(--accent)">AI</span></a>
   </div>
   <div class="right">
-    <span class="tokens" onclick="openSettings()" style="cursor:pointer" title="Usage & Settings"><i class="ri-sparkling-line"></i> <span id="token-count">0</span> tokens</span>
+    <span class="tokens" onclick="openSettings()" style="cursor:pointer" title="Usage & Settings"><i class="ri-sparkling-line"></i> <span id="token-count">0</span> parts</span>
     <button onclick="toggleTheme()" class="menu-btn" title="Toggle theme" style="font-size:14px">
       <i id="theme-icon" class="ri-sun-line"></i>
     </button>
@@ -555,7 +563,6 @@ body {
   <div class="divider"></div>
   <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
   <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
-  <div onclick="alert('Save Project is coming soon!'); document.getElementById('app-menu').classList.remove('show')"><i class="ri-save-3-line"></i> Save Project</div>
   <div class="divider"></div>
   <div class="divider"></div>
   <div onclick="toggleGrid()"><i class="ri-grid-line"></i> Toggle Grid</div>
@@ -624,6 +631,7 @@ body {
     </div>
   </div>
 </div>
+<div id="sidebar-tab" onclick="document.getElementById('sidebar').classList.remove('closed')"><i class="ri-side-bar-line"></i></div>
 
 <!-- 3D Viewer -->
 <div id="viewer">
@@ -641,25 +649,12 @@ body {
     <div id="settings-plan-badge" class="plan-badge">Free</div>
 
     <div class="usage-section">
-      <div class="label">Session (today)</div>
-      <div class="usage-bar-bg"><div class="usage-bar-fill green" id="bar-session" style="width:0%"></div></div>
-      <div class="usage-nums"><span class="spent" id="num-session">0</span><span class="limit" id="lim-session">/ 100</span></div>
-    </div>
-
-    <div class="usage-section">
-      <div class="label">This week</div>
-      <div class="usage-bar-bg"><div class="usage-bar-fill green" id="bar-week" style="width:0%"></div></div>
-      <div class="usage-nums"><span class="spent" id="num-week">0</span><span class="limit" id="lim-week">/ 100</span></div>
-    </div>
-
-    <div class="usage-section">
-      <div class="label">This month</div>
+      <div class="label">Parts converted this month</div>
       <div class="usage-bar-bg"><div class="usage-bar-fill green" id="bar-month" style="width:0%"></div></div>
-      <div class="usage-nums"><span class="spent" id="num-month">0</span><span class="limit" id="lim-month">/ 100</span></div>
+      <div class="usage-nums"><span class="spent" id="num-month">0</span><span class="limit" id="lim-month">/ 30</span></div>
     </div>
 
     <div class="settings-row"><span>Upload limit</span><span class="val" id="settings-upload">10 MB</span></div>
-    <div class="settings-row"><span>Jobs processed</span><span class="val" id="settings-jobs">0</span></div>
     <div class="settings-row"><span>Plan</span><span class="val" id="settings-plan-name">Free</span></div>
 
     <a href="/landing#pricing" class="btn btn-primary" style="width:100%; justify-content:center; margin-top:16px;">Upgrade Plan</a>

@@ -34,7 +34,8 @@ def signup(body: dict, db: Session = Depends(get_db)):
     username = body.get("username", "").strip()
     password = body.get("password", "")
     email = body.get("email", "").strip()
-    logger.debug("Signup attempt for username=%r email=%r", username, email)
+    referral = body.get("referral", "").strip()
+    logger.debug("Signup attempt for username=%r email=%r referral=%r", username, email, referral)
 
     if not username or not password:
         raise HTTPException(status_code=400, detail="Username and password required")
@@ -55,6 +56,7 @@ def signup(body: dict, db: Session = Depends(get_db)):
             username=username,
             email=email or None,
             password_hash=_hash_password(password),
+            referral=referral or None,
         )
         db.add(user)
         db.commit()

@@ -28,21 +28,24 @@ a { color:var(--accent); }
 <p class="updated">Last updated: April 2026</p>
 
 <h2>What we collect</h2>
-<p>When you create an account, we store your username and hashed password. When you join the waitlist, we store your email address. When you upload a mesh file, we process it in memory and do not permanently store your files.</p>
+<p>When you create an account, we store your username and hashed password. When you join the waitlist, we store your email address.</p>
+
+<h2>Your parts data</h2>
+<p><strong>We do not store your mesh files, CAD models, or any part geometry on our servers.</strong> When you upload a mesh file, it is processed entirely in memory. Once the pipeline completes and you download your result, all part data is deleted. We have no access to your designs after your session ends.</p>
 
 <h2>How we use it</h2>
 <ul>
 <li>Account credentials: to authenticate you</li>
 <li>Waitlist emails: to notify you about product updates</li>
-<li>Uploaded meshes: processed in real-time, deleted after the pipeline completes</li>
-<li>Usage metrics: token counts and job history to enforce plan limits</li>
+<li>Uploaded meshes: processed in real-time, deleted when your session ends</li>
+<li>Usage metrics: conversion counts to enforce plan limits (no geometry stored)</li>
 </ul>
 
 <h2>AI processing</h2>
 <p>If you use AI features (chatbot, dimension planner), your feature tree data (not raw mesh geometry) is sent to Claude via the Claude CLI. This is governed by Anthropic's privacy policy. No mesh data is sent to any third party.</p>
 
 <h2>Data storage</h2>
-<p>All data is stored in a SQLite database on the server. Passwords are hashed with SHA-256. We do not sell or share your data with third parties.</p>
+<p>Account data (username, hashed password) is stored in a database on the server. Passwords are hashed with SHA-256. We do not sell or share your data with third parties. No part geometry or CAD files are stored.</p>
 
 <h2>Cookies</h2>
 <p>We use a session token cookie for authentication. No tracking cookies or analytics scripts.</p>

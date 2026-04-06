@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 PLAN_TOKENS = {"free": 100, "starter": 1000, "pro": 5000, "unlimited": float("inf"), "developer": float("inf")}
-PLAN_UPLOAD_MB = {"free": 10, "starter": 50, "pro": 200, "unlimited": 500, "developer": 999}
+PLAN_PARTS = {"free": 3, "payg": 9999, "pro": 30, "team": 100, "developer": 9999}
+PLAN_UPLOAD_MB = {"free": 10, "payg": 50, "starter": 50, "pro": 200, "team": 500, "unlimited": 500, "developer": 999}
 
 # ── Per-IP token tracking (prevents free trial abuse) ──
 _ip_tokens: dict[str, int] = {}  # ip → tokens spent
@@ -680,18 +681,18 @@ async def usage_status(request: Request):
                 if job.created_at >= day_ago:
                     daily += job.token_cost
 
+    # Parts-based usage: count completed jobs this month
+    parts_limit = PLAN_PARTS.get(plan, 3)
+    monthly_jobs = sum(1 for job in queue._jobs.values() if job.status == "done" and job.created_at >= month_ago)
+
     return {
         "plan": plan,
+        "parts_used": monthly_jobs,
+        "parts_limit": parts_limit if parts_limit < 9999 else -1,
         "tokens_spent": queue.tokens_spent,
         "tokens_limit": limit if limit != float("inf") else -1,
-        "tokens_remaining": max(0, limit - queue.tokens_spent) if limit != float("inf") else -1,
         "upload_limit_mb": PLAN_UPLOAD_MB.get(plan, 10),
-        "daily": daily,
-        "weekly": weekly,
-        "monthly": monthly,
         "total_jobs": total_jobs,
-        "ip_tokens": _ip_tokens.get(ip, 0),
-        "ip_jobs": _ip_jobs.get(ip, 0),
     }
 
 
@@ -935,6 +936,37 @@ User question: {message}"""
     except Exception as e:
         logger.exception("Support chat AI call failed")
         return {"reply": "I'm having trouble connecting right now. Please try /contact to reach us directly."}
+
+
+# ── Custom error pages ──
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    # API routes return JSON errors
+    if request.url.path.startswith("/api/") or request.url.path.startswith("/auth/"):
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+    # HTML pages get the 404 page
+    if exc.status_code == 404:
+        return HTMLResponse(
+            (STATIC_DIR / "404.html").read_text(encoding="utf-8"),
+            status_code=404,
+        )
+    # Other errors (500, etc.) get the maintenance page
+    return HTMLResponse(
+        (STATIC_DIR / "maintenance.html").read_text(encoding="utf-8"),
+        status_code=exc.status_code,
+    )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled server error: %s", request.url.path)
+    if request.url.path.startswith("/api/") or request.url.path.startswith("/auth/"):
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
+    return HTMLResponse(
+        (STATIC_DIR / "maintenance.html").read_text(encoding="utf-8"),
+        status_code=500,
+    )
 
 
 def run(host: str = "127.0.0.1", port: int = 8080):

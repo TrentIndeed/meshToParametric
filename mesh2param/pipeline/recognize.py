@@ -130,7 +130,7 @@ def recognize_features(
     try:
         fillet_chamfer = _find_fillets_and_chamfers(
             regions, fitted, edges, region_lookup, fitted_lookup,
-            config, assigned,
+            config, assigned, graph, cleaned,
         )
     except Exception:
         logger.exception("Stage 5 failed finding fillets/chamfers")
@@ -587,12 +587,16 @@ def _find_fillets_and_chamfers(
     fitted_lookup: dict[int, FittedSurface],
     config: RecognizeConfig,
     assigned: set[int],
+    graph: nx.Graph | None = None,
+    cleaned: CleanedMesh | None = None,
 ) -> list[tuple[Feature, set[int]]]:
     """Find fillet and chamfer features.
 
     Detection strategies:
-    1. Cone surfaces → CHAMFER (countersinks around holes, beveled edges)
-    2. Small narrow plane strips at ~135° to neighbors → CHAMFER (flat bevels)
+    1. Cone surfaces → CHAMFER — only if the cone is small relative to the
+       part and actually sits between two principal (plane/cylinder) faces
+       in the adjacency graph (not a standalone conical feature).
+    2. Small narrow plane strips at ~135 deg to neighbors → CHAMFER (flat bevels)
     3. Small partial-arc cylinders → FILLET (rounded edges)
     4. Surfaces adjacent to chamfer/fillet/smooth edges → check type
     """
@@ -600,16 +604,63 @@ def _find_fillets_and_chamfers(
     fillet_rids: set[int] = set()
     chamfer_rids: set[int] = set()
 
-    # Strategy 1: All unassigned CONE surfaces are chamfers
-    # (conical surfaces are countersinks or beveled transitions)
+    # Part-scale reference for size checks
+    bbox_diag = cleaned.bbox_diagonal if cleaned is not None else 100.0
+
+    # Helper: check whether *rid* is adjacent (in the surface graph) to at
+    # least two principal faces (PLANE or CYLINDER that are either assigned
+    # to a feature or large enough to be principal).
+    def _adjacent_to_two_principal(rid: int) -> bool:
+        if graph is None or not graph.has_node(rid):
+            return False
+        principal_count = 0
+        for nbr in graph.neighbors(rid):
+            nbr_fit = fitted_lookup.get(nbr)
+            if nbr_fit is None:
+                continue
+            if nbr_fit.surface_type in (SurfaceType.PLANE, SurfaceType.CYLINDER):
+                principal_count += 1
+                if principal_count >= 2:
+                    return True
+        return False
+
+    # Strategy 1: Unassigned CONE surfaces → CHAMFER, but only if:
+    #   a) The cone's bounding box is small relative to the part (< 10% of
+    #      bbox diagonal), which rules out large conical features.
+    #   b) The cone sits between two principal faces in the adjacency graph,
+    #      which rules out standalone cone geometry (e.g. a conical boss).
     for f in fitted:
         if f.region_id in assigned:
             continue
-        if f.surface_type == SurfaceType.CONE:
-            chamfer_rids.add(f.region_id)
+        if f.surface_type != SurfaceType.CONE:
+            continue
+        r = region_lookup.get(f.region_id)
+        if r is None:
+            continue
+
+        # (a) Size check: cone must be small relative to part
+        cone_bbox_size = r.vertices.max(axis=0) - r.vertices.min(axis=0)
+        cone_diag = float(np.linalg.norm(cone_bbox_size))
+        if cone_diag > bbox_diag * 0.10:
+            logger.debug(
+                "Strategy 1: cone rid=%d too large (diag=%.2f vs part=%.2f), skipping",
+                f.region_id, cone_diag, bbox_diag,
+            )
+            continue
+
+        # (b) Adjacency check: must border at least 2 principal faces
+        if not _adjacent_to_two_principal(f.region_id):
+            logger.debug(
+                "Strategy 1: cone rid=%d not adjacent to 2 principal faces, skipping",
+                f.region_id,
+            )
+            continue
+
+        logger.debug("Strategy 1: cone rid=%d accepted as chamfer (diag=%.2f)", f.region_id, cone_diag)
+        chamfer_rids.add(f.region_id)
 
     # Strategy 2: Small narrow PLANE strips adjacent to chamfer edges
-    # (flat 45° bevels between two larger faces)
+    # (flat 45 deg bevels between two larger faces)
     for e in edges:
         if e.transition_type == TransitionType.CHAMFER:
             for rid in (e.surface_a_id, e.surface_b_id):
@@ -625,26 +676,149 @@ def _find_fillets_and_chamfers(
                     if extent < config.chamfer_width_ratio * r.vertices.ptp() * 2:
                         chamfer_rids.add(rid)
 
-    # Strategy 3: Smooth/fillet edges involving small cylinders → FILLET
+    # Strategy 3: Unassigned small cylinders that form narrow curved strips
+    # between two principal faces → FILLET.
+    #
+    # Validates:
+    #   a) The cylinder radius is small relative to the part (< 5% of
+    #      bbox diagonal), ruling out large cylindrical features.
+    #   b) The cylinder is a partial arc (angular span < 200 deg), not a
+    #      full hole or boss.
+    #   c) The cylinder is adjacent to at least two principal faces (PLANE
+    #      or large CYLINDER) in the surface graph — a fillet must sit
+    #      between two faces, not float alone.
+    #   d) The faces form a connected strip (narrow aspect ratio or small
+    #      face count) — not scattered noise faces.
+    #   e) Fillet radius is derived from the fitted cylinder parameters
+    #      (not just the region bbox).
+    fillet_candidates: list[int] = []
+    for f in fitted:
+        if f.region_id in assigned or f.region_id in chamfer_rids:
+            continue
+        if f.surface_type != SurfaceType.CYLINDER:
+            continue
+        r = region_lookup.get(f.region_id)
+        if r is None:
+            continue
+
+        radius = f.params.get("radius", 0)
+        if radius <= 0:
+            continue
+
+        # (a) Scale check: radius must be small relative to part
+        if radius > bbox_diag * 0.05:
+            logger.debug(
+                "Strategy 3: cyl rid=%d radius=%.2f too large (> 5%% of bbox_diag=%.2f), skipping",
+                f.region_id, radius, bbox_diag,
+            )
+            continue
+
+        # (b) Partial arc check: full cylinders are holes/bosses, not fillets
+        span = _cylinder_angular_span(f, r)
+        if span >= 200:
+            logger.debug(
+                "Strategy 3: cyl rid=%d angular span=%.0f° >= 200°, not a fillet",
+                f.region_id, span,
+            )
+            continue
+
+        # (c) Adjacency check: must border at least 2 principal faces
+        if not _adjacent_to_two_principal(f.region_id):
+            logger.debug(
+                "Strategy 3: cyl rid=%d not adjacent to 2 principal faces, skipping",
+                f.region_id,
+            )
+            continue
+
+        # (d) Strip shape check: fillet faces should form a narrow strip.
+        # Compute the axis-aligned extent along the cylinder axis vs the
+        # perpendicular extent (width across the fillet arc).
+        axis_dir = np.array(f.params.get("axis_dir", [0, 0, 1]))
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+        proj_along = r.vertices @ axis_dir
+        strip_length = float(proj_along.max() - proj_along.min())
+
+        # Width across the arc: project vertices onto the plane perpendicular
+        # to the cylinder axis, then measure the span
+        axis_point = np.array(f.params.get("axis_point", [0, 0, 0]))
+        vecs = r.vertices - axis_point
+        along = np.outer(vecs @ axis_dir, axis_dir)
+        perp = vecs - along
+        perp_extent = float(np.linalg.norm(perp, axis=1).max() - np.linalg.norm(perp, axis=1).min())
+        # Also use the arc width: 2 * radius * sin(span/2) as an upper bound
+        arc_width = 2.0 * radius * np.sin(np.radians(min(span, 180)) / 2)
+
+        # For a legitimate fillet strip: length >> width.
+        # Use the smaller of perp_extent and arc_width as the width estimate.
+        strip_width = min(perp_extent, arc_width) if arc_width > 0 else perp_extent
+        if strip_length > 1e-10 and strip_width > 1e-10:
+            aspect = strip_length / strip_width
+            if aspect < 1.5 and r.num_faces > 20:
+                logger.debug(
+                    "Strategy 3: cyl rid=%d aspect=%.1f < 1.5 and %d faces — "
+                    "not a narrow strip, skipping",
+                    f.region_id, aspect, r.num_faces,
+                )
+                continue
+
+        # (e) Connectivity check via surface graph (fillet faces should be in
+        # a contiguous strip, not scattered).  For small regions (< 30 faces)
+        # we skip this check since they are almost always a single strip.
+        if r.num_faces >= 30 and graph is not None and graph.has_node(f.region_id):
+            # If this region is a single region_id, it's already connected by
+            # definition (the segmenter ensures that).  So we just verify it
+            # isn't too many faces (which would suggest a large feature, not
+            # a fillet).
+            max_fillet_faces = max(50, int(0.02 * len(cleaned.faces))) if cleaned else 200
+            if r.num_faces > max_fillet_faces:
+                logger.debug(
+                    "Strategy 3: cyl rid=%d has %d faces > max %d for fillet, skipping",
+                    f.region_id, r.num_faces, max_fillet_faces,
+                )
+                continue
+
+        logger.debug(
+            "Strategy 3: cyl rid=%d accepted as fillet (r=%.2f, span=%.0f°, "
+            "strip L=%.2f W=%.2f, %d faces)",
+            f.region_id, radius, span, strip_length, strip_width, r.num_faces,
+        )
+        fillet_candidates.append(f.region_id)
+
+    # Also check edges with fillet/smooth transitions — their adjacent small
+    # cylinders may not have been caught above if they were already partially
+    # assigned.  This is the original Strategy 3 edge-based fallback.
     for e in edges:
         if e.transition_type in (TransitionType.FILLET, TransitionType.SMOOTH):
             for rid in (e.surface_a_id, e.surface_b_id):
-                if rid in assigned or rid in chamfer_rids:
+                if rid in assigned or rid in chamfer_rids or rid in fillet_candidates:
                     continue
                 f = fitted_lookup.get(rid)
                 r = region_lookup.get(rid)
                 if f is None or r is None:
                     continue
-                # Small partial-arc cylinder = fillet
-                if f.surface_type == SurfaceType.CYLINDER:
-                    radius = f.params.get("radius", 0)
-                    bbox_diag = np.linalg.norm(r.vertices.max(0) - r.vertices.min(0))
-                    if radius > 0 and radius < bbox_diag * 0.3:
-                        span = _cylinder_angular_span(f, r)
-                        if span < 200:
-                            fillet_rids.add(rid)
+                if f.surface_type != SurfaceType.CYLINDER:
+                    continue
+                radius = f.params.get("radius", 0)
+                if radius <= 0 or radius > bbox_diag * 0.05:
+                    continue
+                span = _cylinder_angular_span(f, r)
+                if span >= 200:
+                    continue
+                if not _adjacent_to_two_principal(rid):
+                    continue
+                logger.debug(
+                    "Strategy 3 (edge fallback): cyl rid=%d accepted as fillet "
+                    "(r=%.2f, span=%.0f°, edge type=%s)",
+                    rid, radius, span, e.transition_type.name,
+                )
+                fillet_candidates.append(rid)
 
-    # Build features
+    # Deduplicate and add to fillet_rids
+    for rid in fillet_candidates:
+        fillet_rids.add(rid)
+
+    # Build features — use the fitted cylinder radius (not bbox) for
+    # the fillet radius, and include axis info for downstream export.
     for rid in fillet_rids:
         if rid in assigned:
             continue
@@ -652,13 +826,18 @@ def _find_fillets_and_chamfers(
         f = fitted_lookup.get(rid)
         if region is None or f is None:
             continue
+        fillet_radius = f.params.get("radius", 0)
+        axis_dir = f.params.get("axis_dir", [0, 0, 1])
+        axis_point = f.params.get("axis_point", [0, 0, 0])
         results.append((
             Feature(
                 type=FeatureType.FILLET,
                 face_indices=region.face_indices.copy(),
                 sketch_geometry={
                     "type": "arc",
-                    "radius": f.params.get("radius", 0),
+                    "radius": round(fillet_radius, 3),
+                    "axis_dir": [round(float(x), 4) for x in axis_dir],
+                    "axis_point": [round(float(x), 4) for x in axis_point],
                 },
                 depth=0.0,
                 operation="REMOVE",

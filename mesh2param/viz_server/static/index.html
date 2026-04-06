@@ -339,7 +339,12 @@ body {
   background: var(--bg-secondary); border-top: 1px solid var(--border);
   display: flex; align-items: center; gap: 8px;
   padding: 8px 16px; overflow-x: auto; z-index: 50;
+  scrollbar-width: thin;
 }
+#timeline::-webkit-scrollbar { height: 6px; }
+#timeline::-webkit-scrollbar-track { background: transparent; }
+#timeline::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+#timeline::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 .timeline-step {
   flex-shrink: 0; width: 80px; height: 56px;
   background: var(--bg-tertiary); border: 2px solid var(--border);
@@ -782,10 +787,16 @@ function toggleTheme() {
   }
 })();
 
-// Auth gate: redirect to login if no token cookie
+// Auth gate: allow 1 free generation without signup, then require login
 (function() {
   const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
-  if (!token) window.location.href = '/login?next=/app&mode=signup';
+  const freeUsed = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_free_used='));
+  // Logged in → allow
+  if (token) return;
+  // Not logged in but free trial not used → allow (guest mode)
+  if (!freeUsed) return;
+  // Free trial used, not logged in → redirect to signup
+  window.location.href = '/login?next=/app&mode=signup';
 })();
 
 // Close menus when clicking outside
@@ -810,6 +821,6 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260405b" type="module"></script>
+<script src="/static/app.js?v=20260405c" type="module"></script>
 </body>
 </html>

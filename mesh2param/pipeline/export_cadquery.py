@@ -243,9 +243,14 @@ def _extract_profile_and_holes(
 
     candidates: list[tuple[float, list]] = []  # (vol_error, profiles)
 
-    offsets = [0.05, 0.25, 0.5, 0.75, 0.95]
-    for frac in offsets:
-        slice_pos = float(all_proj.min()) + extent * frac
+    # Slice at the very top and bottom faces — just 0.1mm inside the surface.
+    # This captures the true outer profile without any hole interference.
+    surface_inset = 0.1  # mm inside the surface
+    slice_positions = [
+        float(all_proj.min()) + surface_inset,  # bottom face
+        float(all_proj.max()) - surface_inset,  # top face
+    ]
+    for slice_pos in slice_positions:
         origin = [0.0, 0.0, 0.0]
         origin[primary_axis] = slice_pos
 
@@ -254,7 +259,7 @@ def _extract_profile_and_holes(
             if section is None:
                 continue
             section_verts = np.array(section.vertices)
-            s2d, _ = section.to_planar()
+            s2d, to_planar_tform = section.to_planar()
             polygons = s2d.polygons_closed
             if len(polygons) == 0:
                 continue
@@ -263,30 +268,93 @@ def _extract_profile_and_holes(
             if total_area < 1.0:
                 continue
 
+            # Build profiles by projecting section vertices to (ax_u, ax_v).
+            # s2d.vertices correspond 1:1 with section_verts, so use s2d
+            # polygon topology but get coordinates from 3D projection.
             from scipy.spatial import cKDTree
-            all_2d = s2d.vertices
-            tree_2d = cKDTree(all_2d)
+            from shapely.geometry import Polygon as SPolyProj
+            from shapely.ops import unary_union
 
-            slice_profiles = []
+            s2d_tree = cKDTree(s2d.vertices)
+
+            projected_polys = []
             for poly in polygons:
                 coords_2d = np.array(poly.exterior.coords)[:-1]
-                _, indices = tree_2d.query(coords_2d)
-                matched_3d = section_verts[indices]
-                profile = [(float(p[ax_u]), float(p[ax_v])) for p in matched_3d]
-                profile = _simplify_profile(profile, tolerance=0.1)
-                if len(profile) >= 3:
-                    slice_profiles.append(profile)
+                _, s2d_indices = s2d_tree.query(coords_2d)
+                pts_3d = section_verts[s2d_indices]
+                proj_coords = [(float(p[ax_u]), float(p[ax_v])) for p in pts_3d]
+                if len(proj_coords) >= 3:
+                    try:
+                        sp = SPolyProj(proj_coords)
+                        if sp.is_valid and sp.area > 1.0:
+                            projected_polys.append(sp)
+                    except Exception:
+                        pass
+
+            # Build profiles: largest polygon = outer boundary.
+            # Other large polygons that are INSIDE the outer = cutouts.
+            # Small polygons near the outer boundary = split pieces to union.
+            if projected_polys:
+                projected_polys.sort(key=lambda p: p.area, reverse=True)
+                outer = projected_polys[0]
+
+                # Check remaining polygons:
+                # - Large + inside outer = cutout (window/pocket)
+                # - Small + inside outer = hole cross-section, DROP it
+                # - Outside outer = split piece, union to extend boundary
+                cutouts = []
+                to_union = [outer]
+                for sp in projected_polys[1:]:
+                    centroid = sp.centroid
+                    if outer.contains(centroid):
+                        if sp.area > outer.area * 0.05:
+                            # Large polygon inside → cutout
+                            cutouts.append(sp)
+                        # else: small polygon inside → hole cross-section, skip
+                    else:
+                        # Outside the outer → union to extend boundary
+                        to_union.append(sp)
+
+                # Union the boundary pieces
+                merged = unary_union(to_union)
+                if merged.is_empty:
+                    continue
+                if merged.geom_type == 'MultiPolygon':
+                    merged = merged.buffer(0.5).buffer(-0.3)
+                    if merged.geom_type == 'MultiPolygon':
+                        merged = max(merged.geoms, key=lambda g: g.area)
+
+                # Subtract cutouts from the merged boundary
+                for cut in cutouts:
+                    merged = merged.difference(cut)
+                    if merged.is_empty:
+                        break
+
+                if merged.is_empty:
+                    continue
+                if merged.geom_type == 'MultiPolygon':
+                    merged = max(merged.geoms, key=lambda g: g.area)
+
+                outer_coords = list(merged.exterior.coords)[:-1]
+                outer_coords = _simplify_profile(outer_coords, tolerance=0.1)
+                slice_profiles = [outer_coords] if len(outer_coords) >= 3 else []
+                # Add inner rings as separate profiles (cutouts)
+                for ring in merged.interiors:
+                    inner_coords = list(ring.coords)[:-1]
+                    inner_coords = _simplify_profile(inner_coords, tolerance=0.1)
+                    if len(inner_coords) >= 3:
+                        slice_profiles.append(inner_coords)
+            else:
+                slice_profiles = []
 
             if not slice_profiles:
                 continue
 
-            # Score: how close is the extruded volume to the mesh volume?
-            extruded_vol = total_area * extent
-            if mesh_volume > 0:
-                vol_error = abs(extruded_vol - mesh_volume) / mesh_volume
-            else:
-                vol_error = -total_area  # fallback: prefer largest area
-            candidates.append((vol_error, slice_profiles))
+            # Score: prefer the slice with the largest profile area.
+            # For chamfered parts, this picks the base (widest) profile
+            # rather than the chamfered (narrower) side.
+            profile_area = _polygon_area(slice_profiles[0])
+            candidates.append((-profile_area, slice_profiles))
         except Exception:
             continue
 
@@ -435,32 +503,9 @@ def _extract_profile_and_holes(
         if f.type == FeatureType.FILLET
     ]
 
-    # Smooth the outer profile to fill half-circle indentations from holes.
-    # When the cross-section slice cuts through holes near the boundary,
-    # the outer polygon dips inward around each hole. A morphological
-    # close (buffer out then in) fills these notches.
-    if best_profiles and holes:
-        from shapely.geometry import Polygon as SPolyClean
-        try:
-            outer = SPolyClean(best_profiles[0])
-            if outer.is_valid:
-                # Find the max hole radius for buffer size
-                max_hr = max(
-                    (h.sketch_geometry.get("radius", 0) for h in holes
-                     if h.sketch_geometry),
-                    default=0,
-                )
-                if max_hr > 0:
-                    buf = max_hr * 1.5
-                    smoothed = outer.buffer(buf, join_style='mitre', mitre_limit=5.0)
-                    smoothed = smoothed.buffer(-buf, join_style='mitre', mitre_limit=5.0)
-                    if not smoothed.is_empty and smoothed.is_valid:
-                        coords = list(smoothed.exterior.coords)[:-1]
-                        coords = _simplify_profile(coords, tolerance=0.1)
-                        if len(coords) >= 3:
-                            best_profiles[0] = coords
-        except Exception:
-            pass
+    # Note: profile smoothing removed — the polygon union step above
+    # already handles merging split cross-sections. Smoothing via
+    # convex hull was destroying concave shapes (L-brackets, etc.).
 
     # Filter out small inner profiles that are hole cross-sections.
     # These appear when the slice cuts through holes in the mesh.
@@ -993,37 +1038,93 @@ def _build_stepwise(
     # --- Chamfers BEFORE holes ---
     # Detect chamfer faces directly from mesh geometry (diagonal normals),
     # match each group to CadQuery edges, and apply individually.
-    # This is general-purpose: works for any prismatic part.
+    # After each chamfer, validate the volume change is proportional to
+    # the expected material removal. Revert if it looks wrong.
     mesh_chamfers = _detect_mesh_chamfers(cleaned, extrude_dir)
     for cham in mesh_chamfers:
         d1 = cham["size"]
         d2 = cham.get("size2", d1)
         sel = cham["selector"]
         label = cham["label"]
+        edge_length_hint = cham.get("edge_length", 0.0)
+        vol_before = abs(float(wp.val().Volume()))
+
         # Try asymmetric first, then progressively smaller
         attempts = [(d1, d2), (d1 * 0.8, d2 * 0.8), (d1 * 0.6, d2 * 0.6)]
+        applied = False
         for a1, a2 in attempts:
             try:
                 min_len = min(a1, a2) * 2.0
-                edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
+                sel_edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
                 if abs(a1 - a2) / max(a1, a2) < 0.15:
-                    wp_test = edges.chamfer(min(a1, a2))
+                    wp_test = sel_edges.chamfer(min(a1, a2))
                 else:
-                    wp_test = edges.chamfer(a1, a2)
-                vol_test = abs(float(wp_test.val().Volume()))
-                if vol_test > 0:
-                    wp = wp_test
-                    v, f = _tessellate_solid(wp)
-                    cham_label = f"{a1:.1f}x{a2:.1f}" if abs(a1-a2) > 0.5 else f"{min(a1,a2):.1f}"
-                    steps.append(ConstructionStep(
-                        name=f"Chamfer {label} ({cham_label}mm)",
-                        tess_vertices=v, tess_faces=f, volume=vol_test,
-                    ))
-                    script_lines.append(f'# Chamfer {label}')
-                    script_lines.append(f'result = result.edges("{sel}").chamfer({a1:.4f}, {a2:.4f})')
-                    break
-            except Exception:
+                    wp_test = sel_edges.chamfer(a1, a2)
+                vol_after = abs(float(wp_test.val().Volume()))
+                if vol_after <= 0:
+                    logger.debug("Chamfer %s (%.2fx%.2f): zero volume, skipping attempt", label, a1, a2)
+                    continue
+
+                # --- Volume validation ---
+                # Expected volume removal for a chamfer:
+                #   V_expected ~= 0.5 * d1 * d2 * total_edge_length
+                # Sum the lengths of the edges that were chamfered.
+                try:
+                    total_edge_len = sum(
+                        e.Length() for e in wp.edges(sel).filter(lambda e: e.Length() > min_len).vals()
+                    )
+                except Exception:
+                    total_edge_len = edge_length_hint if edge_length_hint > 0 else 0.0
+
+                vol_removed = vol_before - vol_after
+                if total_edge_len > 0:
+                    expected_vol = 0.5 * a1 * a2 * total_edge_len
+                    vol_ratio = vol_removed / max(expected_vol, 1e-10)
+                    logger.debug(
+                        "Chamfer %s (%.2fx%.2f): vol_before=%.2f vol_after=%.2f "
+                        "removed=%.2f expected=%.2f ratio=%.2f edge_len=%.2f",
+                        label, a1, a2, vol_before, vol_after,
+                        vol_removed, expected_vol, vol_ratio, total_edge_len,
+                    )
+                    # Allow 0.1x to 10x of expected — reject gross mismatches
+                    if vol_ratio < 0.1 or vol_ratio > 10.0:
+                        logger.warning(
+                            "Chamfer %s: volume change ratio %.2f outside "
+                            "[0.1, 10.0] — reverting (removed=%.2f, expected=%.2f)",
+                            label, vol_ratio, vol_removed, expected_vol,
+                        )
+                        continue
+                else:
+                    # No edge length info — just check volume didn't increase
+                    if vol_after > vol_before * 1.01:
+                        logger.warning("Chamfer %s: volume increased, reverting", label)
+                        continue
+                    logger.debug(
+                        "Chamfer %s (%.2fx%.2f): vol_before=%.2f vol_after=%.2f "
+                        "(no edge length for validation)",
+                        label, a1, a2, vol_before, vol_after,
+                    )
+
+                wp = wp_test
+                v, f = _tessellate_solid(wp)
+                cham_label = f"{a1:.1f}x{a2:.1f}" if abs(a1-a2) > 0.5 else f"{min(a1,a2):.1f}"
+                steps.append(ConstructionStep(
+                    name=f"Chamfer {label} ({cham_label}mm)",
+                    tess_vertices=v, tess_faces=f, volume=vol_after,
+                ))
+                script_lines.append(f'# Chamfer {label}')
+                script_lines.append(f'result = result.edges("{sel}").chamfer({a1:.4f}, {a2:.4f})')
+                logger.info(
+                    "Applied chamfer %s: %.2fx%.2f mm, vol %.2f -> %.2f (removed %.2f)",
+                    label, a1, a2, vol_before, vol_after, vol_removed,
+                )
+                applied = True
+                break
+            except Exception as exc:
+                logger.debug("Chamfer %s (%.2fx%.2f) failed: %s", label, a1, a2, exc)
                 continue
+        if not applied:
+            logger.debug("Chamfer %s: all attempts failed, skipping", label)
 
     # Reorder holes
     if build_order is not None and len(holes) > 0:
@@ -1061,6 +1162,13 @@ def _build_stepwise(
         h_dir = np.array(hole.direction, dtype=float)
         h_dir = h_dir / (np.linalg.norm(h_dir) + 1e-15)
         is_through = hole.type == FeatureType.THROUGH_HOLE
+
+        # Skip non-axis-aligned holes — these are misdetected features
+        # (e.g. inner faces of circular cutouts). Real holes in prismatic
+        # parts are always along principal axes.
+        if np.max(np.abs(h_dir)) < 0.9:
+            logger.debug("Skipping non-axis-aligned hole: dir=%s r=%.2f", h_dir, radius)
+            continue
 
         # Project all bbox corners onto the hole axis to find the
         # full extent of the solid in that direction
@@ -1148,49 +1256,163 @@ def _build_stepwise(
 
     # (Small chamfers are now handled by _detect_mesh_chamfers above)
 
-    # --- Fillets: same progressive approach ---
-    if fillets:
+    # --- Fillets: detect from mesh geometry and apply individually ---
+    # Same approach as chamfers: analyze the mesh to find fillet faces,
+    # compute radius from arc geometry, build edge selectors, and apply
+    # each fillet individually with volume validation and progressive
+    # fallback.
+    mesh_fillets = _detect_mesh_fillets(cleaned, extrude_dir)
+    for fil in mesh_fillets:
+        fil_r = fil["radius"]
+        sel = fil["selector"]
+        label = fil["label"]
+        edge_length_hint = fil.get("edge_length", 0.0)
+        vol_before = abs(float(wp.val().Volume()))
+
+        # Progressive fallback: try detected radius, then 80%, then 60%
+        attempts = [fil_r, fil_r * 0.8, fil_r * 0.6]
+        applied = False
+        for attempt_r in attempts:
+            try:
+                min_len = attempt_r * 2.0
+                sel_edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
+                wp_test = sel_edges.fillet(attempt_r)
+                vol_after = abs(float(wp_test.val().Volume()))
+                if vol_after <= 0:
+                    logger.debug(
+                        "Fillet %s (r=%.2f): zero volume, skipping attempt",
+                        label, attempt_r,
+                    )
+                    continue
+
+                # --- Volume validation ---
+                # A fillet removes material proportional to:
+                #   V_expected ~= (1 - pi/4) * R^2 * total_edge_length
+                # (The removed material is roughly the corner minus the
+                # quarter-circle, per unit edge length.)
+                try:
+                    total_edge_len = sum(
+                        e.Length() for e in wp.edges(sel).filter(
+                            lambda e: e.Length() > min_len
+                        ).vals()
+                    )
+                except Exception:
+                    total_edge_len = edge_length_hint if edge_length_hint > 0 else 0.0
+
+                vol_removed = vol_before - vol_after
+                if total_edge_len > 0:
+                    expected_vol = (1.0 - 3.14159 / 4.0) * attempt_r * attempt_r * total_edge_len
+                    vol_ratio = vol_removed / max(expected_vol, 1e-10)
+                    logger.debug(
+                        "Fillet %s (r=%.2f): vol_before=%.2f vol_after=%.2f "
+                        "removed=%.2f expected=%.2f ratio=%.2f edge_len=%.2f",
+                        label, attempt_r, vol_before, vol_after,
+                        vol_removed, expected_vol, vol_ratio, total_edge_len,
+                    )
+                    # Allow 0.05x to 15x of expected — fillets can vary more
+                    # than chamfers due to concave/convex edge differences
+                    if vol_ratio < 0.05 or vol_ratio > 15.0:
+                        logger.warning(
+                            "Fillet %s: volume change ratio %.2f outside "
+                            "[0.05, 15.0] — reverting (removed=%.2f, expected=%.2f)",
+                            label, vol_ratio, vol_removed, expected_vol,
+                        )
+                        continue
+                else:
+                    # No edge length info — just check volume didn't increase
+                    if vol_after > vol_before * 1.01:
+                        logger.warning("Fillet %s: volume increased, reverting", label)
+                        continue
+                    logger.debug(
+                        "Fillet %s (r=%.2f): vol_before=%.2f vol_after=%.2f "
+                        "(no edge length for validation)",
+                        label, attempt_r, vol_before, vol_after,
+                    )
+
+                wp = wp_test
+                v, f = _tessellate_solid(wp)
+                steps.append(ConstructionStep(
+                    name=f"Fillet {label} (r={attempt_r:.2f}mm)",
+                    tess_vertices=v, tess_faces=f, volume=vol_after,
+                ))
+                script_lines.append(f'# Fillet {label}')
+                script_lines.append(f'result = result.edges("{sel}").fillet({attempt_r:.4f})')
+                logger.info(
+                    "Applied fillet %s: r=%.2f mm, vol %.2f -> %.2f (removed %.2f)",
+                    label, attempt_r, vol_before, vol_after, vol_removed,
+                )
+                applied = True
+                break
+            except Exception as exc:
+                logger.debug("Fillet %s (r=%.2f) failed: %s", label, attempt_r, exc)
+                continue
+        if not applied:
+            logger.debug("Fillet %s: all attempts failed, skipping", label)
+
+    # --- Fallback: if no mesh fillets detected but recognition stage found
+    # fillets, try a conservative global application ---
+    if not mesh_fillets and fillets:
         fillet_radii = []
         for fl in fillets:
             r = fl.sketch_geometry.get("radius", 0)
             if 0.1 < r < 50:
                 fillet_radii.append(r)
 
-        if not fillet_radii:
-            fillet_radii = [min(abs(depth) * 0.05, 2.0)]
+        if fillet_radii:
+            fillet_r = float(np.median(fillet_radii))
+            fillet_r = max(0.2, min(fillet_r, 3.0))
+            vol_before = abs(float(wp.val().Volume()))
 
-        fillet_r = float(np.median(fillet_radii))
-        fillet_r = max(0.2, min(fillet_r, 3.0))
+            fallback_applied = False
+            for attempt_r in [fillet_r, fillet_r * 0.8, fillet_r * 0.6]:
+                # Try each edge-axis selector individually
+                for sel_str in ["|X", "|Y", "|Z"]:
+                    try:
+                        min_len = attempt_r * 2.0
+                        wp_test = wp.edges(sel_str).filter(
+                            lambda e: e.Length() > min_len
+                        ).fillet(attempt_r)
+                        vol_after = abs(float(wp_test.val().Volume()))
+                        if vol_after <= 0:
+                            continue
+                        vol_removed = vol_before - vol_after
+                        # Sanity: fillet should remove material, not add
+                        if vol_after > vol_before * 1.01:
+                            continue
+                        # Sanity: should not remove more than 10% of volume
+                        if vol_removed > vol_before * 0.10:
+                            logger.debug(
+                                "Fallback fillet %s r=%.2f removed %.1f%% of volume — "
+                                "too much, skipping",
+                                sel_str, attempt_r,
+                                vol_removed / vol_before * 100,
+                            )
+                            continue
 
-        applied = False
-        edge_selectors = [
-            lambda wp, r: wp.edges("|X").fillet(r),
-            lambda wp, r: wp.edges("|Y").fillet(r),
-            lambda wp, r: wp.edges(">Z").fillet(r),
-            lambda wp, r: wp.edges("<Z").fillet(r),
-            lambda wp, r: wp.edges().fillet(r),
-        ]
-        for attempt_r in [fillet_r, fillet_r * 0.5, 1.0, 0.5, 0.3]:
-            for selector in edge_selectors:
-                try:
-                    wp_test = selector(wp, attempt_r)
-                    vol_test = abs(float(wp_test.val().Volume()))
-                    if vol_test > 0:
                         wp = wp_test
                         v, f = _tessellate_solid(wp)
                         steps.append(ConstructionStep(
-                            name=f"Fillet (r={attempt_r:.1f}mm × {len(fillets)} features)",
-                            tess_vertices=v, tess_faces=f, volume=vol_test,
+                            name=f"Fillet (r={attempt_r:.1f}mm, fallback {sel_str})",
+                            tess_vertices=v, tess_faces=f, volume=vol_after,
                         ))
-                        script_lines.append(f"result = result.edges().fillet({attempt_r:.4f})")
-                        applied = True
+                        script_lines.append(
+                            f'result = result.edges("{sel_str}").fillet({attempt_r:.4f})'
+                        )
+                        logger.info(
+                            "Applied fallback fillet %s: r=%.2f, vol %.2f -> %.2f",
+                            sel_str, attempt_r, vol_before, vol_after,
+                        )
+                        fallback_applied = True
                         break
-                except Exception:
-                    continue
-            if applied:
-                break
-        if not applied:
-            logger.warning("All fillet sizes/selectors failed — skipping fillet step")
+                    except Exception:
+                        continue
+                if fallback_applied:
+                    break
+            if not fallback_applied:
+                logger.warning(
+                    "All fillet sizes/selectors failed (mesh + fallback) — "
+                    "skipping fillet step"
+                )
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
     return wp, "\n".join(script_lines), steps
@@ -1863,146 +2085,622 @@ def _detect_mesh_chamfers(
     and determines the correct CadQuery edge selector by analyzing which two
     principal faces each chamfer sits between.
 
-    Returns a list of dicts: [{"size": mm, "selector": "|Y and <Z", "label": "bottom Y"}, ...]
+    Uses scale-relative thresholds based on the part's bounding-box diagonal.
+    Validates that each candidate cluster forms a narrow connected strip (not
+    scattered faces or circular cutout geometry).
+
+    Returns a list of dicts, one per individual chamfer:
+        [{"size": mm, "size2": mm, "selector": "|Y and <Z", "label": "bottom Y",
+          "face_count": N, "edge_length": mm}, ...]
     """
     from sklearn.cluster import DBSCAN
 
-    logger.debug("Detecting mesh chamfers: %d faces, extrude_dir=%s", len(cleaned.faces), extrude_dir.tolist())
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+    logger.debug(
+        "Detecting mesh chamfers: %d faces, extrude_dir=%s, bbox_diag=%.2f",
+        len(cleaned.faces), extrude_dir.tolist(), bbox_diag,
+    )
+
+    # --- Scale-relative limits ---
+    size_min = bbox_diag * 0.001   # 0.1% of diagonal
+    size_max = bbox_diag * 0.05    # 5% of diagonal
+    # DBSCAN eps for normal clustering: normals live on the unit sphere so
+    # eps=0.20 works well regardless of part scale.
+    normal_eps = 0.20
+    # Minimum faces in a cluster to be considered real geometry (not noise).
+    # Scales with mesh density: at least 5 or 0.05% of total faces.
+    min_cluster_faces = max(5, int(len(cleaned.faces) * 0.0005))
+
     normals = cleaned.normals
     ext = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
-    bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
 
-    # Find faces whose normal is NOT axis-aligned (diagonal → chamfer face).
-    # A chamfer face sits between two principal faces, so its normal has
-    # significant components in exactly 2 principal directions.
+    # --- Identify diagonal faces ---
+    # A chamfer face between two principal faces has a normal with significant
+    # components in exactly 2 of 3 principal directions. The "diagonal
+    # threshold" is how far off-axis a component must be to count as
+    # significant. Using 0.25 (about 14.5 degrees from axis) is permissive
+    # enough to catch 30/45/60 degree chamfers.
+    diag_thresh = 0.25
     abs_normals = np.abs(normals)
-    # Sort each row: chamfer faces have 2 large and 1 small component
-    sorted_abs = np.sort(abs_normals, axis=1)
-    # Two largest > 0.3, smallest < 0.3
-    diagonal_mask = (sorted_abs[:, 1] > 0.3) & (sorted_abs[:, 2] > 0.3) & (sorted_abs[:, 0] < 0.3)
+    sorted_abs = np.sort(abs_normals, axis=1)  # ascending per row
+    # Two largest components > diag_thresh AND smallest < diag_thresh
+    diagonal_mask = (
+        (sorted_abs[:, 1] > diag_thresh)
+        & (sorted_abs[:, 2] > diag_thresh)
+        & (sorted_abs[:, 0] < diag_thresh)
+    )
 
-    if diagonal_mask.sum() < 5:
+    if diagonal_mask.sum() < min_cluster_faces:
+        logger.debug("Only %d diagonal faces found (need %d), no chamfers",
+                      int(diagonal_mask.sum()), min_cluster_faces)
         return []
 
     diag_indices = np.where(diagonal_mask)[0]
     diag_normals = normals[diag_indices]
+    logger.debug("Found %d diagonal-normal candidate faces", len(diag_indices))
 
-    # Cluster by normal direction — each cluster = one chamfer edge group
-    clustering = DBSCAN(eps=0.25, min_samples=3).fit(diag_normals)
+    # --- Cluster by normal direction ---
+    clustering = DBSCAN(eps=normal_eps, min_samples=3).fit(diag_normals)
     labels = clustering.labels_
+    unique_labels = set(labels) - {-1}
+    logger.debug("DBSCAN produced %d clusters (%d noise faces)",
+                  len(unique_labels), int((labels == -1).sum()))
 
-    results = []
-    for label in set(labels):
-        if label == -1:
-            continue
+    # --- Build face adjacency for connectivity validation ---
+    # Two mesh faces are adjacent if they share an edge (2 vertices).
+    from collections import defaultdict
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi in diag_indices:
+        tri = cleaned.faces[fi]
+        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[0], tri[2])):
+            key = (min(a, b), max(a, b))
+            edge_to_faces[key].append(int(fi))
+
+    def _faces_are_connected(face_set: set[int]) -> bool:
+        """Check if faces form a single connected component via shared edges."""
+        if len(face_set) <= 1:
+            return True
+        adj: dict[int, set[int]] = defaultdict(set)
+        for faces_list in edge_to_faces.values():
+            in_set = [f for f in faces_list if f in face_set]
+            for i in range(len(in_set)):
+                for j in range(i + 1, len(in_set)):
+                    adj[in_set[i]].add(in_set[j])
+                    adj[in_set[j]].add(in_set[i])
+        # BFS
+        start = next(iter(face_set))
+        visited: set[int] = set()
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            queue.extend(adj[node] - visited)
+        return len(visited) == len(face_set)
+
+    # --- Analyze each cluster ---
+    results: list[dict] = []
+    axis_names = ["X", "Y", "Z"]
+
+    for label in sorted(unique_labels):
         cluster_idx = diag_indices[labels == label]
-        if len(cluster_idx) < 20:
-            continue  # skip tiny clusters (transition artifacts, not real chamfers)
+        if len(cluster_idx) < min_cluster_faces:
+            logger.debug("Cluster %d: %d faces < min %d, skipping",
+                          label, len(cluster_idx), min_cluster_faces)
+            continue
 
         avg_normal = normals[cluster_idx].mean(axis=0)
         avg_normal /= (np.linalg.norm(avg_normal) + 1e-15)
 
-        # Determine which two principal faces this chamfer sits between.
+        # --- Determine which two principal axes this chamfer sits between ---
         abs_avg = np.abs(avg_normal)
-        edge_axis_idx = int(np.argmin(abs_avg))  # axis the edge is parallel to
-        edge_axis = ["X", "Y", "Z"][edge_axis_idx]
+        # The edge is parallel to the axis with the SMALLEST normal component
+        edge_axis_idx = int(np.argmin(abs_avg))
+        edge_axis = axis_names[edge_axis_idx]
+        # The two face-axes are the others, sorted by component magnitude
+        face_axis_indices = sorted(
+            [i for i in range(3) if i != edge_axis_idx],
+            key=lambda i: abs_avg[i],
+        )
+        face_ax_a = face_axis_indices[0]  # smaller component
+        face_ax_b = face_axis_indices[1]  # larger component
 
-        # The two face axes (the ones with large normal components)
-        face_axes = sorted([i for i in range(3) if i != edge_axis_idx],
-                           key=lambda i: abs_avg[i])
+        # --- Strip width vs length check (narrow strip = chamfer) ---
+        # Project cluster vertices onto the edge axis (length) and the
+        # perpendicular plane (width).
+        cluster_face_verts = cleaned.vertices[cleaned.faces[cluster_idx].flatten()]
+        edge_dir = np.zeros(3)
+        edge_dir[edge_axis_idx] = 1.0
+        proj_length = cluster_face_verts @ edge_dir
+        strip_length = float(proj_length.max() - proj_length.min())
 
-        # Determine top/bottom: which side of the extrude direction?
-        ext_axis_idx = int(np.argmax(np.abs(ext)))
-        ext_component = avg_normal[ext_axis_idx]
-        ext_char = ["X", "Y", "Z"][ext_axis_idx]
-
-        if abs(ext_component) > 0.2:
-            face_filter = f"<{ext_char}" if ext_component < 0 else f">{ext_char}"
-            selector = f"|{edge_axis} and {face_filter}"
-            side_label = "bottom" if ext_component < 0 else "top"
+        # Width: extent along the direction perpendicular to both edge and
+        # the average normal (i.e. across the chamfer face).
+        perp_dir = np.cross(edge_dir, avg_normal)
+        perp_norm = np.linalg.norm(perp_dir)
+        if perp_norm > 1e-10:
+            perp_dir /= perp_norm
         else:
-            # Chamfer between two side faces — profile shape, skip.
+            # Fallback: use the face_ax_a direction
+            perp_dir = np.zeros(3)
+            perp_dir[face_ax_a] = 1.0
+        proj_width = cluster_face_verts @ perp_dir
+        strip_width = float(proj_width.max() - proj_width.min())
+
+        if strip_length < 1e-10:
+            logger.debug("Cluster %d: zero strip length, skipping", label)
             continue
 
-        # Compute chamfer dimensions from a cross-section at the edge
-        # midpoint. Measures both the inset into the flat face (d1) and
-        # the inset up the side face (d2) for asymmetric chamfer support.
-        verts = cleaned.vertices[cleaned.faces[cluster_idx].flatten()]
+        aspect_ratio = strip_length / max(strip_width, 1e-10)
+        if aspect_ratio < 2.0:
+            logger.debug(
+                "Cluster %d: aspect ratio %.1f < 2.0 (length=%.2f, width=%.2f) "
+                "— not a narrow strip, skipping (likely circular cutout)",
+                label, aspect_ratio, strip_length, strip_width,
+            )
+            continue
 
-        side_axis_idx = [i for i in range(3) if i != edge_axis_idx and i != ext_axis_idx][0]
-        side_sign = np.sign(avg_normal[side_axis_idx])
+        # --- Connectivity check ---
+        cluster_set = set(int(x) for x in cluster_idx)
+        if not _faces_are_connected(cluster_set):
+            logger.debug("Cluster %d: %d faces not connected, skipping",
+                          label, len(cluster_idx))
+            continue
 
-        # Measure chamfer dimensions from the chamfer face geometry.
-        #
-        # d2 (inset into side face / along extrude dir) is measured reliably
-        # from the per-face extent along the extrude axis — the 90th percentile
-        # of per-face max values gives the chamfer boundary without outliers.
-        #
-        # d1 (inset into flat face) is computed from d2 and the chamfer angle,
-        # since direct vertex measurement is unreliable due to sparse tessellation.
+        # --- Edge coverage check ---
+        # The chamfer strip should span >50% of the corresponding bbox
+        # edge length (otherwise it is a scattered partial cluster).
+        bbox_edge_length = float(bbox_size[edge_axis_idx])
+        if bbox_edge_length > 1e-10:
+            coverage = strip_length / bbox_edge_length
+            if coverage < 0.5:
+                logger.debug(
+                    "Cluster %d: strip covers only %.0f%% of edge (%.2f / %.2f), skipping",
+                    label, coverage * 100, strip_length, bbox_edge_length,
+                )
+                continue
+        else:
+            logger.debug("Cluster %d: zero bbox edge length on axis %s, skipping",
+                          label, edge_axis)
+            continue
+
+        # --- Build CadQuery selector ---
+        # Determine which side of each face-axis the chamfer is on.
+        # We support chamfers between ANY two principal faces, not just
+        # top/bottom.
+        centroid = cluster_face_verts.mean(axis=0)
+        bbox_center = (cleaned.bbox[0] + cleaned.bbox[1]) / 2.0
+
+        # For the two face axes, determine <axis or >axis by comparing
+        # the cluster centroid to the bbox center.
+        sign_a = ">" if centroid[face_ax_a] > bbox_center[face_ax_a] else "<"
+        sign_b = ">" if centroid[face_ax_b] > bbox_center[face_ax_b] else "<"
+
+        # The selector uses "|edge_axis" to pick edges parallel to the
+        # edge direction, then filters by the face the chamfer is
+        # closest to. Use the face-axis with the LARGER normal component
+        # (face_ax_b) as the primary filter for best specificity.
+        face_filter = f"{sign_b}{axis_names[face_ax_b]}"
+        selector = f"|{edge_axis} and {face_filter}"
+
+        # Label for display
+        side_label_b = "top" if sign_b == ">" else "bottom"
+        side_label_a = "top" if sign_a == ">" else "bottom"
+        label_str = f"{side_label_b}-{axis_names[face_ax_b]} {edge_axis}"
+
+        # --- Compute chamfer dimensions ---
+        # d2: inset along the face_ax_b direction (the face with larger
+        # normal component). Measured from the bbox boundary.
         face_ext_vals = []
         for fi in cluster_idx:
             tri_v = cleaned.vertices[cleaned.faces[fi]]
-            if ext_component < 0:
-                face_ext_vals.append(float(tri_v[:, ext_axis_idx].max()))
+            if sign_b == "<":
+                face_ext_vals.append(float(tri_v[:, face_ax_b].max()))
             else:
-                face_ext_vals.append(float(tri_v[:, ext_axis_idx].min()))
-        face_ext_vals = np.array(face_ext_vals)
+                face_ext_vals.append(float(tri_v[:, face_ax_b].min()))
+        face_ext_vals_arr = np.array(face_ext_vals)
 
-        ext_boundary = float(cleaned.bbox[0][ext_axis_idx]) if ext_component < 0 else float(cleaned.bbox[1][ext_axis_idx])
-        if ext_component < 0:
-            d2 = float(np.percentile(face_ext_vals, 90)) - ext_boundary
+        if sign_b == "<":
+            ext_boundary = float(cleaned.bbox[0][face_ax_b])
+            d2 = float(np.percentile(face_ext_vals_arr, 90)) - ext_boundary
         else:
-            d2 = ext_boundary - float(np.percentile(face_ext_vals, 10))
+            ext_boundary = float(cleaned.bbox[1][face_ax_b])
+            d2 = ext_boundary - float(np.percentile(face_ext_vals_arr, 10))
 
-        # Compute d1 from the chamfer face angle.
-        # The normal [nx, ny, nz] tells us the angle: d1/d2 = |n_side|/|n_ext|
-        n_side = abs(avg_normal[side_axis_idx])
-        n_ext = abs(avg_normal[ext_axis_idx])
-        d1 = d2 * n_side / max(n_ext, 0.01)
+        # d1: inset along face_ax_a. Computed from d2 and the chamfer angle
+        # via the normal components: d1/d2 = |n_a| / |n_b|
+        n_a = abs(avg_normal[face_ax_a])
+        n_b = abs(avg_normal[face_ax_b])
+        d1 = d2 * n_a / max(n_b, 0.01)
 
-        if d1 < 0.3 or d2 < 0.3:
+        d1 = abs(d1)
+        d2 = abs(d2)
+
+        # --- Scale-relative size filtering ---
+        if d1 < size_min or d2 < size_min:
+            logger.debug(
+                "Cluster %d: chamfer too small (d1=%.3f, d2=%.3f, min=%.3f), skipping",
+                label, d1, d2, size_min,
+            )
+            continue
+        if d1 > size_max or d2 > size_max:
+            logger.debug(
+                "Cluster %d: chamfer too large (d1=%.3f, d2=%.3f, max=%.3f), skipping",
+                label, d1, d2, size_max,
+            )
             continue
 
-        chamfer_d1 = float(d1)
-        chamfer_d2 = float(d2)
-
-        label_str = f"{side_label} {edge_axis}"
         logger.info(
-            "Chamfer group: %d faces, normal=[%.2f,%.2f,%.2f], "
-            "d1=%.1f d2=%.1f, edge=|%s, selector='%s'",
-            len(cluster_idx), *avg_normal, chamfer_d1, chamfer_d2,
+            "Chamfer cluster %d: %d faces, normal=[%.2f,%.2f,%.2f], "
+            "d1=%.2f d2=%.2f, edge=|%s, selector='%s', "
+            "strip L=%.2f W=%.2f aspect=%.1f coverage=%.0f%%",
+            label, len(cluster_idx), *avg_normal, d1, d2,
             edge_axis, selector,
+            strip_length, strip_width, aspect_ratio, coverage * 100,
         )
         results.append({
-            "size": float(chamfer_d1),
-            "size2": float(chamfer_d2),
+            "size": float(d1),
+            "size2": float(d2),
             "selector": selector,
             "label": label_str,
             "face_count": len(cluster_idx),
+            "edge_length": float(strip_length),
         })
 
-    # If multiple chamfers share the same selector, average their sizes
-    # (they should be the same chamfer on parallel edges)
-    by_selector: dict[str, list[dict]] = {}
-    for r in results:
-        by_selector.setdefault(r["selector"], []).append(r)
+    # --- Keep individual chamfers (do NOT merge by selector) ---
+    # Different chamfers may share the same selector but have different
+    # sizes. We keep them separate so CadQuery can apply each individually.
+    # Sort largest first for stable ordering.
+    results.sort(key=lambda x: -x["size"])
 
-    merged = []
-    for sel, group in by_selector.items():
-        if len(group) > 1:
-            avg_d1 = float(np.mean([g["size"] for g in group]))
-            avg_d2 = float(np.mean([g["size2"] for g in group]))
-            merged.append({
-                "size": avg_d1, "size2": avg_d2,
-                "selector": sel, "label": group[0]["label"],
-                "face_count": sum(g["face_count"] for g in group),
-            })
+    logger.debug("Detected %d chamfer(s) total", len(results))
+    return results
+
+
+def _detect_mesh_fillets(
+    cleaned: CleanedMesh, extrude_dir: np.ndarray,
+) -> list[dict]:
+    """Detect fillet edges from the mesh by analyzing smoothly-curving face strips.
+
+    A fillet face is a narrow strip of faces whose normals sweep smoothly
+    between two principal directions (forming an arc, unlike a chamfer which
+    is a flat bevel with a single diagonal normal).
+
+    Detection strategy:
+    1. Identify faces whose normals are NOT axis-aligned (off-axis faces).
+    2. Cluster these by spatial location (not by normal direction, since
+       fillet normals rotate through an arc).
+    3. For each cluster, verify:
+       a) The normals sweep through an angular arc (not clustered at one angle
+          like chamfers).
+       b) The faces form a connected narrow strip (high aspect ratio).
+       c) The strip width (fillet radius) is small relative to the part.
+    4. Compute the fillet radius from the arc geometry.
+    5. Build CadQuery edge selectors.
+
+    Uses scale-relative thresholds based on the part's bounding-box diagonal.
+
+    Returns a list of dicts, one per detected fillet:
+        [{"radius": mm, "selector": "|Y and <Z", "label": "bottom Y",
+          "face_count": N, "edge_length": mm}, ...]
+    """
+    from sklearn.cluster import DBSCAN
+
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+    logger.debug(
+        "Detecting mesh fillets: %d faces, extrude_dir=%s, bbox_diag=%.2f",
+        len(cleaned.faces), extrude_dir.tolist(), bbox_diag,
+    )
+
+    # --- Scale-relative limits ---
+    radius_min = bbox_diag * 0.001   # 0.1% of diagonal
+    radius_max = bbox_diag * 0.05    # 5% of diagonal
+    # Minimum faces in a cluster to be considered real geometry.
+    min_cluster_faces = max(5, int(len(cleaned.faces) * 0.0005))
+
+    normals = cleaned.normals
+    ext = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
+
+    # --- Identify off-axis faces (potential fillet faces) ---
+    # Fillet faces have normals that are NOT aligned to any principal axis.
+    # Unlike chamfer faces (which have normals diagonal between exactly 2
+    # axes), fillet normals can point in any off-axis direction because
+    # the arc sweeps through a range.
+    #
+    # We look for faces where the largest normal component is < 0.85
+    # (more than ~32 degrees off any axis). This captures the curved
+    # middle portion of fillets while excluding the principal faces and
+    # the flat chamfer faces (which are caught by _detect_mesh_chamfers).
+    abs_normals = np.abs(normals)
+    max_component = abs_normals.max(axis=1)
+
+    # Exclude nearly axis-aligned faces (principal faces)
+    off_axis_mask = max_component < 0.85
+
+    # Also exclude faces that look like chamfers (exactly 2 large + 1 small
+    # component). Fillet faces typically have the normal rotating, so the
+    # second-largest component varies more.
+    sorted_abs = np.sort(abs_normals, axis=1)
+    chamfer_like = (
+        (sorted_abs[:, 1] > 0.25)
+        & (sorted_abs[:, 2] > 0.25)
+        & (sorted_abs[:, 0] < 0.25)
+    )
+    # Keep off-axis faces that are NOT chamfer-like
+    fillet_candidate_mask = off_axis_mask & ~chamfer_like
+
+    if fillet_candidate_mask.sum() < min_cluster_faces:
+        logger.debug(
+            "Only %d off-axis non-chamfer faces found (need %d), no fillets",
+            int(fillet_candidate_mask.sum()), min_cluster_faces,
+        )
+        return []
+
+    cand_indices = np.where(fillet_candidate_mask)[0]
+    logger.debug("Found %d off-axis candidate fillet faces", len(cand_indices))
+
+    # --- Cluster by spatial location ---
+    # Unlike chamfers (clustered by normal direction), fillet faces along
+    # the same edge have VARYING normals but are SPATIALLY close. So we
+    # cluster by the face centroid position.
+    face_centroids = np.zeros((len(cand_indices), 3))
+    for i, fi in enumerate(cand_indices):
+        tri = cleaned.vertices[cleaned.faces[fi]]
+        face_centroids[i] = tri.mean(axis=0)
+
+    # DBSCAN eps: scale-relative. Use ~2% of bbox diagonal as the
+    # neighborhood radius — faces on the same fillet edge are very close.
+    spatial_eps = bbox_diag * 0.02
+    clustering = DBSCAN(eps=spatial_eps, min_samples=3).fit(face_centroids)
+    labels = clustering.labels_
+    unique_labels = set(labels) - {-1}
+    logger.debug(
+        "Spatial DBSCAN: %d clusters, %d noise faces (eps=%.2f)",
+        len(unique_labels), int((labels == -1).sum()), spatial_eps,
+    )
+
+    # --- Build face adjacency for connectivity validation ---
+    from collections import defaultdict
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi in cand_indices:
+        tri = cleaned.faces[fi]
+        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[0], tri[2])):
+            key = (min(a, b), max(a, b))
+            edge_to_faces[key].append(int(fi))
+
+    def _faces_are_connected(face_set: set[int]) -> bool:
+        """Check if faces form a single connected component via shared edges."""
+        if len(face_set) <= 1:
+            return True
+        adj: dict[int, set[int]] = defaultdict(set)
+        for faces_list in edge_to_faces.values():
+            in_set = [f for f in faces_list if f in face_set]
+            for i in range(len(in_set)):
+                for j in range(i + 1, len(in_set)):
+                    adj[in_set[i]].add(in_set[j])
+                    adj[in_set[j]].add(in_set[i])
+        start = next(iter(face_set))
+        visited: set[int] = set()
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            queue.extend(adj[node] - visited)
+        return len(visited) == len(face_set)
+
+    # --- Analyze each cluster ---
+    results: list[dict] = []
+    axis_names = ["X", "Y", "Z"]
+
+    for label in sorted(unique_labels):
+        cluster_mask = labels == label
+        cluster_idx = cand_indices[cluster_mask]
+        if len(cluster_idx) < min_cluster_faces:
+            logger.debug("Fillet cluster %d: %d faces < min %d, skipping",
+                         label, len(cluster_idx), min_cluster_faces)
+            continue
+
+        cluster_normals = normals[cluster_idx]
+        cluster_centroids = face_centroids[cluster_mask]
+
+        # --- Normal arc check ---
+        # Fillet faces should have normals that sweep through an angular
+        # range (the arc of the fillet). Chamfer faces have normals all
+        # pointing in roughly the same direction.
+        # Compute the angular spread of normals in the cluster.
+        mean_normal = cluster_normals.mean(axis=0)
+        mean_normal /= (np.linalg.norm(mean_normal) + 1e-15)
+
+        # Angle of each face normal relative to the mean
+        dots = np.clip(cluster_normals @ mean_normal, -1, 1)
+        angles_from_mean = np.degrees(np.arccos(dots))
+        angular_spread = float(angles_from_mean.max() - angles_from_mean.min())
+
+        # A fillet arc should have normals spanning at least 15 degrees
+        # (otherwise it's nearly flat — more like a chamfer or noise).
+        # It should span less than ~120 degrees (a 90-degree fillet
+        # sweeps about 90 degrees of normal change).
+        if angular_spread < 15:
+            logger.debug(
+                "Fillet cluster %d: angular spread %.1f° < 15° — "
+                "too flat, skipping (likely chamfer or principal face)",
+                label, angular_spread,
+            )
+            continue
+        if angular_spread > 120:
+            logger.debug(
+                "Fillet cluster %d: angular spread %.1f° > 120° — "
+                "too wide, skipping (likely complex geometry)",
+                label, angular_spread,
+            )
+            continue
+
+        # --- Determine the edge axis (direction along the fillet strip) ---
+        # The fillet strip is elongated along the edge it rounds. Use PCA
+        # on the cluster centroids to find the principal direction.
+        centroid_mean = cluster_centroids.mean(axis=0)
+        centered = cluster_centroids - centroid_mean
+
+        # SVD to find principal direction
+        try:
+            _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
+            principal_dir = vt[0]  # direction of maximum variance = strip direction
+        except Exception:
+            logger.debug("Fillet cluster %d: SVD failed, skipping", label)
+            continue
+
+        # Snap to the nearest principal axis
+        abs_principal = np.abs(principal_dir)
+        edge_axis_idx = int(np.argmax(abs_principal))
+        edge_axis = axis_names[edge_axis_idx]
+
+        # --- Strip dimensions ---
+        cluster_face_verts = cleaned.vertices[cleaned.faces[cluster_idx].flatten()]
+        edge_dir = np.zeros(3)
+        edge_dir[edge_axis_idx] = 1.0
+        proj_length = cluster_face_verts @ edge_dir
+        strip_length = float(proj_length.max() - proj_length.min())
+
+        # Width: extent perpendicular to both the edge direction and the
+        # mean normal direction (across the fillet arc).
+        perp_dir = np.cross(edge_dir, mean_normal)
+        perp_norm = np.linalg.norm(perp_dir)
+        if perp_norm > 1e-10:
+            perp_dir /= perp_norm
         else:
-            merged.append(group[0])
+            # Fallback: pick any axis perpendicular to the edge
+            other_axes = [i for i in range(3) if i != edge_axis_idx]
+            perp_dir = np.zeros(3)
+            perp_dir[other_axes[0]] = 1.0
 
-    merged.sort(key=lambda x: -x["size"])
-    return merged
+        proj_width = cluster_face_verts @ perp_dir
+        strip_width = float(proj_width.max() - proj_width.min())
+
+        if strip_length < 1e-10:
+            logger.debug("Fillet cluster %d: zero strip length, skipping", label)
+            continue
+
+        # --- Aspect ratio check (narrow strip = fillet) ---
+        aspect_ratio = strip_length / max(strip_width, 1e-10)
+        if aspect_ratio < 2.0:
+            logger.debug(
+                "Fillet cluster %d: aspect ratio %.1f < 2.0 "
+                "(L=%.2f, W=%.2f) — not a narrow strip, skipping",
+                label, aspect_ratio, strip_length, strip_width,
+            )
+            continue
+
+        # --- Connectivity check ---
+        cluster_set = set(int(x) for x in cluster_idx)
+        if not _faces_are_connected(cluster_set):
+            logger.debug("Fillet cluster %d: %d faces not connected, skipping",
+                         label, len(cluster_idx))
+            continue
+
+        # --- Edge coverage check ---
+        # The fillet strip should span >40% of the corresponding bbox
+        # edge length (lower threshold than chamfers since fillets may
+        # not cover the full edge).
+        bbox_edge_length = float(bbox_size[edge_axis_idx])
+        if bbox_edge_length > 1e-10:
+            coverage = strip_length / bbox_edge_length
+            if coverage < 0.40:
+                logger.debug(
+                    "Fillet cluster %d: strip covers only %.0f%% of edge "
+                    "(%.2f / %.2f), skipping",
+                    label, coverage * 100, strip_length, bbox_edge_length,
+                )
+                continue
+        else:
+            logger.debug("Fillet cluster %d: zero bbox edge length on axis %s, skipping",
+                         label, edge_axis)
+            continue
+
+        # --- Compute fillet radius from the arc geometry ---
+        # Method: fit a circle to the cross-section of the fillet strip.
+        # Project the cluster face vertices onto the plane perpendicular
+        # to the edge direction, then find the radius of the arc they form.
+        #
+        # Simpler approach: the strip width is approximately
+        # 2 * R * sin(sweep/2) and the strip "depth" (extent along the
+        # mean normal) is R * (1 - cos(sweep/2)). For a 90-degree fillet,
+        # width ~ R * sqrt(2) and depth ~ R * (1 - 1/sqrt(2)) ~ 0.29*R.
+        #
+        # Most robust: use the strip width and the angular spread to
+        # estimate R. For a circular arc spanning angle theta:
+        # chord = 2*R*sin(theta/2), so R = chord / (2*sin(theta/2))
+        sweep_rad = np.radians(angular_spread)
+        sin_half = np.sin(sweep_rad / 2)
+        if sin_half > 0.1:
+            # Use the strip width as the chord length
+            fillet_radius = strip_width / (2.0 * sin_half)
+        else:
+            # Very small sweep — approximate
+            fillet_radius = strip_width / 2.0
+
+        # Cross-check: the strip width should also be consistent with
+        # the radius estimate (not wildly off from the expected arc size)
+        if fillet_radius < radius_min:
+            logger.debug(
+                "Fillet cluster %d: radius %.3f too small (min=%.3f), skipping",
+                label, fillet_radius, radius_min,
+            )
+            continue
+        if fillet_radius > radius_max:
+            logger.debug(
+                "Fillet cluster %d: radius %.3f too large (max=%.3f), skipping",
+                label, fillet_radius, radius_max,
+            )
+            continue
+
+        # --- Build CadQuery selector ---
+        # Same pattern as chamfers: "|edge_axis and </>face_axis"
+        # Determine which two face axes the fillet sits between.
+        face_axis_indices = sorted(
+            [i for i in range(3) if i != edge_axis_idx],
+            key=lambda i: np.abs(mean_normal[i]),
+        )
+        face_ax_a = face_axis_indices[0]  # smaller normal component
+        face_ax_b = face_axis_indices[1]  # larger normal component
+
+        centroid = cluster_face_verts.mean(axis=0)
+        bbox_center = (cleaned.bbox[0] + cleaned.bbox[1]) / 2.0
+
+        sign_a = ">" if centroid[face_ax_a] > bbox_center[face_ax_a] else "<"
+        sign_b = ">" if centroid[face_ax_b] > bbox_center[face_ax_b] else "<"
+
+        face_filter = f"{sign_b}{axis_names[face_ax_b]}"
+        selector = f"|{edge_axis} and {face_filter}"
+
+        side_label_b = "top" if sign_b == ">" else "bottom"
+        label_str = f"{side_label_b}-{axis_names[face_ax_b]} {edge_axis}"
+
+        logger.info(
+            "Fillet cluster %d: %d faces, mean_normal=[%.2f,%.2f,%.2f], "
+            "radius=%.2f, sweep=%.0f°, edge=|%s, selector='%s', "
+            "strip L=%.2f W=%.2f aspect=%.1f coverage=%.0f%%",
+            label, len(cluster_idx), *mean_normal, fillet_radius, angular_spread,
+            edge_axis, selector,
+            strip_length, strip_width, aspect_ratio, coverage * 100,
+        )
+        results.append({
+            "radius": float(fillet_radius),
+            "selector": selector,
+            "label": label_str,
+            "face_count": len(cluster_idx),
+            "edge_length": float(strip_length),
+        })
+
+    # Sort largest radius first for stable ordering.
+    results.sort(key=lambda x: -x["radius"])
+
+    logger.debug("Detected %d fillet(s) total", len(results))
+    return results
 
 
 def _estimate_mesh_volume(cleaned: CleanedMesh) -> float:

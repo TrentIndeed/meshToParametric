@@ -457,6 +457,251 @@ footer {
               transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .fade-in.visible { opacity: 1; transform: translateY(0); }
+
+/* ── Demo Widget ── */
+.demo-widget {
+  padding: clamp(4rem, 10vh, 7rem) 0;
+  background: var(--bg);
+  position: relative;
+  overflow: hidden;
+}
+.demo-widget::before {
+  content: ''; position: absolute; top: 30%; left: 50%; transform: translate(-50%, -50%);
+  width: 700px; height: 500px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(34,211,238,0.04) 0%, transparent 70%);
+  filter: blur(80px); pointer-events: none;
+}
+.demo-widget .section-header {
+  text-align: center; margin-bottom: 2.5rem; position: relative; z-index: 1;
+}
+.demo-widget .section-header h2 { margin-bottom: 0.75rem; }
+.demo-widget .section-header p { margin: 0 auto; }
+
+/* Upload zone */
+.demo-upload-zone {
+  max-width: 640px; margin: 0 auto; position: relative; z-index: 1;
+}
+.demo-dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 14px;
+  padding: 3rem 2rem;
+  text-align: center;
+  background: var(--bg-card);
+  transition: border-color 0.3s, background 0.3s, box-shadow 0.3s;
+  cursor: pointer;
+  position: relative;
+}
+.demo-dropzone:hover,
+.demo-dropzone.dragover {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  box-shadow: 0 0 40px rgba(34,211,238,0.08);
+}
+.demo-dropzone-icon {
+  font-size: 2.5rem; margin-bottom: 1rem; opacity: 0.6;
+}
+.demo-dropzone h3 {
+  font-size: 1.15rem; font-weight: 600; color: var(--text); margin-bottom: 0.5rem;
+}
+.demo-dropzone p {
+  font-size: 0.9rem; color: var(--text-muted); margin: 0 auto;
+}
+.demo-dropzone input[type="file"] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+}
+.demo-file-info {
+  display: none;
+  align-items: center; justify-content: space-between;
+  margin-top: 1rem; padding: 0.85rem 1.25rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.demo-file-info.visible { display: flex; }
+.demo-file-name {
+  font-weight: 600; font-size: 0.95rem; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%;
+}
+.demo-file-size {
+  font-size: 0.8rem; color: var(--text-muted); flex-shrink: 0;
+}
+.demo-convert-btn {
+  display: none; width: 100%; margin-top: 1rem;
+  padding: 0.85rem 2rem; font-size: 1.05rem;
+  justify-content: center;
+}
+.demo-convert-btn.visible { display: inline-flex; }
+.demo-error {
+  display: none; margin-top: 0.75rem; padding: 0.75rem 1rem;
+  background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.25);
+  border-radius: 8px; color: #EF4444; font-size: 0.85rem;
+}
+.demo-error.visible { display: block; }
+
+/* Free trial used state */
+.demo-trial-used {
+  display: none; text-align: center; padding: 2.5rem 2rem;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  max-width: 640px; margin: 0 auto;
+}
+.demo-trial-used.visible { display: block; }
+.demo-trial-used h3 { font-size: 1.15rem; margin-bottom: 0.75rem; color: var(--text); }
+.demo-trial-used p { font-size: 0.9rem; color: var(--text-muted); margin: 0 auto 1.5rem; }
+
+/* Processing stepper */
+.demo-processing-wrap {
+  max-width: 560px; margin: 0 auto; position: relative; z-index: 1;
+}
+.demo-stepper {
+  display: flex; flex-direction: column; gap: 0;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 2rem 2.25rem; overflow: hidden;
+}
+.demo-step {
+  display: flex; align-items: center; gap: 1rem;
+  padding: 0.85rem 0;
+  position: relative;
+}
+.demo-step:not(:last-child)::after {
+  content: ''; position: absolute; left: 15px; top: 100%; width: 2px; height: 0.85rem;
+  background: var(--border);
+}
+.demo-step-indicator {
+  width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.75rem; font-weight: 700;
+  background: var(--bg-elevated); border: 2px solid var(--border);
+  color: var(--text-muted);
+  transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.demo-step.active .demo-step-indicator {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+  animation: demo-pulse 1.5s ease-in-out infinite;
+}
+.demo-step.done .demo-step-indicator {
+  border-color: #22C55E;
+  background: rgba(34,197,94,0.12);
+  color: #22C55E;
+}
+.demo-step.done .demo-step-indicator::before { content: none; }
+.demo-step-label {
+  font-size: 0.95rem; font-weight: 500; color: var(--text-muted);
+  transition: color 0.3s;
+}
+.demo-step.active .demo-step-label { color: var(--text); }
+.demo-step.done .demo-step-label { color: var(--text-secondary); }
+
+@keyframes demo-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34,211,238,0.3); }
+  50% { box-shadow: 0 0 0 8px rgba(34,211,238,0); }
+}
+
+.demo-processing-status {
+  text-align: center; margin-top: 1.25rem;
+  font-size: 0.85rem; color: var(--text-muted);
+}
+
+/* Preview view */
+.demo-preview-wrap {
+  position: relative; z-index: 1;
+}
+.demo-preview-layout {
+  display: grid; grid-template-columns: 1fr 320px; gap: 1.5rem;
+  margin-bottom: 0;
+}
+@media (max-width: 900px) {
+  .demo-preview-layout { grid-template-columns: 1fr; }
+}
+
+/* Before/After toggle */
+.demo-viewer-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+.demo-viewer-toggle {
+  display: flex; background: var(--bg-elevated); border-radius: 8px;
+  border: 1px solid var(--border); overflow: hidden;
+}
+.demo-viewer-toggle button {
+  background: none; border: none; color: var(--text-muted);
+  padding: 0.45rem 1rem; font-size: 0.8rem; font-weight: 600;
+  font-family: 'Outfit', sans-serif; cursor: pointer; transition: all 0.2s;
+}
+.demo-viewer-toggle button.active {
+  background: var(--accent-dim); color: var(--accent);
+}
+.demo-viewer-toggle button:hover:not(.active) { color: var(--text-secondary); }
+
+/* 3D canvas container */
+.demo-3d-container {
+  width: 100%; height: 500px;
+  background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px;
+  overflow: hidden; position: relative;
+}
+.demo-3d-container canvas { display: block; width: 100%; height: 100%; }
+@media (max-width: 768px) {
+  .demo-3d-container { height: 350px; }
+}
+
+/* Feature tree panel */
+.demo-feature-tree {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 1.5rem; overflow-y: auto; max-height: 560px;
+}
+.demo-feature-tree h4 {
+  font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--text-muted); font-weight: 600; margin-bottom: 1rem;
+}
+.demo-feature-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.6rem 0.75rem; border-radius: 8px;
+  transition: background 0.2s;
+}
+.demo-feature-item:hover { background: var(--surface-glass); }
+.demo-feature-item .feat-name {
+  font-size: 0.9rem; font-weight: 500; color: var(--text);
+}
+.demo-feature-item .feat-vol {
+  font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;
+}
+.demo-feature-item + .demo-feature-item {
+  border-top: 1px solid var(--border);
+}
+
+/* Signup gate banner */
+.demo-gate-banner {
+  margin-top: 1.5rem; padding: 1.5rem 2rem;
+  background: linear-gradient(135deg, var(--bg-card), rgba(34,211,238,0.05));
+  border: 1px solid var(--accent-border); border-radius: 14px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1.5rem; flex-wrap: wrap;
+}
+.demo-gate-banner .gate-text h4 {
+  font-size: 1.05rem; font-weight: 600; color: var(--text); margin-bottom: 0.25rem;
+}
+.demo-gate-banner .gate-text p {
+  font-size: 0.85rem; color: var(--text-secondary); margin: 0;
+}
+.demo-gate-actions {
+  display: flex; gap: 0.75rem; flex-shrink: 0; flex-wrap: wrap;
+}
+.demo-gate-actions .btn {
+  white-space: nowrap; font-size: 0.85rem;
+}
+.demo-gate-actions .btn-disabled {
+  background: var(--bg-elevated); color: var(--text-muted);
+  border: 1px solid var(--border); cursor: not-allowed; opacity: 0.6;
+  pointer-events: none;
+}
+.demo-gate-actions .btn-disabled .lock-icon {
+  font-size: 0.75rem; margin-right: 0.25rem;
+}
+@media (max-width: 600px) {
+  .demo-gate-banner { flex-direction: column; text-align: center; }
+  .demo-gate-actions { justify-content: center; }
+}
 </style>
 </head>
 <body>
@@ -484,10 +729,10 @@ footer {
       <h1>Mesh in.<br><span class="gradient">Parametric CAD</span> out.</h1>
       <p>Upload an STL, OBJ, or 3MF. Get back a fully editable STEP file with a real feature tree — sketches, extrusions, holes, chamfers, fillets — built from scratch in under 60 seconds.</p>
       <div class="hero-actions">
-        <a href="#waitlist" class="btn btn-primary" style="padding:0.85rem 2rem; font-size:1.05rem;">Get 5 Free Conversions</a>
+        <a href="/app" class="btn btn-primary" style="padding:0.85rem 2rem; font-size:1.05rem;">Try Free — No Signup</a>
         <a href="#see-it-work" class="btn btn-secondary" style="padding:0.85rem 2rem; font-size:1.05rem;">See It Work</a>
       </div>
-      <div class="hero-waitlist-label" style="margin-top:1rem;">No credit card required.</div>
+      <div class="hero-waitlist-label" style="margin-top:1rem;">1 free conversion. No signup. No credit card.</div>
     </div>
     <!-- Hero demo video -->
     <div style="margin-top:3rem; width:100%; max-width:900px;">
@@ -495,6 +740,105 @@ footer {
         <video autoplay muted loop playsinline preload="auto" style="width:100%; display:block;">
           <source src="/static/hero.mp4" type="video/mp4">
         </video>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Demo Widget: Try It Now -->
+<section id="demo" class="demo-widget">
+  <div class="container">
+    <div class="section-header fade-in">
+      <h2>Convert a mesh right now</h2>
+      <p>Drop any STL, OBJ, PLY, or 3MF. See the result in seconds.</p>
+    </div>
+
+    <!-- State 0: Free trial already used -->
+    <div id="demo-trial-used" class="demo-trial-used">
+      <h3>You've used your free conversion</h3>
+      <p>Create a free account to convert more parts and unlock STEP downloads.</p>
+      <a href="/login?next=/app&mode=signup" class="btn btn-primary">Create Free Account</a>
+    </div>
+
+    <!-- State 1: Upload -->
+    <div id="demo-upload" class="demo-upload-zone fade-in">
+      <div class="demo-dropzone" id="demo-dropzone">
+        <div class="demo-dropzone-icon">&#11014;</div>
+        <h3>Drop a mesh file here</h3>
+        <p>STL, OBJ, PLY, or 3MF &middot; Max 10 MB</p>
+        <input type="file" id="demo-file-input" accept=".stl,.obj,.ply,.3mf">
+      </div>
+      <div class="demo-file-info" id="demo-file-info">
+        <span class="demo-file-name" id="demo-file-name"></span>
+        <span class="demo-file-size" id="demo-file-size"></span>
+      </div>
+      <button class="btn btn-primary demo-convert-btn" id="demo-convert-btn" onclick="demoStartConvert()">Convert to Parametric CAD</button>
+      <div class="demo-error" id="demo-error"></div>
+    </div>
+
+    <!-- State 2: Processing -->
+    <div id="demo-processing" style="display:none">
+      <div class="demo-processing-wrap">
+        <div class="demo-stepper" id="demo-stepper">
+          <div class="demo-step" data-stage="0">
+            <div class="demo-step-indicator">1</div>
+            <span class="demo-step-label">Mesh ingestion &amp; cleanup</span>
+          </div>
+          <div class="demo-step" data-stage="1">
+            <div class="demo-step-indicator">2</div>
+            <span class="demo-step-label">Surface segmentation</span>
+          </div>
+          <div class="demo-step" data-stage="2">
+            <div class="demo-step-indicator">3</div>
+            <span class="demo-step-label">Primitive fitting</span>
+          </div>
+          <div class="demo-step" data-stage="3">
+            <div class="demo-step-indicator">4</div>
+            <span class="demo-step-label">Topology &amp; edge classification</span>
+          </div>
+          <div class="demo-step" data-stage="4">
+            <div class="demo-step-indicator">5</div>
+            <span class="demo-step-label">Feature recognition</span>
+          </div>
+          <div class="demo-step" data-stage="5">
+            <div class="demo-step-indicator">6</div>
+            <span class="demo-step-label">Parametric CAD export</span>
+          </div>
+        </div>
+        <div class="demo-processing-status" id="demo-processing-status">Starting conversion...</div>
+      </div>
+    </div>
+
+    <!-- State 3: Preview -->
+    <div id="demo-preview" style="display:none">
+      <div class="demo-preview-wrap">
+        <div class="demo-viewer-header">
+          <div style="font-size:0.85rem; color:var(--text-muted); font-weight:500;">Result Preview</div>
+          <div class="demo-viewer-toggle" id="demo-viewer-toggle">
+            <button class="active" onclick="demoToggleView('cad')">CAD Model</button>
+            <button onclick="demoToggleView('mesh')">Original Mesh</button>
+          </div>
+        </div>
+        <div class="demo-preview-layout">
+          <div>
+            <div class="demo-3d-container" id="demo-3d-container"></div>
+          </div>
+          <div class="demo-feature-tree" id="demo-feature-tree">
+            <h4>Feature Tree</h4>
+            <div id="demo-feature-list"></div>
+          </div>
+        </div>
+        <div class="demo-gate-banner">
+          <div class="gate-text">
+            <h4>Your part converted successfully</h4>
+            <p>Sign up free to download the STEP file and access the full editor.</p>
+          </div>
+          <div class="demo-gate-actions">
+            <span class="btn btn-disabled"><span class="lock-icon">&#128274;</span> Download STEP</span>
+            <span class="btn btn-disabled"><span class="lock-icon">&#128274;</span> Open in Onshape</span>
+            <a href="/login?next=/app&mode=signup" class="btn btn-primary">Sign Up Free</a>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -787,7 +1131,7 @@ footer {
 <section id="waitlist" class="waitlist">
   <div class="container">
     <h2 class="fade-in">Start converting parts today</h2>
-    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">5 free conversions. No credit card. Join the waitlist for early access.</p>
+    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">1 free conversion, no signup. Join the waitlist for 5 bonus conversions with any paid plan.</p>
     <form class="waitlist-form fade-in" onsubmit="return handleWaitlist(event)">
       <input type="email" id="waitlist-email" placeholder="you@company.com" required>
       <button type="submit" class="btn btn-primary">Join</button>
@@ -818,6 +1162,8 @@ footer {
   </div>
 </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
 <script>
 // ── Scroll animation: frame-by-frame tied to scroll ──
 const TOTAL_FRAMES = 121;
@@ -892,6 +1238,405 @@ function copyLink() {
   btn.textContent = '✓';
   setTimeout(() => btn.textContent = '🔗', 2000);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Demo Widget — self-contained upload → process → preview
+// ═══════════════════════════════════════════════════════════════
+(function() {
+  'use strict';
+
+  // ── State ──
+  let demoFile = null;
+  let demoJobId = null;
+  let demoPreviewData = null;   // from /api/preview
+  let demoMeshGeometry = null;  // Three.js geometry for original mesh
+  let demoCadGeometry = null;   // Three.js geometry for final CAD step
+  let demoScene = null;
+  let demoCamera = null;
+  let demoRenderer = null;
+  let demoControls = null;
+  let demoCurrentView = 'cad';  // 'cad' | 'mesh'
+  let demoPollTimer = null;
+  let demoSteps = [];           // step data from job status
+
+  // ── DOM refs ──
+  const elUpload = document.getElementById('demo-upload');
+  const elProcessing = document.getElementById('demo-processing');
+  const elPreview = document.getElementById('demo-preview');
+  const elTrialUsed = document.getElementById('demo-trial-used');
+  const elDropzone = document.getElementById('demo-dropzone');
+  const elFileInput = document.getElementById('demo-file-input');
+  const elFileInfo = document.getElementById('demo-file-info');
+  const elFileName = document.getElementById('demo-file-name');
+  const elFileSize = document.getElementById('demo-file-size');
+  const elConvertBtn = document.getElementById('demo-convert-btn');
+  const elError = document.getElementById('demo-error');
+  const elStepper = document.getElementById('demo-stepper');
+  const elStatus = document.getElementById('demo-processing-status');
+  const elContainer = document.getElementById('demo-3d-container');
+  const elFeatureList = document.getElementById('demo-feature-list');
+  const elToggle = document.getElementById('demo-viewer-toggle');
+
+  // ── Check free trial cookie ──
+  function hasCookie(name) {
+    return document.cookie.split(';').some(c => c.trim().startsWith(name + '='));
+  }
+
+  if (hasCookie('paramesh_free_used')) {
+    elUpload.style.display = 'none';
+    elTrialUsed.classList.add('visible');
+  }
+
+  // ── File validation ──
+  const ALLOWED_EXT = ['.stl', '.obj', '.ply', '.3mf'];
+  const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+
+  function validateFile(file) {
+    if (!file) return 'No file selected.';
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    if (!ALLOWED_EXT.includes(ext)) return 'Unsupported format. Use STL, OBJ, PLY, or 3MF.';
+    if (file.size > MAX_SIZE) return 'File too large. Maximum is 10 MB.';
+    return null;
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function showError(msg) {
+    elError.textContent = msg;
+    elError.classList.add('visible');
+  }
+
+  function hideError() {
+    elError.classList.remove('visible');
+  }
+
+  function selectFile(file) {
+    hideError();
+    const err = validateFile(file);
+    if (err) { showError(err); return; }
+    demoFile = file;
+    elFileName.textContent = file.name;
+    elFileSize.textContent = formatSize(file.size);
+    elFileInfo.classList.add('visible');
+    elConvertBtn.classList.add('visible');
+  }
+
+  // ── Drag and drop ──
+  elDropzone.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    elDropzone.classList.add('dragover');
+  });
+  elDropzone.addEventListener('dragleave', function(e) {
+    e.preventDefault();
+    elDropzone.classList.remove('dragover');
+  });
+  elDropzone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    elDropzone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) selectFile(e.dataTransfer.files[0]);
+  });
+  elFileInput.addEventListener('change', function() {
+    if (this.files.length) selectFile(this.files[0]);
+  });
+
+  // ── Convert button ──
+  window.demoStartConvert = async function() {
+    if (!demoFile) return;
+    hideError();
+    elConvertBtn.disabled = true;
+    elConvertBtn.textContent = 'Uploading...';
+
+    try {
+      // Step 1: Upload to /api/preview
+      const formData = new FormData();
+      formData.append('file', demoFile);
+      const previewResp = await fetch('/api/preview', { method: 'POST', body: formData });
+      if (!previewResp.ok) {
+        const errData = await previewResp.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Upload failed. Please try again.');
+      }
+      demoPreviewData = await previewResp.json();
+
+      // Step 2: Start pipeline
+      const runResp = await fetch('/api/run-pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ temp_path: demoPreviewData.temp_path, filename: demoFile.name })
+      });
+      if (!runResp.ok) {
+        const errData = await runResp.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Could not start conversion.');
+      }
+      const runData = await runResp.json();
+      demoJobId = runData.job_id;
+
+      // Save job_id in cookie so the app can load it after signup
+      document.cookie = 'paramesh_demo_job=' + demoJobId + '; path=/; max-age=' + (30*86400) + '; SameSite=Lax';
+
+      // Build mesh geometry from preview data
+      demoMeshGeometry = buildGeometryFromArrays(demoPreviewData.mesh_vertices, demoPreviewData.mesh_faces);
+
+      // Transition to processing view
+      elUpload.style.display = 'none';
+      elProcessing.style.display = 'block';
+      startPolling();
+
+    } catch (err) {
+      showError(err.message || 'Something went wrong.');
+      elConvertBtn.disabled = false;
+      elConvertBtn.textContent = 'Convert to Parametric CAD';
+    }
+  };
+
+  // ── Build Three.js BufferGeometry from flat arrays ──
+  function buildGeometryFromArrays(vertices, faces) {
+    if (!vertices || !faces || !vertices.length || !faces.length) return null;
+    const geo = new THREE.BufferGeometry();
+    const vArr = new Float32Array(vertices);
+    geo.setAttribute('position', new THREE.BufferAttribute(vArr, 3));
+    const iArr = new Uint32Array(faces);
+    geo.setIndex(new THREE.BufferAttribute(iArr, 1));
+    geo.computeVertexNormals();
+    geo.computeBoundingSphere();
+    return geo;
+  }
+
+  // ── Polling ──
+  function startPolling() {
+    if (demoPollTimer) clearInterval(demoPollTimer);
+    demoPollTimer = setInterval(pollStatus, 2000);
+    pollStatus(); // first poll immediately
+  }
+
+  async function pollStatus() {
+    if (!demoJobId) return;
+    try {
+      const resp = await fetch('/api/job/' + demoJobId + '/status');
+      if (!resp.ok) return;
+      const data = await resp.json();
+
+      demoSteps = data.steps || [];
+      const current = data.current_stage != null ? data.current_stage : -1;
+      const status = data.status;
+
+      // Update stepper UI
+      const stepEls = elStepper.querySelectorAll('.demo-step');
+      stepEls.forEach((el, i) => {
+        el.classList.remove('active', 'done');
+        if (status === 'done') {
+          el.classList.add('done');
+          el.querySelector('.demo-step-indicator').innerHTML = '&#10003;';
+        } else if (i < current) {
+          el.classList.add('done');
+          el.querySelector('.demo-step-indicator').innerHTML = '&#10003;';
+        } else if (i === current) {
+          el.classList.add('active');
+        }
+      });
+
+      if (status === 'done') {
+        elStatus.textContent = 'Conversion complete!';
+        elStatus.style.color = 'var(--accent)';
+        clearInterval(demoPollTimer);
+        demoPollTimer = null;
+        // Short delay for satisfaction, then show preview
+        setTimeout(() => showPreview(), 800);
+      } else if (status === 'error') {
+        elStatus.textContent = 'Conversion failed. ' + (data.error || '');
+        elStatus.style.color = '#EF4444';
+        clearInterval(demoPollTimer);
+        demoPollTimer = null;
+      } else {
+        const stageNames = ['Ingesting mesh...', 'Segmenting surfaces...', 'Fitting primitives...', 'Classifying edges...', 'Recognizing features...', 'Building CAD model...'];
+        elStatus.textContent = stageNames[current] || 'Processing...';
+      }
+    } catch (err) {
+      // Silently retry
+    }
+  }
+
+  // ── Show Preview ──
+  async function showPreview() {
+    elProcessing.style.display = 'none';
+    elPreview.style.display = 'block';
+
+    // Populate feature tree from steps
+    elFeatureList.innerHTML = '';
+    if (demoSteps.length) {
+      demoSteps.forEach((step, i) => {
+        const item = document.createElement('div');
+        item.className = 'demo-feature-item';
+        const volStr = step.volume != null ? step.volume.toFixed(1) + ' mm\u00B3' : '';
+        item.innerHTML = '<span class="feat-name">' + escapeHtml(step.name || ('Step ' + (i + 1))) + '</span>' +
+                         '<span class="feat-vol">' + volStr + '</span>';
+        elFeatureList.appendChild(item);
+      });
+    }
+
+    // Load final step geometry
+    try {
+      const lastIdx = demoSteps.length - 1;
+      if (lastIdx >= 0) {
+        const stepResp = await fetch('/api/job/' + demoJobId + '/step/' + lastIdx);
+        if (stepResp.ok) {
+          const stepData = await stepResp.json();
+          demoCadGeometry = buildGeometryFromArrays(stepData.vertices, stepData.faces);
+        }
+      }
+    } catch (err) {
+      // Fallback: use mesh geometry
+    }
+
+    initThreeScene();
+  }
+
+  function escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  // ── Three.js Scene ──
+  function initThreeScene() {
+    if (demoRenderer) {
+      // Dispose previous
+      demoRenderer.dispose();
+      elContainer.innerHTML = '';
+    }
+
+    const w = elContainer.clientWidth;
+    const h = elContainer.clientHeight;
+
+    demoScene = new THREE.Scene();
+    demoScene.background = new THREE.Color(0xFFFFFF);
+
+    demoCamera = new THREE.PerspectiveCamera(45, w / h, 0.1, 5000);
+    demoCamera.position.set(0, 0, 3);
+
+    demoRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    demoRenderer.setSize(w, h);
+    demoRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    demoRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    demoRenderer.toneMappingExposure = 1.4;
+    demoRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    elContainer.appendChild(demoRenderer.domElement);
+
+    demoControls = new THREE.OrbitControls(demoCamera, demoRenderer.domElement);
+    demoControls.enableDamping = true;
+    demoControls.dampingFactor = 0.08;
+
+    // Lighting — match main app viewer (bright, even)
+    const hemi = new THREE.HemisphereLight(0xE0E8F0, 0x3D4450, 0.8);
+    demoScene.add(hemi);
+    const ambient = new THREE.AmbientLight(0x556677, 0.5);
+    demoScene.add(ambient);
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    keyLight.position.set(200, 300, 150);
+    keyLight.castShadow = true;
+    demoScene.add(keyLight);
+    const fillLight = new THREE.DirectionalLight(0xB0C4DE, 0.6);
+    fillLight.position.set(-150, 100, -100);
+    demoScene.add(fillLight);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.4);
+    rimLight.position.set(0, -100, -200);
+    demoScene.add(rimLight);
+
+    // Grid — light grey like main viewer
+    const grid = new THREE.GridHelper(500, 40, 0xE0E0E0, 0xEEEEEE);
+    demoScene.add(grid);
+
+    // Add the current view geometry
+    setViewGeometry(demoCurrentView);
+
+    // Animation loop
+    function animate() {
+      requestAnimationFrame(animate);
+      demoControls.update();
+      demoRenderer.render(demoScene, demoCamera);
+    }
+    animate();
+
+    // Resize handler
+    const resizeObs = new ResizeObserver(() => {
+      const rw = elContainer.clientWidth;
+      const rh = elContainer.clientHeight;
+      if (rw && rh) {
+        demoCamera.aspect = rw / rh;
+        demoCamera.updateProjectionMatrix();
+        demoRenderer.setSize(rw, rh);
+      }
+    });
+    resizeObs.observe(elContainer);
+  }
+
+  let demoCurrentMesh = null;
+
+  function setViewGeometry(view) {
+    // Remove old mesh
+    if (demoCurrentMesh) {
+      demoScene.remove(demoCurrentMesh);
+      if (demoCurrentMesh.geometry) demoCurrentMesh.geometry.dispose();
+      if (demoCurrentMesh.material) demoCurrentMesh.material.dispose();
+      demoCurrentMesh = null;
+    }
+
+    const geo = view === 'cad' ? (demoCadGeometry || demoMeshGeometry) : demoMeshGeometry;
+    if (!geo) return;
+
+    let mesh;
+    if (view === 'mesh') {
+      // Wireframe for original mesh
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xA1A1AA,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.7
+      });
+      mesh = new THREE.Mesh(geo, mat);
+    } else {
+      // PBR solid — match main app viewer material
+      const mat = new THREE.MeshPhysicalMaterial({
+        color: 0xC0C8D0,
+        metalness: 0.5,
+        roughness: 0.28,
+        clearcoat: 0.15,
+        clearcoatRoughness: 0.3,
+        reflectivity: 0.6,
+        side: THREE.DoubleSide,
+      });
+      mesh = new THREE.Mesh(geo, mat);
+    }
+
+    // Center and scale
+    geo.computeBoundingSphere();
+    const center = geo.boundingSphere.center;
+    const radius = geo.boundingSphere.radius;
+    mesh.position.set(-center.x, -center.y, -center.z);
+    const scale = 1.5 / (radius || 1);
+    mesh.scale.set(scale, scale, scale);
+
+    demoScene.add(mesh);
+    demoCurrentMesh = mesh;
+
+    // Position camera — above-right angle like main viewer
+    demoCamera.position.set(1.5, 2.0, 2.5);
+    demoControls.target.set(0, 0, 0);
+    demoControls.update();
+  }
+
+  // ── View toggle ──
+  window.demoToggleView = function(view) {
+    demoCurrentView = view;
+    const btns = elToggle.querySelectorAll('button');
+    btns.forEach(b => b.classList.toggle('active', b.textContent.toLowerCase().includes(view === 'cad' ? 'cad' : 'mesh')));
+    if (demoScene) setViewGeometry(view);
+  };
+
+})();
 </script>
 <script src="/static/support-widget.js"></script>
 </body>

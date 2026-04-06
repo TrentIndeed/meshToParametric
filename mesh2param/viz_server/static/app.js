@@ -190,6 +190,8 @@ window._THREE = THREE;
 // ── Load step geometry ──
 async function loadStep(index) {
   console.debug('[loadStep]', index, 'of', steps.length, 'jobId:', currentJobId);
+  // Show feature tree when clicking a step
+  document.getElementById('sidebar').classList.remove('closed');
   const url = currentJobId ? `/api/job/${currentJobId}/step/${index}` : `/api/step/${index}`;
   let res;
   try {
@@ -264,6 +266,10 @@ async function loadStep(index) {
         clearcoat: 0.15,
         clearcoatRoughness: 0.3,
         reflectivity: 0.6,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
       });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;

@@ -255,6 +255,20 @@ nav .links a:hover { color: var(--text); }
   font-size: 0.8rem; color: var(--text-muted); padding: 0 1rem 0.75rem;
 }
 
+/* ── Cleaner cards ── */
+.cleaner-cards {
+  display: flex; gap: 1.25rem; justify-content: center; flex-wrap: wrap; margin-bottom: 2.5rem;
+}
+.cleaner-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1.25rem 1.5rem; min-width: 160px; flex: 1; max-width: 220px; text-align: center;
+}
+@media (max-width: 600px) {
+  .cleaner-cards { flex-direction: row; gap: 0.75rem; }
+  .cleaner-card { min-width: 0; padding: 1rem; max-width: none; }
+  .cleaner-card div:first-child { font-size: 1.1rem !important; }
+}
+
 /* ── Comparison chart ── */
 .comparison { overflow-x: auto; }
 .comparison table {
@@ -354,8 +368,11 @@ footer {
   .stats .inner { grid-template-columns: repeat(2, 1fr); }
   .how-it-works .step { grid-template-columns: 1fr; }
   .how-it-works .step:nth-child(even) { direction: ltr; }
-  nav .links { gap: 0.5rem; }
+  nav .links { gap: 0.4rem; }
   nav .links a:not(.btn) { display: none; }
+  nav .links .btn { padding: 0.5rem 0.75rem; font-size: 0.75rem; white-space: nowrap; }
+  nav .logo img { width: 32px !important; height: 32px !important; }
+  nav .logo { font-size: 1rem; gap: 4px !important; }
   .btn { padding: 0.6rem 1rem; font-size: 0.85rem; }
   .waitlist-form { flex-direction: column; padding: 10px; }
   .waitlist-form input, .waitlist-form .btn { width: 100%; text-align: center; }
@@ -998,16 +1015,16 @@ footer {
   <div class="container" style="text-align:center;">
     <h2 class="fade-in" style="margin-bottom: 0.75rem;">Free mesh cleaner</h2>
     <p class="fade-in" style="margin: 0 auto 2rem; max-width:600px;">Fix broken meshes instantly. Repair topology, remove degenerate faces, fill holes, and resize — no signup required.</p>
-    <div class="fade-in" style="display:flex; gap:2rem; justify-content:center; flex-wrap:wrap; margin-bottom:2.5rem;">
-      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; min-width:160px;">
+    <div class="fade-in cleaner-cards">
+      <div class="cleaner-card">
         <div style="font-size:1.5rem; font-weight:700; color:var(--accent);">Repair</div>
         <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Fix normals, fill holes, remove degenerates</div>
       </div>
-      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; min-width:160px;">
+      <div class="cleaner-card">
         <div style="font-size:1.5rem; font-weight:700; color:var(--accent);">Resize</div>
         <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Scale to exact dimensions in mm</div>
       </div>
-      <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; min-width:160px;">
+      <div class="cleaner-card">
         <div style="font-size:1.5rem; font-weight:700; color:var(--accent);">Export</div>
         <div style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Download cleaned STL instantly</div>
       </div>

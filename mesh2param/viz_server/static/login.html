@@ -53,6 +53,21 @@ body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,s
       <label>Email (optional)</label>
       <input id="email" type="email" autocomplete="email">
     </div>
+    <div class="field" id="referral-field" style="display:none">
+      <label>How did you hear about us?</label>
+      <select id="referral" style="width:100%; padding:0.7rem 1rem; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:inherit; font-size:0.95rem; outline:none; cursor:pointer;">
+        <option value="">Select one...</option>
+        <option value="google">Google search</option>
+        <option value="twitter">X / Twitter</option>
+        <option value="linkedin">LinkedIn</option>
+        <option value="reddit">Reddit</option>
+        <option value="youtube">YouTube</option>
+        <option value="discord">Discord</option>
+        <option value="friend">Friend / colleague</option>
+        <option value="github">GitHub</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
     <div class="field">
       <label>Password</label>
       <input id="password" type="password" required autocomplete="current-password">
@@ -81,6 +96,7 @@ function switchTab(m) {
   document.getElementById('tab-login').classList.toggle('active', m === 'login');
   document.getElementById('tab-signup').classList.toggle('active', m === 'signup');
   document.getElementById('email-field').style.display = m === 'signup' ? '' : 'none';
+  document.getElementById('referral-field').style.display = m === 'signup' ? '' : 'none';
   document.getElementById('submit-btn').textContent = m === 'login' ? 'Sign In' : 'Create Account';
   document.getElementById('error').style.display = 'none';
 }
@@ -96,6 +112,7 @@ async function handleSubmit(e) {
   const endpoint = mode === 'login' ? '/auth/login' : '/auth/signup';
   const body = { username, password };
   if (mode === 'signup' && email) body.email = email;
+  if (mode === 'signup') body.referral = document.getElementById('referral').value;
 
   try {
     const res = await fetch(endpoint, {

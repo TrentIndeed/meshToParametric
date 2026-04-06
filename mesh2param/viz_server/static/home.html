@@ -5,66 +5,203 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Home — Paramesh AI</title>
 <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root { --bg:#0A0A0B; --bg-card:#161618; --border:#27272A; --text:#FAFAFA;
-  --muted:#A1A1AA; --dim:#52525B; --accent:#22D3EE; --green:#22C55E; --purple:#BC8CFF; }
-* { margin:0; padding:0; box-sizing:border-box; }
-body { background:var(--bg); color:var(--text); font-family:'Outfit',system-ui,sans-serif; }
+:root {
+  --bg: #0A0A0B;
+  --bg-elevated: #111113;
+  --bg-card: #161618;
+  --border: #27272A;
+  --text: #FAFAFA;
+  --text-secondary: #A1A1AA;
+  --text-muted: #52525B;
+  --accent: #22D3EE;
+  --accent-dim: rgba(34, 211, 238, 0.08);
+  --accent-border: rgba(34, 211, 238, 0.15);
+  --green: #22C55E;
+  --green-dim: rgba(34, 197, 94, 0.08);
+  --green-border: rgba(34, 197, 94, 0.15);
+  --purple: #A78BFA;
+  --purple-dim: rgba(167, 139, 250, 0.08);
+  --purple-border: rgba(167, 139, 250, 0.15);
+  --orange: #F59E0B;
+  --orange-dim: rgba(245, 158, 11, 0.08);
+  --orange-border: rgba(245, 158, 11, 0.15);
+  --red: #F85149;
+}
 
-nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:1rem 0;
-  background:rgba(10,10,11,0.8); backdrop-filter:blur(20px); border-bottom:1px solid var(--border); }
-nav .inner { display:flex; align-items:center; justify-content:space-between;
-  max-width:1000px; margin:0 auto; padding:0 clamp(1.5rem,4vw,3rem); }
-nav .logo { font-size:1.1rem; font-weight:700; color:var(--text); text-decoration:none; }
-nav .logo span { color:var(--accent); }
-nav .right { display:flex; align-items:center; gap:1.5rem; }
-nav .right a { color:var(--dim); text-decoration:none; font-size:0.9rem; }
-nav .right a:hover { color:var(--text); }
-.user-badge { font-size:0.85rem; color:var(--accent); font-weight:600;
-  background:rgba(34,211,238,0.08); padding:0.3rem 0.8rem; border-radius:100px; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Outfit', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
 
-.container { max-width:1000px; margin:0 auto; padding:6rem clamp(1.5rem,4vw,3rem) 3rem; }
-h1 { font-size:clamp(1.8rem,4vw,2.5rem); font-weight:700; letter-spacing:-0.03em; margin-bottom:0.5rem; }
-.subtitle { color:var(--muted); margin-bottom:3rem; font-size:1.05rem; }
+/* ── Nav ── */
+nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  padding: 1rem 0;
+  background: rgba(10, 10, 11, 0.8);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+}
+nav .inner {
+  display: flex; align-items: center; justify-content: space-between;
+  max-width: 1100px; margin: 0 auto; padding: 0 clamp(1.5rem, 4vw, 3rem);
+}
+nav .logo {
+  font-size: 1.1rem; font-weight: 700; letter-spacing: -0.02em;
+  color: var(--text); text-decoration: none;
+}
+nav .logo span { color: var(--accent); }
+nav .right { display: flex; align-items: center; gap: 1.5rem; }
+nav .right a {
+  color: var(--text-muted); text-decoration: none; font-size: 0.9rem;
+  font-weight: 500; transition: color 0.2s;
+}
+nav .right a:hover { color: var(--text); }
+.user-badge {
+  font-size: 0.85rem; color: var(--accent); font-weight: 600;
+  background: var(--accent-dim); border: 1px solid var(--accent-border);
+  padding: 0.35rem 0.9rem; border-radius: 100px;
+}
 
-.tools-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; margin-bottom:3rem; }
-@media(max-width:600px) { .tools-grid { grid-template-columns:1fr; } }
+/* ── Layout ── */
+.container {
+  max-width: 1100px; margin: 0 auto;
+  padding: 7rem clamp(1.5rem, 4vw, 3rem) 4rem;
+}
 
-.tool-card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px;
-  padding:2rem; text-decoration:none; display:flex; flex-direction:column;
-  transition:border-color 0.2s, transform 0.15s; cursor:pointer; }
-.tool-card:hover { border-color:var(--accent); transform:translateY(-2px); }
-.tool-card .icon { width:48px; height:48px; border-radius:12px;
-  display:flex; align-items:center; justify-content:center; font-size:1.5rem; margin-bottom:1rem; }
-.tool-card .icon.cad { background:rgba(34,211,238,0.1); color:var(--accent); }
-.tool-card .icon.clean { background:rgba(34,197,94,0.1); color:var(--green); }
-.tool-card .icon.learn { background:rgba(188,140,255,0.1); color:var(--purple); }
-.tool-card h3 { font-size:1.1rem; font-weight:600; margin-bottom:0.4rem; }
-.tool-card p { color:var(--muted); font-size:0.9rem; line-height:1.5; flex:1; }
-.tool-card .tag { display:inline-block; margin-top:0.75rem; font-size:0.75rem;
-  font-weight:600; text-transform:uppercase; letter-spacing:0.05em;
-  padding:0.2rem 0.6rem; border-radius:4px; }
-.tag-free { background:rgba(34,197,94,0.1); color:var(--green); }
-.tag-tokens { background:rgba(34,211,238,0.1); color:var(--accent); }
+/* ── Header ── */
+.page-header { margin-bottom: 3rem; }
+.page-header h1 {
+  font-size: clamp(2rem, 5vw, 3rem); font-weight: 700;
+  letter-spacing: -0.03em; line-height: 1.1; margin-bottom: 0.5rem;
+}
+.page-header h1 .gradient {
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.page-header p {
+  color: var(--text-secondary); font-size: 1.1rem; line-height: 1.6;
+}
 
-/* Usage summary */
-.usage-bar { margin-bottom:3rem; background:var(--bg-card); border:1px solid var(--border);
-  border-radius:12px; padding:1.25rem 1.5rem; }
-.usage-bar .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem; }
-.usage-bar .label { font-size:0.85rem; color:var(--muted); }
-.usage-bar .val { font-size:0.85rem; font-family:'JetBrains Mono',monospace; }
-.bar-bg { height:6px; background:var(--bg); border-radius:3px; overflow:hidden; }
-.bar-fill { height:100%; border-radius:3px; background:var(--accent); transition:width 0.3s; }
+/* ── Usage card ── */
+.usage-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  display: flex; align-items: center; gap: 2rem;
+}
+.usage-card .info { flex: 1; }
+.usage-card .label { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+.usage-card .val {
+  font-size: 0.95rem; font-family: 'JetBrains Mono', monospace;
+  color: var(--text); font-weight: 500;
+}
+.usage-card .plan-badge {
+  font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em;
+  font-weight: 600; color: var(--accent); background: var(--accent-dim);
+  border: 1px solid var(--accent-border); padding: 0.25rem 0.7rem;
+  border-radius: 100px; margin-left: 0.75rem;
+}
+.bar-track {
+  flex: 1; height: 6px; background: var(--bg); border-radius: 3px;
+  overflow: hidden; min-width: 200px;
+}
+.bar-fill {
+  height: 100%; border-radius: 3px; background: var(--accent);
+  transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
 
-/* Quick links */
-.quick-links { display:flex; gap:1.5rem; flex-wrap:wrap; }
-.quick-links a { color:var(--muted); text-decoration:none; font-size:0.9rem; }
-.quick-links a:hover { color:var(--accent); }
+/* ── Tools grid ── */
+.tools-grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 1.25rem; margin-bottom: 3.5rem;
+}
+@media (max-width: 640px) { .tools-grid { grid-template-columns: 1fr; } }
 
-footer { padding:3rem 0; border-top:1px solid var(--border); text-align:center;
-  font-size:0.85rem; color:var(--dim); margin-top:3rem; }
-footer a { color:var(--dim); text-decoration:none; margin:0 0.75rem; }
+.tool-card {
+  position: relative; text-decoration: none; color: var(--text); display: flex;
+  flex-direction: column; padding: 2rem;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; overflow: hidden;
+  transition: border-color 0.3s, transform 0.2s, box-shadow 0.3s;
+  cursor: pointer;
+}
+.tool-card::before {
+  content: ''; position: absolute; inset: 0;
+  background: radial-gradient(circle at 50% 0%, var(--card-glow, transparent) 0%, transparent 70%);
+  opacity: 0; transition: opacity 0.3s;
+}
+.tool-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.3);
+}
+.tool-card:hover::before { opacity: 1; }
+
+.tool-card.primary { --card-glow: rgba(34, 211, 238, 0.06); }
+.tool-card.primary:hover { border-color: var(--accent-border); }
+.tool-card.free { --card-glow: rgba(34, 197, 94, 0.06); }
+.tool-card.free:hover { border-color: var(--green-border); }
+.tool-card.learn { --card-glow: rgba(34, 211, 238, 0.06); }
+.tool-card.learn:hover { border-color: var(--accent-border); }
+
+.tool-icon {
+  width: 52px; height: 52px; border-radius: 14px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.4rem; margin-bottom: 1.25rem; position: relative;
+}
+.tool-icon.cad { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-border); }
+.tool-icon.clean { background: var(--green-dim); color: var(--green); border: 1px solid var(--green-border); }
+.tool-icon.resize { background: var(--orange-dim); color: var(--orange); border: 1px solid var(--orange-border); }
+.tool-icon.learn-icon { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-border); }
+
+.tool-card h3 {
+  font-size: 1.15rem; font-weight: 600; letter-spacing: -0.02em;
+  margin-bottom: 0.5rem; position: relative; color: var(--text);
+}
+.tool-card p {
+  color: var(--text-secondary); font-size: 0.9rem; line-height: 1.6;
+  flex: 1; position: relative;
+}
+.tool-tag {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  margin-top: 1rem; font-size: 0.75rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  padding: 0.3rem 0.75rem; border-radius: 6px; position: relative;
+}
+.tool-tag.tokens { background: var(--accent-dim); color: var(--accent); }
+.tool-tag.free-tag { background: var(--green-dim); color: var(--green); }
+.tool-tag.learn-tag { background: var(--accent-dim); color: var(--accent); }
+
+.tool-card .arrow {
+  position: absolute; top: 2rem; right: 2rem;
+  color: var(--text-muted); font-size: 1.2rem;
+  transition: transform 0.2s, color 0.2s;
+}
+.tool-card:hover .arrow { transform: translateX(4px); color: var(--text); }
+
+/* ── Quick links ── */
+.quick-links {
+  display: flex; gap: 2rem; flex-wrap: wrap;
+  padding-top: 2rem; border-top: 1px solid var(--border);
+}
+.quick-links a {
+  color: var(--text-muted); text-decoration: none; font-size: 0.9rem;
+  font-weight: 500; transition: color 0.2s;
+}
+.quick-links a:hover { color: var(--accent); }
+
+/* ── Mobile ── */
+@media (max-width: 640px) {
+  .usage-card { flex-direction: column; gap: 1rem; align-items: stretch; }
+  .bar-track { min-width: 0; }
+  nav .right { gap: 1rem; }
+  nav .right a { font-size: 0.8rem; }
+}
 </style>
 <script>
 // Auth gate
@@ -88,61 +225,64 @@ footer a { color:var(--dim); text-decoration:none; margin:0 0.75rem; }
 </nav>
 
 <div class="container">
-  <h1 id="greeting">Welcome back</h1>
-  <p class="subtitle">Pick a tool to get started.</p>
 
-  <!-- Usage bar -->
-  <div class="usage-bar">
-    <div class="top">
-      <span class="label">Tokens used this session</span>
-      <span class="val" id="usage-text">0 / 100</span>
-    </div>
-    <div class="bar-bg"><div class="bar-fill" id="usage-fill" style="width:0%"></div></div>
+  <!-- Header -->
+  <div class="page-header">
+    <h1 id="greeting">Welcome back</h1>
+    <p>Pick a tool to get started.</p>
   </div>
 
-  <!-- Tool cards -->
+  <!-- Usage -->
+  <div class="usage-card">
+    <div class="info">
+      <div class="label">Conversions used<span class="plan-badge" id="plan-badge">Free</span></div>
+      <div class="val" id="usage-text">0 / 100</div>
+    </div>
+    <div class="bar-track"><div class="bar-fill" id="usage-fill" style="width:0%"></div></div>
+  </div>
+
+  <!-- Tools -->
   <div class="tools-grid">
-    <a href="/app" class="tool-card">
-      <div class="icon cad">&#9651;</div>
+    <a href="/app" class="tool-card primary">
+      <span class="arrow">&rarr;</span>
+      <div class="tool-icon cad">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      </div>
       <h3>Mesh to CAD</h3>
       <p>Upload a mesh file and convert it into a parametric CAD model with a full feature tree. AI-powered feature recognition.</p>
-      <span class="tag tag-tokens">Uses tokens</span>
+      <span class="tool-tag tokens">Uses conversions</span>
     </a>
-    <a href="/clean" class="tool-card">
-      <div class="icon clean">&#10003;</div>
-      <h3>Mesh Cleaner</h3>
-      <p>Fix broken meshes instantly. Repair normals, remove degenerate faces, merge vertices, fill holes. Download cleaned STL.</p>
-      <span class="tag tag-free">Free unlimited</span>
+
+    <a href="/clean" class="tool-card free">
+      <span class="arrow">&rarr;</span>
+      <div class="tool-icon clean">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+      </div>
+      <h3>Mesh Cleaner &amp; Resizer</h3>
+      <p>Fix broken meshes and scale to exact dimensions. Repair normals, fill holes, remove degenerates, resize in mm. Download cleaned STL.</p>
+      <span class="tool-tag free-tag">Free &middot; unlimited</span>
     </a>
-    <a href="/clean" class="tool-card">
-      <div class="icon clean">&#8596;</div>
-      <h3>Mesh Resize</h3>
-      <p>Scale your mesh to target dimensions or apply a uniform scale factor. Set exact width, height, and depth in mm.</p>
-      <span class="tag tag-free">Free unlimited</span>
-    </a>
-    <a href="/learn" class="tool-card">
-      <div class="icon learn">&#9733;</div>
+
+    <a href="/learn" class="tool-card learn">
+      <span class="arrow">&rarr;</span>
+      <div class="tool-icon learn-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+      </div>
       <h3>Learn</h3>
       <p>Free guides on STL to STEP conversion, mesh repair, feature recognition, and CAD reconstruction.</p>
-      <span class="tag tag-free">Free</span>
+      <span class="tool-tag learn-tag">20 guides</span>
     </a>
   </div>
 
   <!-- Quick links -->
   <div class="quick-links">
     <a href="/changelog">Changelog</a>
-    <a href="/contact">Contact Support</a>
-    <a href="https://discord.gg/placeholder">Discord</a>
+    <a href="/contact">Contact</a>
     <a href="/privacy">Privacy</a>
     <a href="/terms">Terms</a>
   </div>
-</div>
 
-<footer>
-  <a href="/">Landing Page</a>
-  <a href="/learn">Learn</a>
-  <a href="/contact">Contact</a>
-</footer>
+</div>
 
 <script>
 // Load username from cookie
@@ -155,13 +295,19 @@ if (userCookie) {
 
 // Load usage
 fetch('/api/usage').then(r=>r.json()).then(u => {
-  const limit = u.tokens_limit > 0 ? u.tokens_limit : 100;
-  const pct = Math.min(100, (u.tokens_spent / limit) * 100);
-  document.getElementById('usage-text').textContent = u.tokens_spent + ' / ' + limit;
+  const limit = (u.parts_limit && u.parts_limit > 0) ? u.parts_limit : 30;
+  const spent = u.parts_used || 0;
+  const unlimited = u.parts_limit === -1;
+  const pct = unlimited ? 0 : Math.min(100, (spent / limit) * 100);
+  document.getElementById('usage-text').textContent = unlimited ? spent + ' parts (unlimited)' : spent + ' / ' + limit + ' parts';
   document.getElementById('usage-fill').style.width = pct + '%';
-  if (pct > 85) document.getElementById('usage-fill').style.background = '#F85149';
-  else if (pct > 60) document.getElementById('usage-fill').style.background = '#D29922';
-});
+  if (pct > 85) document.getElementById('usage-fill').style.background = 'var(--red)';
+  else if (pct > 60) document.getElementById('usage-fill').style.background = '#F59E0B';
+  // Show plan name
+  if (u.plan) {
+    document.getElementById('plan-badge').textContent = u.plan.charAt(0).toUpperCase() + u.plan.slice(1);
+  }
+}).catch(() => {});
 </script>
 <script src="/static/support-widget.js"></script>
 </body>

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Page Not Found — Paramesh AI</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0A0A0B; --bg-card: #161618; --border: #27272A;
+  --text: #FAFAFA; --text-secondary: #A1A1AA; --text-muted: #52525B;
+  --accent: #22D3EE; --accent-dim: rgba(34,211,238,0.08); --accent-border: rgba(34,211,238,0.15);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: 'Outfit', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center;
+  padding: 2rem;
+}
+.code {
+  font-size: clamp(6rem, 15vw, 10rem); font-weight: 800;
+  letter-spacing: -0.04em; line-height: 1;
+  background: linear-gradient(135deg, var(--accent), #A78BFA);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  margin-bottom: 1rem;
+}
+h1 {
+  font-size: clamp(1.4rem, 3vw, 2rem); font-weight: 600;
+  letter-spacing: -0.02em; margin-bottom: 0.75rem;
+}
+p {
+  color: var(--text-secondary); font-size: 1.05rem;
+  line-height: 1.6; max-width: 480px; margin-bottom: 2.5rem;
+}
+.actions { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; }
+.btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  padding: 0.7rem 1.75rem; border-radius: 8px; font-size: 0.95rem;
+  font-weight: 600; font-family: 'Outfit', sans-serif;
+  cursor: pointer; transition: all 0.2s; text-decoration: none; border: none;
+}
+.btn-primary { background: var(--accent); color: var(--bg); }
+.btn-primary:hover { background: #06B6D4; }
+.btn-secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { border-color: var(--accent-border); color: var(--accent); }
+.path {
+  margin-top: 3rem; font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem; color: var(--text-muted);
+  background: var(--bg-card); border: 1px solid var(--border);
+  padding: 0.5rem 1rem; border-radius: 6px;
+}
+</style>
+</head>
+<body>
+  <div class="code">404</div>
+  <h1>Page not found</h1>
+  <p>The page you're looking for doesn't exist or may have been moved.</p>
+  <div class="actions">
+    <a href="/" class="btn btn-primary">Back to Home</a>
+    <a href="/app" class="btn btn-secondary">Open App</a>
+    <a href="/contact" class="btn btn-secondary">Contact Support</a>
+  </div>
+  <div class="path" id="path"></div>
+  <script>document.getElementById('path').textContent = window.location.pathname;</script>
+</body>
+</html>

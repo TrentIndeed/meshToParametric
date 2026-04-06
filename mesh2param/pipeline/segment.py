@@ -38,18 +38,38 @@ def segment_mesh(
     if config is None:
         config = SegmentConfig()
 
-    adjacency = _build_face_adjacency(cleaned.faces)
-    sharp_edges = _detect_sharp_edges(cleaned.normals, adjacency, config)
-    labels = _region_growing(cleaned.normals, adjacency, config, sharp_edges)
-    labels = _merge_small_regions(labels, adjacency, cleaned.normals, config.min_region_faces)
-    labels = _split_flat_from_curved(labels, cleaned.normals, adjacency)
-    # Use a smaller min_faces for the post-split merge so that small flat
-    # strips (e.g. 2-4 face plane regions between cylinder holes) don't get
-    # re-absorbed into the adjacent cylinder region they were just split from.
-    labels = _merge_small_regions(labels, adjacency, cleaned.normals, min(config.min_region_faces, 2))
-    labels = _curvature_split(labels, cleaned, adjacency, config)
-    labels = _split_cylinders_from_planes(labels, cleaned, adjacency)
-    labels = _merge_adjacent_cylinder_fragments(labels, cleaned, adjacency)
+    logger.debug(
+        "segment_mesh called: faces=%d, normals_shape=%s",
+        len(cleaned.faces), cleaned.normals.shape,
+    )
+
+    try:
+        adjacency = _build_face_adjacency(cleaned.faces)
+        logger.debug("Face adjacency built: %d entries", len(adjacency))
+    except Exception:
+        logger.exception("Stage 2 failed building face adjacency: faces=%d", len(cleaned.faces))
+        raise
+
+    try:
+        sharp_edges = _detect_sharp_edges(cleaned.normals, adjacency, config)
+        logger.debug("Sharp edges detected: %d pairs", len(sharp_edges))
+        labels = _region_growing(cleaned.normals, adjacency, config, sharp_edges)
+        logger.debug("Region growing produced %d unique labels", len(np.unique(labels)))
+        labels = _merge_small_regions(labels, adjacency, cleaned.normals, config.min_region_faces)
+        labels = _split_flat_from_curved(labels, cleaned.normals, adjacency)
+        # Use a smaller min_faces for the post-split merge so that small flat
+        # strips (e.g. 2-4 face plane regions between cylinder holes) don't get
+        # re-absorbed into the adjacent cylinder region they were just split from.
+        labels = _merge_small_regions(labels, adjacency, cleaned.normals, min(config.min_region_faces, 2))
+        labels = _curvature_split(labels, cleaned, adjacency, config)
+        labels = _split_cylinders_from_planes(labels, cleaned, adjacency)
+        labels = _merge_adjacent_cylinder_fragments(labels, cleaned, adjacency)
+    except Exception:
+        logger.exception(
+            "Stage 2 failed during segmentation passes: faces=%d, labels_shape=%s",
+            len(cleaned.faces), labels.shape if 'labels' in dir() else 'N/A',
+        )
+        raise
 
     regions = _build_regions(labels, cleaned, adjacency)
     logger.info("Segmented mesh into %d regions", len(regions))
@@ -61,6 +81,7 @@ def _build_face_adjacency(faces: np.ndarray) -> dict[int, set[int]]:
 
     Two faces are adjacent if they share exactly two vertices (an edge).
     """
+    logger.debug("Building face adjacency for %d faces", len(faces))
     edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
     for fi, face in enumerate(faces):
         for i in range(3):
@@ -342,9 +363,14 @@ def _curvature_split(
     config: SegmentConfig,
 ) -> np.ndarray:
     """Split regions with high curvature variance using k-means on (normal, curvature)."""
+    logger.debug("Curvature split: %d labels in, threshold=%.6f", len(np.unique(labels)), config.curvature_variance_threshold)
     labels = labels.copy()
-    vertex_curvatures = _estimate_vertex_curvatures(cleaned)
-    face_curvatures = _vertex_to_face_curvatures(vertex_curvatures, cleaned.faces)
+    try:
+        vertex_curvatures = _estimate_vertex_curvatures(cleaned)
+        face_curvatures = _vertex_to_face_curvatures(vertex_curvatures, cleaned.faces)
+    except Exception:
+        logger.exception("Curvature estimation failed: verts=%d, faces=%d", len(cleaned.vertices), len(cleaned.faces))
+        raise
 
     next_label = int(labels.max()) + 1
     unique_labels = np.unique(labels)
@@ -408,6 +434,7 @@ def _split_cylinders_from_planes(
     """
     from sklearn.cluster import DBSCAN
 
+    logger.debug("Splitting cylinders from planes: %d labels", len(np.unique(labels)))
     labels = labels.copy()
     next_label = int(labels.max()) + 1
 
@@ -707,7 +734,12 @@ def _build_regions(
     adjacency: dict[int, set[int]],
 ) -> list[FaceRegion]:
     """Convert label array into a list of FaceRegion objects."""
-    vertex_curvatures = _estimate_vertex_curvatures(cleaned)
+    logger.debug("Building regions from %d unique labels", len(np.unique(labels)))
+    try:
+        vertex_curvatures = _estimate_vertex_curvatures(cleaned)
+    except Exception:
+        logger.exception("Vertex curvature estimation failed during region building")
+        raise
     face_curvatures = _vertex_to_face_curvatures(vertex_curvatures, cleaned.faces)
 
     regions = []

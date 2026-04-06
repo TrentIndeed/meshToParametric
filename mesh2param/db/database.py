@@ -4,6 +4,7 @@ Adapted from operatorDashboard. Uses SQLite by default.
 Models: User (auth), MeshJob (pipeline runs), JobStep (construction steps).
 """
 
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -16,10 +17,14 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
+logger = logging.getLogger(__name__)
+
 # Default to ./data/mesh2param.db
 data_dir = Path(__file__).parent.parent.parent / "data"
 data_dir.mkdir(exist_ok=True)
 DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{data_dir}/mesh2param.db"
+
+logger.debug("Database URL: %s", DATABASE_URL)
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
@@ -119,13 +124,22 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        logger.exception("Database session error during request")
+        raise
     finally:
         db.close()
 
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
-    _migrate_db()
+    logger.debug("Initializing database (create_all + migrate)")
+    try:
+        Base.metadata.create_all(bind=engine)
+        _migrate_db()
+        logger.info("Database initialized successfully")
+    except Exception:
+        logger.exception("Failed to initialize database")
+        raise
 
 
 def _migrate_db():
@@ -168,5 +182,6 @@ def _migrate_db():
 
         conn.commit()
         conn.close()
+        logger.debug("Database migration completed")
     except Exception:
-        pass  # non-fatal — fresh DBs will have all columns from create_all
+        logger.exception("Database migration failed (non-fatal for fresh DBs)")

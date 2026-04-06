@@ -84,6 +84,10 @@ def export_cadquery(
     Returns:
         CadQueryResult with the solid, generated script, and validation.
     """
+    logger.debug(
+        "export_cadquery called: %d features, use_llm=%s, output_path=%s",
+        feature_tree.num_features, use_llm, output_path,
+    )
     mesh_volume = _estimate_mesh_volume(cleaned)
 
     # Extract base profile (needed by both LLM and heuristic paths)
@@ -91,8 +95,15 @@ def export_cadquery(
     extrude_dir = np.array(base_feature.direction)
     depth = base_feature.depth
 
-    profiles, extrude_start, hole_features, chamfer_features, fillet_features = \
-        _extract_profile_and_holes(feature_tree, cleaned, extrude_dir)
+    try:
+        profiles, extrude_start, hole_features, chamfer_features, fillet_features = \
+            _extract_profile_and_holes(feature_tree, cleaned, extrude_dir)
+    except Exception:
+        logger.exception(
+            "Stage 6b failed extracting profile: extrude_dir=%s, depth=%.2f",
+            extrude_dir.tolist(), depth,
+        )
+        raise
 
     if profiles is None or len(profiles) == 0:
         logger.error("Failed to extract base profile from mesh")
@@ -108,17 +119,29 @@ def export_cadquery(
     # 2. Extrude base
     # 3+. Cut holes
     # N+. Apply chamfers and fillets
-    solid, script, steps = _build_stepwise(
-        profiles, depth, extrude_dir, extrude_start,
-        hole_features, chamfer_features, fillet_features,
-        build_order=build_order, cleaned=cleaned,
+    logger.debug(
+        "Building CadQuery solid: %d profiles, depth=%.2f, %d holes, %d chamfers, %d fillets",
+        len(profiles), depth, len(hole_features), len(chamfer_features), len(fillet_features),
     )
+    try:
+        solid, script, steps = _build_stepwise(
+            profiles, depth, extrude_dir, extrude_start,
+            hole_features, chamfer_features, fillet_features,
+            build_order=build_order, cleaned=cleaned,
+        )
+    except Exception:
+        logger.exception(
+            "Stage 6b failed during CadQuery solid construction: profiles=%d, holes=%d",
+            len(profiles), len(hole_features),
+        )
+        raise
 
     # Compute CAD volume
     try:
         import cadquery as cq
         cad_volume = abs(float(solid.val().Volume()))
     except Exception:
+        logger.debug("Could not compute CAD volume from solid, defaulting to 0.0")
         cad_volume = 0.0
 
     volume_error = abs(cad_volume - mesh_volume) / (mesh_volume + 1e-15) * 100
@@ -130,12 +153,16 @@ def export_cadquery(
     # Export STEP
     step_path = ""
     if output_path is not None:
-        import cadquery as cq
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        cq.exporters.export(solid, str(output_path))
-        step_path = str(output_path)
-        logger.info("Exported STEP to %s", step_path)
+        try:
+            import cadquery as cq
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cq.exporters.export(solid, str(output_path))
+            step_path = str(output_path)
+            logger.info("Exported STEP to %s", step_path)
+        except Exception:
+            logger.exception("STEP export failed: output_path=%s", output_path)
+            raise
 
     logger.info(
         "CadQuery export: mesh_vol=%.1f, cad_vol=%.1f, error=%.2f%%, status=%s",
@@ -188,6 +215,10 @@ def _extract_profile_and_holes(
 
     Returns (list_of_profiles, extrude_start, holes).
     """
+    logger.debug(
+        "_extract_profile_and_holes: extrude_dir=%s, %d features",
+        extrude_dir.tolist(), feature_tree.num_features,
+    )
     mesh = trimesh.Trimesh(
         vertices=cleaned.vertices, faces=cleaned.faces, process=False,
     )
@@ -853,6 +884,14 @@ def _build_stepwise(
     """
     import cadquery as cq
 
+    logger.debug(
+        "_build_stepwise: %d profiles, depth=%.2f, extrude_dir=%s, %d holes, "
+        "%d chamfers, %d fillets, build_order=%s",
+        len(profiles), depth, extrude_dir.tolist(), len(holes),
+        len(chamfers) if chamfers else 0, len(fillets) if fillets else 0,
+        build_order.strategy if build_order else "heuristic",
+    )
+
     abs_dir = np.abs(extrude_dir)
     primary_axis = int(np.argmax(abs_dir))
     plane_map = {0: "YZ", 1: "XZ", 2: "XY"}
@@ -1102,7 +1141,10 @@ def _build_stepwise(
                 f".circle({radius:.4f}).extrude({cut_length:.4f}))"
             )
         except Exception as e:
-            logger.warning("Failed to cut hole %d: %s", i, e)
+            logger.warning(
+                "Failed to cut hole %d (r=%.2f, center=%s, dir=%s): %s",
+                i, radius, center.tolist(), h_dir.tolist(), e,
+            )
 
     # (Small chamfers are now handled by _detect_mesh_chamfers above)
 
@@ -1166,6 +1208,7 @@ def _build_from_mesh_and_cut_holes(
     The mesh gives us the exact body shape; the recognized holes give
     us the parametric cut geometry (center, radius, depth, direction).
     """
+    logger.debug("_build_from_mesh_and_cut_holes: %d holes, verts=%d", len(holes), len(cleaned.vertices))
     import cadquery as cq
     import tempfile, os
 
@@ -1542,6 +1585,7 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
     OCCT's BRepMesh otherwise leaves hollow.
     Curved faces use standard BRepMesh triangulation.
     """
+    logger.debug("Tessellating CadQuery solid")
     try:
         from OCP.BRep import BRep_Tool
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
@@ -1830,6 +1874,7 @@ def _detect_mesh_chamfers(
     """
     from sklearn.cluster import DBSCAN
 
+    logger.debug("Detecting mesh chamfers: %d faces, extrude_dir=%s", len(cleaned.faces), extrude_dir.tolist())
     normals = cleaned.normals
     ext = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
     bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
@@ -1974,8 +2019,14 @@ def _estimate_mesh_volume(cleaned: CleanedMesh) -> float:
             vertices=cleaned.vertices, faces=cleaned.faces, process=False,
         )
         if mesh.is_watertight:
-            return abs(float(mesh.volume))
-        return abs(float(mesh.convex_hull.volume))
+            vol = abs(float(mesh.volume))
+            logger.debug("CQ mesh volume (watertight): %.2f", vol)
+            return vol
+        vol = abs(float(mesh.convex_hull.volume))
+        logger.debug("CQ mesh volume (convex hull): %.2f", vol)
+        return vol
     except Exception:
         extents = cleaned.bbox[1] - cleaned.bbox[0]
-        return float(np.prod(extents))
+        vol = float(np.prod(extents))
+        logger.debug("CQ mesh volume (bbox fallback): %.2f", vol)
+        return vol

@@ -23,7 +23,10 @@ async def chat(body: dict):
     Request: {"message": "make hole 1 larger", "context": {...}}
     Response: {"reply": "...", "edit": null | {...}}
     """
+    logger.debug("Chat request: message_len=%d, has_context=%s",
+                 len(body.get("message", "")), bool(body.get("context")))
     if not is_available():
+        logger.debug("Chat unavailable: Claude CLI not installed or not authenticated")
         return {"reply": "AI is unavailable — Claude CLI not installed or not authenticated.", "edit": None}
 
     message = body.get("message", "").strip()
@@ -65,6 +68,7 @@ Construction steps:
 
     try:
         response = call_ai(prompt, timeout=30)
+        logger.debug("Chat AI response received: len=%d", len(response))
 
         # Parse JSON response
         text = response.strip()
@@ -81,9 +85,11 @@ Construction steps:
                 "usage": get_usage(),
             }
         except json.JSONDecodeError:
+            logger.debug("Chat AI response was not valid JSON, returning raw text")
             return {"reply": text, "edit": None, "usage": get_usage()}
 
     except RuntimeError as e:
+        logger.exception("Chat AI call failed")
         return {"reply": f"AI error: {e}", "edit": None, "usage": get_usage()}
 
 
@@ -94,6 +100,8 @@ async def analyze_mesh(body: dict):
     Request: {"bbox_min": [...], "bbox_max": [...], "volume": ..., "num_faces": ..., "features": [...]}
     Response: {"part_type": "bracket", "suggested_dimensions": {...}, "scale_factor": 1.0, "notes": "..."}
     """
+    logger.debug("Analyze-mesh request: num_faces=%s, volume=%s",
+                 body.get("num_faces"), body.get("volume"))
     if not is_available():
         return {
             "part_type": "unknown",
@@ -150,6 +158,7 @@ Respond with ONLY valid JSON:
 
     try:
         response = call_ai(prompt, timeout=30)
+        logger.debug("Analyze-mesh AI response received: len=%d", len(response))
 
         text = response.strip()
         if text.startswith("```"):
@@ -163,6 +172,7 @@ Respond with ONLY valid JSON:
             data["usage"] = get_usage()
             return data
         except json.JSONDecodeError:
+            logger.debug("Analyze-mesh AI response was not valid JSON, returning raw text")
             return {
                 "part_type": "unknown",
                 "suggested_dimensions": {},
@@ -173,6 +183,7 @@ Respond with ONLY valid JSON:
             }
 
     except RuntimeError as e:
+        logger.exception("Analyze-mesh AI call failed")
         return {
             "part_type": "unknown",
             "suggested_dimensions": {},

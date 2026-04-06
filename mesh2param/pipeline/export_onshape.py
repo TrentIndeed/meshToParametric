@@ -84,8 +84,20 @@ def export_to_onshape(
     if config is None:
         config = ExportConfig()
 
+    logger.debug(
+        "export_to_onshape called: %d features, dry_run=%s",
+        feature_tree.num_features, config.dry_run,
+    )
+
     # Build the ordered export plan
-    operations = _build_export_plan(feature_tree)
+    try:
+        operations = _build_export_plan(feature_tree)
+    except Exception:
+        logger.exception(
+            "Stage 6a failed building export plan: %d features",
+            feature_tree.num_features,
+        )
+        raise
 
     # Estimate mesh volume
     mesh_volume = _estimate_mesh_volume(cleaned)
@@ -113,6 +125,7 @@ def export_to_onshape(
 
 def _build_export_plan(feature_tree: FeatureTree) -> list[ExportOperation]:
     """Generate an ordered list of FeatureScript operations from the feature tree."""
+    logger.debug("Building export plan from dependency graph (%d nodes)", feature_tree.dependency_graph.number_of_nodes())
     order = list(nx.topological_sort(feature_tree.dependency_graph))
     operations = []
 
@@ -251,13 +264,19 @@ def _estimate_mesh_volume(cleaned: CleanedMesh) -> float:
             process=False,
         )
         if mesh.is_watertight:
-            return abs(float(mesh.volume))
+            vol = abs(float(mesh.volume))
+            logger.debug("Mesh volume (watertight): %.2f", vol)
+            return vol
         # Non-watertight: estimate from convex hull
-        return abs(float(mesh.convex_hull.volume))
+        vol = abs(float(mesh.convex_hull.volume))
+        logger.debug("Mesh volume (convex hull estimate): %.2f", vol)
+        return vol
     except Exception:
         # Fallback: bounding box volume
         extents = cleaned.bbox[1] - cleaned.bbox[0]
-        return float(np.prod(extents))
+        vol = float(np.prod(extents))
+        logger.debug("Mesh volume (bbox fallback): %.2f", vol)
+        return vol
 
 
 # ---------------------------------------------------------------------------

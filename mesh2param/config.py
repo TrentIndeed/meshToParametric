@@ -1,4 +1,8 @@
+import logging
+
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class IngestConfig(BaseModel):
@@ -10,6 +14,14 @@ class IngestConfig(BaseModel):
     target_edge_ratio: float = 0.005
     max_hole_edges: int = 50
 
+    def model_post_init(self, __context) -> None:
+        logger.debug(
+            "IngestConfig loaded: remesh=%s, target_edge_ratio=%.4f, max_hole_edges=%d",
+            self.remesh,
+            self.target_edge_ratio,
+            self.max_hole_edges,
+        )
+
 
 class SegmentConfig(BaseModel):
     """Configuration for Stage 2: Surface Segmentation."""
@@ -19,6 +31,14 @@ class SegmentConfig(BaseModel):
     min_region_faces: int = 10
     curvature_variance_threshold: float = 0.1
     max_kmeans_clusters: int = 5
+
+    def model_post_init(self, __context) -> None:
+        logger.debug(
+            "SegmentConfig loaded: plane_angle=%.1f deg, curved_angle=%.1f deg, min_faces=%d",
+            self.plane_angle_threshold_deg,
+            self.curved_angle_threshold_deg,
+            self.min_region_faces,
+        )
 
 
 class FitConfig(BaseModel):
@@ -31,6 +51,15 @@ class FitConfig(BaseModel):
     axis_snap_angle_deg: float = 2.0  # snap axis to principal axis if within this angle
     try_alternative_types: bool = True  # retry with other surface types if RMS too high
 
+    def model_post_init(self, __context) -> None:
+        logger.debug(
+            "FitConfig loaded: rms_tol=%.4f, ransac_iter=%d, snap_tol=%.3f, alt_types=%s",
+            self.rms_tolerance_ratio,
+            self.ransac_iterations,
+            self.snap_tolerance,
+            self.try_alternative_types,
+        )
+
 
 class TopologyConfig(BaseModel):
     """Configuration for Stage 4: Topology & Edge Classification."""
@@ -39,6 +68,13 @@ class TopologyConfig(BaseModel):
     smooth_angle_threshold_deg: float = 175.0  # dihedral above this → SMOOTH
     fillet_radius_ratio: float = 0.05  # max fillet radius as fraction of bbox diagonal
     chamfer_width_ratio: float = 0.05  # max chamfer extent as fraction of bbox diagonal
+
+    def model_post_init(self, __context) -> None:
+        logger.debug(
+            "TopologyConfig loaded: sharp_angle=%.1f deg, smooth_angle=%.1f deg",
+            self.sharp_angle_threshold_deg,
+            self.smooth_angle_threshold_deg,
+        )
 
 
 class RecognizeConfig(BaseModel):
@@ -50,6 +86,14 @@ class RecognizeConfig(BaseModel):
     slot_max_width_ratio: float = 0.3  # max slot width as fraction of bbox diagonal
     min_feature_faces: int = 3  # minimum faces for a feature
 
+    def model_post_init(self, __context) -> None:
+        logger.debug(
+            "RecognizeConfig loaded: min_feature_faces=%d, hole_max_r=%.2f, pocket_max_d=%.2f",
+            self.min_feature_faces,
+            self.hole_max_radius_ratio,
+            self.pocket_max_depth_ratio,
+        )
+
 
 class ExportConfig(BaseModel):
     """Configuration for Stage 6: Onshape Export."""
@@ -60,3 +104,12 @@ class ExportConfig(BaseModel):
     rate_limit_delay: float = 1.0
     max_retries: int = 3
     volume_tolerance_pct: float = 5.0  # acceptable volume error %
+
+    def model_post_init(self, __context) -> None:
+        logger.debug(
+            "ExportConfig loaded: dry_run=%s, base_url=%s, timeout=%.1fs, retries=%d",
+            self.dry_run,
+            self.onshape_base_url,
+            self.api_timeout,
+            self.max_retries,
+        )

@@ -41,15 +41,32 @@ def build_topology(
     if config is None:
         config = TopologyConfig()
 
+    logger.debug(
+        "build_topology called: %d regions, %d fitted surfaces, %d mesh faces",
+        len(regions), len(fitted), cleaned.num_faces,
+    )
+
     bbox_diag = cleaned.bbox_diagonal
 
     # Map each mesh face to its region
-    face_to_region = _build_face_to_region(regions, cleaned.num_faces)
+    try:
+        face_to_region = _build_face_to_region(regions, cleaned.num_faces)
+    except Exception:
+        logger.exception(
+            "Stage 4 failed building face-to-region map: regions=%d, faces=%d",
+            len(regions), cleaned.num_faces,
+        )
+        raise
 
     # Discover which regions share mesh edges
-    region_adjacencies = _find_region_adjacencies(
-        cleaned.faces, face_to_region,
-    )
+    try:
+        region_adjacencies = _find_region_adjacencies(
+            cleaned.faces, face_to_region,
+        )
+        logger.debug("Found %d region adjacency pairs", len(region_adjacencies))
+    except Exception:
+        logger.exception("Stage 4 failed finding region adjacencies")
+        raise
 
     # Build lookups
     fitted_lookup = {f.region_id: f for f in fitted}
@@ -58,16 +75,24 @@ def build_topology(
     # Classify each inter-region boundary
     surface_edges = []
     for (rid_a, rid_b), info in region_adjacencies.items():
-        dihedral_rad = _compute_mean_dihedral(info["face_pairs"], cleaned.normals)
-        dihedral_deg = float(np.degrees(dihedral_rad))
+        try:
+            dihedral_rad = _compute_mean_dihedral(info["face_pairs"], cleaned.normals)
+            dihedral_deg = float(np.degrees(dihedral_rad))
 
-        edge_vertices = _chain_edge_vertices(info["mesh_edges"], cleaned.vertices)
+            edge_vertices = _chain_edge_vertices(info["mesh_edges"], cleaned.vertices)
 
-        transition = _classify_transition(
-            rid_a, rid_b, dihedral_deg,
-            fitted_lookup, region_lookup,
-            bbox_diag, config,
-        )
+            transition = _classify_transition(
+                rid_a, rid_b, dihedral_deg,
+                fitted_lookup, region_lookup,
+                bbox_diag, config,
+            )
+        except Exception:
+            logger.exception(
+                "Stage 4 failed classifying edge between regions %d and %d "
+                "(face_pairs=%d, mesh_edges=%d)",
+                rid_a, rid_b, len(info["face_pairs"]), len(info["mesh_edges"]),
+            )
+            raise
 
         surface_edges.append(SurfaceEdge(
             surface_a_id=rid_a,

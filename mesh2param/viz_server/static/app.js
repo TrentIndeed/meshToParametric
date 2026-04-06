@@ -1,6 +1,8 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
 
+console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
+
 // ── State ──
 let currentStep = -1;
 let steps = [];
@@ -34,12 +36,25 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
+console.debug('[init] WebGL renderer created, size:', container.clientWidth, 'x', container.clientHeight, 'pixelRatio:', Math.min(window.devicePixelRatio, 2));
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.minDistance = 10;
-controls.maxDistance = 2000;
+controls.enableZoom = false; // we handle zoom ourselves with smooth interpolation
+
+const ZOOM_MIN = 30;
+const ZOOM_MAX = 1500;
+const ZOOM_FACTOR = 0.08; // 8% per scroll tick
+const ZOOM_LERP = 0.12; // smoothing factor per frame (higher = snappier)
+let _zoomTargetDist = null; // null = no pending zoom
+
+renderer.domElement.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const dist = _zoomTargetDist ?? camera.position.distanceTo(controls.target);
+  const sign = e.deltaY > 0 ? 1 : -1;
+  _zoomTargetDist = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, dist * (1 + sign * ZOOM_FACTOR)));
+}, { passive: false });
 
 // ── Studio Lighting — bright, even illumination ──
 const hemi = new THREE.HemisphereLight(0xE0E8F0, 0x3D4450, 0.8);
@@ -129,6 +144,8 @@ function updateSceneBg() {
   }
   // Update axis gizmo border
   axisRenderer.domElement.style.borderColor = isDark ? 'rgba(48,54,61,0.5)' : 'rgba(208,215,222,0.5)';
+  // Re-render thumbnails with new background color
+  if (cachedStatusData) populateUI(cachedStatusData);
 }
 window._updateSceneBg = updateSceneBg;
 
@@ -140,8 +157,9 @@ axisCamera.lookAt(0, 0, 0);
 const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 axisRenderer.setSize(120, 120);
 axisRenderer.setClearColor(0x000000, 0);
+console.debug('[init] Axis gizmo renderer created');
 const axIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
-axisRenderer.domElement.style.cssText = `position:fixed;bottom:90px;left:10px;z-index:50;pointer-events:none;border:1px solid ${axIsDark ? 'rgba(48,54,61,0.5)' : 'rgba(208,215,222,0.5)'};border-radius:8px;`;
+axisRenderer.domElement.style.cssText = `position:fixed;bottom:90px;left:10px;z-index:60;pointer-events:none;border:1px solid ${axIsDark ? 'rgba(48,54,61,0.5)' : 'rgba(208,215,222,0.5)'};border-radius:8px;`;
 document.body.appendChild(axisRenderer.domElement);
 
 // Axis lines with cone tips (short, in gizmo scene)
@@ -171,29 +189,37 @@ window._THREE = THREE;
 
 // ── Load step geometry ──
 async function loadStep(index) {
+  console.debug('[loadStep]', index, 'of', steps.length, 'jobId:', currentJobId);
   const url = currentJobId ? `/api/job/${currentJobId}/step/${index}` : `/api/step/${index}`;
   let res;
   try {
     res = await fetch(url);
   } catch (e) {
-    console.error('Failed to fetch step', index, e);
+    console.error('[loadStep] network error fetching', url, e);
     return;
   }
   if (!res.ok) {
-    console.error('Step fetch error', index, res.status);
+    console.error('[loadStep] HTTP', res.status, 'for', url);
     return;
   }
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.error('[loadStep] JSON parse failed for step', index, e);
+    return;
+  }
   if (data.error) {
-    console.error('Step data error', index, data.error);
+    console.error('[loadStep] server error for step', index, data.error);
     return;
   }
   if (!data.vertices || data.vertices.length === 0) {
-    console.warn('Step has no geometry', index);
+    console.warn('[loadStep] step', index, 'has no geometry');
     return;
   }
 
   // Clear previous model — dispose geometry/materials to free GPU memory
+  const disposed = modelGroup.children.length;
   while (modelGroup.children.length) {
     const child = modelGroup.children[0];
     if (child.geometry) child.geometry.dispose();
@@ -203,49 +229,61 @@ async function loadStep(index) {
     }
     modelGroup.remove(child);
   }
+  if (disposed > 0) console.debug('[loadStep] disposed', disposed, 'previous objects');
 
-  const verts = new Float32Array(data.vertices);
-  const indices = data.faces;
+  try {
+    const verts = new Float32Array(data.vertices);
+    const indices = data.faces;
 
-  if (data.is_sketch) {
-    // Draw as lines using face indices (each degenerate tri = one edge)
-    const points = [];
-    for (let f = 0; f < indices.length; f += 3) {
-      const a = indices[f], b = indices[f + 1];
-      points.push(
-        new THREE.Vector3(verts[a*3], verts[a*3+1], verts[a*3+2]),
-        new THREE.Vector3(verts[b*3], verts[b*3+1], verts[b*3+2]),
-      );
+    if (data.is_sketch) {
+      console.debug('[loadStep] rendering sketch, edges:', Math.floor(indices.length / 3));
+      // Draw as lines using face indices (each degenerate tri = one edge)
+      const points = [];
+      for (let f = 0; f < indices.length; f += 3) {
+        const a = indices[f], b = indices[f + 1];
+        points.push(
+          new THREE.Vector3(verts[a*3], verts[a*3+1], verts[a*3+2]),
+          new THREE.Vector3(verts[b*3], verts[b*3+1], verts[b*3+2]),
+        );
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineBasicMaterial({ color: 0x58A6FF, linewidth: 2 });
+      modelGroup.add(new THREE.LineSegments(geo, mat));
+    } else {
+      console.debug('[loadStep] rendering solid mesh, verts:', Math.round(verts.length / 3), 'faces:', Math.round(indices.length / 3));
+      // Solid mesh
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+
+      const mat = new THREE.MeshPhysicalMaterial({
+        color: 0xC0C8D0,
+        metalness: 0.5,
+        roughness: 0.28,
+        clearcoat: 0.15,
+        clearcoatRoughness: 0.3,
+        reflectivity: 0.6,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      modelGroup.add(mesh);
     }
-    const geo = new THREE.BufferGeometry().setFromPoints(points);
-    const mat = new THREE.LineBasicMaterial({ color: 0x58A6FF, linewidth: 2 });
-    modelGroup.add(new THREE.LineSegments(geo, mat));
-  } else {
-    // Solid mesh
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-    geo.setIndex(indices);
-    geo.computeVertexNormals();
-
-    const mat = new THREE.MeshPhysicalMaterial({
-      color: 0xC0C8D0,
-      metalness: 0.5,
-      roughness: 0.28,
-      clearcoat: 0.15,
-      clearcoatRoughness: 0.3,
-      reflectivity: 0.6,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    modelGroup.add(mesh);
+  } catch (e) {
+    console.error('[loadStep] geometry/material creation failed for step', index, e);
+    return;
   }
 
   // Center model at origin — reset position first to avoid cumulative drift
-  modelGroup.position.set(0, 0, 0);
-  const box = new THREE.Box3().setFromObject(modelGroup);
-  const center = box.getCenter(new THREE.Vector3());
-  modelGroup.position.sub(center);
+  try {
+    modelGroup.position.set(0, 0, 0);
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    const center = box.getCenter(new THREE.Vector3());
+    modelGroup.position.sub(center);
+  } catch (e) {
+    console.error('[loadStep] bounding box calculation failed for step', index, e);
+  }
 
   // Keep camera where it is — don't animate on step clicks or reloads
   controls.target.set(0, 0, 0);
@@ -254,6 +292,7 @@ async function loadStep(index) {
   // Update UI
   currentStep = index;
   localStorage.setItem('paramesh_last_step', index.toString());
+  console.debug('[loadStep] step loaded:', index, 'name:', data.name, 'verts:', Math.round(data.vertices.length / 3));
   updateActiveStates();
 
   // Show step name toast briefly
@@ -264,7 +303,7 @@ async function loadStep(index) {
     toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;color:var(--text-primary);z-index:100;opacity:0;transition:opacity 0.3s;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.1);';
     document.body.appendChild(toast);
   }
-  toast.textContent = `Step ${index + 1}/${steps.length}: ${data.name} (${Math.round(verts.length/3)} verts)`;
+  toast.textContent = `Step ${index + 1}/${steps.length}: ${data.name} (${Math.round(data.vertices.length/3)} verts)`;
   toast.style.opacity = '1';
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 1500);
@@ -278,12 +317,16 @@ function updateActiveStates() {
   document.querySelectorAll('.feature-item').forEach((el, i) => {
     el.classList.toggle('active', i === currentStep);
   });
-  document.querySelectorAll('.timeline-step').forEach((el, i) => {
+  // Skip .timeline-special buttons (Mesh, Compare) when highlighting
+  document.querySelectorAll('.timeline-step:not(.timeline-special)').forEach((el, i) => {
     el.classList.toggle('active', i === currentStep);
   });
+  // Deactivate special buttons
+  document.querySelectorAll('.timeline-special').forEach(el => el.classList.remove('active'));
 }
 
 function populateUI(statusData) {
+  console.debug('[populateUI] building tree and timeline for', statusData.steps?.length, 'steps, filename:', statusData.filename);
   const list = document.getElementById('feature-list');
   const timeline = document.getElementById('timeline');
   list.innerHTML = '';
@@ -291,7 +334,7 @@ function populateUI(statusData) {
   steps = statusData.steps;
 
   // PNG icon mapping — icons from /static/icons/
-  const I = (file, cls) => ({ cls, svg: `<img src="/static/icons/${file}" style="width:22px;height:22px;">` });
+  const I = (file, cls) => ({ cls, svg: `<img src="/static/icons/${file}" style="width:22px;height:22px;border-radius:50%;">` });
   const iconMap = {
     'Sketch':   I('sketch.png', 'sketch'),
     'Extrude':  I('extrude.png', 'extrude'),
@@ -309,11 +352,9 @@ function populateUI(statusData) {
     'Original': I('bodies.png', 'sketch'),
   };
 
-  // Show sketches folder and clear it
+  // Hide sketches folder — sketches go inline under Body
   const sketchesFolder = document.getElementById('sketches-folder');
-  const sketchesList = document.getElementById('sketches-list');
-  sketchesList.innerHTML = '';
-  let hasSketch = false;
+  sketchesFolder.style.display = 'none';
 
   // Add "Original Mesh" button at the start of timeline
   const meshBtn = document.createElement('div');
@@ -338,8 +379,6 @@ function populateUI(statusData) {
       if (step.name.includes(key)) { iconInfo = val; break; }
     }
 
-    const isSketch = step.name.toLowerCase().includes('sketch');
-
     // Feature tree item
     const item = document.createElement('div');
     item.className = 'feature-item';
@@ -352,13 +391,8 @@ function populateUI(statusData) {
     `;
     item.onclick = () => loadStep(i);
 
-    // Put sketches in the sketches folder, features in the main list
-    if (isSketch) {
-      sketchesList.appendChild(item);
-      hasSketch = true;
-    } else {
-      list.appendChild(item);
-    }
+    // All features go in the body list (sketches are inline, like Onshape)
+    list.appendChild(item);
 
     // Timeline step — thumbnail rendered async (no text overlay)
     const tStep = document.createElement('div');
@@ -398,53 +432,75 @@ function populateUI(statusData) {
     // CAD on the right (offset +X) — load last step
     const lastIdx = statusData.steps.length - 1;
     const cadUrl = currentJobId ? `/api/job/${currentJobId}/step/${lastIdx}` : `/api/step/${lastIdx}`;
-    fetch(cadUrl).then(r => r.json()).then(cadData => {
-      if (!cadData.vertices) return;
-      const cadVerts = new Float32Array(cadData.vertices);
-      const cadGeo = new THREE.BufferGeometry();
-      cadGeo.setAttribute('position', new THREE.BufferAttribute(cadVerts, 3));
-      cadGeo.setIndex(cadData.faces);
-      cadGeo.computeVertexNormals();
-      const cadMat = new THREE.MeshPhysicalMaterial({
-        color: 0xC0C8D0, metalness: 0.5, roughness: 0.28,
-        clearcoat: 0.15, reflectivity: 0.6,
-      });
-      const cadObj = new THREE.Mesh(cadGeo, cadMat);
+    console.debug('[compare] fetching CAD step', lastIdx, 'from', cadUrl);
+    fetch(cadUrl).then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + cadUrl);
+      return r.json();
+    }).then(cadData => {
+      if (!cadData.vertices) { console.warn('[compare] CAD step has no vertices'); return; }
+      try {
+        const cadVerts = new Float32Array(cadData.vertices);
+        const cadGeo = new THREE.BufferGeometry();
+        cadGeo.setAttribute('position', new THREE.BufferAttribute(cadVerts, 3));
+        cadGeo.setIndex(cadData.faces);
+        cadGeo.computeVertexNormals();
+        const cadMat = new THREE.MeshPhysicalMaterial({
+          color: 0xC0C8D0, metalness: 0.5, roughness: 0.28,
+          clearcoat: 0.15, reflectivity: 0.6,
+        });
+        const cadObj = new THREE.Mesh(cadGeo, cadMat);
 
-      // Center both, then offset
-      const meshBox = new THREE.Box3().setFromBufferAttribute(meshGeo.attributes.position);
-      const cadBox = new THREE.Box3().setFromBufferAttribute(cadGeo.attributes.position);
-      const meshCenter = meshBox.getCenter(new THREE.Vector3());
-      const cadCenter = cadBox.getCenter(new THREE.Vector3());
-      const meshSize = meshBox.getSize(new THREE.Vector3()).length();
-      const gap = meshSize * 0.3;
+        // Center both, then place side by side with small gap
+        const meshBox = new THREE.Box3().setFromBufferAttribute(meshGeo.attributes.position);
+        const cadBox = new THREE.Box3().setFromBufferAttribute(cadGeo.attributes.position);
+        const meshCenter = meshBox.getCenter(new THREE.Vector3());
+        const cadCenter = cadBox.getCenter(new THREE.Vector3());
+        const meshSize = meshBox.getSize(new THREE.Vector3());
+        const cadSize = cadBox.getSize(new THREE.Vector3());
+        const spacing = Math.max(meshSize.x, cadSize.x) * 0.15; // 15% of widest object
+        const halfGap = (meshSize.x + cadSize.x) / 4 + spacing / 2;
 
-      meshObj.position.set(-gap - meshCenter.x, -meshCenter.y, -meshCenter.z);
-      cadObj.position.set(gap - cadCenter.x, -cadCenter.y, -cadCenter.z);
+        // Center each, then shift left/right
+        meshObj.position.set(-halfGap - meshCenter.x, -meshCenter.y, -meshCenter.z);
+        cadObj.position.set(halfGap - cadCenter.x, -cadCenter.y, -cadCenter.z);
 
-      modelGroup.add(meshObj);
-      modelGroup.add(cadObj);
+        modelGroup.add(meshObj);
+        modelGroup.add(cadObj);
 
-      // Add wireframe to mesh side
-      modelGroup.add(new THREE.LineSegments(
-        new THREE.WireframeGeometry(meshGeo),
-        new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
-      ).translateX(-gap - meshCenter.x).translateY(-meshCenter.y).translateZ(-meshCenter.z));
+        // Add wireframe to mesh side
+        const wire = new THREE.LineSegments(
+          new THREE.WireframeGeometry(meshGeo),
+          new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
+        );
+        wire.position.copy(meshObj.position);
+        modelGroup.add(wire);
 
-      modelGroup.position.set(0, 0, 0);
-      controls.target.set(0, 0, 0);
-      controls.update();
+        // Center the whole group
+        modelGroup.position.set(0, 0, 0);
+        const combinedBox = new THREE.Box3().setFromObject(modelGroup);
+        const combinedCenter = combinedBox.getCenter(new THREE.Vector3());
+        modelGroup.position.sub(combinedCenter);
+
+        // Zoom out to fit both models
+        const combinedSize = combinedBox.getSize(new THREE.Vector3()).length();
+        const camY = Math.max(combinedSize * 0.9, combinedBox.getSize(new THREE.Vector3()).y * 2.0);
+        animateCamera(
+          { x: combinedSize * 0.5, y: camY, z: combinedSize * 0.5 },
+          { x: 0, y: 0, z: 0 },
+          1.0,
+        );
+        console.debug('[compare] split view rendered, spacing:', spacing.toFixed(1), 'combinedSize:', combinedSize.toFixed(1));
+      } catch (e) {
+        console.error('[compare] geometry creation failed', e);
+      }
 
       // Deactivate all steps
       document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
       compareBtn.classList.add('active');
-    }).catch(() => {});
+    }).catch(e => { console.error('[compare] failed to load CAD for split view', e); });
   };
   timeline.appendChild(compareBtn);
-
-  // Show sketches folder if there are sketches
-  sketchesFolder.style.display = hasSketch ? '' : 'none';
 
   // Show body folder if there are features
   const bodyFolder = document.getElementById('body-folder');
@@ -457,30 +513,112 @@ function populateUI(statusData) {
   }
 
   // Render thumbnails sequentially to avoid WebGL race conditions
-  renderThumbQueue();
+  console.debug('[populateUI] queued', thumbQueue.length, 'thumbnails for rendering');
+  renderThumbQueue().then(() => {
+    // Render Mesh thumbnail from saved preview data
+    if (savedMeshPreview) {
+      const url = renderMeshThumbnail(savedMeshPreview.mesh_vertices, savedMeshPreview.mesh_faces);
+      if (url) {
+        meshBtn.style.backgroundImage = `url(${url})`;
+        meshBtn.style.backgroundSize = 'cover';
+        meshBtn.style.backgroundPosition = 'center';
+        meshBtn.querySelector('span').style.display = 'none';
+      }
+    }
+    // Render Compare thumbnail showing both mesh + CAD side by side
+    if (savedMeshPreview && statusData.steps.length > 0) {
+      const lastIdx = statusData.steps.length - 1;
+      const cadUrl2 = currentJobId ? `/api/job/${currentJobId}/step/${lastIdx}` : `/api/step/${lastIdx}`;
+      fetch(cadUrl2).then(r => r.json()).then(cadData => {
+        if (!cadData.vertices) return;
+        try {
+          const ts = new THREE.Scene();
+          const td = document.documentElement.getAttribute('data-theme') === 'dark';
+          ts.background = new THREE.Color(td ? 0x161B22 : 0xF5F5F5);
+          ts.add(new THREE.AmbientLight(0xffffff, 0.5));
+          const tl = new THREE.DirectionalLight(0xffffff, 0.9);
+          tl.position.set(150, 200, 100);
+          ts.add(tl);
+
+          // Mesh side
+          const mv = new Float32Array(savedMeshPreview.mesh_vertices);
+          const mg = new THREE.BufferGeometry();
+          mg.setAttribute('position', new THREE.BufferAttribute(mv, 3));
+          mg.setIndex(savedMeshPreview.mesh_faces);
+          mg.computeVertexNormals();
+          const mm = new THREE.Mesh(mg, new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 }));
+
+          // CAD side
+          const cv = new Float32Array(cadData.vertices);
+          const cg = new THREE.BufferGeometry();
+          cg.setAttribute('position', new THREE.BufferAttribute(cv, 3));
+          cg.setIndex(cadData.faces);
+          cg.computeVertexNormals();
+          const cm = new THREE.Mesh(cg, new THREE.MeshStandardMaterial({ color: 0xB0B8C0, metalness: 0.4, roughness: 0.35 }));
+
+          // Position side by side
+          const mb = new THREE.Box3().setFromBufferAttribute(mg.attributes.position);
+          const cb = new THREE.Box3().setFromBufferAttribute(cg.attributes.position);
+          const mc = mb.getCenter(new THREE.Vector3());
+          const cc = cb.getCenter(new THREE.Vector3());
+          const ms = mb.getSize(new THREE.Vector3());
+          const cs = cb.getSize(new THREE.Vector3());
+          const sp = Math.max(ms.x, cs.x) * 0.15;
+          const hg = (ms.x + cs.x) / 4 + sp / 2;
+          mm.position.set(-hg - mc.x, -mc.y, -mc.z);
+          cm.position.set(hg - cc.x, -cc.y, -cc.z);
+          ts.add(mm);
+          ts.add(cm);
+
+          // Fit camera
+          const tb = new THREE.Box3().setFromObject(ts);
+          const tc = tb.getCenter(new THREE.Vector3());
+          const tsize = tb.getSize(new THREE.Vector3()).length();
+          const tcam = new THREE.PerspectiveCamera(45, 160 / 112, 0.1, 5000);
+          tcam.position.set(tc.x + tsize * 0.7, tc.y + tsize * 0.5, tc.z + tsize * 0.7);
+          tcam.lookAt(tc);
+          thumbRenderer.render(ts, tcam);
+          const url = thumbRenderer.domElement.toDataURL('image/png');
+          compareBtn.style.backgroundImage = `url(${url})`;
+          compareBtn.style.backgroundSize = 'cover';
+          compareBtn.style.backgroundPosition = 'center';
+          compareBtn.querySelector('span').style.display = 'none';
+        } catch (e) { console.warn('[compare thumb] failed', e); }
+      }).catch(() => {});
+    }
+  });
 }
 
 // ── Thumbnail renderer (offscreen, serialized) ──
 const thumbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 thumbRenderer.setSize(160, 112);
 thumbRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+console.debug('[init] Thumbnail renderer created (160x112)');
 let thumbQueue = [];
 let thumbRendering = false;
 
 async function renderThumbQueue() {
   if (thumbRendering) return;
   thumbRendering = true;
+  console.debug('[renderThumbQueue] starting, items:', thumbQueue.length);
+  let rendered = 0;
   while (thumbQueue.length > 0) {
     const { index, element } = thumbQueue.shift();
-    const dataUrl = await renderThumbnail(index);
-    if (dataUrl && element) {
-      element.style.backgroundImage = `url(${dataUrl})`;
-      element.style.backgroundSize = 'cover';
-      element.style.backgroundPosition = 'center';
-      const num = element.querySelector('.step-num');
-      if (num) num.style.display = 'none';
+    try {
+      const dataUrl = await renderThumbnail(index);
+      if (dataUrl && element) {
+        element.style.backgroundImage = `url(${dataUrl})`;
+        element.style.backgroundSize = 'cover';
+        element.style.backgroundPosition = 'center';
+        const num = element.querySelector('.step-num');
+        if (num) num.style.display = 'none';
+        rendered++;
+      }
+    } catch (e) {
+      console.error('[renderThumbQueue] failed for step', index, e);
     }
   }
+  console.debug('[renderThumbQueue] done, rendered:', rendered);
   thumbRendering = false;
 }
 
@@ -488,8 +626,9 @@ async function renderThumbnail(stepIndex) {
   try {
     const url = currentJobId ? `/api/job/${currentJobId}/step/${stepIndex}` : `/api/step/${stepIndex}`;
     const res = await fetch(url);
-    if (!res.ok) return null;
-    const data = await res.json();
+    if (!res.ok) { console.warn('[renderThumbnail] HTTP', res.status, 'for step', stepIndex, url); return null; }
+    let data;
+    try { data = await res.json(); } catch (e) { console.error('[renderThumbnail] JSON parse failed for step', stepIndex, e); return null; }
     if (!data.vertices || data.vertices.length === 0) return null;
 
     const thumbScene = new THREE.Scene();
@@ -547,6 +686,40 @@ async function renderThumbnail(stepIndex) {
   }
 }
 
+// Render a thumbnail from raw mesh vertex/face data (for Mesh button)
+function renderMeshThumbnail(meshVerts, meshFaces) {
+  try {
+    const thumbScene = new THREE.Scene();
+    const thumbIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    thumbScene.background = new THREE.Color(thumbIsDark ? 0x161B22 : 0xF5F5F5);
+    thumbScene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const light = new THREE.DirectionalLight(0xffffff, 0.9);
+    light.position.set(150, 200, 100);
+    thumbScene.add(light);
+
+    const verts = new Float32Array(meshVerts);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geo.setIndex(meshFaces);
+    geo.computeVertexNormals();
+    thumbScene.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 })));
+    thumbScene.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), new THREE.LineBasicMaterial({ color: 0x30363D })));
+
+    const box = new THREE.Box3().setFromObject(thumbScene);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3()).length();
+    if (size < 0.001) return null;
+    const thumbCam = new THREE.PerspectiveCamera(45, 160 / 112, 0.1, 5000);
+    thumbCam.position.set(center.x + size * 0.8, center.y + size * 0.6, center.z + size * 0.8);
+    thumbCam.lookAt(center);
+    thumbRenderer.render(thumbScene, thumbCam);
+    return thumbRenderer.domElement.toDataURL('image/png');
+  } catch (e) {
+    console.warn('[renderMeshThumbnail] failed', e);
+    return null;
+  }
+}
+
 // ── File Upload: two-step flow (preview mesh → analyze & build) ──
 let pendingFile = null;
 let pendingTempPath = null;
@@ -555,6 +728,7 @@ let savedMeshPreview = null; // saved mesh data for comparison view
 document.getElementById('file-input').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  console.debug('[upload] file selected:', file.name, 'size:', (file.size / 1024).toFixed(1), 'KB');
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
@@ -579,17 +753,23 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
           progressDetail.textContent = 'Uploading...';
         }
       };
-      xhr.onload = () => resolve(JSON.parse(xhr.responseText));
-      xhr.onerror = () => reject(new Error('Upload failed'));
+      xhr.onload = () => {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch (parseErr) { console.error('[upload] JSON parse error from preview response', parseErr); reject(parseErr); }
+      };
+      xhr.onerror = () => { console.error('[upload] XHR network error for /api/preview'); reject(new Error('Upload failed')); };
       xhr.send(form);
     });
 
     loading.classList.remove('show');
 
     if (previewRes.error) {
+      console.error('[upload] preview returned error:', previewRes.error);
       alert(previewRes.error);
       return;
     }
+
+    console.debug('[upload] preview received:', previewRes.faces, 'faces,', previewRes.vertices, 'verts, complexity:', previewRes.complexity, 'score:', previewRes.complexity_score);
 
     // AI thinking messages about the uploaded mesh
     addChatMessage('ai', `Loaded ${previewRes.filename || 'mesh'}: ${previewRes.faces.toLocaleString()} faces, ${previewRes.vertices.toLocaleString()} vertices`, true);
@@ -610,7 +790,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       if (json.length < 5_000_000) { // 5MB limit for sessionStorage
         sessionStorage.setItem('paramesh_preview', json);
       }
-    } catch (e) { console.warn('Could not save preview to sessionStorage:', e); }
+    } catch (e) { console.warn('[upload] could not save preview to sessionStorage:', e); }
 
     // Reset UI from any previous job
     document.getElementById('feature-list').innerHTML = '';
@@ -623,6 +803,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     pendingFile = file;
     saveViewerState('preview');
     savedMeshPreview = previewRes;
+    console.debug('[upload] state -> preview, showing raw mesh');
     _showRawMesh(previewRes);
 
     // Show preview info bar with complexity meter
@@ -674,6 +855,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     document.getElementById('empty-state').style.display = 'none';
 
   } catch (err) {
+    console.error('[upload] failed:', err);
     alert('Upload failed: ' + err.message);
     loading.classList.remove('show');
   } finally {
@@ -683,43 +865,56 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 
 // Show raw mesh triangles in the viewer (before pipeline)
 function _showRawMesh(previewRes) {
+  console.debug('[_showRawMesh] verts:', previewRes.mesh_vertices?.length, 'faces:', previewRes.mesh_faces?.length);
   while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
 
-  const verts = new Float32Array(previewRes.mesh_vertices);
-  const faces = previewRes.mesh_faces;
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-  geo.setIndex(faces);
-  geo.computeVertexNormals();
+  try {
+    const verts = new Float32Array(previewRes.mesh_vertices);
+    const faces = previewRes.mesh_faces;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geo.setIndex(faces);
+    geo.computeVertexNormals();
 
-  // Wireframe look — show this is a raw mesh, not a CAD model
-  const mat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
-  modelGroup.add(new THREE.Mesh(geo, mat));
-  modelGroup.add(new THREE.LineSegments(
-    new THREE.WireframeGeometry(geo),
-    new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
-  ));
+    // Wireframe look — show this is a raw mesh, not a CAD model
+    const mat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
+    modelGroup.add(new THREE.Mesh(geo, mat));
+    modelGroup.add(new THREE.LineSegments(
+      new THREE.WireframeGeometry(geo),
+      new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
+    ));
+    console.debug('[_showRawMesh] created mesh + wireframe objects');
+  } catch (e) {
+    console.error('[_showRawMesh] geometry creation failed', e);
+    return;
+  }
 
   // Center model at origin — reset position first to avoid cumulative drift
-  modelGroup.position.set(0, 0, 0);
-  const box = new THREE.Box3().setFromObject(modelGroup);
-  const center = box.getCenter(new THREE.Vector3());
-  modelGroup.position.sub(center);
-  const size = box.getSize(new THREE.Vector3()).length();
+  try {
+    modelGroup.position.set(0, 0, 0);
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    const center = box.getCenter(new THREE.Vector3());
+    modelGroup.position.sub(center);
+    const size = box.getSize(new THREE.Vector3()).length();
 
-  // Smooth animation from current camera position to above-right angle
-  const meshHeight = box.getSize(new THREE.Vector3()).y;
-  const camY = Math.max(size * 1.2, meshHeight * 2.5);
-  animateCamera(
-    { x: size * 0.7, y: camY, z: size * 0.7 },
-    { x: 0, y: 0, z: 0 },
-    1.5,
-  );
+    // Smooth animation from current camera position to above-right angle
+    const meshHeight = box.getSize(new THREE.Vector3()).y;
+    const camY = Math.max(size * 1.2, meshHeight * 2.5);
+    console.debug('[_showRawMesh] centering, bbox size:', size.toFixed(1), 'animating camera');
+    animateCamera(
+      { x: size * 0.7, y: camY, z: size * 0.7 },
+      { x: 0, y: 0, z: 0 },
+      1.5,
+    );
+  } catch (e) {
+    console.error('[_showRawMesh] bounding box / camera setup failed', e);
+  }
 }
 
 // Analyze & Build button handler
 document.getElementById('btn-analyze').addEventListener('click', async () => {
   if (!pendingTempPath) return;
+  console.debug('[analyze] starting pipeline, temp_path:', pendingTempPath);
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
@@ -738,10 +933,13 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ temp_path: pendingTempPath, filename: pendingFile?.name || 'mesh' }),
     });
-    const data = await res.json();
-    if (data.error) { alert(data.error); loading.classList.remove('show'); return; }
+    if (!res.ok) { console.error('[analyze] /api/run-pipeline HTTP', res.status); alert('Pipeline request failed: HTTP ' + res.status); loading.classList.remove('show'); return; }
+    let data;
+    try { data = await res.json(); } catch (e) { console.error('[analyze] JSON parse failed from /api/run-pipeline', e); alert('Pipeline response invalid'); loading.classList.remove('show'); return; }
+    if (data.error) { console.error('[analyze] pipeline error:', data.error); alert(data.error); loading.classList.remove('show'); return; }
 
     currentJobId = data.job_id;
+    console.debug('[analyze] job submitted, id:', currentJobId);
 
     // Show AI thinking process in chat as pipeline runs
     addChatMessage('system', 'Pipeline started — analyzing mesh...');
@@ -776,7 +974,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
 
           if (d.status === 'done') { clearInterval(poll); resolve(d); }
           else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
-        } catch (e) {}
+        } catch (e) { console.warn('[analyze] poll error:', e); }
       }, 500);
     });
 
@@ -803,17 +1001,23 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
 
       // Run slicer comparison in background and show accuracy
       if (currentJobId) {
-        fetch(`/api/job/${currentJobId}/compare`).then(r => r.json()).then(comp => {
+        console.debug('[analyze] requesting slicer comparison for job:', currentJobId);
+        fetch(`/api/job/${currentJobId}/compare`).then(r => {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }).then(comp => {
           if (comp.score !== undefined) {
+            console.debug('[analyze] comparison score:', comp.score.toFixed(1), '%, slices:', comp.per_slice?.length);
             addChatMessage('ai', `🎯 Cross-section accuracy: ${comp.score.toFixed(0)}% (${comp.per_slice?.length || 0} slices compared)`);
           }
-        }).catch(() => {}); // silently skip if comparison fails
+        }).catch(e => { console.warn('[analyze] slicer comparison failed (non-critical):', e.message); });
       }
 
       // Try AI dimension analysis — keep loading visible with status
       loadingText.textContent = 'Analyzing dimensions...';
       progressBar.style.width = '100%';
       try {
+        console.debug('[analyze] requesting AI dimension analysis');
         const analysisRes = await fetch('/api/chat/analyze-mesh', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -825,7 +1029,9 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             features: statusData.steps.map(s => ({ type: s.name, depth: 0 })),
           }),
         });
+        if (!analysisRes.ok) { console.warn('[analyze] dimension analysis HTTP', analysisRes.status); throw new Error('HTTP ' + analysisRes.status); }
         const analysis = await analysisRes.json();
+        console.debug('[analyze] dimension analysis received, skip:', analysis.skip);
 
         if (!analysis.skip) {
           loading.classList.remove('show');
@@ -833,6 +1039,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           return; // Modal will call finishLoad when confirmed
         }
       } catch (err) {
+        console.warn('[analyze] AI dimension analysis unavailable, falling back to bbox:', err.message);
         // AI unavailable — show basic dimension review from bbox
         if (statusData.bbox_min && statusData.bbox_max) {
           const dims = [0,1,2].map(i => Math.abs(statusData.bbox_max[i] - statusData.bbox_min[i]));
@@ -860,22 +1067,36 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       document.getElementById('status-dot').className = 'status-dot';
     }
   } catch (err) {
+    console.error('[analyze] pipeline error:', err);
     alert('Pipeline error: ' + err.message);
     document.getElementById('status-dot').className = 'status-dot';
     loading.classList.remove('show');
   }
 });
 
+// Rerun pipeline with the same mesh
+window.rerunPipeline = function() {
+  if (!pendingTempPath) return;
+  document.getElementById('btn-rerun').style.display = 'none';
+  document.getElementById('btn-analyze').click();
+};
+
 let cachedStatusData = null;
 
 function finishLoad(statusData) {
+  console.debug('[finishLoad] state -> cad, steps:', statusData.steps?.length, 'volume:', statusData.mesh_volume, 'tokens:', statusData.tokens_used);
   cachedStatusData = statusData;
   saveViewerState('cad');
   sessionStorage.removeItem('paramesh_preview'); // clear preview, CAD is now primary
+  // Persist mesh data for Mesh/Compare buttons across refreshes
+  if (savedMeshPreview) {
+    try { sessionStorage.setItem('paramesh_mesh_compare', JSON.stringify(savedMeshPreview)); } catch (e) { /* too large */ }
+  }
   populateUI(statusData);
   document.getElementById('token-count').textContent = statusData.tokens_used;
   document.getElementById('status-dot').className = 'status-dot done';
   document.getElementById('btn-export').disabled = false;
+  document.getElementById('btn-rerun').style.display = pendingTempPath ? '' : 'none';
 
   // Enable chat
   document.getElementById('chat-input').disabled = false;
@@ -887,21 +1108,27 @@ function finishLoad(statusData) {
   if (statusData.steps.length > 0) {
     loadStep(statusData.steps.length - 1).then(() => {
       // Animate camera only when CAD model first loads
-      const box = new THREE.Box3().setFromObject(modelGroup);
-      const s = box.getSize(new THREE.Vector3());
-      const size = s.length();
-      const camY = Math.max(size * 1.2, s.y * 2.5);
-      animateCamera(
-        { x: size * 0.7, y: camY, z: size * 0.7 },
-        { x: 0, y: 0, z: 0 },
-        1.2,
-      );
+      try {
+        const box = new THREE.Box3().setFromObject(modelGroup);
+        const s = box.getSize(new THREE.Vector3());
+        const size = s.length();
+        const camY = Math.max(size * 1.2, s.y * 2.5);
+        console.debug('[finishLoad] model loaded, bbox size:', size.toFixed(1), 'animating camera');
+        animateCamera(
+          { x: size * 0.7, y: camY, z: size * 0.7 },
+          { x: 0, y: 0, z: 0 },
+          1.2,
+        );
+      } catch (e) {
+        console.error('[finishLoad] camera animation failed', e);
+      }
     });
   }
 }
 
 // ── Dimension Review Modal ──
 function showDimensionModal(analysis, statusData) {
+  console.debug('[showDimensionModal] part_type:', analysis.part_type, 'dims:', Object.keys(analysis.suggested_dimensions || {}));
   cachedStatusData = statusData;
   const modal = document.getElementById('dim-modal');
   const rows = document.getElementById('dim-rows');
@@ -960,6 +1187,7 @@ function addChatMessage(role, text, isThinking = false) {
 async function sendChatMessage() {
   const text = chatInput.value.trim();
   if (!text) return;
+  console.debug('[sendChat] sending message, length:', text.length);
 
   addChatMessage('user', text);
   chatInput.value = '';
@@ -975,16 +1203,21 @@ async function sendChatMessage() {
 
   try {
     const statusRes = await fetch('/api/status');
-    const context = await statusRes.json();
+    if (!statusRes.ok) console.warn('[sendChat] /api/status HTTP', statusRes.status);
+    let context;
+    try { context = await statusRes.json(); } catch (e) { console.error('[sendChat] failed to parse /api/status response', e); context = {}; }
 
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: text, context }),
     });
-    const data = await res.json();
+    if (!res.ok) { console.error('[sendChat] /api/chat HTTP', res.status); throw new Error('Chat request failed: HTTP ' + res.status); }
+    let data;
+    try { data = await res.json(); } catch (e) { console.error('[sendChat] JSON parse failed from /api/chat', e); throw e; }
 
     typing.remove();
+    console.debug('[sendChat] reply received, length:', data.reply?.length);
     addChatMessage('ai', data.reply);
 
     // Update token count
@@ -998,6 +1231,7 @@ async function sendChatMessage() {
       // TODO: re-run pipeline with modified params and refresh viewer
     }
   } catch (err) {
+    console.error('[sendChat] error:', err);
     typing.remove();
     addChatMessage('ai', `Error: ${err.message}`);
   } finally {
@@ -1011,12 +1245,15 @@ chatSend.addEventListener('click', sendChatMessage);
 
 // ── Settings modal ──
 window.openSettings = async function() {
+  console.debug('[openSettings] opening settings modal');
   const modal = document.getElementById('settings-modal');
   modal.classList.add('show');
 
   try {
     const res = await fetch('/api/usage');
+    if (!res.ok) { console.error('[openSettings] /api/usage HTTP', res.status); return; }
     const u = await res.json();
+    console.debug('[openSettings] usage loaded, plan:', u.plan, 'daily:', u.daily);
 
     const limit = u.tokens_limit > 0 ? u.tokens_limit : 100;
 
@@ -1032,7 +1269,7 @@ window.openSettings = async function() {
     fillBar('bar-week', 'num-week', 'lim-week', u.weekly, limit);
     // Month
     fillBar('bar-month', 'num-month', 'lim-month', u.monthly, limit);
-  } catch (e) {}
+  } catch (e) { console.error('[openSettings] failed to load usage data', e); }
 };
 
 function fillBar(barId, numId, limId, spent, limit) {
@@ -1117,12 +1354,14 @@ function saveViewerState(state) {
 }
 
 async function autoLoad() {
+  console.debug('[autoLoad] checking for saved state...');
   // Check sessionStorage for a saved mesh preview
   const saved = sessionStorage.getItem('paramesh_preview');
   if (saved) {
     try {
       const previewRes = JSON.parse(saved);
       if (previewRes.mesh_vertices && previewRes.mesh_vertices.length > 0) {
+        console.debug('[autoLoad] restoring preview from sessionStorage, verts:', previewRes.mesh_vertices.length);
         document.getElementById('empty-state').style.display = 'none';
         _showRawMesh(previewRes);
         pendingTempPath = previewRes.temp_path;
@@ -1132,20 +1371,29 @@ async function autoLoad() {
         return; // DONE — skip CAD load entirely
       }
     } catch (e) {
-      console.error('Preview restore error:', e);
+      console.error('[autoLoad] preview restore failed:', e);
     }
   }
   // No preview — load last completed CAD job
+  console.debug('[autoLoad] no preview found, checking /api/status for last CAD job');
   try {
     const res = await fetch('/api/status');
-    if (!res.ok) return;
-    const data = await res.json();
+    if (!res.ok) { console.debug('[autoLoad] /api/status HTTP', res.status, '- no previous job'); return; }
+    let data;
+    try { data = await res.json(); } catch (e) { console.error('[autoLoad] JSON parse failed from /api/status', e); return; }
     if (data.status === 'done' && data.steps && data.steps.length > 0) {
       currentJobId = data.job_id || null;
+      console.debug('[autoLoad] restoring CAD job:', currentJobId, 'steps:', data.steps.length);
       document.getElementById('empty-state').style.display = 'none';
+      // Restore mesh data for Mesh/Compare buttons
+      const savedMesh = sessionStorage.getItem('paramesh_mesh_compare');
+      if (savedMesh) {
+        try { savedMeshPreview = JSON.parse(savedMesh); console.debug('[autoLoad] restored mesh compare data'); } catch (e) { /* ignore */ }
+      }
       // Load the last viewed step (saved in localStorage)
       const lastStep = parseInt(localStorage.getItem('paramesh_last_step') || '-1');
       if (lastStep >= 0 && lastStep < data.steps.length) {
+        console.debug('[autoLoad] restoring last step:', lastStep);
         populateUI(data);
         cachedStatusData = data;
         document.getElementById('status-dot').className = 'status-dot done';
@@ -1153,25 +1401,38 @@ async function autoLoad() {
         document.getElementById('chat-input').disabled = false;
         document.getElementById('chat-send').disabled = false;
         loadStep(lastStep).then(() => {
-          // Fit camera to model after autoLoad
-          const box = new THREE.Box3().setFromObject(modelGroup);
-          const s = box.getSize(new THREE.Vector3());
-          const size = s.length();
-          const camY = Math.max(size * 1.2, s.y * 2.5);
-          camera.position.set(size * 0.7, camY, size * 0.7);
-          controls.target.set(0, 0, 0);
-          controls.update();
+          // Fit camera to loaded model using smooth animation
+          try {
+            const box = new THREE.Box3().setFromObject(modelGroup);
+            const s = box.getSize(new THREE.Vector3());
+            const size = s.length();
+            if (size > 0) {
+              const camY = Math.max(size * 1.2, s.y * 2.5);
+              console.debug('[autoLoad] camera fit, bbox size:', size.toFixed(1));
+              animateCamera(
+                { x: size * 0.7, y: camY, z: size * 0.7 },
+                { x: 0, y: 0, z: 0 },
+                1.2,
+              );
+            }
+          } catch (e) {
+            console.error('[autoLoad] camera animation failed', e);
+          }
         });
       } else {
+        console.debug('[autoLoad] no valid last step, calling finishLoad');
         finishLoad(data);
       }
+    } else {
+      console.debug('[autoLoad] no completed job found, status:', data.status);
     }
-  } catch (e) { /* no previous job */ }
+  } catch (e) { console.debug('[autoLoad] no previous job available:', e.message); }
 }
 // ── Camera animation system (must be before autoLoad) ──
 let cameraAnim = null;
 
 function animateCamera(endPos, endTarget, duration = 1.5) {
+  console.debug('[animateCamera] to:', endPos, 'target:', endTarget, 'duration:', duration + 's');
   cameraAnim = {
     startPos: camera.position.clone(),
     endPos: new THREE.Vector3(endPos.x, endPos.y, endPos.z),
@@ -1198,8 +1459,26 @@ function animate() {
     if (t >= 1) cameraAnim = null;
   }
 
+  // Smooth zoom interpolation
+  if (_zoomTargetDist !== null) {
+    const dir = camera.position.clone().sub(controls.target);
+    const curDist = dir.length();
+    const newDist = curDist + ((_zoomTargetDist - curDist) * ZOOM_LERP);
+    if (Math.abs(newDist - _zoomTargetDist) < 0.5) {
+      dir.normalize().multiplyScalar(_zoomTargetDist);
+      _zoomTargetDist = null;
+    } else {
+      dir.normalize().multiplyScalar(newDist);
+    }
+    camera.position.copy(controls.target).add(dir);
+  }
+
   controls.update();
   renderer.render(scene, camera);
+
+  // Expose camera distance for debugging
+  window._camDist = camera.position.distanceTo(controls.target);
+  window._camPos = { x: camera.position.x.toFixed(1), y: camera.position.y.toFixed(1), z: camera.position.z.toFixed(1) };
 
   // Sync axis gizmo rotation with main camera
   axisCamera.position.copy(camera.position).sub(controls.target).normalize().multiplyScalar(5);

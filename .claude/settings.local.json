@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_stage4_topology.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_stage3_fit.py -v --tb=short)",
+      "Bash(python run_visuals.py --stage 4 --visual-only)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(python -m pytest tests/test_stage5_features.py -v --tb=short)",
+      "Bash(python run_visuals.py --stage 5 --visual-only)",
+      "Bash(python -m pytest tests/test_stage6_export.py -v --tb=short)",
+      "Bash(python run_visuals.py --stage 6 --visual-only)",
+      "Bash(python -c \"import cadquery; print\\(cadquery.__version__\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"from mesh2param.ai import is_available; print\\(''CLI available:'', is_available\\(\\)\\)\")",
+      "Bash(python -m pytest tests/test_stage6_export.py -v --tb=short -q)",
+      "Bash(python -m pytest tests/test_stage6_export.py -q --tb=short)",
+      "Bash(python tests/debug_holes.py)"
+    ]
+  }
+}

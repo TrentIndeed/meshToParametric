@@ -84,22 +84,32 @@ def _get_user_plan(request) -> str:
         from mesh2param.db.database import SessionLocal
         db = SessionLocal()
         try:
-            return get_user_plan(token, db)
+            plan = get_user_plan(token, db)
+            logger.debug("Resolved user plan=%s from auth cookie", plan)
+            return plan
         finally:
             db.close()
     except Exception:
+        logger.exception("Failed to resolve user plan from auth cookie")
         return "free"
     _ip_jobs[ip] = _ip_jobs.get(ip, 0) + 1
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    logger.info("Starting Paramesh AI server")
+    try:
+        init_db()
+    except Exception:
+        logger.exception("Failed to initialize database on startup")
+        raise
     # Load completed jobs from DB so they survive restarts
     queue.load_completed_from_db()
     # Charge IP when jobs complete
     queue.set_on_complete(lambda job: _charge_ip(job.client_ip, job.token_cost) if job.client_ip else None)
+    logger.info("Server startup complete")
     yield
+    logger.info("Server shutting down")
 
 
 app = FastAPI(title="Paramesh AI", lifespan=lifespan)
@@ -162,8 +172,15 @@ async def contact_page():
 def _load_learn_data():
     import json
     path = STATIC_DIR / "learn-data.json"
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error("Learn data file not found: %s", path)
+        return []
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse learn data JSON: %s", path)
+        return []
 
 def _render_learn_page(entry, all_entries):
     """Server-render a learn page by replacing template placeholders."""
@@ -262,14 +279,18 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
     """
     import trimesh
 
-    # Check IP limits before processing
-    plan = _get_user_plan(request)
     ip = _get_client_ip(request)
+    plan = _get_user_plan(request)
+    logger.debug("Preview request: filename=%r ip=%s plan=%s", file.filename, ip, plan)
+
+    # Check IP limits before processing
     ok, reason = _check_ip_limit(ip, plan)
     if not ok:
+        logger.debug("Preview rejected for ip=%s: %s", ip, reason)
         return JSONResponse({"status": "error", "error": reason}, status_code=403)
 
     content = await file.read()
+    logger.debug("Preview file received: %r size=%d bytes", file.filename, len(content))
     suffix = Path(file.filename).suffix
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp.write(content)
@@ -388,6 +409,7 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
             "mesh_faces": cleaned.faces.flatten().tolist(),
         }
     except Exception as e:
+        logger.exception("Preview failed for file %r", file.filename)
         Path(tmp.name).unlink(missing_ok=True)
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
@@ -397,6 +419,8 @@ async def run_pipeline(request: Request, body: dict):
     """Run the full pipeline on a previously previewed mesh. Takes temp_path from /api/preview."""
     plan = _get_user_plan(request)
     ip = _get_client_ip(request)
+    logger.debug("Run-pipeline request: filename=%r ip=%s plan=%s",
+                 body.get("filename"), ip, plan)
     ok, reason = _check_ip_limit(ip, plan)
     if not ok:
         return JSONResponse({"status": "error", "error": reason}, status_code=403)
@@ -413,6 +437,7 @@ async def run_pipeline(request: Request, body: dict):
         return JSONResponse({"status": "error", "error": "No mesh to process. Upload first."}, status_code=400)
 
     job_id = queue.submit(filename, temp_path, client_ip=ip)
+    logger.info("Pipeline queued: job_id=%s filename=%r ip=%s", job_id, filename, ip)
     return {"status": "queued", "job_id": job_id}
 
 
@@ -421,6 +446,7 @@ async def upload(request: Request, file: UploadFile = File(...)):
     """Submit a mesh for pipeline processing. Returns a job ID to poll."""
     plan = _get_user_plan(request)
     ip = _get_client_ip(request)
+    logger.debug("Upload request: filename=%r ip=%s plan=%s", file.filename, ip, plan)
     ok, reason = _check_ip_limit(ip, plan)
     if not ok:
         return JSONResponse({"status": "error", "error": reason}, status_code=403)
@@ -445,6 +471,8 @@ async def upload(request: Request, file: UploadFile = File(...)):
     tmp.close()
 
     job_id = queue.submit(file.filename, tmp.name, client_ip=ip)
+    logger.info("Upload queued: job_id=%s filename=%r size=%d ip=%s",
+                job_id, file.filename, len(content), ip)
     return {"status": "queued", "job_id": job_id}
 
 
@@ -466,6 +494,7 @@ async def job_status(job_id: str):
 
     return {
         "job_id": job.id,
+        "filename": job.filename,
         "status": job.status,
         "progress": job.progress,
         "stage": job.progress_stage,
@@ -671,9 +700,11 @@ async def usage_status(request: Request):
 @app.post("/api/clean")
 async def clean_mesh(file: UploadFile = File(...)):
     import trimesh
+    logger.debug("Clean request: filename=%r", file.filename)
     suffix = Path(file.filename).suffix
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     content = await file.read()
+    logger.debug("Clean file received: %r size=%d bytes", file.filename, len(content))
     tmp.write(content)
     tmp.close()
     try:
@@ -696,6 +727,7 @@ async def clean_mesh(file: UploadFile = File(...)):
             "faces": cleaned.faces.flatten().tolist(),
         })
     except Exception as e:
+        logger.exception("Clean failed for file %r", file.filename)
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
     finally:
         Path(tmp.name).unlink(missing_ok=True)
@@ -704,6 +736,9 @@ async def clean_mesh(file: UploadFile = File(...)):
 @app.post("/api/clean/resize")
 async def resize_mesh(body: dict):
     import trimesh
+    logger.debug("Resize request: scale=%s target_dims=%s/%s/%s",
+                 body.get("scale"), body.get("target_width"),
+                 body.get("target_height"), body.get("target_depth"))
     vertices = body.get("vertices", [])
     faces = body.get("faces", [])
     scale = body.get("scale", 1.0)
@@ -742,6 +777,7 @@ async def download_cleaned(filename: str):
 async def waitlist(body: dict):
     from mesh2param.db.database import SessionLocal, WaitlistEntry
     email = body.get("email", "").strip().lower()
+    logger.debug("Waitlist request: email=%r", email)
     if not email or "@" not in email:
         return JSONResponse({"error": "Valid email required"}, status_code=400)
     db = SessionLocal()
@@ -750,7 +786,11 @@ async def waitlist(body: dict):
         if not existing:
             db.add(WaitlistEntry(email=email))
             db.commit()
+            logger.info("New waitlist signup: %s", email)
         return {"status": "ok", "message": "You're on the list"}
+    except Exception:
+        logger.exception("Database error adding to waitlist: %s", email)
+        return JSONResponse({"status": "error", "error": "Failed to join waitlist"}, status_code=500)
     finally:
         db.close()
 
@@ -769,8 +809,10 @@ async def changelog_api():
             parts = line.split("|", 2)
             if len(parts) == 3:
                 commits.append({"hash": parts[0][:8], "date": parts[1], "message": parts[2]})
+        logger.debug("Changelog: returned %d commits", len(commits))
         return {"commits": commits}
     except Exception:
+        logger.exception("Failed to fetch git changelog")
         return {"commits": []}
 
 
@@ -784,6 +826,8 @@ async def contact_form(body: dict):
     name = body.get("name", "").strip()
     email = body.get("email", "").strip()
     message = body.get("message", "").strip()
+    logger.debug("Contact form submission: name=%r email=%r msg_len=%d",
+                 name, email, len(message))
 
     if not name or not email or not message:
         return JSONResponse({"error": "All fields required"}, status_code=400)
@@ -794,6 +838,10 @@ async def contact_form(body: dict):
         ticket = SupportTicket(name=name, email=email, message=message)
         db.add(ticket)
         db.commit()
+        logger.info("Support ticket saved: name=%r email=%r", name, email)
+    except Exception:
+        logger.exception("Failed to save support ticket from %r", email)
+        return JSONResponse({"status": "error", "error": "Failed to save message"}, status_code=500)
     finally:
         db.close()
 
@@ -828,6 +876,7 @@ async def support_chat(body: dict):
     from mesh2param.ai import is_available, call_ai
 
     message = body.get("message", "").strip()
+    logger.debug("Support chat: message_len=%d", len(message))
     if not message:
         return {"reply": "Please type a question."}
 
@@ -884,6 +933,7 @@ User question: {message}"""
                 pass
         return {"reply": reply}
     except Exception as e:
+        logger.exception("Support chat AI call failed")
         return {"reply": "I'm having trouble connecting right now. Please try /contact to reach us directly."}
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class SurfaceType(Enum):
@@ -29,15 +32,31 @@ class FaceRegion:
     normals: np.ndarray  # (N, 3) float64 — per-face normals for faces in this region
     boundary_edges: list[tuple[int, int]] = field(default_factory=list)
 
+    def __post_init__(self):
+        logger.debug(
+            "FaceRegion %d created: type=%s, %d faces, %d vertices, %d boundary edges",
+            self.region_id,
+            self.surface_type.value,
+            len(self.face_indices),
+            len(self.vertices),
+            len(self.boundary_edges),
+        )
+        if len(self.face_indices) == 0:
+            logger.warning("FaceRegion %d has zero faces", self.region_id)
+
     @property
     def num_faces(self) -> int:
         return len(self.face_indices)
 
     def to_dict(self) -> dict:
-        return {
-            "region_id": self.region_id,
-            "num_faces": self.num_faces,
-            "surface_type": self.surface_type.value,
-            "num_vertices": len(self.vertices),
-            "num_boundary_edges": len(self.boundary_edges),
-        }
+        try:
+            return {
+                "region_id": self.region_id,
+                "num_faces": self.num_faces,
+                "surface_type": self.surface_type.value,
+                "num_vertices": len(self.vertices),
+                "num_boundary_edges": len(self.boundary_edges),
+            }
+        except Exception:
+            logger.exception("FaceRegion.to_dict failed for region_id=%s", self.region_id)
+            raise

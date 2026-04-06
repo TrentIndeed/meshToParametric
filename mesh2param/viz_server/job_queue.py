@@ -77,6 +77,7 @@ class JobQueue:
         """Submit a new job. Returns job ID."""
         job_id = uuid.uuid4().hex[:12]
         job = Job(id=job_id, filename=filename, file_path=file_path, client_ip=client_ip)
+        logger.info("Job submitted: id=%s filename=%r ip=%s", job_id, filename, client_ip)
 
         with self._lock:
             self._jobs[job_id] = job
@@ -88,6 +89,8 @@ class JobQueue:
                         to_remove.append(jid)
                 for jid in to_remove:
                     del self._jobs[jid]
+                if to_remove:
+                    logger.debug("Evicted %d old jobs from memory", len(to_remove))
 
         self._queue.put(job_id)
         return job_id
@@ -131,25 +134,31 @@ class JobQueue:
         from mesh2param.pipeline.recognize import recognize_features
 
         job.status = "processing"
+        logger.info("Pipeline started for job %s (file=%r)", job.id, job.filename)
 
         job.progress = 10
         job.progress_stage = "Ingesting mesh..."
+        logger.debug("Job %s: stage=ingest file=%s", job.id, job.file_path)
         cleaned = ingest_mesh(job.file_path, IngestConfig(remesh=False))
 
         job.progress = 25
         job.progress_stage = "Segmenting surfaces..."
+        logger.debug("Job %s: stage=segment faces=%d", job.id, cleaned.num_faces)
         regions = segment_mesh(cleaned, SegmentConfig())
 
         job.progress = 40
         job.progress_stage = "Fitting primitives..."
+        logger.debug("Job %s: stage=fit regions=%d", job.id, len(regions))
         fitted = fit_surfaces(regions, cleaned, FitConfig())
 
         job.progress = 55
         job.progress_stage = "Building topology..."
+        logger.debug("Job %s: stage=topology fitted=%d", job.id, len(fitted))
         graph, edges = build_topology(regions, fitted, cleaned, TopologyConfig())
 
         job.progress = 65
         job.progress_stage = "Recognizing features..."
+        logger.debug("Job %s: stage=recognize edges=%d", job.id, len(edges))
         tree = recognize_features(regions, fitted, graph, edges, cleaned, RecognizeConfig())
 
         job.features = tree
@@ -160,11 +169,16 @@ class JobQueue:
 
         job.progress = 75
         job.progress_stage = "Building CAD model..."
+        logger.debug("Job %s: stage=cadquery features=%d", job.id, len(tree.features))
 
         # CadQuery in subprocess
-        tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-        pickle.dump((tree, cleaned), tmp_in)
-        tmp_in.close()
+        try:
+            tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            pickle.dump((tree, cleaned), tmp_in)
+            tmp_in.close()
+        except Exception:
+            logger.exception("Job %s: failed to serialize pipeline data for CadQuery subprocess", job.id)
+            raise
 
         tmp_out = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
         tmp_out.close()
@@ -180,18 +194,37 @@ result.solid = None
 with open(r'{tmp_out.name}', 'wb') as f:
     pickle.dump(result, f)
 """
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=180,
-        )
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Job %s: CadQuery subprocess timed out after 180s", job.id)
+            Path(tmp_in.name).unlink(missing_ok=True)
+            Path(tmp_out.name).unlink(missing_ok=True)
+            raise RuntimeError("CadQuery subprocess timed out after 180s")
+        except Exception:
+            logger.exception("Job %s: CadQuery subprocess failed to launch", job.id)
+            Path(tmp_in.name).unlink(missing_ok=True)
+            Path(tmp_out.name).unlink(missing_ok=True)
+            raise
         Path(tmp_in.name).unlink(missing_ok=True)
 
         if proc.returncode != 0:
+            logger.error("Job %s: CadQuery subprocess failed (exit %d): %s",
+                         job.id, proc.returncode, proc.stderr[-300:])
+            Path(tmp_out.name).unlink(missing_ok=True)
             raise RuntimeError(f"CadQuery failed: {proc.stderr[-300:]}")
 
-        with open(tmp_out.name, "rb") as f:
-            result = pickle.load(f)
-        Path(tmp_out.name).unlink(missing_ok=True)
+        try:
+            with open(tmp_out.name, "rb") as f:
+                result = pickle.load(f)
+        except Exception:
+            logger.exception("Job %s: failed to deserialize CadQuery output", job.id)
+            raise
+        finally:
+            Path(tmp_out.name).unlink(missing_ok=True)
 
         job.steps = result.construction_steps
         job.cad_volume = result.cad_volume
@@ -214,6 +247,8 @@ with open(r'{tmp_out.name}', 'wb') as f:
         self._tokens_spent += cost
 
         job.status = "done"
+        logger.info("Pipeline completed for job %s: %d steps, token_cost=%d",
+                     job.id, len(job.steps), job.token_cost)
 
         # Persist to SQLite
         self._save_to_db(job)
@@ -223,7 +258,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
             try:
                 self._on_complete(job)
             except Exception:
-                pass
+                logger.exception("Job %s: on_complete callback failed", job.id)
 
     # ── Database persistence ──
 
@@ -269,7 +304,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
                         job.bbox_min = json.loads(db_job.bbox_min_json) if db_job.bbox_min_json else [0, 0, 0]
                         job.bbox_max = json.loads(db_job.bbox_max_json) if db_job.bbox_max_json else [0, 0, 0]
                     except Exception:
-                        pass
+                        logger.debug("Failed to parse bbox JSON for job %s, using defaults", job_id)
 
                     # Restore construction steps
                     db_steps = (
@@ -287,13 +322,15 @@ with open(r'{tmp_out.name}', 'wb') as f:
                                 shape = tuple(int(x) for x in db_step.vertices_shape.split(","))
                                 tess_verts = np.frombuffer(db_step.vertices_blob, dtype=np.float64).reshape(shape)
                             except Exception:
-                                pass
+                                logger.debug("Failed to deserialize vertices for job %s step %s",
+                                             job_id, db_step.step_index)
                         if db_step.faces_blob and db_step.faces_shape:
                             try:
                                 shape = tuple(int(x) for x in db_step.faces_shape.split(","))
                                 tess_faces = np.frombuffer(db_step.faces_blob, dtype=np.int64).reshape(shape)
                             except Exception:
-                                pass
+                                logger.debug("Failed to deserialize faces for job %s step %s",
+                                             job_id, db_step.step_index)
                         steps.append(ConstructionStep(
                             name=db_step.name,
                             tess_vertices=tess_verts if tess_verts is not None else np.array([]),
@@ -423,7 +460,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
                     job.bbox_min = json.loads(db_job.bbox_min_json) if db_job.bbox_min_json else [0, 0, 0]
                     job.bbox_max = json.loads(db_job.bbox_max_json) if db_job.bbox_max_json else [0, 0, 0]
                 except Exception:
-                    pass
+                    logger.debug("Failed to parse bbox JSON for single-load job %s", job_id)
 
                 db_steps = (
                     db.query(DBJobStep)
@@ -440,13 +477,15 @@ with open(r'{tmp_out.name}', 'wb') as f:
                             shape = tuple(int(x) for x in db_step.vertices_shape.split(","))
                             tess_verts = np.frombuffer(db_step.vertices_blob, dtype=np.float64).reshape(shape)
                         except Exception:
-                            pass
+                            logger.debug("Failed to deserialize vertices for job %s step %s (single-load)",
+                                         job_id, db_step.step_index)
                     if db_step.faces_blob and db_step.faces_shape:
                         try:
                             shape = tuple(int(x) for x in db_step.faces_shape.split(","))
                             tess_faces = np.frombuffer(db_step.faces_blob, dtype=np.int64).reshape(shape)
                         except Exception:
-                            pass
+                            logger.debug("Failed to deserialize faces for job %s step %s (single-load)",
+                                         job_id, db_step.step_index)
                     steps.append(ConstructionStep(
                         name=db_step.name,
                         tess_vertices=tess_verts if tess_verts is not None else np.array([]),
@@ -468,12 +507,16 @@ with open(r'{tmp_out.name}', 'wb') as f:
     @staticmethod
     def _estimate_volume(cleaned) -> float:
         import trimesh
-        mesh = trimesh.Trimesh(
-            vertices=cleaned.vertices, faces=cleaned.faces, process=False,
-        )
-        if mesh.is_watertight:
-            return abs(float(mesh.volume))
-        return abs(float(mesh.convex_hull.volume))
+        try:
+            mesh = trimesh.Trimesh(
+                vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+            )
+            if mesh.is_watertight:
+                return abs(float(mesh.volume))
+            return abs(float(mesh.convex_hull.volume))
+        except Exception:
+            logger.exception("Failed to estimate mesh volume")
+            return 0.0
 
 
 # Singleton

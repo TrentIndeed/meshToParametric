@@ -43,13 +43,27 @@ def ingest_mesh(
         config = IngestConfig()
 
     path = Path(file_path)
+    logger.debug("ingest_mesh called: file_path=%s, config=%s", path, config)
+
     _validate_file(path)
 
-    mesh = _load_mesh(path)
-    mesh = _remove_degenerate_faces(mesh, config.min_face_area)
-    mesh = _merge_vertices(mesh, config.merge_tolerance)
-    mesh = _fix_normals(mesh)
-    mesh = _fill_holes(mesh, config.max_hole_edges)
+    try:
+        mesh = _load_mesh(path)
+    except Exception:
+        logger.exception("Stage 1 failed during mesh loading: file=%s", path)
+        raise
+
+    try:
+        mesh = _remove_degenerate_faces(mesh, config.min_face_area)
+        mesh = _merge_vertices(mesh, config.merge_tolerance)
+        mesh = _fix_normals(mesh)
+        mesh = _fill_holes(mesh, config.max_hole_edges)
+    except Exception:
+        logger.exception(
+            "Stage 1 failed during mesh cleanup: file=%s, verts=%d, faces=%d",
+            path, len(mesh.vertices), len(mesh.faces),
+        )
+        raise
 
     if config.remesh:
         mesh = _remesh(mesh, config.target_edge_ratio)
@@ -57,7 +71,12 @@ def ingest_mesh(
     # Re-fix normals after remeshing since it can introduce inconsistencies
     mesh = _fix_normals(mesh)
 
-    return _build_cleaned_mesh(mesh, path)
+    result = _build_cleaned_mesh(mesh, path)
+    logger.debug(
+        "ingest_mesh completed: verts=%d, faces=%d, watertight=%s",
+        len(result.vertices), len(result.faces), result.is_watertight,
+    )
+    return result
 
 
 def _validate_file(path: Path) -> None:
@@ -71,6 +90,7 @@ def _validate_file(path: Path) -> None:
 
 
 def _load_mesh(path: Path) -> trimesh.Trimesh:
+    logger.debug("Loading mesh file: %s (%.1f KB)", path, path.stat().st_size / 1024)
     loaded = trimesh.load(str(path))
 
     # 3MF and some formats return a Scene; extract the first mesh geometry
@@ -119,14 +139,25 @@ def _merge_vertices(mesh: trimesh.Trimesh, tolerance: float) -> trimesh.Trimesh:
 
 
 def _fix_normals(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    trimesh.repair.fix_winding(mesh)
-    trimesh.repair.fix_normals(mesh)
+    try:
+        trimesh.repair.fix_winding(mesh)
+        trimesh.repair.fix_normals(mesh)
+    except Exception:
+        logger.exception("Normal repair failed: verts=%d, faces=%d", len(mesh.vertices), len(mesh.faces))
+        raise
     return mesh
 
 
 def _fill_holes(mesh: trimesh.Trimesh, max_hole_edges: int) -> trimesh.Trimesh:
     if not mesh.is_watertight:
-        trimesh.repair.fill_holes(mesh)
+        try:
+            trimesh.repair.fill_holes(mesh)
+        except Exception:
+            logger.exception(
+                "Hole filling raised an exception: verts=%d, faces=%d",
+                len(mesh.vertices), len(mesh.faces),
+            )
+            raise
         if mesh.is_watertight:
             logger.info("Filled holes — mesh is now watertight")
         else:
@@ -169,6 +200,10 @@ def _remesh(mesh: trimesh.Trimesh, target_edge_ratio: float) -> trimesh.Trimesh:
 
 
 def _build_cleaned_mesh(mesh: trimesh.Trimesh, source_path: Path) -> CleanedMesh:
+    logger.debug(
+        "Building CleanedMesh: verts=%d, faces=%d, watertight=%s",
+        len(mesh.vertices), len(mesh.faces), mesh.is_watertight,
+    )
     return CleanedMesh(
         vertices=np.array(mesh.vertices, dtype=np.float64),
         faces=np.array(mesh.faces, dtype=np.int64),

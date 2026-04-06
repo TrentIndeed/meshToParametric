@@ -45,16 +45,33 @@ def fit_surfaces(
     if config is None:
         config = FitConfig()
 
+    logger.debug(
+        "fit_surfaces called: %d regions, bbox_diagonal=%.4f",
+        len(regions), cleaned.bbox_diagonal,
+    )
+
     bbox_diag = cleaned.bbox_diagonal
     rms_tol = config.rms_tolerance_ratio * bbox_diag
     inlier_thresh = config.ransac_inlier_threshold_ratio * bbox_diag
+    logger.debug("Fit tolerances: rms_tol=%.6f, inlier_thresh=%.6f", rms_tol, inlier_thresh)
 
     results = []
     for region in regions:
         points = region.vertices
         normals = region.normals
+        logger.debug(
+            "Fitting region %d: type=%s, points=%d, normals=%d",
+            region.region_id, region.surface_type.value, len(points), len(normals),
+        )
 
-        fitted = _fit_region(region, points, normals, config, rms_tol, inlier_thresh)
+        try:
+            fitted = _fit_region(region, points, normals, config, rms_tol, inlier_thresh)
+        except Exception:
+            logger.exception(
+                "Stage 3 failed fitting region %d (type=%s, points=%d)",
+                region.region_id, region.surface_type.value, len(points),
+            )
+            raise
 
         # Try alternative types if RMS exceeds tolerance
         if config.try_alternative_types and fitted.rms_error > rms_tol:
@@ -93,6 +110,7 @@ def fit_surfaces(
             region.region_id, fitted.surface_type.value, fitted.rms_error, rms_tol,
         )
 
+    logger.debug("fit_surfaces completed: %d surfaces fitted", len(results))
     return results
 
 
@@ -329,7 +347,7 @@ def _fit_sphere(
         center = result.x[:3]
         radius = abs(result.x[3])
     except Exception:
-        pass
+        logger.debug("Sphere least-squares refinement failed for %d points, using algebraic fit", n)
 
     dists = np.abs(np.linalg.norm(points - center, axis=1) - radius)
     rms = float(np.sqrt(np.mean(dists ** 2)))
@@ -467,7 +485,10 @@ def _refine_cylinder(
         axis_dir = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
         radius = abs(p[5])
     except Exception:
-        pass
+        logger.debug(
+            "Cylinder least-squares refinement failed: axis_point=%s, radius=%.4f, %d points",
+            axis_point.tolist(), radius, len(points),
+        )
 
     return axis_point, axis_dir, radius
 
@@ -594,7 +615,10 @@ def _refine_cone(
         axis_dir = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
         half_angle = abs(p[5])
     except Exception:
-        pass
+        logger.debug(
+            "Cone least-squares refinement failed: apex=%s, half_angle=%.4f, %d points",
+            apex.tolist(), half_angle, len(points),
+        )
 
     return apex, axis_dir, half_angle
 

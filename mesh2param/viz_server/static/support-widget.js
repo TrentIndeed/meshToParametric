@@ -56,7 +56,7 @@
       <button onclick="document.getElementById('pw-panel').classList.remove('open')">&times;</button>
     </div>
     <div id="pw-msgs">
-      <div class="pw-msg bot">Hey! I can help with questions about Paramesh AI — features, pricing, mesh formats, troubleshooting. Ask away.</div>
+      <div class="pw-msg bot">Having an issue or question about Paramesh AI? I can help with pricing, supported formats, and troubleshooting.</div>
     </div>
     <div id="pw-input-row">
       <input id="pw-input" placeholder="Ask a question..." />
@@ -71,12 +71,36 @@
     if (panel.classList.contains('open')) document.getElementById('pw-input').focus();
   });
 
+  // Rate limiting: 5 messages per session, 3 second cooldown
+  const MAX_MESSAGES = 5;
+  let messageCount = 0;
+  let lastSendTime = 0;
+  const COOLDOWN_MS = 3000;
+
   // Send
   async function send() {
     const input = document.getElementById('pw-input');
     const msgs = document.getElementById('pw-msgs');
     const text = input.value.trim();
     if (!text) return;
+
+    // Rate limit checks
+    const now = Date.now();
+    if (now - lastSendTime < COOLDOWN_MS) {
+      return; // silent cooldown
+    }
+    if (messageCount >= MAX_MESSAGES) {
+      const limitMsg = document.createElement('div');
+      limitMsg.className = 'pw-msg bot';
+      limitMsg.textContent = 'You\'ve reached the message limit for this session. For more help, please visit our contact page at /contact.';
+      msgs.appendChild(limitMsg);
+      msgs.scrollTop = msgs.scrollHeight;
+      input.value = '';
+      return;
+    }
+
+    messageCount++;
+    lastSendTime = now;
 
     // User message
     const userMsg = document.createElement('div');

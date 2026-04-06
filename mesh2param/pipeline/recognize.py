@@ -55,6 +55,11 @@ def recognize_features(
     if config is None:
         config = RecognizeConfig()
 
+    logger.debug(
+        "recognize_features called: %d regions, %d fitted, %d graph nodes, %d edges",
+        len(regions), len(fitted), graph.number_of_nodes(), len(edges),
+    )
+
     bbox_diag = cleaned.bbox_diagonal
 
     region_lookup = {r.region_id: r for r in regions}
@@ -65,47 +70,71 @@ def recognize_features(
     features: list[Feature] = []
 
     # --- 1. Base extrusion: the largest group of connected planar faces ---
-    base_feature, base_rids = _find_base_extrusion(
-        regions, fitted, graph, cleaned,
-    )
+    try:
+        base_feature, base_rids = _find_base_extrusion(
+            regions, fitted, graph, cleaned,
+        )
+    except Exception:
+        logger.exception("Stage 5 failed finding base extrusion: regions=%d", len(regions))
+        raise
     features.append(base_feature)
     assigned.update(base_rids)
     base_idx = 0
+    logger.debug("Base extrusion found: %d region IDs, depth=%.2f", len(base_rids), base_feature.depth)
 
     # --- 2. Holes: full cylinders ---
-    hole_features = _find_holes(
-        regions, fitted, graph, region_lookup, cleaned, config, assigned,
-    )
+    try:
+        hole_features = _find_holes(
+            regions, fitted, graph, region_lookup, cleaned, config, assigned,
+        )
+    except Exception:
+        logger.exception("Stage 5 failed finding holes")
+        raise
     for hf, rids in hole_features:
         hf.dependencies = [base_idx]
         features.append(hf)
         assigned.update(rids)
+    logger.debug("Found %d holes", len(hole_features))
 
     # --- 3. Pockets: inward-facing plane groups connected together ---
-    pocket_features = _find_pockets(
-        regions, fitted, graph, region_lookup, fitted_lookup,
-        cleaned, config, assigned, base_rids,
-    )
+    try:
+        pocket_features = _find_pockets(
+            regions, fitted, graph, region_lookup, fitted_lookup,
+            cleaned, config, assigned, base_rids,
+        )
+    except Exception:
+        logger.exception("Stage 5 failed finding pockets")
+        raise
     for pf, rids in pocket_features:
         pf.dependencies = [base_idx]
         features.append(pf)
         assigned.update(rids)
+    logger.debug("Found %d pockets", len(pocket_features))
 
     # --- 4. Bosses: outward-facing plane groups above the base ---
-    boss_features = _find_bosses(
-        regions, fitted, graph, region_lookup, fitted_lookup,
-        cleaned, config, assigned, base_rids,
-    )
+    try:
+        boss_features = _find_bosses(
+            regions, fitted, graph, region_lookup, fitted_lookup,
+            cleaned, config, assigned, base_rids,
+        )
+    except Exception:
+        logger.exception("Stage 5 failed finding bosses")
+        raise
     for bf, rids in boss_features:
         bf.dependencies = [base_idx]
         features.append(bf)
         assigned.update(rids)
+    logger.debug("Found %d bosses", len(boss_features))
 
     # --- 5. Fillets and chamfers (from Stage 4 edge classification) ---
-    fillet_chamfer = _find_fillets_and_chamfers(
-        regions, fitted, edges, region_lookup, fitted_lookup,
-        config, assigned,
-    )
+    try:
+        fillet_chamfer = _find_fillets_and_chamfers(
+            regions, fitted, edges, region_lookup, fitted_lookup,
+            config, assigned,
+        )
+    except Exception:
+        logger.exception("Stage 5 failed finding fillets/chamfers")
+        raise
     for fc, rids in fillet_chamfer:
         # Fillets/chamfers depend on whichever features own their neighbor surfaces
         fc.dependencies = _resolve_dependencies(

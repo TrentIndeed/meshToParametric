@@ -52,6 +52,7 @@ def _section_to_polygons(
     try:
         section = mesh.section(plane_origin=plane_origin, plane_normal=plane_normal)
     except Exception:
+        logger.debug("Mesh section failed at origin=%s, normal=%s", plane_origin, plane_normal)
         return []
 
     if section is None:
@@ -156,6 +157,11 @@ def compare_slices(
     """
     from shapely.geometry import MultiPolygon, Polygon
 
+    logger.debug(
+        "compare_slices called: orig_verts=%d, orig_faces=%d, cad_verts=%d, cad_faces=%d, n_slices=%d",
+        len(cleaned.vertices), len(cleaned.faces), len(cad_vertices), len(cad_faces), n_slices,
+    )
+
     n_slices = max(5, min(10, n_slices))
     extrude_dir = np.asarray(extrude_dir, dtype=np.float64)
     norm = np.linalg.norm(extrude_dir)
@@ -165,8 +171,16 @@ def compare_slices(
         extrude_dir = extrude_dir / norm
 
     # Build trimesh objects
-    orig_mesh = _make_trimesh(cleaned.vertices, cleaned.faces)
-    cad_mesh = _make_trimesh(cad_vertices, cad_faces)
+    try:
+        orig_mesh = _make_trimesh(cleaned.vertices, cleaned.faces)
+        cad_mesh = _make_trimesh(cad_vertices, cad_faces)
+    except Exception:
+        logger.exception(
+            "Failed to build trimesh objects for comparison: "
+            "orig_verts=%d, cad_verts=%d",
+            len(cleaned.vertices), len(cad_vertices),
+        )
+        raise
 
     # Compute extent along the PRIMARY AXIS (not the signed extrude direction).
     # This avoids sign issues when the extrude dir is negative.
@@ -255,11 +269,16 @@ def compare_slices(
     # Overall score: average IoU * 100
     ious = [s["iou"] for s in per_slice]
     score = float(np.mean(ious) * 100) if ious else 0.0
+    logger.debug("Slice comparison score: %.1f%% (%d slices)", score, len(per_slice))
 
     # Generate figure
-    figure_path = _render_figure(
-        per_slice, orig_poly_slices, cad_poly_slices, heights, score,
-    )
+    try:
+        figure_path = _render_figure(
+            per_slice, orig_poly_slices, cad_poly_slices, heights, score,
+        )
+    except Exception:
+        logger.exception("Failed to render comparison figure")
+        figure_path = ""
 
     return {
         "score": round(score, 1),

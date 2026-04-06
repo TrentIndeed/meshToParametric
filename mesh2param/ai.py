@@ -54,12 +54,15 @@ def find_claude() -> str:
     """Locate the claude CLI binary."""
     found = shutil.which("claude")
     if found:
+        logger.debug("Found claude CLI via shutil.which: %s", found)
         return found
     appdata = os.environ.get("APPDATA", "")
     for ext in (".cmd", ".exe", ""):
         p = os.path.join(appdata, "npm", f"claude{ext}")
         if os.path.isfile(p):
+            logger.debug("Found claude CLI in APPDATA: %s", p)
             return p
+    logger.debug("Claude CLI not found, defaulting to 'claude'")
     return "claude"
 
 
@@ -90,8 +93,12 @@ def call_ai(prompt: str, model: str = "claude-sonnet-4-6", timeout: int = 60) ->
     """
     global _call_count, _last_call_time
 
+    logger.debug("call_ai: model=%s, prompt_len=%d, timeout=%d, call_count=%d",
+                 model, len(prompt), timeout, _call_count)
+
     # ── Budget check ──
     if _call_count >= MAX_CALLS_PER_SESSION:
+        logger.warning("AI call budget exhausted (%d/%d)", _call_count, MAX_CALLS_PER_SESSION)
         raise RuntimeError(
             f"AI call budget exhausted ({MAX_CALLS_PER_SESSION} calls per session)"
         )
@@ -99,6 +106,7 @@ def call_ai(prompt: str, model: str = "claude-sonnet-4-6", timeout: int = 60) ->
     # ── Rate limit ──
     elapsed = time.time() - _last_call_time
     if elapsed < RATE_LIMIT_SECONDS:
+        logger.debug("Rate limiting: sleeping %.1fs", RATE_LIMIT_SECONDS - elapsed)
         time.sleep(RATE_LIMIT_SECONDS - elapsed)
 
     # ── Prompt length check ──
@@ -113,6 +121,7 @@ def call_ai(prompt: str, model: str = "claude-sonnet-4-6", timeout: int = 60) ->
     full_prompt = _SYSTEM_PREFIX + sanitized
 
     try:
+        logger.debug("Invoking Claude CLI: %s", CLAUDE)
         result = subprocess.run(
             [CLAUDE, "--model", model, "--output-format", "json", "--max-turns", "1"],
             input=full_prompt,
@@ -121,17 +130,23 @@ def call_ai(prompt: str, model: str = "claude-sonnet-4-6", timeout: int = 60) ->
             timeout=timeout,
         )
     except FileNotFoundError:
+        logger.error("Claude CLI not found at %s", CLAUDE)
         raise RuntimeError(
             "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
         )
     except subprocess.TimeoutExpired:
+        logger.error("Claude CLI timed out after %ds", timeout)
         raise RuntimeError(f"Claude CLI timed out after {timeout}s")
 
     _call_count += 1
     _last_call_time = time.time()
 
     if result.returncode != 0:
+        logger.error("Claude CLI failed (exit %d): %s", result.returncode, result.stderr[:300])
         raise RuntimeError(f"Claude CLI failed (exit {result.returncode}): {result.stderr[:500]}")
+
+    logger.debug("Claude CLI returned %d bytes (call %d/%d)",
+                 len(result.stdout), _call_count, MAX_CALLS_PER_SESSION)
 
     text = result.stdout.strip()
     try:
@@ -139,7 +154,7 @@ def call_ai(prompt: str, model: str = "claude-sonnet-4-6", timeout: int = 60) ->
         if "result" in data:
             text = data["result"]
     except (json.JSONDecodeError, KeyError):
-        pass
+        logger.debug("Claude CLI output was not JSON-wrapped, using raw stdout")
 
     # ── Truncate response ──
     if len(text) > MAX_RESPONSE_CHARS:
@@ -210,14 +225,20 @@ def call_ai_vision(
     """
     global _call_count, _last_call_time
 
+    logger.debug("call_ai_vision: model=%s, prompt_len=%d, images=%d, timeout=%d",
+                 model, len(prompt), len(image_paths), timeout)
+
     if _call_count >= MAX_CALLS_PER_SESSION:
+        logger.warning("AI vision call budget exhausted (%d/%d)", _call_count, MAX_CALLS_PER_SESSION)
         raise RuntimeError(f"AI call budget exhausted ({MAX_CALLS_PER_SESSION} calls)")
 
     elapsed = time.time() - _last_call_time
     if elapsed < RATE_LIMIT_SECONDS:
+        logger.debug("Rate limiting vision call: sleeping %.1fs", RATE_LIMIT_SECONDS - elapsed)
         time.sleep(RATE_LIMIT_SECONDS - elapsed)
 
     if len(prompt) > MAX_PROMPT_CHARS:
+        logger.warning("Vision prompt truncated from %d to %d chars", len(prompt), MAX_PROMPT_CHARS)
         prompt = prompt[:MAX_PROMPT_CHARS] + "\n... (truncated)"
 
     prefix = system_prefix if system_prefix else (
@@ -233,19 +254,26 @@ def call_ai_vision(
         cmd.extend(["--file", img])
 
     try:
+        logger.debug("Invoking Claude CLI (vision): %s with %d images", CLAUDE, len(image_paths))
         result = subprocess.run(
             cmd, input=full_prompt, capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError:
+        logger.error("Claude CLI not found at %s (vision call)", CLAUDE)
         raise RuntimeError("Claude CLI not found")
     except subprocess.TimeoutExpired:
+        logger.error("Claude CLI vision call timed out after %ds", timeout)
         raise RuntimeError(f"Claude CLI timed out after {timeout}s")
 
     _call_count += 1
     _last_call_time = time.time()
 
     if result.returncode != 0:
+        logger.error("Claude CLI vision failed (exit %d): %s", result.returncode, result.stderr[:300])
         raise RuntimeError(f"Claude CLI failed (exit {result.returncode}): {result.stderr[:500]}")
+
+    logger.debug("Claude CLI vision returned %d bytes (call %d/%d)",
+                 len(result.stdout), _call_count, MAX_CALLS_PER_SESSION)
 
     text = result.stdout.strip()
     try:
@@ -253,9 +281,10 @@ def call_ai_vision(
         if "result" in data:
             text = data["result"]
     except (json.JSONDecodeError, KeyError):
-        pass
+        logger.debug("Claude CLI vision output was not JSON-wrapped, using raw stdout")
 
     if len(text) > MAX_RESPONSE_CHARS:
+        logger.warning("Vision response truncated from %d to %d chars", len(text), MAX_RESPONSE_CHARS)
         text = text[:MAX_RESPONSE_CHARS]
 
     return text
@@ -270,6 +299,9 @@ def is_available() -> bool:
             text=True,
             timeout=10,
         )
-        return result.returncode == 0
+        available = result.returncode == 0
+        logger.debug("Claude CLI availability check: %s", available)
+        return available
     except Exception:
+        logger.debug("Claude CLI availability check failed (not installed or error)")
         return False

@@ -465,6 +465,9 @@ footer {
     transform: translateY(28px);
     filter: blur(6px);
   }
+  .scroll-anim .text-overlay:not(.hidden) h3 {
+    color: #fff;
+  }
 }
 
 /* ── Fade-in animation ── */
@@ -1134,7 +1137,7 @@ footer {
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I self-host it?</div>
-        <div class="faq-a">Yes. Paramesh AI is open source. Install with pip, run the web viewer locally, and process meshes on your own hardware. No cloud dependency.</div>
+        <div class="faq-a">Yes. Install with pip, run the web viewer locally, and process meshes on your own hardware. A paid subscription is required for full functionality. No cloud dependency.</div>
       </div>
       <div class="faq-item fade-in">
         <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How does the AI chatbot work?</div>

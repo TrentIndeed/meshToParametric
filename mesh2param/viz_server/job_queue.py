@@ -44,8 +44,18 @@ class Job:
     features: object = None
     cleaned: object = None
     steps: list = field(default_factory=list)
+    variants: list = field(default_factory=list)  # list of {name, strategy, steps}
+    active_variant: int = 0  # index of currently selected variant
     mesh_volume: float = 0.0
     cad_volume: float = 0.0
+    # Progress visualization — updated per stage for live rendering
+    progress_vertices: list | None = None  # flat float list
+    progress_faces: list | None = None     # flat int list
+    progress_colors: list | None = None    # flat float list (per-face RGB)
+    progress_colors_per_face: bool = False
+    progress_edges: list | None = None     # flat float list (line segment pairs)
+    progress_edge_colors: list | None = None  # flat float list (per-edge-vertex RGB)
+    progress_version: int = 0  # incremented on each viz update
     bbox_min: list = field(default_factory=lambda: [0, 0, 0])
     bbox_max: list = field(default_factory=lambda: [0, 0, 0])
     token_cost: int = 0
@@ -73,10 +83,11 @@ class JobQueue:
     def tokens_spent(self) -> int:
         return self._tokens_spent
 
-    def submit(self, filename: str, file_path: str, client_ip: str = "") -> str:
+    def submit(self, filename: str, file_path: str, client_ip: str = "", num_variants: int = 1) -> str:
         """Submit a new job. Returns job ID."""
         job_id = uuid.uuid4().hex[:12]
         job = Job(id=job_id, filename=filename, file_path=file_path, client_ip=client_ip)
+        job._num_variants = max(1, min(4, num_variants))
         logger.info("Job submitted: id=%s filename=%r ip=%s", job_id, filename, client_ip)
 
         with self._lock:
@@ -136,30 +147,129 @@ class JobQueue:
         job.status = "processing"
         logger.info("Pipeline started for job %s (file=%r)", job.id, job.filename)
 
-        job.progress = 10
+        # Helper: set mesh visualization on the job for live progress
+        def _set_mesh_viz(cleaned_mesh, face_colors=None, edge_pts=None, edge_colors=None):
+            """Update the job's progress geometry for the frontend to render.
+            Pauses briefly so the frontend poll can pick up each stage."""
+            job.progress_vertices = cleaned_mesh.vertices.flatten().tolist()
+            job.progress_faces = cleaned_mesh.faces.flatten().tolist()
+            if face_colors is not None:
+                # Send per-FACE colors (num_faces, 3) — frontend builds
+                # non-indexed geometry and assigns each face's 3 vertices
+                # the same color for sharp per-face coloring.
+                job.progress_colors = face_colors.flatten().tolist()
+                job.progress_colors_per_face = True
+            else:
+                job.progress_colors = None
+                job.progress_colors_per_face = False
+            job.progress_edges = edge_pts.flatten().tolist() if edge_pts is not None else None
+            job.progress_edge_colors = edge_colors.flatten().tolist() if edge_colors is not None else None
+            job.progress_version += 1
+            logger.info("Progress viz v%d: %d verts, %d faces, colors=%s, edges=%s", job.progress_version,
+                        len(job.progress_vertices), len(job.progress_faces),
+                        'yes' if job.progress_colors else 'no',
+                        'yes' if job.progress_edges else 'no')
+            time.sleep(0.8)  # pause so frontend poll catches this stage
+
+        # Stage 1: Ingest
+        job.progress = 5
         job.progress_stage = "Ingesting mesh..."
         logger.debug("Job %s: stage=ingest file=%s", job.id, job.file_path)
         cleaned = ingest_mesh(job.file_path, IngestConfig(remesh=False))
+        _set_mesh_viz(cleaned)
 
-        job.progress = 25
+        # Stage 2: Segment — color each region distinctly
+        job.progress = 8
         job.progress_stage = "Segmenting surfaces..."
         logger.debug("Job %s: stage=segment faces=%d", job.id, cleaned.num_faces)
         regions = segment_mesh(cleaned, SegmentConfig())
 
-        job.progress = 40
+        # Generate per-face colors from region IDs
+        region_colors_map = {}
+        palette = [
+            [0.36, 0.67, 0.93], [0.93, 0.46, 0.36], [0.40, 0.85, 0.55],
+            [0.90, 0.75, 0.30], [0.70, 0.45, 0.85], [0.95, 0.55, 0.65],
+            [0.30, 0.80, 0.80], [0.85, 0.60, 0.40], [0.55, 0.70, 0.35],
+            [0.65, 0.55, 0.90], [0.45, 0.65, 0.75], [0.80, 0.40, 0.50],
+        ]
+        face_colors_seg = np.full((len(cleaned.faces), 3), 0.6)
+        for ri, region in enumerate(regions):
+            color = palette[ri % len(palette)]
+            region_colors_map[region.region_id] = color
+            for fi in region.face_indices:
+                if fi < len(face_colors_seg):
+                    face_colors_seg[fi] = color
+        _set_mesh_viz(cleaned, face_colors=face_colors_seg)
+
+        # Stage 3: Fit — color by surface type
+        job.progress = 12
         job.progress_stage = "Fitting primitives..."
         logger.debug("Job %s: stage=fit regions=%d", job.id, len(regions))
         fitted = fit_surfaces(regions, cleaned, FitConfig())
 
-        job.progress = 55
+        type_colors = {
+            'PLANE': [0.36, 0.56, 0.93],     # blue
+            'CYLINDER': [0.30, 0.78, 0.40],   # green
+            'CONE': [0.93, 0.65, 0.30],       # orange
+            'SPHERE': [0.93, 0.35, 0.35],     # red
+        }
+        face_colors_fit = np.full((len(cleaned.faces), 3), 0.6)
+        fitted_lookup = {f.region_id: f for f in fitted}
+        for region in regions:
+            f = fitted_lookup.get(region.region_id)
+            if f:
+                color = type_colors.get(f.surface_type.name, [0.6, 0.6, 0.6])
+                for fi in region.face_indices:
+                    if fi < len(face_colors_fit):
+                        face_colors_fit[fi] = color
+        _set_mesh_viz(cleaned, face_colors=face_colors_fit)
+
+        # Stage 4: Topology — show edges colored by classification
+        job.progress = 18
         job.progress_stage = "Building topology..."
         logger.debug("Job %s: stage=topology fitted=%d", job.id, len(fitted))
-        graph, edges = build_topology(regions, fitted, cleaned, TopologyConfig())
+        graph, edges_list = build_topology(regions, fitted, cleaned, TopologyConfig())
 
-        job.progress = 65
+        edge_type_colors = {
+            'SHARP': [1.0, 1.0, 1.0],      # white
+            'FILLET': [0.35, 0.65, 1.0],    # blue
+            'CHAMFER': [1.0, 0.85, 0.25],   # yellow
+            'SMOOTH': [0.5, 0.5, 0.5],      # gray
+        }
+        edge_pts_list = []
+        edge_col_list = []
+        region_lookup = {r.region_id: r for r in regions}
+        for edge in edges_list:
+            ra = region_lookup.get(edge.surface_a_id)
+            rb = region_lookup.get(edge.surface_b_id)
+            if ra is None or rb is None:
+                continue
+            # Find shared boundary vertices between the two regions
+            set_a = set(cleaned.faces[ra.face_indices].flatten()) if len(ra.face_indices) > 0 else set()
+            set_b = set(cleaned.faces[rb.face_indices].flatten()) if len(rb.face_indices) > 0 else set()
+            shared = set_a & set_b
+            if len(shared) < 2:
+                continue
+            shared_verts = cleaned.vertices[list(shared)]
+            # Draw a line from min to max along the longest axis
+            extent = shared_verts.max(axis=0) - shared_verts.min(axis=0)
+            ax = int(np.argmax(extent))
+            sorted_idx = np.argsort(shared_verts[:, ax])
+            p0 = shared_verts[sorted_idx[0]]
+            p1 = shared_verts[sorted_idx[-1]]
+            color = edge_type_colors.get(edge.transition_type.name, [0.5, 0.5, 0.5])
+            edge_pts_list.extend([p0, p1])
+            edge_col_list.extend([color, color])
+
+        edge_pts = np.array(edge_pts_list) if edge_pts_list else None
+        edge_cols = np.array(edge_col_list) if edge_col_list else None
+        _set_mesh_viz(cleaned, face_colors=face_colors_fit, edge_pts=edge_pts, edge_colors=edge_cols)
+
+        # Stage 5: Recognize features
+        job.progress = 22
         job.progress_stage = "Recognizing features..."
-        logger.debug("Job %s: stage=recognize edges=%d", job.id, len(edges))
-        tree = recognize_features(regions, fitted, graph, edges, cleaned, RecognizeConfig())
+        logger.debug("Job %s: stage=recognize edges=%d", job.id, len(edges_list))
+        tree = recognize_features(regions, fitted, graph, edges_list, cleaned, RecognizeConfig())
 
         job.features = tree
         job.cleaned = cleaned
@@ -167,8 +277,37 @@ class JobQueue:
         job.bbox_min = cleaned.bbox[0].tolist()
         job.bbox_max = cleaned.bbox[1].tolist()
 
-        job.progress = 75
+        # Stage 5 visualization: color mesh by recognized feature type
+        from mesh2param.models.feature import FeatureType
+        feature_type_colors = {
+            FeatureType.BASE_EXTRUSION: [0.35, 0.55, 0.90],  # blue
+            FeatureType.THROUGH_HOLE:   [0.30, 0.80, 0.40],  # green
+            FeatureType.BLIND_HOLE:     [0.25, 0.70, 0.50],  # teal
+            FeatureType.CHAMFER:        [1.00, 0.85, 0.25],  # yellow
+            FeatureType.FILLET:         [0.95, 0.55, 0.25],  # orange
+            FeatureType.POCKET:         [0.70, 0.35, 0.80],  # purple
+            FeatureType.BOSS:           [0.85, 0.45, 0.45],  # red
+        }
+        face_colors_feat = np.full((len(cleaned.faces), 3), 0.55)  # gray default
+        for feat in tree.features:
+            color = feature_type_colors.get(feat.type, [0.55, 0.55, 0.55])
+            try:
+                fi_arr = feat.face_indices
+                if fi_arr is not None and hasattr(fi_arr, '__len__') and len(fi_arr) > 0:
+                    for fi in fi_arr:
+                        if int(fi) < len(face_colors_feat):
+                            face_colors_feat[int(fi)] = color
+            except Exception:
+                pass
+        _set_mesh_viz(cleaned, face_colors=face_colors_feat, edge_pts=edge_pts, edge_colors=edge_cols)
+
+        # Keep feature colors but remove edge lines for the build stage.
+        # The colored mesh shows what CadQuery is constructing.
+        job.progress_edges = None
+        job.progress_edge_colors = None
+        job.progress = 30
         job.progress_stage = "Building CAD model..."
+        time.sleep(0.8)
         logger.debug("Job %s: stage=cadquery features=%d", job.id, len(tree.features))
 
         # CadQuery in subprocess
@@ -183,13 +322,14 @@ class JobQueue:
         tmp_out = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
         tmp_out.close()
 
+        num_variants = getattr(job, '_num_variants', 1)
         script = f"""
 import pickle, sys
 sys.path.insert(0, '.')
 with open(r'{tmp_in.name}', 'rb') as f:
     tree, cleaned = pickle.load(f)
 from mesh2param.pipeline.export_cadquery import export_cadquery
-result = export_cadquery(tree, cleaned, use_llm=False)
+result = export_cadquery(tree, cleaned, use_llm=True, num_variants={num_variants})
 result.solid = None
 with open(r'{tmp_out.name}', 'wb') as f:
     pickle.dump(result, f)
@@ -197,7 +337,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", script],
-                capture_output=True, text=True, timeout=180,
+                capture_output=True, text=True, timeout=600,  # 10 min for 4 variants
             )
         except subprocess.TimeoutExpired:
             logger.error("Job %s: CadQuery subprocess timed out after 180s", job.id)
@@ -228,6 +368,17 @@ with open(r'{tmp_out.name}', 'wb') as f:
 
         job.steps = result.construction_steps
         job.cad_volume = result.cad_volume
+        # Store variants
+        job.variants = []
+        for v in getattr(result, 'variants', []):
+            job.variants.append({
+                'name': v.name,
+                'strategy': v.strategy,
+                'steps': v.construction_steps,
+                'cad_volume': v.cad_volume,
+            })
+        if job.variants:
+            job.steps = job.variants[0]['steps']  # default to first variant
         job.progress = 100
         job.progress_stage = "Done"
 
@@ -331,13 +482,31 @@ with open(r'{tmp_out.name}', 'wb') as f:
                             except Exception:
                                 logger.debug("Failed to deserialize faces for job %s step %s",
                                              job_id, db_step.step_index)
+                        overlay = None
+                        if getattr(db_step, "sketch_overlay_blob", None) and getattr(db_step, "sketch_overlay_shape", None):
+                            try:
+                                shape = tuple(int(x) for x in db_step.sketch_overlay_shape.split(","))
+                                overlay = np.frombuffer(db_step.sketch_overlay_blob, dtype=np.float64).reshape(shape)
+                            except Exception:
+                                pass
                         steps.append(ConstructionStep(
                             name=db_step.name,
                             tess_vertices=tess_verts if tess_verts is not None else np.array([]),
                             tess_faces=tess_faces if tess_faces is not None else np.array([]),
                             volume=db_step.volume or 0.0,
+                            sketch_overlay=overlay,
                         ))
                     job.steps = steps
+
+                    # Restore variants from pickled blob
+                    if getattr(db_job, 'variants_blob', None):
+                        try:
+                            import pickle as _pkl
+                            job.variants = _pkl.loads(db_job.variants_blob)
+                            if job.variants:
+                                job.steps = job.variants[0]['steps']
+                        except Exception:
+                            logger.debug("Failed to restore variants for job %s", job_id)
 
                     with self._lock:
                         self._jobs[job_id] = job
@@ -377,6 +546,15 @@ with open(r'{tmp_out.name}', 'wb') as f:
                     except Exception:
                         pass
 
+                # Pickle variants for DB persistence
+                variants_blob = None
+                if job.variants:
+                    try:
+                        import pickle as _pkl
+                        variants_blob = _pkl.dumps(job.variants)
+                    except Exception:
+                        logger.warning("Failed to pickle variants for job %s", job.id)
+
                 db_job = DBMeshJob(
                     user_id=1,  # default user; TODO: pass actual user from request
                     job_uuid=job.id,
@@ -392,6 +570,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
                     bbox_min_json=json.dumps(job.bbox_min),
                     bbox_max_json=json.dumps(job.bbox_max),
                     features_json=features_summary,
+                    variants_blob=variants_blob,
                     completed_at=datetime.utcnow(),
                 )
                 db.add(db_job)
@@ -411,6 +590,13 @@ with open(r'{tmp_out.name}', 'wb') as f:
                         faces_blob = arr.tobytes()
                         faces_shape = ",".join(str(s) for s in arr.shape)
 
+                    overlay_blob = None
+                    overlay_shape = None
+                    if getattr(step, "sketch_overlay", None) is not None and len(step.sketch_overlay) > 0:
+                        arr = np.asarray(step.sketch_overlay, dtype=np.float64)
+                        overlay_blob = arr.tobytes()
+                        overlay_shape = ",".join(str(s) for s in arr.shape)
+
                     db_step = DBJobStep(
                         job_id=db_job.id,
                         step_index=i,
@@ -421,6 +607,8 @@ with open(r'{tmp_out.name}', 'wb') as f:
                         vertices_shape=verts_shape,
                         faces_blob=faces_blob,
                         faces_shape=faces_shape,
+                        sketch_overlay_blob=overlay_blob,
+                        sketch_overlay_shape=overlay_shape,
                     )
                     db.add(db_step)
 

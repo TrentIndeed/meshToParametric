@@ -131,12 +131,38 @@ Token cost: ~20 for a simple bracket, ~55 for a complex mount with chamfers.
 
 ## Deployment
 
+### Local Development Server
+
 ```bash
-# Deploy to Hetzner VPS (same as operatorDashboard)
-python deploy.py --ip YOUR_VPS_IP --domain parameshai.com
+python -m mesh2param.viz_server.app
+# Running at http://127.0.0.1:8080/app
 ```
 
-Docker + Caddy on port 8081, alongside operatorDashboard.
+### Deploy to VPS
+
+Deploys via SSH to a Hetzner VPS running Docker + Caddy (port 8081), alongside operatorDashboard.
+
+```bash
+# Deploy (VPS IP: 5.161.100.230)
+python deploy.py --ip 5.161.100.230 --domain parameshai.com
+```
+
+The deploy script will:
+1. SSH into the VPS
+2. Clone or pull the `main` branch to `/opt/meshToParametric`
+3. Write `.env` with `AUTH_SECRET` and `DATABASE_URL`
+4. Run `docker compose up -d --build` (container port 8080 → host port 8081)
+5. Append Caddy reverse proxy config for the domain if not already present
+
+**Note:** Container restart clears in-memory job data. User accounts persist in SQLite (`./data/mesh2param.db` volume).
+
+### Both at Once
+
+```bash
+# Start local server and deploy to VPS in parallel
+python -m mesh2param.viz_server.app &
+python deploy.py --ip 5.161.100.230 --domain parameshai.com
+```
 
 ## Key Libraries
 

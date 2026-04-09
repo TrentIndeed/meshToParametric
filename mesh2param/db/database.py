@@ -70,6 +70,7 @@ class MeshJob(Base):
     bbox_min_json = Column(Text)  # JSON [x, y, z]
     bbox_max_json = Column(Text)  # JSON [x, y, z]
     features_json = Column(Text)  # JSON summary of feature tree
+    variants_blob = Column(LargeBinary)  # pickled list of variant data
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
 
@@ -91,6 +92,8 @@ class JobStep(Base):
     faces_blob = Column(LargeBinary)     # int64 (F, 3) flattened
     vertices_shape = Column(String)      # "V,3"
     faces_shape = Column(String)         # "F,3"
+    sketch_overlay_blob = Column(LargeBinary)  # float64 (N, 3) flattened
+    sketch_overlay_shape = Column(String)      # "N,3"
     # Keep legacy columns for backward compat
     vertices_json = Column(Text)
     faces_json = Column(Text)

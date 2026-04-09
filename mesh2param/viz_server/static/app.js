@@ -49,6 +49,11 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.enableZoom = false; // we handle zoom ourselves with smooth interpolation
 
+// Track user dragging for idle rotation pause
+window._userDragging = false;
+controls.addEventListener('start', () => { window._userDragging = true; window._idleDist = null; });
+controls.addEventListener('end', () => { window._userDragging = false; });
+
 const ZOOM_MIN = 30;
 const ZOOM_MAX = 1500;
 const ZOOM_FACTOR = 0.08; // 8% per scroll tick
@@ -165,7 +170,8 @@ axisRenderer.setSize(120, 120);
 axisRenderer.setClearColor(0x000000, 0);
 console.debug('[init] Axis gizmo renderer created');
 const axIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
-axisRenderer.domElement.style.cssText = `position:fixed;bottom:90px;left:10px;z-index:60;pointer-events:none;border:1px solid ${axIsDark ? 'rgba(48,54,61,0.5)' : 'rgba(208,215,222,0.5)'};border-radius:8px;`;
+axisRenderer.setSize(56, 56);
+axisRenderer.domElement.style.cssText = `position:fixed;bottom:12px;left:12px;z-index:60;pointer-events:none;border-radius:6px;`;
 document.body.appendChild(axisRenderer.domElement);
 
 // Axis lines with cone tips (short, in gizmo scene)
@@ -192,6 +198,110 @@ window._camera = camera;
 window._controls = controls;
 window._modelGroup = modelGroup;
 window._THREE = THREE;
+
+// ── Progress geometry renderer (live pipeline visualization) ──
+let _lastProgressStage = '';
+function _renderProgressGeometry(pg) {
+  if (!pg || !pg.vertices || !pg.faces) return;
+
+  // Clear previous model
+  while (modelGroup.children.length) {
+    const child = modelGroup.children[0];
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+      else child.material.dispose();
+    }
+    modelGroup.remove(child);
+  }
+
+  const verts = new Float32Array(pg.vertices);
+  const indices = pg.faces;
+  const numFaces = Math.floor(indices.length / 3);
+
+  // Build non-indexed geometry with per-face colors
+  const positions = new Float32Array(numFaces * 9);
+  const colors = new Float32Array(numFaces * 9);
+  const hasColors = pg.colors && pg.colors.length > 0;
+  const perFace = pg.colors_per_face; // colors array is (numFaces*3) not (numVerts*3)
+
+  for (let i = 0; i < numFaces; i++) {
+    const a = indices[i * 3], b = indices[i * 3 + 1], c = indices[i * 3 + 2];
+    // Get face color (same for all 3 vertices of this face)
+    let faceR = 0.55, faceG = 0.58, faceB = 0.62;
+    if (hasColors && perFace) {
+      faceR = pg.colors[i * 3];
+      faceG = pg.colors[i * 3 + 1];
+      faceB = pg.colors[i * 3 + 2];
+    } else if (hasColors) {
+      // per-vertex colors (legacy)
+      faceR = pg.colors[a * 3];
+      faceG = pg.colors[a * 3 + 1];
+      faceB = pg.colors[a * 3 + 2];
+    }
+    for (let j = 0; j < 3; j++) {
+      const vi = [a, b, c][j];
+      positions[i * 9 + j * 3]     = verts[vi * 3];
+      positions[i * 9 + j * 3 + 1] = verts[vi * 3 + 1];
+      positions[i * 9 + j * 3 + 2] = verts[vi * 3 + 2];
+      colors[i * 9 + j * 3]     = faceR;
+      colors[i * 9 + j * 3 + 1] = faceG;
+      colors[i * 9 + j * 3 + 2] = faceB;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    metalness: 0.2,
+    roughness: 0.6,
+    side: THREE.FrontSide,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  modelGroup.add(mesh);
+
+  // Edge lines (for topology stage)
+  if (pg.edges && pg.edges.length >= 6) {
+    const edgeVerts = pg.edges;
+    const edgeColors = pg.edge_colors;
+    const pts = [];
+    const eCols = [];
+    for (let i = 0; i < edgeVerts.length; i += 3) {
+      pts.push(new THREE.Vector3(edgeVerts[i], edgeVerts[i+1], edgeVerts[i+2]));
+      if (edgeColors && edgeColors.length > i) {
+        eCols.push(edgeColors[i], edgeColors[i+1], edgeColors[i+2]);
+      }
+    }
+    const edgeGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    if (eCols.length > 0) {
+      edgeGeo.setAttribute('color', new THREE.Float32BufferAttribute(eCols, 3));
+    }
+    const edgeMat = new THREE.LineBasicMaterial({
+      vertexColors: eCols.length > 0,
+      color: eCols.length > 0 ? 0xffffff : 0x58A6FF,
+      linewidth: 1,
+      depthTest: false,
+    });
+    const lines = new THREE.LineSegments(edgeGeo, edgeMat);
+    lines.renderOrder = 1;
+    modelGroup.add(lines);
+  }
+
+  // Center model
+  modelGroup.position.set(0, 0, 0);
+  try {
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    const center = box.getCenter(new THREE.Vector3());
+    modelGroup.position.sub(center);
+  } catch (e) {}
+
+  document.getElementById('empty-state').style.display = 'none';
+}
 
 // ── Load step geometry ──
 async function loadStep(index) {
@@ -243,7 +353,7 @@ async function loadStep(index) {
     const verts = new Float32Array(data.vertices);
     const indices = data.faces;
 
-    if (data.is_sketch) {
+    if (data.is_sketch && !data.sketch_overlay) {
       console.debug('[loadStep] rendering sketch, edges:', Math.floor(indices.length / 3));
       // Draw as lines using face indices (each degenerate tri = one edge)
       const points = [];
@@ -259,20 +369,26 @@ async function loadStep(index) {
       modelGroup.add(new THREE.LineSegments(geo, mat));
     } else {
       console.debug('[loadStep] rendering solid mesh, verts:', Math.round(verts.length / 3), 'faces:', Math.round(indices.length / 3));
-      // Solid mesh
+      // Build non-indexed geometry so each face has its own vertices
+      // and correct per-face normals — eliminates Z-fighting artifacts
+      // from BRepMesh's duplicate vertices at face boundaries.
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-      geo.setIndex(indices);
+      const numFaces = Math.floor(indices.length / 3);
+      const positions = new Float32Array(numFaces * 9);
+      for (let i = 0; i < numFaces; i++) {
+        const a = indices[i * 3], b = indices[i * 3 + 1], c = indices[i * 3 + 2];
+        positions[i * 9]     = verts[a * 3];     positions[i * 9 + 1] = verts[a * 3 + 1]; positions[i * 9 + 2] = verts[a * 3 + 2];
+        positions[i * 9 + 3] = verts[b * 3];     positions[i * 9 + 4] = verts[b * 3 + 1]; positions[i * 9 + 5] = verts[b * 3 + 2];
+        positions[i * 9 + 6] = verts[c * 3];     positions[i * 9 + 7] = verts[c * 3 + 1]; positions[i * 9 + 8] = verts[c * 3 + 2];
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
       geo.computeVertexNormals();
 
-      const mat = new THREE.MeshPhysicalMaterial({
-        color: 0xC0C8D0,
-        metalness: 0.5,
-        roughness: 0.28,
-        clearcoat: 0.15,
-        clearcoatRoughness: 0.3,
-        reflectivity: 0.6,
-        side: THREE.DoubleSide,
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xB8C0C8,
+        metalness: 0.35,
+        roughness: 0.45,
+        side: THREE.FrontSide,
         polygonOffset: true,
         polygonOffsetFactor: 1,
         polygonOffsetUnits: 1,
@@ -281,6 +397,53 @@ async function loadStep(index) {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       modelGroup.add(mesh);
+
+      // If this step has a sketch overlay, draw visible blue edges on top of the solid
+      if (data.sketch_overlay && data.sketch_overlay.length >= 6) {
+        const skVerts = data.sketch_overlay;
+        const pts = [];
+        for (let i = 0; i < skVerts.length; i += 3) {
+          pts.push(new THREE.Vector3(skVerts[i], skVerts[i+1], skVerts[i+2]));
+        }
+
+        // Draw each edge as a thin cylinder tube so it's visible at any zoom
+        const tubeMat = new THREE.MeshBasicMaterial({ color: 0x58A6FF, depthTest: false });
+        for (let i = 0; i < pts.length; i += 2) {
+          const a = pts[i], b = pts[i+1];
+          const dir = new THREE.Vector3().subVectors(b, a);
+          const len = dir.length();
+          if (len < 0.01) continue;
+          const tubeR = Math.max(0.3, len * 0.008);
+          const tubeGeo = new THREE.CylinderGeometry(tubeR, tubeR, len, 6, 1);
+          tubeGeo.rotateX(Math.PI / 2);
+          const tube = new THREE.Mesh(tubeGeo, tubeMat);
+          tube.position.copy(a).add(b).multiplyScalar(0.5);
+          tube.lookAt(b);
+          tube.renderOrder = 1;
+          modelGroup.add(tube);
+        }
+
+        // Also draw semi-transparent filled triangle
+        if (pts.length >= 6) {
+          const triGeo = new THREE.BufferGeometry();
+          const triVerts = new Float32Array([
+            pts[0].x, pts[0].y, pts[0].z,
+            pts[2].x, pts[2].y, pts[2].z,
+            pts[4].x, pts[4].y, pts[4].z,
+          ]);
+          triGeo.setAttribute('position', new THREE.BufferAttribute(triVerts, 3));
+          triGeo.computeVertexNormals();
+          const triMat = new THREE.MeshBasicMaterial({
+            color: 0x58A6FF, transparent: true, opacity: 0.25,
+            side: THREE.DoubleSide, depthTest: false,
+          });
+          const triMesh = new THREE.Mesh(triGeo, triMat);
+          triMesh.renderOrder = 1;
+          modelGroup.add(triMesh);
+        }
+
+        console.debug('[loadStep] added sketch overlay:', pts.length / 2, 'edges');
+      }
     }
   } catch (e) {
     console.error('[loadStep] geometry/material creation failed for step', index, e);
@@ -315,7 +478,8 @@ async function loadStep(index) {
     toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;color:var(--text-primary);z-index:100;opacity:0;transition:opacity 0.3s;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.1);';
     document.body.appendChild(toast);
   }
-  toast.textContent = `Step ${index + 1}/${steps.length}: ${data.name} (${Math.round(data.vertices.length/3)} verts)`;
+  const toastName = data.name.split(/\s*[—→]\s*/)[0].trim();
+  toast.textContent = `Step ${index + 1}/${steps.length}: ${toastName}`;
   toast.style.opacity = '1';
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 1500);
@@ -323,6 +487,39 @@ async function loadStep(index) {
 }
 
 window._loadStep = loadStep;
+
+// ── Build Animation ──
+let _animPlaying = false;
+window.playBuildAnimation = async function() {
+  const btn = document.getElementById('play-btn');
+  if (!btn) return;
+
+  // Toggle: if already playing, stop
+  if (_animPlaying) {
+    _animPlaying = false;
+    return;
+  }
+
+  if (!steps || steps.length === 0) return;
+  _animPlaying = true;
+  window._pipelineRotate = true;
+  btn.classList.add('playing');
+  btn.querySelector('i').className = 'ri-stop-fill';
+
+  const stepDelay = 350; // 350ms per feature
+
+  for (let i = 0; i < steps.length; i++) {
+    if (!_animPlaying) break;
+    await loadStep(i);
+    await new Promise(r => setTimeout(r, stepDelay));
+  }
+
+  _animPlaying = false;
+  window._pipelineRotate = false;
+  modelGroup.rotation.y = 0;
+  btn.classList.remove('playing');
+  btn.querySelector('i').className = 'ri-play-fill';
+};
 
 // ── UI Updates ──
 function updateActiveStates() {
@@ -353,6 +550,8 @@ function populateUI(statusData) {
     'Through':  I('hole.png', 'hole'),
     'Blind':    I('hole.png', 'hole'),
     'Chamfer':  I('chamfer.png', 'chamfer'),
+    'Side Profile': I('sketch.png', 'sketch'),
+    'Side Cut': I('chamfer.png', 'chamfer'),
     'Fillet':   I('fillet.png', 'fillet'),
     'Pocket':   I('shell.png', 'pocket'),
     'Boss':     I('extrude.png', 'boss'),
@@ -368,15 +567,15 @@ function populateUI(statusData) {
   const sketchesFolder = document.getElementById('sketches-folder');
   sketchesFolder.style.display = 'none';
 
-  // Add "Original Mesh" button at the start of timeline
+  // Add "Mesh" button at the start of timeline
   const meshBtn = document.createElement('div');
-  meshBtn.className = 'timeline-step timeline-special';
+  meshBtn.className = 'timeline-step timeline-special timeline-dashed';
+  meshBtn.style.background = 'var(--bg-tertiary)';
   meshBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">Mesh</span>';
   meshBtn.title = 'Show original mesh';
   meshBtn.onclick = () => {
     if (savedMeshPreview) {
       _showRawMesh(savedMeshPreview, false);
-      // Deactivate all steps
       document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
       meshBtn.classList.add('active');
@@ -384,42 +583,76 @@ function populateUI(statusData) {
   };
   timeline.appendChild(meshBtn);
 
+  // Build feature tree items (left sidebar) — these navigate individual steps
   statusData.steps.forEach((step, i) => {
-    // Determine icon
-    let iconInfo = I('component.png', 'extrude'); // default fallback
+    let iconInfo = I('component.png', 'extrude');
     for (const [key, val] of Object.entries(iconMap)) {
       if (step.name.includes(key)) { iconInfo = val; break; }
     }
-
-    // Feature tree item
+    // Strip LLM description after — or →
+    const shortName = step.name.split(/\s*[—→]\s*/)[0].trim();
     const item = document.createElement('div');
     item.className = 'feature-item';
     item.innerHTML = `
       <div class="icon ${iconInfo.cls}">${iconInfo.svg}</div>
       <div class="texts">
-        <div class="name">${step.name}</div>
+        <div class="name">${shortName}</div>
         <div class="detail">${step.volume > 0 ? step.volume.toLocaleString() + ' mm³' : '2D'}</div>
       </div>
     `;
     item.onclick = () => loadStep(i);
-
-    // All features go in the body list (sketches are inline, like Onshape)
     list.appendChild(item);
-
-    // Timeline step — thumbnail rendered async (no text overlay)
-    const tStep = document.createElement('div');
-    tStep.className = 'timeline-step';
-    tStep.innerHTML = `<span class="step-num">${i + 1}</span>`;
-    tStep.onclick = () => loadStep(i);
-    timeline.appendChild(tStep);
-
-    // Queue thumbnail for sequential rendering
-    thumbQueue.push({ index: i, element: tStep });
   });
 
-  // Add "Compare" split-screen button at the end of timeline
+  // --- Bottom timeline: variant thumbnails ---
+  // Each variant is a different build order of the same part.
+  const variants = statusData.variants || [];
+  const activeVariant = statusData.active_variant || 0;
+
+  variants.forEach((variant, vi) => {
+    const vBtn = document.createElement('div');
+    vBtn.className = 'timeline-step timeline-special variant-btn' + (vi === activeVariant ? ' active' : '');
+    vBtn.innerHTML = `<span style="font-size:9px;color:var(--text-secondary);text-align:center;line-height:1.2">${variant.name}</span>`;
+    vBtn.title = variant.strategy || variant.name;
+    vBtn.onclick = async () => {
+      // Switch variant on server
+      const res = await fetch(`/api/job/${currentJobId}/variant/${vi}`, { method: 'POST' });
+      if (!res.ok) return;
+      const data = await res.json();
+      // Update steps and rebuild feature tree
+      statusData.steps = data.steps;
+      statusData.num_steps = data.num_steps;
+      statusData.active_variant = vi;
+      statusData.cad_volume = data.cad_volume;
+      // Rebuild UI
+      populateUI(statusData);
+      // Load final step of new variant
+      loadStep(data.num_steps - 1);
+    };
+    timeline.appendChild(vBtn);
+
+    // Queue thumbnail render for the final step of this variant
+    // (use the variant's last step index — all variants share the same job steps endpoint
+    // after switching, so we render from the currently active steps)
+    if (vi === activeVariant) {
+      thumbQueue.push({ index: statusData.steps.length - 1, element: vBtn });
+    }
+  });
+
+  // If no variants, show a simple "CAD" button
+  if (variants.length === 0) {
+    const cadBtn = document.createElement('div');
+    cadBtn.className = 'timeline-step timeline-special active';
+    cadBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">CAD</span>';
+    cadBtn.onclick = () => loadStep(statusData.steps.length - 1);
+    timeline.appendChild(cadBtn);
+    thumbQueue.push({ index: statusData.steps.length - 1, element: cadBtn });
+  }
+
+  // Add "Compare" split-screen button at the end
   const compareBtn = document.createElement('div');
-  compareBtn.className = 'timeline-step timeline-special';
+  compareBtn.className = 'timeline-step timeline-special timeline-dashed';
+  compareBtn.style.background = 'var(--bg-tertiary)';
   compareBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">Compare</span>';
   compareBtn.title = 'Split view: Mesh vs CAD';
   compareBtn.onclick = () => {
@@ -526,8 +759,8 @@ function populateUI(statusData) {
 
   // Render thumbnails sequentially to avoid WebGL race conditions
   console.debug('[populateUI] queued', thumbQueue.length, 'thumbnails for rendering');
-  renderThumbQueue().then(() => {
-    // Render Mesh thumbnail from saved preview data
+  renderThumbQueue().then(async () => {
+    // Render Mesh thumbnail
     if (savedMeshPreview) {
       const url = renderMeshThumbnail(savedMeshPreview.mesh_vertices, savedMeshPreview.mesh_faces);
       if (url) {
@@ -536,6 +769,33 @@ function populateUI(statusData) {
         meshBtn.style.backgroundPosition = 'center';
         meshBtn.querySelector('span').style.display = 'none';
       }
+    }
+
+    // Render thumbnails for non-active variants by switching, rendering, switching back
+    const variantBtns = timeline.querySelectorAll('.timeline-step.variant-btn');
+    for (let vi = 0; vi < variants.length; vi++) {
+      if (vi === activeVariant) continue;
+      const btn = variantBtns[vi];
+      if (!btn) continue;
+      try {
+        // Temporarily switch to this variant
+        const swRes = await fetch(`/api/job/${currentJobId}/variant/${vi}`, { method: 'POST' });
+        if (!swRes.ok) continue;
+        const swData = await swRes.json();
+        // Render its final step
+        const url = await renderThumbnail(swData.num_steps - 1);
+        if (url && btn) {
+          btn.style.backgroundImage = `url(${url})`;
+          btn.style.backgroundSize = 'cover';
+          btn.style.backgroundPosition = 'center';
+          const label = btn.querySelector('span');
+          if (label) label.style.display = 'none';
+        }
+      } catch (e) { console.warn('[variant thumb] failed for variant', vi, e); }
+    }
+    // Switch back to the active variant
+    if (variants.length > 0) {
+      await fetch(`/api/job/${currentJobId}/variant/${activeVariant}`, { method: 'POST' });
     }
     // Render Compare thumbnail showing both mesh + CAD side by side
     if (savedMeshPreview && statusData.steps.length > 0) {
@@ -622,8 +882,8 @@ async function renderThumbQueue() {
         element.style.backgroundImage = `url(${dataUrl})`;
         element.style.backgroundSize = 'cover';
         element.style.backgroundPosition = 'center';
-        const num = element.querySelector('.step-num');
-        if (num) num.style.display = 'none';
+        const label = element.querySelector('.step-num') || element.querySelector('span');
+        if (label) label.style.display = 'none';
         rendered++;
       }
     } catch (e) {
@@ -822,6 +1082,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     document.getElementById('preview-bar').style.display = 'block';
     document.getElementById('preview-faces').textContent = previewRes.faces.toLocaleString() + ' faces';
     document.getElementById('preview-dims').textContent = previewRes.dimensions.map(d => d + 'mm').join(' × ');
+    window._lastPreviewDims = previewRes.dimensions;
     document.getElementById('preview-tokens').textContent = '1 part conversion';
 
     // Complexity meter
@@ -854,7 +1115,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       warning.style.display = 'block';
       warning.textContent = previewRes.reject_reason || 'This mesh is too complex for the current pipeline.';
       document.getElementById('btn-analyze').style.display = 'none';
-      addChatMessage('ai', '⚠️ ' + (previewRes.reject_reason || 'Mesh is too complex to process.'), true);
+      addChatMessage('ai', (previewRes.reject_reason || 'Mesh is too complex to process.'), true);
     } else {
       warning.style.display = 'none';
       document.getElementById('btn-analyze').style.display = '';
@@ -863,7 +1124,7 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
       }
     }
 
-    document.getElementById('btn-upload').style.display = 'none';
+    // Keep upload button visible so user can upload a different mesh
     document.getElementById('empty-state').style.display = 'none';
 
   } catch (err) {
@@ -913,14 +1174,9 @@ function _showRawMesh(previewRes, animateToFit = true) {
 
     // Smooth animation only on first upload, not when clicking Mesh button
     if (animateToFit) {
-      const meshHeight = box.getSize(new THREE.Vector3()).y;
-      const camY = Math.max(size * 1.2, meshHeight * 2.5);
-      console.debug('[_showRawMesh] centering, bbox size:', size.toFixed(1), 'animating camera');
-      animateCamera(
-        { x: size * 0.7, y: camY, z: size * 0.7 },
-        { x: 0, y: 0, z: 0 },
-        1.5,
-      );
+      const pos = bestCameraPos(box);
+      console.debug('[_showRawMesh] centering, bbox size:', size.toFixed(1), 'animating camera to face largest profile');
+      animateCamera(pos, { x: 0, y: 0, z: 0 }, 1.5);
     } else {
       controls.target.set(0, 0, 0);
       controls.update();
@@ -930,10 +1186,63 @@ function _showRawMesh(previewRes, animateToFit = true) {
   }
 }
 
+// ── Variant slider ──
+document.getElementById('variant-slider')?.addEventListener('input', (e) => {
+  document.getElementById('variant-count').textContent = e.target.value;
+});
+
+// ── Resize dimension gate ──
+let _dimGateResolve = null;
+window.cancelDimGate = function() {
+  document.getElementById('dim-gate').classList.remove('show');
+  if (_dimGateResolve) _dimGateResolve(null);
+  _dimGateResolve = null;
+};
+window.confirmDimGate = function() {
+  const w = parseFloat(document.getElementById('gate-width').value) || 0;
+  const h = parseFloat(document.getElementById('gate-height').value) || 0;
+  const t = parseFloat(document.getElementById('gate-thickness').value) || 0;
+  document.getElementById('dim-gate').classList.remove('show');
+  if (_dimGateResolve) _dimGateResolve({ width: w, height: h, thickness: t });
+  _dimGateResolve = null;
+};
+
+function showDimGate(previewDims) {
+  // Pre-fill with current mesh dimensions
+  if (previewDims && previewDims.length === 3) {
+    const sorted = [...previewDims].sort((a, b) => b - a);
+    document.getElementById('gate-width').value = sorted[0].toFixed(1);
+    document.getElementById('gate-height').value = sorted[1].toFixed(1);
+    document.getElementById('gate-thickness').value = sorted[2].toFixed(1);
+  }
+  document.getElementById('dim-gate').classList.add('show');
+  return new Promise(resolve => { _dimGateResolve = resolve; });
+}
+
 // Analyze & Build button handler
+let _analyzeRunning = false;
 document.getElementById('btn-analyze').addEventListener('click', async () => {
-  if (!pendingTempPath) return;
+  if (!pendingTempPath || _analyzeRunning) return;
+
+  // Check if resize is enabled — show dimension gate
+  const resizeOn = document.getElementById('resize-toggle')?.checked;
+  if (resizeOn) {
+    const dims = await showDimGate(window._lastPreviewDims || []);
+    if (!dims) return; // user cancelled
+    // TODO: pass dims to pipeline for scaling
+    console.debug('[analyze] resize dimensions:', dims);
+  }
+
+  _analyzeRunning = true;
+  _lastProgressStage = '';
+  window._pipelineRotate = true;
   console.debug('[analyze] starting pipeline, temp_path:', pendingTempPath);
+
+  // Hide UI elements during generation
+  document.getElementById('actions').style.display = 'none';
+  document.getElementById('timeline').style.display = 'none';
+  document.getElementById('play-btn').style.display = 'none';
+  document.getElementById('preview-bar').style.display = 'none';
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
@@ -950,29 +1259,36 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     const res = await fetch('/api/run-pipeline', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ temp_path: pendingTempPath, filename: pendingFile?.name || 'mesh' }),
+      body: JSON.stringify({
+        temp_path: pendingTempPath,
+        filename: pendingFile?.name || 'mesh',
+        num_variants: parseInt(document.getElementById('variant-slider')?.value || '1'),
+      }),
     });
     if (!res.ok) { console.error('[analyze] /api/run-pipeline HTTP', res.status); alert('Pipeline request failed: HTTP ' + res.status); loading.classList.remove('show'); return; }
     let data;
     try { data = await res.json(); } catch (e) { console.error('[analyze] JSON parse failed from /api/run-pipeline', e); alert('Pipeline response invalid'); loading.classList.remove('show'); return; }
-    if (data.error) { console.error('[analyze] pipeline error:', data.error); alert(data.error); loading.classList.remove('show'); return; }
+    if (data.error) {
+      console.error('[analyze] pipeline error:', data.error);
+      loading.classList.remove('show');
+      if (data.error.includes('not found') || data.error.includes('Upload first')) {
+        // Stale temp path from previous session — clear and prompt re-upload
+        sessionStorage.removeItem('paramesh_preview');
+        pendingTempPath = null;
+        document.getElementById('btn-analyze').style.display = 'none';
+        document.getElementById('btn-upload').style.display = '';
+        addChatMessage('system', 'Session expired. Please re-upload your mesh file.');
+      } else {
+        alert(data.error);
+      }
+      return;
+    }
 
     currentJobId = data.job_id;
     console.debug('[analyze] job submitted, id:', currentJobId);
 
-    // Show AI thinking process in chat as pipeline runs
     addChatMessage('system', 'Pipeline started — analyzing mesh...');
     let lastStage = '';
-
-    const thinkingMessages = {
-      'Ingesting mesh...': '🔍 Reading mesh file, checking topology...',
-      'Segmenting surfaces...': '🧩 Identifying surface regions — planes, cylinders, cones...',
-      'Fitting primitives...': '📐 Fitting analytic surfaces to each region...',
-      'Building topology...': '🔗 Analyzing edge relationships — sharp, fillet, chamfer...',
-      'Recognizing features...': '🏗️ Detecting features — extrusions, holes, pockets, chamfers...',
-      'Building CAD model...': '⚙️ Building parametric solid: sketch → extrude → cut → chamfer...',
-      'Done': '✅ CAD model built successfully!',
-    };
 
     // Poll progress and stream thinking to chat
     const statusData = await new Promise((resolve, reject) => {
@@ -984,20 +1300,28 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           loadingText.textContent = d.stage || 'Processing...';
           progressDetail.textContent = d.progress + '%';
 
-          // Add thinking message when stage changes
+          // Show LLM build strategy when it becomes available
           if (d.stage && d.stage !== lastStage) {
             lastStage = d.stage;
-            const thought = thinkingMessages[d.stage];
-            if (thought) addChatMessage('ai', thought, true);
+            if (d.variants && d.variants.length > 0 && lastStage === 'Building CAD model...') {
+              const strategy = d.variants[0].strategy;
+              if (strategy) addChatMessage('ai', 'Build strategy: ' + strategy);
+            }
           }
 
+          // Render progress geometry on the 3D model
+          if (d.progress_geometry) {
+            _renderProgressGeometry(d.progress_geometry);
+          }
+
+          if (_cancelledJobId === currentJobId) { clearInterval(poll); reject(new Error('Cancelled')); return; }
           if (d.status === 'done') { clearInterval(poll); resolve(d); }
           else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
         } catch (e) { console.warn('[analyze] poll error:', e); }
       }, 500);
     });
 
-    progressBar.style.width = '100%';
+    progressBar.style.width = '90%';
     loadingText.textContent = 'Loading model...';
 
     // Hide preview bar, show upload button again
@@ -1011,7 +1335,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       const holes = statusData.steps.filter(s => s.name.includes('Hole')).length;
       const chamfers = statusData.steps.filter(s => s.name.includes('Chamfer')).length;
       const fillets = statusData.steps.filter(s => s.name.includes('Fillet')).length;
-      let summary = `📊 Reconstructed with ${statusData.num_steps} features: 1 base extrusion`;
+      let summary = `Reconstructed with ${statusData.num_steps} features: 1 base extrusion`;
       if (holes > 0) summary += `, ${holes} hole${holes > 1 ? 's' : ''}`;
       if (chamfers > 0) summary += `, ${chamfers} chamfer${chamfers > 1 ? 's' : ''}`;
       if (fillets > 0) summary += `, ${fillets} fillet${fillets > 1 ? 's' : ''}`;
@@ -1027,59 +1351,15 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
         }).then(comp => {
           if (comp.score !== undefined) {
             console.debug('[analyze] comparison score:', comp.score.toFixed(1), '%, slices:', comp.per_slice?.length);
-            addChatMessage('ai', `🎯 Cross-section accuracy: ${comp.score.toFixed(0)}% (${comp.per_slice?.length || 0} slices compared)`);
+            addChatMessage('ai', `Cross-section accuracy: ${comp.score.toFixed(0)}% (${comp.per_slice?.length || 0} slices compared)`);
           }
         }).catch(e => { console.warn('[analyze] slicer comparison failed (non-critical):', e.message); });
       }
 
-      // Try AI dimension analysis — keep loading visible with status
-      loadingText.textContent = 'Analyzing dimensions...';
-      progressBar.style.width = '100%';
-      try {
-        console.debug('[analyze] requesting AI dimension analysis');
-        const analysisRes = await fetch('/api/chat/analyze-mesh', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            bbox_min: statusData.bbox_min,
-            bbox_max: statusData.bbox_max,
-            volume: statusData.mesh_volume,
-            num_faces: statusData.num_steps,
-            features: statusData.steps.map(s => ({ type: s.name, depth: 0 })),
-          }),
-        });
-        if (!analysisRes.ok) { console.warn('[analyze] dimension analysis HTTP', analysisRes.status); throw new Error('HTTP ' + analysisRes.status); }
-        const analysis = await analysisRes.json();
-        console.debug('[analyze] dimension analysis received, skip:', analysis.skip);
+      // AI dimension analysis in background — populates panel when ready
+      fetchDimensionAnalysis(statusData);
 
-        if (!analysis.skip) {
-          loading.classList.remove('show');
-          showDimensionModal(analysis, statusData);
-          return; // Modal will call finishLoad when confirmed
-        }
-      } catch (err) {
-        console.warn('[analyze] AI dimension analysis unavailable, falling back to bbox:', err.message);
-        // AI unavailable — show basic dimension review from bbox
-        if (statusData.bbox_min && statusData.bbox_max) {
-          const dims = [0,1,2].map(i => Math.abs(statusData.bbox_max[i] - statusData.bbox_min[i]));
-          dims.sort((a,b) => b - a);
-          const basicAnalysis = {
-            part_type: 'Prismatic part',
-            suggested_dimensions: {
-              width: Math.round(dims[0] * 10) / 10,
-              height: Math.round(dims[1] * 10) / 10,
-              thickness: Math.round(dims[2] * 10) / 10,
-            },
-            notes: 'Dimensions from bounding box. AI analysis unavailable.',
-          };
-          loading.classList.remove('show');
-          showDimensionModal(basicAnalysis, statusData);
-          return;
-        }
-      }
-
-      loading.classList.remove('show');
-      // No dimensions available — load directly
+      // finishLoad will dismiss the loading overlay after the 3D model renders
       finishLoad(statusData);
     } else {
       alert('Pipeline error: ' + (data.error || 'unknown'));
@@ -1090,8 +1370,28 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     alert('Pipeline error: ' + err.message);
     document.getElementById('status-dot').className = 'status-dot';
     loading.classList.remove('show');
+  } finally {
+    _analyzeRunning = false;
+    // Keep _pipelineRotate true — finishLoad will stop it after model renders
+    // Restore UI elements
+    document.getElementById('actions').style.display = '';
+    document.getElementById('timeline').style.display = '';
   }
 });
+
+// Cancel pipeline
+let _cancelledJobId = null;
+window._cancelPipeline = function() {
+  _cancelledJobId = currentJobId;
+  _analyzeRunning = false;
+  window._pipelineRotate = false;
+  modelGroup.rotation.y = 0;
+  document.getElementById('loading').classList.remove('show');
+  document.getElementById('actions').style.display = '';
+  document.getElementById('timeline').style.display = '';
+  document.getElementById('status-dot').className = 'status-dot';
+  addChatMessage('system', 'Pipeline cancelled.');
+};
 
 // Rerun pipeline with the same mesh
 window.rerunPipeline = function() {
@@ -1101,6 +1401,28 @@ window.rerunPipeline = function() {
 };
 
 let cachedStatusData = null;
+
+function buildDimsFromStatus(statusData) {
+  const raw = [0,1,2].map(i => Math.abs(statusData.bbox_max[i] - statusData.bbox_min[i]));
+  raw.sort((a,b) => b - a);
+  const dims = {
+    width: Math.round(raw[0] * 10) / 10,
+    height: Math.round(raw[1] * 10) / 10,
+    thickness: Math.round(raw[2] * 10) / 10,
+  };
+  // Extract hole diameters from step names like "Blind Hole (r=2.5...)"
+  if (statusData.steps) {
+    const radii = [];
+    for (const s of statusData.steps) {
+      const m = s.name.match(/[Hh]ole.*r=([\d.]+)/);
+      if (m) radii.push(parseFloat(m[1]));
+    }
+    if (radii.length > 0) {
+      dims.hole_diameters = radii.map(r => Math.round(r * 2 * 10) / 10);
+    }
+  }
+  return { part_type: 'Detected', suggested_dimensions: dims, notes: '' };
+}
 
 function finishLoad(statusData) {
   console.debug('[finishLoad] state -> cad, steps:', statusData.steps?.length, 'volume:', statusData.mesh_volume, 'tokens:', statusData.tokens_used);
@@ -1114,83 +1436,165 @@ function finishLoad(statusData) {
     try { sessionStorage.setItem('paramesh_mesh_compare', JSON.stringify(savedMeshPreview)); } catch (e) { /* too large */ }
   }
   populateUI(statusData);
-  document.getElementById('token-count').textContent = statusData.parts_used || statusData.tokens_used || 0;
+
+  // Show dimension panel from bbox (AI analysis will upgrade it if available)
+  if (statusData.bbox_min && statusData.bbox_max) {
+    populateDimPanel(buildDimsFromStatus(statusData));
+  }
+  const partsCount = statusData.parts_used || statusData.tokens_used || 0;
+  document.getElementById('token-count').textContent = partsCount;
+  localStorage.setItem('paramesh_parts_count', partsCount);
   document.getElementById('status-dot').className = 'status-dot done';
   document.getElementById('btn-export').disabled = false;
   document.getElementById('btn-rerun').style.display = pendingTempPath ? '' : 'none';
+  document.getElementById('play-btn').style.display = '';
 
-  // Enable chat
+  // Enable chat and dimension editing
   document.getElementById('chat-input').disabled = false;
   document.getElementById('chat-send').disabled = false;
+  const editBtn = document.getElementById('dim-edit-btn');
+  if (editBtn) editBtn.style.display = '';
 
   // Add system message to chat
   addChatMessage('system', `Model loaded: ${statusData.num_steps} features, ${statusData.mesh_volume.toLocaleString()} mm³`);
 
+  const loading = document.getElementById('loading');
+  const progressBar = document.getElementById('progress-bar');
+
   if (statusData.steps.length > 0) {
     loadStep(statusData.steps.length - 1).then(() => {
+      // Dismiss loading overlay and stop idle rotation now that 3D model is rendered
+      progressBar.style.width = '100%';
+      loading.classList.remove('show');
+      window._pipelineRotate = false;
       // Animate camera only when CAD model first loads
       try {
         const box = new THREE.Box3().setFromObject(modelGroup);
-        const s = box.getSize(new THREE.Vector3());
-        const size = s.length();
-        const camY = Math.max(size * 1.2, s.y * 2.5);
-        console.debug('[finishLoad] model loaded, bbox size:', size.toFixed(1), 'animating camera');
-        animateCamera(
-          { x: size * 0.7, y: camY, z: size * 0.7 },
-          { x: 0, y: 0, z: 0 },
-          1.2,
-        );
+        const pos = bestCameraPos(box);
+        console.debug('[finishLoad] model loaded, animating camera to face largest profile');
+        animateCamera(pos, { x: 0, y: 0, z: 0 }, 1.2);
+        // Auto-play build animation after camera settles
+        setTimeout(() => { if (typeof playBuildAnimation === 'function') playBuildAnimation(); }, 1500);
       } catch (e) {
         console.error('[finishLoad] camera animation failed', e);
       }
     });
+  } else {
+    loading.classList.remove('show');
   }
 }
 
-// ── Dimension Review Modal ──
-function showDimensionModal(analysis, statusData) {
-  console.debug('[showDimensionModal] part_type:', analysis.part_type, 'dims:', Object.keys(analysis.suggested_dimensions || {}));
-  cachedStatusData = statusData;
-  const modal = document.getElementById('dim-modal');
-  const rows = document.getElementById('dim-rows');
-  const notes = document.getElementById('dim-notes');
+// ── Inline Dimension Panel ──
+async function fetchDimensionAnalysis(statusData) {
+  let analysis;
+  try {
+    console.debug('[analyze] requesting AI dimension analysis');
+    const res = await fetch('/api/chat/analyze-mesh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bbox_min: statusData.bbox_min,
+        bbox_max: statusData.bbox_max,
+        volume: statusData.mesh_volume,
+        num_faces: statusData.num_steps,
+        features: statusData.steps.map(s => ({ type: s.name, depth: 0 })),
+      }),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    analysis = await res.json();
+    if (analysis.skip) throw new Error('skip');
+  } catch (err) {
+    console.warn('[analyze] AI dimension analysis unavailable, falling back to bbox:', err.message);
+    if (statusData.bbox_min && statusData.bbox_max) {
+      const dims = [0,1,2].map(i => Math.abs(statusData.bbox_max[i] - statusData.bbox_min[i]));
+      dims.sort((a,b) => b - a);
+      analysis = {
+        part_type: 'Prismatic part',
+        suggested_dimensions: {
+          width: Math.round(dims[0] * 10) / 10,
+          height: Math.round(dims[1] * 10) / 10,
+          thickness: Math.round(dims[2] * 10) / 10,
+        },
+        notes: 'Dimensions from bounding box. AI analysis unavailable.',
+      };
+    } else {
+      return; // No dimension data at all
+    }
+  }
+  populateDimPanel(analysis);
+}
 
-  document.getElementById('dim-part-type').innerHTML = `
-    <div style="font-size:14px;color:var(--accent);margin-bottom:12px">
-      Detected: <strong>${analysis.part_type || 'Unknown'}</strong>
-    </div>`;
+function populateDimPanel(analysis) {
+  console.debug('[dimPanel] part_type:', analysis.part_type, 'dims:', Object.keys(analysis.suggested_dimensions || {}));
+  const panel = document.getElementById('dim-panel');
+  const rows = document.getElementById('dim-rows');
+
+  document.getElementById('dim-part-type').textContent = analysis.part_type || 'Unknown';
 
   rows.innerHTML = '';
   const dims = analysis.suggested_dimensions || {};
   for (const [key, val] of Object.entries(dims)) {
     const displayVal = Array.isArray(val) ? val.join(', ') : val;
-    rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value"><input class="dim-input" type="text" data-key="${key}" value="${displayVal}"> mm</span></div>`;
+    rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value"><input class="dim-input" type="text" data-key="${key}" value="${displayVal}" readonly> mm</span></div>`;
   }
 
-  notes.textContent = analysis.notes || '';
   if (analysis.usage) {
     document.getElementById('token-count').textContent = analysis.usage.calls_used || 0;
   }
 
-  modal.classList.add('show');
+  panel.style.display = '';
+  panel.classList.remove('collapsed');
+
+  // Persist to localStorage
+  try { localStorage.setItem('paramesh_dims', JSON.stringify(analysis)); } catch (e) {}
 }
 
-// Called from HTML buttons
-window.skipDimensionReview = function() {
-  document.getElementById('dim-modal').classList.remove('show');
-  if (cachedStatusData) finishLoad(cachedStatusData);
+window.toggleDimPanel = function() {
+  document.getElementById('dim-panel').classList.toggle('collapsed');
 };
 
-window.confirmDimensionReview = function() {
-  // Read edited dimension values from inputs
+window.toggleDimEdit = function() {
   const inputs = document.querySelectorAll('#dim-rows .dim-input');
-  const editedDims = {};
-  inputs.forEach(inp => { editedDims[inp.dataset.key] = inp.value.trim(); });
-  document.getElementById('dim-modal').classList.remove('show');
-  if (cachedStatusData) finishLoad(cachedStatusData);
-  const dimSummary = Object.entries(editedDims).map(([k, v]) => `${k}: ${v} mm`).join(', ');
-  addChatMessage('system', `Dimensions confirmed: ${dimSummary}`);
+  const btn = document.getElementById('dim-edit-btn');
+  const isReadonly = inputs[0]?.readOnly;
+  inputs.forEach(inp => {
+    inp.readOnly = !isReadonly;
+    inp.style.background = isReadonly ? 'var(--bg-tertiary)' : 'transparent';
+    inp.style.borderColor = isReadonly ? 'var(--accent)' : 'var(--border)';
+  });
+  btn.innerHTML = isReadonly ? '<i class="ri-check-line"></i> Done' : '<i class="ri-pencil-line"></i> Edit';
+  btn.style.borderColor = isReadonly ? 'var(--accent)' : 'var(--border)';
+  btn.style.color = isReadonly ? 'var(--accent)' : 'var(--text-muted)';
 };
+
+// Restore dimension panel from localStorage on load
+try {
+  const savedDims = localStorage.getItem('paramesh_dims');
+  if (savedDims) {
+    const analysis = JSON.parse(savedDims);
+    if (analysis.suggested_dimensions) populateDimPanel(analysis);
+  }
+} catch (e) {}
+
+// Persist and restore variant slider + resize toggle
+document.getElementById('variant-slider')?.addEventListener('change', (e) => {
+  localStorage.setItem('paramesh_num_variants', e.target.value);
+});
+document.getElementById('resize-toggle')?.addEventListener('change', (e) => {
+  localStorage.setItem('paramesh_resize_on', e.target.checked ? '1' : '0');
+});
+try {
+  const savedVariants = localStorage.getItem('paramesh_num_variants');
+  if (savedVariants) {
+    const slider = document.getElementById('variant-slider');
+    if (slider) { slider.value = savedVariants; document.getElementById('variant-count').textContent = savedVariants; }
+  }
+  const savedResize = localStorage.getItem('paramesh_resize_on');
+  if (savedResize === '1') {
+    const toggle = document.getElementById('resize-toggle');
+    if (toggle) toggle.checked = true;
+  }
+} catch (e) {}
 
 // ── AI Chat ──
 const chatMessages = document.getElementById('chat-messages');
@@ -1370,6 +1774,12 @@ function saveViewerState(state) {
   localStorage.setItem('paramesh_viewer_state', state);
 }
 
+// Restore parts count from localStorage
+try {
+  const savedParts = localStorage.getItem('paramesh_parts_count');
+  if (savedParts) document.getElementById('token-count').textContent = savedParts;
+} catch (e) {}
+
 async function autoLoad() {
   console.debug('[autoLoad] checking for saved state...');
   // Check sessionStorage for a saved mesh preview
@@ -1377,15 +1787,32 @@ async function autoLoad() {
   if (saved) {
     try {
       const previewRes = JSON.parse(saved);
-      if (previewRes.mesh_vertices && previewRes.mesh_vertices.length > 0) {
-        console.debug('[autoLoad] restoring preview from sessionStorage, verts:', previewRes.mesh_vertices.length);
-        document.getElementById('empty-state').style.display = 'none';
-        _showRawMesh(previewRes);
-        pendingTempPath = previewRes.temp_path;
-        pendingFile = null;
-        document.getElementById('btn-analyze').style.display = '';
-        document.getElementById('btn-upload').style.display = 'none';
-        return; // DONE — skip CAD load entirely
+      if (previewRes.mesh_vertices && previewRes.mesh_vertices.length > 0 && previewRes.temp_path) {
+        // Verify the temp file still exists on the server
+        try {
+          const check = await fetch('/api/check-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ temp_path: previewRes.temp_path }),
+          });
+          const checkData = await check.json();
+          if (!checkData.exists) {
+            console.warn('[autoLoad] stale preview — temp file gone, clearing');
+            sessionStorage.removeItem('paramesh_preview');
+            // fall through to load last CAD job
+          } else {
+            console.debug('[autoLoad] restoring preview from sessionStorage, verts:', previewRes.mesh_vertices.length);
+            document.getElementById('empty-state').style.display = 'none';
+            _showRawMesh(previewRes);
+            pendingTempPath = previewRes.temp_path;
+            pendingFile = null;
+            document.getElementById('btn-analyze').style.display = '';
+            return;
+          }
+        } catch (e) {
+          console.warn('[autoLoad] check-file failed, clearing stale preview');
+          sessionStorage.removeItem('paramesh_preview');
+        }
       }
     } catch (e) {
       console.error('[autoLoad] preview restore failed:', e);
@@ -1441,8 +1868,13 @@ async function autoLoad() {
         cachedStatusData = data;
         document.getElementById('status-dot').className = 'status-dot done';
         document.getElementById('btn-export').disabled = false;
+        document.getElementById('play-btn').style.display = '';
         document.getElementById('chat-input').disabled = false;
         document.getElementById('chat-send').disabled = false;
+        // Show dimension panel from bbox on restore
+        if (data.bbox_min && data.bbox_max) {
+          populateDimPanel(buildDimsFromStatus(data));
+        }
         loadStep(lastStep).then(() => {
           // Fit camera to loaded model using smooth animation
           try {
@@ -1488,6 +1920,24 @@ function animateCamera(endPos, endTarget, duration = 1.5) {
 
 function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
 
+// Compute camera position facing the largest profile of the model
+function bestCameraPos(box) {
+  const s = box.getSize(new THREE.Vector3());
+  const size = s.length();
+  // Find the two largest dimensions — the camera should face the smallest dimension (thickness)
+  const dims = [{axis: 'x', val: s.x}, {axis: 'y', val: s.y}, {axis: 'z', val: s.z}];
+  dims.sort((a, b) => a.val - b.val);
+  const thinAxis = dims[0].axis; // smallest = thickness direction
+  const dist = size * 1.8;
+
+  // Position camera along the thin axis, offset slightly for perspective
+  const pos = { x: dist * 0.2, y: dist * 0.35, z: dist * 0.2 };
+  if (thinAxis === 'x') pos.x = dist;
+  else if (thinAxis === 'y') pos.y = dist;
+  else pos.z = dist;
+  return pos;
+}
+
 autoLoad();
 
 function animate() {
@@ -1514,6 +1964,26 @@ function animate() {
       dir.normalize().multiplyScalar(newDist);
     }
     camera.position.copy(controls.target).add(dir);
+  }
+
+  // Idle rotation during pipeline — orbit camera around Z axis (vertical spin)
+  if (window._pipelineRotate && !window._userDragging) {
+    if (!window._idleDist) {
+      window._idleDist = camera.position.distanceTo(controls.target);
+      window._idleTheta = Math.atan2(camera.position.y - controls.target.y, camera.position.x - controls.target.x);
+      window._idleZ = camera.position.z;
+    }
+    window._idleTheta += 0.00075;
+    const zOff = window._idleZ - controls.target.z;
+    const r = Math.sqrt(Math.max(0.1, window._idleDist * window._idleDist - zOff * zOff));
+    camera.position.set(
+      controls.target.x + r * Math.cos(window._idleTheta),
+      controls.target.y + r * Math.sin(window._idleTheta),
+      window._idleZ
+    );
+    camera.lookAt(controls.target);
+  } else if (!window._pipelineRotate) {
+    window._idleDist = null;
   }
 
   controls.update();

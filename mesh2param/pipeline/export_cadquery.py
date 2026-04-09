@@ -34,6 +34,18 @@ class ConstructionStep:
     tess_vertices: np.ndarray  # (V, 3)
     tess_faces: np.ndarray  # (F, 3)
     volume: float = 0.0
+    sketch_overlay: np.ndarray | None = None  # (N, 3) — pairs of 3D points for blue sketch lines
+
+
+@dataclass
+class BuildVariant:
+    """One build variant — a specific construction order for the same part."""
+
+    name: str  # e.g. "LLM Optimized", "Largest First", etc.
+    strategy: str  # one-line description of the build approach
+    construction_steps: list[ConstructionStep] = field(default_factory=list)
+    script: str = ""
+    cad_volume: float = 0.0
 
 
 @dataclass
@@ -44,6 +56,7 @@ class CadQueryResult:
     tess_vertices: np.ndarray | None = None  # (V, 3) tessellated solid verts
     tess_faces: np.ndarray | None = None  # (F, 3) tessellated solid faces
     construction_steps: list[ConstructionStep] = field(default_factory=list)
+    variants: list[BuildVariant] = field(default_factory=list)
     script: str = ""
     step_path: str = ""
     mesh_volume: float = 0.0
@@ -68,6 +81,7 @@ def export_cadquery(
     cleaned: CleanedMesh,
     output_path: str | Path | None = None,
     use_llm: bool = True,
+    num_variants: int = 1,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -109,41 +123,61 @@ def export_cadquery(
         logger.error("Failed to extract base profile from mesh")
         return CadQueryResult(mesh_volume=mesh_volume, status="FAIL")
 
-    # Get construction order — LLM-guided or default
-    build_order = None
-    if use_llm:
-        build_order = _llm_plan_build_order(feature_tree, cleaned)
+    # --- Build 4 variants with different construction orders ---
+    build_args = dict(
+        profiles=profiles, depth=depth, extrude_dir=extrude_dir,
+        extrude_start=extrude_start, holes=hole_features,
+        chamfers=chamfer_features, fillets=fillet_features, cleaned=cleaned,
+    )
 
-    # Build the CadQuery solid step-by-step:
-    # 1. Sketch profile
-    # 2. Extrude base
-    # 3+. Cut holes
-    # N+. Apply chamfers and fillets
     logger.debug(
         "Building CadQuery solid: %d profiles, depth=%.2f, %d holes, %d chamfers, %d fillets",
         len(profiles), depth, len(hole_features), len(chamfer_features), len(fillet_features),
     )
-    try:
-        solid, script, steps = _build_stepwise(
-            profiles, depth, extrude_dir, extrude_start,
-            hole_features, chamfer_features, fillet_features,
-            build_order=build_order, cleaned=cleaned,
-        )
-    except Exception:
-        logger.exception(
-            "Stage 6b failed during CadQuery solid construction: profiles=%d, holes=%d",
-            len(profiles), len(hole_features),
-        )
-        raise
 
-    # Compute CAD volume
-    try:
-        import cadquery as cq
-        cad_volume = abs(float(solid.val().Volume()))
-    except Exception:
-        logger.debug("Could not compute CAD volume from solid, defaulting to 0.0")
-        cad_volume = 0.0
+    variants: list[BuildVariant] = []
 
+    # Variant 1: LLM-optimized (or default heuristic if LLM unavailable)
+    llm_order = None
+    if use_llm:
+        llm_order = _llm_plan_build_order(feature_tree, cleaned)
+
+    try:
+        solid, script, steps = _build_stepwise(**build_args, build_order=llm_order)
+        v1_name = "AI Optimized" if llm_order else "Default"
+        v1_strategy = llm_order.strategy if llm_order else "Default heuristic ordering"
+        try:
+            v1_vol = abs(float(solid.val().Volume()))
+        except Exception:
+            v1_vol = 0.0
+        variants.append(BuildVariant(
+            name=v1_name, strategy=v1_strategy,
+            construction_steps=steps, script=script, cad_volume=v1_vol,
+        ))
+    except Exception:
+        logger.exception("Variant 1 (LLM/default) failed")
+        solid, script, steps = None, "", []
+
+    # Variants 2-N: Heuristic orderings (only if num_variants > 1)
+    heuristic_orders = _make_heuristic_orders(feature_tree.features) if num_variants > 1 else []
+    for h_name, h_strategy, h_plan in heuristic_orders[:num_variants - 1]:
+        try:
+            h_solid, h_script, h_steps = _build_stepwise(**build_args, build_order=h_plan)
+            try:
+                h_vol = abs(float(h_solid.val().Volume()))
+            except Exception:
+                h_vol = 0.0
+            variants.append(BuildVariant(
+                name=h_name, strategy=h_strategy,
+                construction_steps=h_steps, script=h_script, cad_volume=h_vol,
+            ))
+        except Exception:
+            logger.warning("Variant '%s' failed, skipping", h_name)
+
+    logger.info("Built %d variants: %s", len(variants), [v.name for v in variants])
+
+    # Primary result uses the first (best) variant
+    cad_volume = variants[0].cad_volume if variants else 0.0
     volume_error = abs(cad_volume - mesh_volume) / (mesh_volume + 1e-15) * 100
     status = "PASS" if volume_error < 10.0 else "FAIL"
 
@@ -174,6 +208,7 @@ def export_cadquery(
         tess_vertices=tess_verts,
         tess_faces=tess_faces,
         construction_steps=steps,
+        variants=variants,
         script=script,
         step_path=step_path,
         mesh_volume=mesh_volume,
@@ -235,21 +270,30 @@ def _extract_profile_and_holes(
     normal = [0.0, 0.0, 0.0]
     normal[primary_axis] = 1.0
 
-    # Collect profiles from multiple slices. Pick the slice whose extruded
-    # volume is closest to the actual mesh volume — this handles tapered parts
-    # better than just picking the largest cross-section.
+    # Collect profiles from multiple slices across the full depth.
+    # Pick the slice with the largest outer profile area — this finds the
+    # widest cross-section, avoiding positions where holes/pockets reduce it.
     mesh_volume = abs(float(mesh.volume)) if mesh.is_watertight else 0
     extent = float(all_proj.max() - all_proj.min())
 
-    candidates: list[tuple[float, list]] = []  # (vol_error, profiles)
+    candidates: list[tuple[float, list]] = []  # (-area, profiles)
 
-    # Slice at the very top and bottom faces — just 0.1mm inside the surface.
-    # This captures the true outer profile without any hole interference.
+    # Sample slices across the full depth: top, bottom, and intermediate
+    # positions.  Intermediate slices avoid blind holes near the faces and
+    # find the true widest outer boundary.
     surface_inset = 0.1  # mm inside the surface
+    z_min = float(all_proj.min())
+    z_max = float(all_proj.max())
     slice_positions = [
-        float(all_proj.min()) + surface_inset,  # bottom face
-        float(all_proj.max()) - surface_inset,  # top face
+        z_min + surface_inset,                   # bottom face
+        z_max - surface_inset,                   # top face
     ]
+    # Add intermediate slices (10%, 25%, 50%, 75%, 90% of depth)
+    for frac in [0.10, 0.25, 0.50, 0.75, 0.90]:
+        pos = z_min + extent * frac
+        # Avoid duplicates near the surface inset positions
+        if pos > z_min + surface_inset + 0.2 and pos < z_max - surface_inset - 0.2:
+            slice_positions.append(pos)
     for slice_pos in slice_positions:
         origin = [0.0, 0.0, 0.0]
         origin[primary_axis] = slice_pos
@@ -299,7 +343,8 @@ def _extract_profile_and_holes(
                 outer = projected_polys[0]
 
                 # Check remaining polygons:
-                # - Large + inside outer = cutout (window/pocket)
+                # - Large non-circular + inside outer = cutout (window/pocket)
+                # - Circular + inside outer = hole cross-section, DROP it
                 # - Small + inside outer = hole cross-section, DROP it
                 # - Outside outer = split piece, union to extend boundary
                 cutouts = []
@@ -307,10 +352,14 @@ def _extract_profile_and_holes(
                 for sp in projected_polys[1:]:
                     centroid = sp.centroid
                     if outer.contains(centroid):
-                        if sp.area > outer.area * 0.05:
-                            # Large polygon inside → cutout
+                        # Check if this is roughly circular (a hole cross-section).
+                        # Circularity = 4*pi*area / perimeter^2 — 1.0 for perfect circle.
+                        circ = 4.0 * 3.14159 * sp.area / (sp.length ** 2) if sp.length > 0 else 0
+                        is_circular = circ > 0.70
+                        if sp.area > outer.area * 0.10 and not is_circular:
+                            # Large non-circular polygon inside → cutout (window/pocket)
                             cutouts.append(sp)
-                        # else: small polygon inside → hole cross-section, skip
+                        # else: hole cross-section or small feature, skip
                     else:
                         # Outside the outer → union to extend boundary
                         to_union.append(sp)
@@ -335,6 +384,10 @@ def _extract_profile_and_holes(
                 if merged.geom_type == 'MultiPolygon':
                     merged = max(merged.geoms, key=lambda g: g.area)
 
+                # Score by outer boundary area BEFORE subtracting cutouts.
+                # This way holes/pockets inside the slice don't penalize it.
+                outer_boundary_area = merged.area
+
                 outer_coords = list(merged.exterior.coords)[:-1]
                 outer_coords = _simplify_profile(outer_coords, tolerance=0.1)
                 slice_profiles = [outer_coords] if len(outer_coords) >= 3 else []
@@ -350,11 +403,10 @@ def _extract_profile_and_holes(
             if not slice_profiles:
                 continue
 
-            # Score: prefer the slice with the largest profile area.
-            # For chamfered parts, this picks the base (widest) profile
-            # rather than the chamfered (narrower) side.
-            profile_area = _polygon_area(slice_profiles[0])
-            candidates.append((-profile_area, slice_profiles))
+            # Prefer the slice with the largest outer boundary.
+            # Using the boundary area (before hole subtraction) ensures
+            # slices through blind holes aren't penalized.
+            candidates.append((-outer_boundary_area, slice_profiles))
         except Exception:
             continue
 
@@ -653,6 +705,58 @@ class BuildPlan:
     feature_order: list[int]  # feature indices in construction order
     notes: dict[int, str] = field(default_factory=dict)  # per-feature notes
     strategy: str = ""  # overall construction strategy description
+
+
+def _make_heuristic_orders(
+    features: list,
+) -> list[tuple[str, str, BuildPlan]]:
+    """Generate 3 heuristic build orders (name, strategy, BuildPlan).
+
+    These complement the LLM order to give the user 4 choices total.
+    Feature 0 (base extrusion) is always first.
+    """
+    from mesh2param.models.feature import FeatureType
+
+    n = len(features)
+    if n <= 1:
+        return []
+
+    holes = [(i, f) for i, f in enumerate(features) if f.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE)]
+    chamfers = [(i, f) for i, f in enumerate(features) if f.type == FeatureType.CHAMFER]
+    fillets = [(i, f) for i, f in enumerate(features) if f.type == FeatureType.FILLET]
+    other = [(i, f) for i, f in enumerate(features) if i > 0 and (i, f) not in holes + chamfers + fillets]
+
+    results = []
+
+    # --- Variant 2: Largest holes first ---
+    sorted_holes = sorted(holes, key=lambda x: -(x[1].sketch_geometry.get("radius", 0) if x[1].sketch_geometry else 0))
+    order = [0] + [i for i, _ in sorted_holes] + [i for i, _ in other] + [i for i, _ in chamfers] + [i for i, _ in fillets]
+    results.append((
+        "Largest First",
+        "Cut largest holes first for stable booleans, chamfers and fillets last",
+        BuildPlan(feature_order=order, strategy="Largest holes first"),
+    ))
+
+    # --- Variant 3: Smallest holes first ---
+    sorted_holes_rev = sorted(holes, key=lambda x: (x[1].sketch_geometry.get("radius", 0) if x[1].sketch_geometry else 0))
+    order = [0] + [i for i, _ in sorted_holes_rev] + [i for i, _ in other] + [i for i, _ in fillets] + [i for i, _ in chamfers]
+    results.append((
+        "Smallest First",
+        "Cut smallest holes first, finish with fillets then chamfers",
+        BuildPlan(feature_order=order, strategy="Smallest holes first"),
+    ))
+
+    # --- Variant 4: Grouped by type ---
+    through = [(i, f) for i, f in holes if f.type == FeatureType.THROUGH_HOLE]
+    blind = [(i, f) for i, f in holes if f.type == FeatureType.BLIND_HOLE]
+    order = [0] + [i for i, _ in through] + [i for i, _ in blind] + [i for i, _ in other] + [i for i, _ in chamfers] + [i for i, _ in fillets]
+    results.append((
+        "By Type",
+        "All through-holes, then blind holes, then chamfers, then fillets",
+        BuildPlan(feature_order=order, strategy="Grouped by feature type"),
+    ))
+
+    return results
 
 
 def _llm_visual_verify(
@@ -1036,95 +1140,197 @@ def _build_stepwise(
     ))
 
     # --- Chamfers BEFORE holes ---
-    # Detect chamfer faces directly from mesh geometry (diagonal normals),
-    # match each group to CadQuery edges, and apply individually.
-    # After each chamfer, validate the volume change is proportional to
-    # the expected material removal. Revert if it looks wrong.
+    # Detect chamfer faces from mesh geometry. For each chamfer:
+    #   - Full-edge chamfers (bevel spans >=80% of face): use .chamfer()
+    #     so it maps to an editable Onshape Chamfer feature.
+    #   - Partial/stepped chamfers: use a side-profile cut (triangle
+    #     extruded along the edge) since .chamfer() can't model these.
     mesh_chamfers = _detect_mesh_chamfers(cleaned, extrude_dir)
     for cham in mesh_chamfers:
-        d1 = cham["size"]
-        d2 = cham.get("size2", d1)
-        sel = cham["selector"]
         label = cham["label"]
+        d1 = cham["size"]
+        d2 = cham["size2"]
+        sel = cham["selector"]
         edge_length_hint = cham.get("edge_length", 0.0)
         vol_before = abs(float(wp.val().Volume()))
 
-        # Try asymmetric first, then progressively smaller
-        attempts = [(d1, d2), (d1 * 0.8, d2 * 0.8), (d1 * 0.6, d2 * 0.6)]
-        applied = False
-        for a1, a2 in attempts:
-            try:
-                min_len = min(a1, a2) * 2.0
-                sel_edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
-                if abs(a1 - a2) / max(a1, a2) < 0.15:
-                    wp_test = sel_edges.chamfer(min(a1, a2))
-                else:
-                    wp_test = sel_edges.chamfer(a1, a2)
-                vol_after = abs(float(wp_test.val().Volume()))
-                if vol_after <= 0:
-                    logger.debug("Chamfer %s (%.2fx%.2f): zero volume, skipping attempt", label, a1, a2)
-                    continue
-
-                # --- Volume validation ---
-                # Expected volume removal for a chamfer:
-                #   V_expected ~= 0.5 * d1 * d2 * total_edge_length
-                # Sum the lengths of the edges that were chamfered.
+        if cham["is_full_edge"]:
+            # --- Full-edge chamfer: use .chamfer() API ---
+            attempts = [(d1, d2), (d1 * 0.8, d2 * 0.8), (d1 * 0.6, d2 * 0.6)]
+            applied = False
+            for a1, a2 in attempts:
                 try:
-                    total_edge_len = sum(
-                        e.Length() for e in wp.edges(sel).filter(lambda e: e.Length() > min_len).vals()
-                    )
-                except Exception:
-                    total_edge_len = edge_length_hint if edge_length_hint > 0 else 0.0
+                    min_len = min(a1, a2) * 2.0
+                    sel_edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
+                    if abs(a1 - a2) / max(a1, a2) < 0.15:
+                        wp_test = sel_edges.chamfer(min(a1, a2))
+                    else:
+                        wp_test = sel_edges.chamfer(a1, a2)
+                    vol_after = abs(float(wp_test.val().Volume()))
+                    if vol_after <= 0:
+                        continue
 
-                vol_removed = vol_before - vol_after
-                if total_edge_len > 0:
-                    expected_vol = 0.5 * a1 * a2 * total_edge_len
-                    vol_ratio = vol_removed / max(expected_vol, 1e-10)
-                    logger.debug(
-                        "Chamfer %s (%.2fx%.2f): vol_before=%.2f vol_after=%.2f "
-                        "removed=%.2f expected=%.2f ratio=%.2f edge_len=%.2f",
-                        label, a1, a2, vol_before, vol_after,
-                        vol_removed, expected_vol, vol_ratio, total_edge_len,
-                    )
-                    # Allow 0.1x to 10x of expected — reject gross mismatches
-                    if vol_ratio < 0.1 or vol_ratio > 10.0:
-                        logger.warning(
-                            "Chamfer %s: volume change ratio %.2f outside "
-                            "[0.1, 10.0] — reverting (removed=%.2f, expected=%.2f)",
-                            label, vol_ratio, vol_removed, expected_vol,
+                    vol_removed = vol_before - vol_after
+                    try:
+                        total_edge_len = sum(
+                            e.Length() for e in wp.edges(sel).filter(
+                                lambda e: e.Length() > min_len
+                            ).vals()
                         )
+                    except Exception:
+                        total_edge_len = edge_length_hint
+
+                    if total_edge_len > 0:
+                        expected_vol = 0.5 * a1 * a2 * total_edge_len
+                        vol_ratio = vol_removed / max(expected_vol, 1e-10)
+                        if vol_ratio < 0.1 or vol_ratio > 10.0:
+                            logger.debug(
+                                "Chamfer %s (%.2fx%.2f): ratio %.2f out of range, trying smaller",
+                                label, a1, a2, vol_ratio,
+                            )
+                            continue
+                    elif vol_after > vol_before * 1.01:
                         continue
-                else:
-                    # No edge length info — just check volume didn't increase
-                    if vol_after > vol_before * 1.01:
-                        logger.warning("Chamfer %s: volume increased, reverting", label)
-                        continue
-                    logger.debug(
-                        "Chamfer %s (%.2fx%.2f): vol_before=%.2f vol_after=%.2f "
-                        "(no edge length for validation)",
+
+                    wp = wp_test
+                    v, f = _tessellate_solid(wp)
+                    cham_label = f"{a1:.1f}x{a2:.1f}" if abs(a1 - a2) > 0.5 else f"{min(a1, a2):.1f}"
+                    steps.append(ConstructionStep(
+                        name=f"Chamfer {label} ({cham_label}mm)",
+                        tess_vertices=v, tess_faces=f, volume=vol_after,
+                    ))
+                    script_lines.append(f'# Chamfer {label}')
+                    script_lines.append(f'result = result.edges("{sel}").chamfer({a1:.4f}, {a2:.4f})')
+                    logger.info(
+                        "Applied chamfer %s: %.2fx%.2f mm (.chamfer), vol %.2f -> %.2f",
                         label, a1, a2, vol_before, vol_after,
                     )
+                    applied = True
+                    break
+                except Exception as exc:
+                    logger.debug("Chamfer %s (%.2fx%.2f) failed: %s", label, a1, a2, exc)
+                    continue
+            if applied:
+                continue  # success — move to next chamfer
 
-                wp = wp_test
-                v, f = _tessellate_solid(wp)
-                cham_label = f"{a1:.1f}x{a2:.1f}" if abs(a1-a2) > 0.5 else f"{min(a1,a2):.1f}"
-                steps.append(ConstructionStep(
-                    name=f"Chamfer {label} ({cham_label}mm)",
-                    tess_vertices=v, tess_faces=f, volume=vol_after,
-                ))
-                script_lines.append(f'# Chamfer {label}')
-                script_lines.append(f'result = result.edges("{sel}").chamfer({a1:.4f}, {a2:.4f})')
-                logger.info(
-                    "Applied chamfer %s: %.2fx%.2f mm, vol %.2f -> %.2f (removed %.2f)",
-                    label, a1, a2, vol_before, vol_after, vol_removed,
-                )
-                applied = True
-                break
-            except Exception as exc:
-                logger.debug("Chamfer %s (%.2fx%.2f) failed: %s", label, a1, a2, exc)
+            # .chamfer() failed — fall through to profile cut
+            logger.debug("Chamfer %s: .chamfer() failed, trying profile cut", label)
+
+        # --- Partial/stepped chamfer OR .chamfer() fallback: side-profile cut ---
+        corner = cham["corner"]
+        along_b = cham["along_b"]
+        along_a = cham["along_a"]
+        eidx = cham["edge_axis_idx"]
+        e_min = cham["edge_min"]
+        e_max = cham["edge_max"]
+        try:
+            ax_u, ax_v = [i for i in range(3) if i != eidx]
+            # "Through All" — extrude far beyond the part in both directions
+            bbox_diag_local = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+            through_all = bbox_diag_local * 5
+            cut_origin = [0.0, 0.0, 0.0]
+            cut_origin[eidx] = e_min - through_all
+
+            plane_normal = [0.0, 0.0, 0.0]
+            plane_normal[eidx] = 1.0
+            # Choose xDir so that the CQ plane's yDir aligns with +ax_v.
+            # For normal along Y with xDir=X, yDir=cross(Y,X)=-Z (flipped).
+            # Using xDir along ax_v instead gives yDir along ax_u — then
+            # moveTo(v, u) maps correctly. Pick whichever xDir avoids a flip.
+            x_dir = [0.0, 0.0, 0.0]
+            x_dir[ax_u] = 1.0
+            y_dir_check = np.cross(plane_normal, x_dir)
+            if y_dir_check[ax_v] < 0:
+                # Flip: use ax_v as xDir instead, then u→ax_v, v→ax_u
+                x_dir = [0.0, 0.0, 0.0]
+                x_dir[ax_v] = 1.0
+                swap_uv = True
+            else:
+                swap_uv = False
+
+            cut_plane = cq.Plane(
+                origin=cq.Vector(*cut_origin),
+                normal=cq.Vector(*plane_normal),
+                xDir=cq.Vector(*x_dir),
+            )
+
+            def _pt(p):
+                return (p[ax_v], p[ax_u]) if swap_uv else (p[ax_u], p[ax_v])
+
+            tri_pts = [along_b, corner, along_a]
+            p0 = _pt(tri_pts[0])
+            cut_wp = cq.Workplane(cut_plane).moveTo(*p0)
+            for pt in tri_pts[1:]:
+                cut_wp = cut_wp.lineTo(*_pt(pt))
+            cut_wp = (cut_wp.close()
+                    .extrude(2 * through_all + e_max - e_min))
+
+            wp_test = wp.cut(cut_wp)
+            vol_after = abs(float(wp_test.val().Volume()))
+            if vol_after <= 0:
+                logger.debug("Chamfer %s: profile cut zero volume, skipping", label)
                 continue
-        if not applied:
-            logger.debug("Chamfer %s: all attempts failed, skipping", label)
+
+            vol_removed = vol_before - vol_after
+            expected_vol = 0.5 * d1 * d2 * (e_max - e_min)
+            vol_ratio = vol_removed / max(expected_vol, 1e-10)
+
+            if vol_ratio < 0.05 or vol_ratio > 10.0:
+                logger.warning(
+                    "Chamfer %s: profile cut ratio %.2f out of range — skipping",
+                    label, vol_ratio,
+                )
+                continue
+
+            # --- Sketch step: solid body + blue triangle sketch overlay ---
+            body_v, body_f = _tessellate_solid(wp)
+
+            # Build sketch line pairs for the polygon edges
+            poly_3d = []
+            for pt in tri_pts:
+                p = np.zeros(3)
+                p[ax_u] = pt[ax_u]
+                p[ax_v] = pt[ax_v]
+                p[eidx] = e_min
+                poly_3d.append(p)
+            # N edges: pt0→pt1, pt1→pt2, ..., ptN→pt0
+            sketch_pairs = []
+            for i in range(len(poly_3d)):
+                sketch_pairs.append(poly_3d[i])
+                sketch_pairs.append(poly_3d[(i + 1) % len(poly_3d)])
+            sketch_lines = np.array(sketch_pairs)
+
+            cham_label = f"{d1:.1f}x{d2:.1f}" if abs(d1 - d2) > 0.5 else f"{min(d1, d2):.1f}"
+            steps.append(ConstructionStep(
+                name=f"Side Profile {label}",
+                tess_vertices=body_v, tess_faces=body_f, volume=vol_before,
+                sketch_overlay=sketch_lines,
+            ))
+
+            # --- Cut step: the actual extrude-cut ---
+            wp = wp_test
+            v, f = _tessellate_solid(wp)
+            steps.append(ConstructionStep(
+                name=f"Side Cut {label} ({cham_label}mm)",
+                tess_vertices=v, tess_faces=f, volume=vol_after,
+            ))
+            script_lines.append(f'# Chamfer {label} — profile cut')
+            script_lines.append(
+                f'cut = cq.Workplane(cq.Plane(origin=cq.Vector{tuple(cut_origin)}, '
+                f'normal=cq.Vector{tuple(plane_normal)}, xDir=cq.Vector{tuple(x_dir)}))'
+                f'.moveTo({corner[ax_u]:.4f}, {corner[ax_v]:.4f})'
+                f'.lineTo({along_b[ax_u]:.4f}, {along_b[ax_v]:.4f})'
+                f'.lineTo({along_a[ax_u]:.4f}, {along_a[ax_v]:.4f})'
+                f'.close().extrude({e_max - e_min:.4f})'
+            )
+            script_lines.append('result = result.cut(cut)')
+            logger.info(
+                "Applied chamfer %s: %.2fx%.2f mm profile cut, "
+                "vol %.2f -> %.2f (ratio %.2f)",
+                label, d1, d2, vol_before, vol_after, vol_ratio,
+            )
+        except Exception as exc:
+            logger.debug("Chamfer %s profile cut failed: %s", label, exc)
 
     # Reorder holes
     if build_order is not None and len(holes) > 0:
@@ -1349,70 +1555,7 @@ def _build_stepwise(
         if not applied:
             logger.debug("Fillet %s: all attempts failed, skipping", label)
 
-    # --- Fallback: if no mesh fillets detected but recognition stage found
-    # fillets, try a conservative global application ---
-    if not mesh_fillets and fillets:
-        fillet_radii = []
-        for fl in fillets:
-            r = fl.sketch_geometry.get("radius", 0)
-            if 0.1 < r < 50:
-                fillet_radii.append(r)
-
-        if fillet_radii:
-            fillet_r = float(np.median(fillet_radii))
-            fillet_r = max(0.2, min(fillet_r, 3.0))
-            vol_before = abs(float(wp.val().Volume()))
-
-            fallback_applied = False
-            for attempt_r in [fillet_r, fillet_r * 0.8, fillet_r * 0.6]:
-                # Try each edge-axis selector individually
-                for sel_str in ["|X", "|Y", "|Z"]:
-                    try:
-                        min_len = attempt_r * 2.0
-                        wp_test = wp.edges(sel_str).filter(
-                            lambda e: e.Length() > min_len
-                        ).fillet(attempt_r)
-                        vol_after = abs(float(wp_test.val().Volume()))
-                        if vol_after <= 0:
-                            continue
-                        vol_removed = vol_before - vol_after
-                        # Sanity: fillet should remove material, not add
-                        if vol_after > vol_before * 1.01:
-                            continue
-                        # Sanity: should not remove more than 10% of volume
-                        if vol_removed > vol_before * 0.10:
-                            logger.debug(
-                                "Fallback fillet %s r=%.2f removed %.1f%% of volume — "
-                                "too much, skipping",
-                                sel_str, attempt_r,
-                                vol_removed / vol_before * 100,
-                            )
-                            continue
-
-                        wp = wp_test
-                        v, f = _tessellate_solid(wp)
-                        steps.append(ConstructionStep(
-                            name=f"Fillet (r={attempt_r:.1f}mm, fallback {sel_str})",
-                            tess_vertices=v, tess_faces=f, volume=vol_after,
-                        ))
-                        script_lines.append(
-                            f'result = result.edges("{sel_str}").fillet({attempt_r:.4f})'
-                        )
-                        logger.info(
-                            "Applied fallback fillet %s: r=%.2f, vol %.2f -> %.2f",
-                            sel_str, attempt_r, vol_before, vol_after,
-                        )
-                        fallback_applied = True
-                        break
-                    except Exception:
-                        continue
-                if fallback_applied:
-                    break
-            if not fallback_applied:
-                logger.warning(
-                    "All fillet sizes/selectors failed (mesh + fallback) — "
-                    "skipping fillet step"
-                )
+    # (No fallback fillets — only mesh-detected fillets are applied)
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
     return wp, "\n".join(script_lines), steps
@@ -1825,9 +1968,13 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
 
         shape = solid.val().wrapped
 
-        # Use OCCT's BRepMesh for all faces with tight tolerance
-        # (custom Delaunay was leaving gaps on concave planar faces)
-        BRepMesh_IncrementalMesh(shape, 0.05, False, 0.1, True)
+        # Clear any cached triangulation from previous operations
+        # (BRepMesh reuses stale mesh data after boolean cuts otherwise)
+        from OCP.BRepTools import BRepTools
+        BRepTools.Clean_s(shape)
+
+        # Re-mesh — balance between smooth rendering and performance
+        BRepMesh_IncrementalMesh(shape, 0.02, False, 0.05, True)
 
         all_verts = []
         all_faces = []
@@ -2104,7 +2251,7 @@ def _detect_mesh_chamfers(
 
     # --- Scale-relative limits ---
     size_min = bbox_diag * 0.001   # 0.1% of diagonal
-    size_max = bbox_diag * 0.05    # 5% of diagonal
+    size_max = bbox_diag * 0.10    # 10% of diagonal
     # DBSCAN eps for normal clustering: normals live on the unit sphere so
     # eps=0.20 works well regardless of part scale.
     normal_eps = 0.20
@@ -2149,9 +2296,11 @@ def _detect_mesh_chamfers(
 
     # --- Build face adjacency for connectivity validation ---
     # Two mesh faces are adjacent if they share an edge (2 vertices).
+    # Use ALL mesh faces (not just diagonal) so chamfer strips that share
+    # edges with non-diagonal faces still appear connected.
     from collections import defaultdict
     edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for fi in diag_indices:
+    for fi in range(len(cleaned.faces)):
         tri = cleaned.faces[fi]
         for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[0], tri[2])):
             key = (min(a, b), max(a, b))
@@ -2242,13 +2391,6 @@ def _detect_mesh_chamfers(
             )
             continue
 
-        # --- Connectivity check ---
-        cluster_set = set(int(x) for x in cluster_idx)
-        if not _faces_are_connected(cluster_set):
-            logger.debug("Cluster %d: %d faces not connected, skipping",
-                          label, len(cluster_idx))
-            continue
-
         # --- Edge coverage check ---
         # The chamfer strip should span >50% of the corresponding bbox
         # edge length (otherwise it is a scattered partial cluster).
@@ -2267,78 +2409,106 @@ def _detect_mesh_chamfers(
             continue
 
         # --- Build CadQuery selector ---
-        # Determine which side of each face-axis the chamfer is on.
-        # We support chamfers between ANY two principal faces, not just
-        # top/bottom.
-        centroid = cluster_face_verts.mean(axis=0)
-        bbox_center = (cleaned.bbox[0] + cleaned.bbox[1]) / 2.0
-
-        # For the two face axes, determine <axis or >axis by comparing
-        # the cluster centroid to the bbox center.
-        sign_a = ">" if centroid[face_ax_a] > bbox_center[face_ax_a] else "<"
-        sign_b = ">" if centroid[face_ax_b] > bbox_center[face_ax_b] else "<"
+        # Determine which bbox corner the chamfer removes material from.
+        # The chamfer face normal points AWAY from the solid. Its components
+        # indicate which direction the face points: the corner to cut is
+        # on the side the normal points toward (the outside of the removed wedge).
+        sign_a = ">" if avg_normal[face_ax_a] > 0 else "<"
+        sign_b = ">" if avg_normal[face_ax_b] > 0 else "<"
 
         # The selector uses "|edge_axis" to pick edges parallel to the
-        # edge direction, then filters by the face the chamfer is
-        # closest to. Use the face-axis with the LARGER normal component
-        # (face_ax_b) as the primary filter for best specificity.
-        face_filter = f"{sign_b}{axis_names[face_ax_b]}"
-        selector = f"|{edge_axis} and {face_filter}"
+        # edge direction, then filters by BOTH face axes to distinguish
+        # e.g. left-side vs right-side chamfers that share the same Z.
+        selector = f"|{edge_axis} and {sign_b}{axis_names[face_ax_b]} and {sign_a}{axis_names[face_ax_a]}"
 
         # Label for display
         side_label_b = "top" if sign_b == ">" else "bottom"
         side_label_a = "top" if sign_a == ">" else "bottom"
         label_str = f"{side_label_b}-{axis_names[face_ax_b]} {edge_axis}"
 
-        # --- Compute chamfer dimensions ---
-        # d2: inset along the face_ax_b direction (the face with larger
-        # normal component). Measured from the bbox boundary.
-        face_ext_vals = []
-        for fi in cluster_idx:
-            tri_v = cleaned.vertices[cleaned.faces[fi]]
-            if sign_b == "<":
-                face_ext_vals.append(float(tri_v[:, face_ax_b].max()))
-            else:
-                face_ext_vals.append(float(tri_v[:, face_ax_b].min()))
-        face_ext_vals_arr = np.array(face_ext_vals)
+        # --- Compute chamfer triangle ---
+        # d2: measured from cluster vertices near the side face boundary.
+        boundary_tol = max(1.0, bbox_diag * 0.005)
 
-        if sign_b == "<":
-            ext_boundary = float(cleaned.bbox[0][face_ax_b])
-            d2 = float(np.percentile(face_ext_vals_arr, 90)) - ext_boundary
+        corner_a = float(cleaned.bbox[1][face_ax_a]) if sign_a == ">" else float(cleaned.bbox[0][face_ax_a])
+        corner_b = float(cleaned.bbox[1][face_ax_b]) if sign_b == ">" else float(cleaned.bbox[0][face_ax_b])
+
+        if sign_a == ">":
+            near_a_mask = cluster_face_verts[:, face_ax_a] > corner_a - boundary_tol
         else:
-            ext_boundary = float(cleaned.bbox[1][face_ax_b])
-            d2 = ext_boundary - float(np.percentile(face_ext_vals_arr, 10))
+            near_a_mask = cluster_face_verts[:, face_ax_a] < corner_a + boundary_tol
+        if near_a_mask.sum() > 0:
+            near_a_verts = cluster_face_verts[near_a_mask]
+            if sign_b == "<":
+                inner_b = float(near_a_verts[:, face_ax_b].max())
+            else:
+                inner_b = float(near_a_verts[:, face_ax_b].min())
+        else:
+            inner_b = corner_b
 
-        # d1: inset along face_ax_a. Computed from d2 and the chamfer angle
-        # via the normal components: d1/d2 = |n_a| / |n_b|
-        n_a = abs(avg_normal[face_ax_a])
-        n_b = abs(avg_normal[face_ax_b])
-        d1 = d2 * n_a / max(n_b, 0.01)
+        d2 = abs(inner_b - corner_b)
 
-        d1 = abs(d1)
-        d2 = abs(d2)
+        # d1: derive from d2 and the chamfer angle ratio.
+        n_a_comp = abs(avg_normal[face_ax_a])
+        n_b_comp = abs(avg_normal[face_ax_b])
+        d1 = d2 * n_a_comp / max(n_b_comp, 0.01)
 
-        # --- Scale-relative size filtering ---
+        # Subtract margin so the triangle extends PAST the mesh edge,
+        # eliminating slivers from tessellation gaps.  Smaller d1/d2 →
+        # along_a/along_b move further from the corner → bigger cut.
+        d1 -= 0.5
+        d2 -= 0.5
+        d1 = max(d1, 0.5)
+        d2 = max(d2, 0.5)
+
+        # Build triangle with corner pushed 1mm outside the bbox.
+        # The two legs that sit on the model's faces extend past the
+        # boundary, eliminating slivers.  The hypotenuse shifts slightly
+        # (~1mm on a 13mm chamfer = <8%) which is within mesh reconstruction
+        # tolerance.  This approach is simple and robust for all part sizes.
+        overshoot = 1.0  # mm past bbox on face-aligned legs
+
+        corner = [0.0, 0.0, 0.0]
+        corner[face_ax_a] = corner_a + (overshoot if sign_a == ">" else -overshoot)
+        corner[face_ax_b] = corner_b + (overshoot if sign_b == ">" else -overshoot)
+
+        along_b = list(corner)
+        along_b[face_ax_b] = corner_b + d2 * (-1.0 if sign_b == ">" else 1.0)
+
+        along_a = list(corner)
+        along_a[face_ax_a] = corner_a + d1 * (-1.0 if sign_a == ">" else 1.0)
+
+        poly_pts = [along_b, corner, along_a]
+
+        # --- Size filtering ---
         if d1 < size_min or d2 < size_min:
             logger.debug(
                 "Cluster %d: chamfer too small (d1=%.3f, d2=%.3f, min=%.3f), skipping",
                 label, d1, d2, size_min,
             )
             continue
-        if d1 > size_max or d2 > size_max:
-            logger.debug(
-                "Cluster %d: chamfer too large (d1=%.3f, d2=%.3f, max=%.3f), skipping",
-                label, d1, d2, size_max,
-            )
-            continue
+
+        # Extrude range along edge axis
+        edge_min = float(cleaned.bbox[0][edge_axis_idx])
+        edge_max = float(cleaned.bbox[1][edge_axis_idx])
+
+        # Determine if this is a simple full-edge chamfer (can use .chamfer())
+        # or a partial/stepped chamfer that needs a profile cut.
+        # A full-edge chamfer's d2 spans >=80% of the face extent.
+        face_extent = float(bbox_size[face_ax_b])
+        face_coverage = d2 / face_extent if face_extent > 1e-10 else 0
+        is_full_edge = face_coverage >= 0.80
 
         logger.info(
             "Chamfer cluster %d: %d faces, normal=[%.2f,%.2f,%.2f], "
             "d1=%.2f d2=%.2f, edge=|%s, selector='%s', "
-            "strip L=%.2f W=%.2f aspect=%.1f coverage=%.0f%%",
+            "strip L=%.2f W=%.2f aspect=%.1f coverage=%.0f%% "
+            "face_coverage=%.0f%% → %s",
             label, len(cluster_idx), *avg_normal, d1, d2,
             edge_axis, selector,
             strip_length, strip_width, aspect_ratio, coverage * 100,
+            face_coverage * 100,
+            "chamfer" if is_full_edge else "profile cut",
         )
         results.append({
             "size": float(d1),
@@ -2347,6 +2517,15 @@ def _detect_mesh_chamfers(
             "label": label_str,
             "face_count": len(cluster_idx),
             "edge_length": float(strip_length),
+            "is_full_edge": is_full_edge,
+            "edge_axis_idx": edge_axis_idx,
+            "face_ax_a": face_ax_a,
+            "face_ax_b": face_ax_b,
+            "corner": corner,
+            "along_b": along_b,
+            "along_a": along_a,
+            "edge_min": edge_min,
+            "edge_max": edge_max,
         })
 
     # --- Keep individual chamfers (do NOT merge by selector) ---

@@ -282,7 +282,10 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
     content = await file.read()
     logger.debug("Preview file received: %r size=%d bytes", file.filename, len(content))
     suffix = Path(file.filename).suffix
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    # Store in data/uploads/ instead of system temp (survives server restarts)
+    upload_dir = Path("data/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=upload_dir)
     tmp.write(content)
     tmp.close()
 
@@ -304,21 +307,46 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
         except Exception:
             pass
 
-        # Complexity analysis — based on face count and geometry
+        # Complexity analysis — based on geometry, not face count.
+        # A scanned part can have millions of faces but still be simple
+        # (6 planes, 4 holes). Score is based on:
+        # 1. Number of distinct normal directions (surface count estimate)
+        # 2. Whether the part is prismatic (mostly axis-aligned normals)
+        # 3. Watertight status
         import numpy as np
 
-        # Complexity scoring: prismatic parts (brackets, plates, mounts)
-        # are what this tool is built for — they should score low.
-        # Only organic/freeform or very dense meshes score high.
+        normals = cleaned.normals
+        abs_normals = np.abs(normals)
+
+        # Count how many faces have axis-aligned normals (prismatic indicator)
+        # A face is "axis-aligned" if its largest normal component > 0.85
+        max_component = abs_normals.max(axis=1)
+        prismatic_ratio = float((max_component > 0.85).sum()) / max(len(normals), 1)
+
+        # Estimate number of distinct surface directions via clustering
+        # Round normals to 1 decimal and count unique directions
+        rounded = np.round(normals, 1)
+        unique_dirs = len(set(map(tuple, rounded)))
+
+        # Score: more unique directions = more complex geometry
+        # Prismatic parts: ~10-30 unique dirs. Organic: 100+
         score = 0
-        if face_count <= 3000:
-            score += 10   # normal prismatic part
-        elif face_count <= 6000:
-            score += 35   # moderately complex
-        elif face_count <= 10000:
-            score += 60   # complex
+        if unique_dirs <= 20:
+            score += 5
+        elif unique_dirs <= 50:
+            score += 15
+        elif unique_dirs <= 100:
+            score += 35
+        elif unique_dirs <= 200:
+            score += 55
         else:
-            score += 85   # very complex / likely organic
+            score += 75
+
+        # Prismatic bonus — mostly axis-aligned = simple
+        if prismatic_ratio > 0.7:
+            score = max(5, score - 20)
+        elif prismatic_ratio < 0.3:
+            score += 15  # organic/freeform penalty
 
         # Non-watertight penalty
         if not cleaned.is_watertight:
@@ -326,9 +354,9 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
 
         score = min(100, round(score))
 
-        normal_spread = 0.0  # not computed in simplified scoring
+        normal_spread = round(1.0 - prismatic_ratio, 3)
 
-        # Classification and limits
+        # Classification
         if score <= 25:
             complexity = "Simple"
             difficulty = "low"
@@ -347,13 +375,13 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
         else:
             complexity = "Too Complex"
             difficulty = "extreme"
-            can_process = face_count <= 10000
-            reason = "This mesh has too many surfaces, high curvature variation, or non-prismatic geometry. The tool works best on prismatic mechanical parts (brackets, plates, mounts) with under 5000 faces." if not can_process else None
+            can_process = prismatic_ratio > 0.3
+            reason = "This mesh appears to be organic or freeform geometry. The tool works best on prismatic mechanical parts (brackets, plates, mounts)." if not can_process else None
 
-        # Hard limits
-        if face_count > 10000:
+        # No hard face count limit — high-poly scans of simple parts are fine
+        if not cleaned.is_watertight and face_count > 50000:
             can_process = False
-            reason = f"Mesh has {face_count:,} faces (limit: 10,000). Simplify the mesh before uploading."
+            reason = f"Non-watertight mesh with {face_count:,} faces. Repair the mesh first using the free cleaner at /clean."
         if not cleaned.is_watertight and face_count > 5000:
             can_process = False
             reason = f"Non-watertight mesh with {face_count:,} faces. Repair the mesh first using the free cleaner at /clean."
@@ -385,6 +413,13 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
         logger.exception("Preview failed for file %r", file.filename)
         Path(tmp.name).unlink(missing_ok=True)
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+@app.post("/api/check-file")
+async def check_file(body: dict):
+    """Check if a previously uploaded temp file still exists."""
+    temp_path = body.get("temp_path", "")
+    return {"exists": bool(temp_path and Path(temp_path).exists())}
 
 
 @app.post("/api/run-pipeline")
@@ -419,8 +454,9 @@ async def run_pipeline(request: Request, body: dict):
     if not temp_path or not Path(temp_path).exists():
         return JSONResponse({"status": "error", "error": "No mesh to process. Upload first."}, status_code=400)
 
-    job_id = queue.submit(filename, temp_path, client_ip=ip)
-    logger.info("Pipeline queued: job_id=%s filename=%r ip=%s plan=%s", job_id, filename, ip, plan)
+    num_variants = max(1, min(4, int(body.get("num_variants", 1))))
+    job_id = queue.submit(filename, temp_path, client_ip=ip, num_variants=num_variants)
+    logger.info("Pipeline queued: job_id=%s filename=%r ip=%s plan=%s variants=%d", job_id, filename, ip, plan, num_variants)
 
     # Set free trial cookie for guest users (marks the 1 free generation as used)
     response = JSONResponse({"status": "queued", "job_id": job_id})
@@ -454,7 +490,9 @@ async def upload(request: Request, file: UploadFile = File(...)):
         )
 
     suffix = Path(file.filename).suffix
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    upload_dir = Path("data/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=upload_dir)
     tmp.write(content)
     tmp.close()
 
@@ -480,7 +518,19 @@ async def job_status(job_id: str):
             "has_geometry": step.tess_vertices is not None and len(step.tess_vertices) > 0,
         })
 
-    return {
+    # Variant info
+    variants_info = []
+    for i, v in enumerate(getattr(job, 'variants', [])):
+        v_steps = v.get('steps', [])
+        variants_info.append({
+            "index": i,
+            "name": v.get('name', f'Variant {i+1}'),
+            "strategy": v.get('strategy', ''),
+            "num_steps": len(v_steps),
+            "cad_volume": round(v.get('cad_volume', 0), 1),
+        })
+
+    result = {
         "job_id": job.id,
         "filename": job.filename,
         "status": job.status,
@@ -495,6 +545,59 @@ async def job_status(job_id: str):
         "bbox_max": job.bbox_max,
         "token_cost": job.token_cost,
         "tokens_used": queue.tokens_spent,
+        "variants": variants_info,
+        "active_variant": getattr(job, 'active_variant', 0),
+    }
+
+    # Include progress geometry if pipeline is still running
+    pv = getattr(job, 'progress_vertices', None)
+    if job.status == "processing" and pv:
+        result["progress_geometry"] = {
+            "vertices": pv,
+            "faces": job.progress_faces,
+            "stage": job.progress_stage,
+            "version": getattr(job, 'progress_version', 0),
+        }
+        if job.progress_colors:
+            result["progress_geometry"]["colors"] = job.progress_colors
+            result["progress_geometry"]["colors_per_face"] = getattr(job, 'progress_colors_per_face', False)
+        if job.progress_edges:
+            result["progress_geometry"]["edges"] = job.progress_edges
+        if job.progress_edge_colors:
+            result["progress_geometry"]["edge_colors"] = job.progress_edge_colors
+
+    return result
+
+
+@app.post("/api/job/{job_id}/variant/{variant_index}")
+async def switch_variant(job_id: str, variant_index: int):
+    """Switch the active build variant. Updates steps for all subsequent requests."""
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    variants = getattr(job, 'variants', [])
+    if variant_index < 0 or variant_index >= len(variants):
+        return JSONResponse({"error": "Invalid variant index"}, status_code=404)
+
+    job.active_variant = variant_index
+    job.steps = variants[variant_index]['steps']
+    job.cad_volume = variants[variant_index].get('cad_volume', 0)
+
+    steps_info = []
+    for i, step in enumerate(job.steps):
+        steps_info.append({
+            "index": i, "name": step.name,
+            "volume": round(step.volume, 1),
+            "has_geometry": step.tess_vertices is not None and len(step.tess_vertices) > 0,
+        })
+
+    return {
+        "active_variant": variant_index,
+        "name": variants[variant_index].get('name', ''),
+        "strategy": variants[variant_index].get('strategy', ''),
+        "num_steps": len(job.steps),
+        "steps": steps_info,
+        "cad_volume": round(job.cad_volume, 1),
     }
 
 
@@ -511,13 +614,16 @@ async def job_step(job_id: str, index: int):
     if step.tess_vertices is None or step.tess_faces is None:
         return JSONResponse({"error": "No geometry"}, status_code=404)
 
-    return {
+    result = {
         "name": step.name,
         "volume": round(step.volume, 1),
         "is_sketch": "sketch" in step.name.lower(),
         "vertices": step.tess_vertices.flatten().tolist(),
         "faces": step.tess_faces.flatten().tolist(),
     }
+    if step.sketch_overlay is not None:
+        result["sketch_overlay"] = step.sketch_overlay.flatten().tolist()
+    return result
 
 
 @app.get("/api/job/{job_id}/compare")
@@ -624,12 +730,15 @@ async def step_legacy(index: int):
     step = job.steps[index]
     if step.tess_vertices is None:
         return JSONResponse({"error": "No geometry"}, status_code=404)
-    return {
+    legacy_result = {
         "name": step.name, "volume": round(step.volume, 1),
         "is_sketch": "sketch" in step.name.lower(),
         "vertices": step.tess_vertices.flatten().tolist(),
         "faces": step.tess_faces.flatten().tolist(),
     }
+    if getattr(step, "sketch_overlay", None) is not None:
+        legacy_result["sketch_overlay"] = step.sketch_overlay.flatten().tolist()
+    return legacy_result
 
 
 @app.get("/api/progress")
@@ -690,7 +799,9 @@ async def clean_mesh(file: UploadFile = File(...)):
     import trimesh
     logger.debug("Clean request: filename=%r", file.filename)
     suffix = Path(file.filename).suffix
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    upload_dir = Path("data/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=upload_dir)
     content = await file.read()
     logger.debug("Clean file received: %r size=%d bytes", file.filename, len(content))
     tmp.write(content)

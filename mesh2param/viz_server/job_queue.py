@@ -170,7 +170,7 @@ class JobQueue:
                         len(job.progress_vertices), len(job.progress_faces),
                         'yes' if job.progress_colors else 'no',
                         'yes' if job.progress_edges else 'no')
-            time.sleep(0.8)  # pause so frontend poll catches this stage
+            time.sleep(0.3)  # brief pause so frontend poll catches this stage
 
         # Stage 1: Ingest
         job.progress = 5

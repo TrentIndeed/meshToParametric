@@ -138,10 +138,24 @@ def export_cadquery(
     variants: list[BuildVariant] = []
 
     # Variant 1: LLM-optimized (or default heuristic if LLM unavailable)
+    # Skip LLM for simple parts (<10 features) — not worth the 10-15s latency
     llm_order = None
-    if use_llm:
-        llm_order = _llm_plan_build_order(feature_tree, cleaned)
+    num_features = len(feature_tree.features)
+    if use_llm and num_features >= 10:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Start LLM call in background while building the default variant
+        llm_future = ThreadPoolExecutor(1).submit(_llm_plan_build_order, feature_tree, cleaned)
+    elif use_llm:
+        llm_future = None
+        # For simple parts, try a quick LLM call with short timeout
+        try:
+            llm_order = _llm_plan_build_order(feature_tree, cleaned)
+        except Exception:
+            pass
+    else:
+        llm_future = None
 
+    # Build default variant immediately (no waiting for LLM)
     try:
         solid, script, steps = _build_stepwise(**build_args, build_order=llm_order)
         v1_name = "AI Optimized" if llm_order else "Default"
@@ -157,6 +171,27 @@ def export_cadquery(
     except Exception:
         logger.exception("Variant 1 (LLM/default) failed")
         solid, script, steps = None, "", []
+
+    # If LLM was running in background, collect result and add as a variant
+    if llm_future is not None:
+        try:
+            llm_result = llm_future.result(timeout=30)
+            if llm_result:
+                llm_solid, llm_script, llm_steps = _build_stepwise(**build_args, build_order=llm_result)
+                try:
+                    llm_vol = abs(float(llm_solid.val().Volume()))
+                except Exception:
+                    llm_vol = 0.0
+                variants.append(BuildVariant(
+                    name="AI Optimized", strategy=llm_result.strategy,
+                    construction_steps=llm_steps, script=llm_script, cad_volume=llm_vol,
+                ))
+                # Promote AI variant to first position
+                if len(variants) > 1:
+                    variants[0], variants[-1] = variants[-1], variants[0]
+                    solid = llm_solid  # use AI solid as primary
+        except Exception:
+            logger.debug("LLM build order timed out or failed, using default")
 
     # Variants 2-N: Heuristic orderings (only if num_variants > 1)
     heuristic_orders = _make_heuristic_orders(feature_tree.features) if num_variants > 1 else []
@@ -1144,7 +1179,7 @@ def _build_stepwise(
     script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
     script_lines.append(f"result = result.extrude({depth})")
 
-    v, f = _tessellate_solid(wp)
+    v, f = _tessellate_solid(wp, fast=True)
     vol = abs(float(wp.val().Volume())) if wp else 0
     steps.append(ConstructionStep(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
@@ -1204,7 +1239,7 @@ def _build_stepwise(
                         continue
 
                     wp = wp_test
-                    v, f = _tessellate_solid(wp)
+                    v, f = _tessellate_solid(wp, fast=True)
                     cham_label = f"{a1:.1f}x{a2:.1f}" if abs(a1 - a2) > 0.5 else f"{min(a1, a2):.1f}"
                     steps.append(ConstructionStep(
                         name=f"Chamfer {label} ({cham_label}mm)",
@@ -1294,7 +1329,7 @@ def _build_stepwise(
                 continue
 
             # --- Sketch step: solid body + blue triangle sketch overlay ---
-            body_v, body_f = _tessellate_solid(wp)
+            body_v, body_f = _tessellate_solid(wp, fast=True)
 
             # Build sketch line pairs for the polygon edges
             poly_3d = []
@@ -1320,7 +1355,7 @@ def _build_stepwise(
 
             # --- Cut step: the actual extrude-cut ---
             wp = wp_test
-            v, f = _tessellate_solid(wp)
+            v, f = _tessellate_solid(wp, fast=True)
             steps.append(ConstructionStep(
                 name=f"Side Cut {label} ({cham_label}mm)",
                 tess_vertices=v, tess_faces=f, volume=vol_after,
@@ -1448,7 +1483,7 @@ def _build_stepwise(
             else:
                 wp = wp_test
 
-            v, f = _tessellate_solid(wp)
+            v, f = _tessellate_solid(wp, fast=True)
             vol = abs(float(wp.val().Volume()))
             steps.append(ConstructionStep(
                 name=hole_name, tess_vertices=v, tess_faces=f, volume=vol,
@@ -1547,7 +1582,7 @@ def _build_stepwise(
                     )
 
                 wp = wp_test
-                v, f = _tessellate_solid(wp)
+                v, f = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
                     name=f"Fillet {label} (r={attempt_r:.2f}mm)",
                     tess_vertices=v, tess_faces=f, volume=vol_after,
@@ -1952,7 +1987,7 @@ def _build_solid(
 # ---------------------------------------------------------------------------
 
 
-def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
+def _tessellate_solid(solid, fast=False) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Tessellate a CadQuery solid for visualization.
 
     Uses per-face triangulation: extracts each B-rep face, gets its boundary
@@ -1960,8 +1995,10 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
     faces.  This guarantees interior triangles for large flat surfaces that
     OCCT's BRepMesh otherwise leaves hollow.
     Curved faces use standard BRepMesh triangulation.
+
+    fast=True uses coarser tolerance for intermediate construction steps.
     """
-    logger.debug("Tessellating CadQuery solid")
+    logger.debug("Tessellating CadQuery solid (fast=%s)", fast)
     try:
         from OCP.BRep import BRep_Tool
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
@@ -1984,8 +2021,9 @@ def _tessellate_solid(solid) -> tuple[np.ndarray | None, np.ndarray | None]:
         from OCP.BRepTools import BRepTools
         BRepTools.Clean_s(shape)
 
-        # Re-mesh — balance between smooth rendering and performance
-        BRepMesh_IncrementalMesh(shape, 0.02, False, 0.05, True)
+        # Mesh tolerance: coarse for intermediate steps, fine for final
+        mesh_tol = 0.15 if fast else 0.02
+        BRepMesh_IncrementalMesh(shape, mesh_tol, False, 0.3 if fast else 0.05, True)
 
         all_verts = []
         all_faces = []

@@ -455,7 +455,12 @@ async def run_pipeline(request: Request, body: dict):
         return JSONResponse({"status": "error", "error": "No mesh to process. Upload first."}, status_code=400)
 
     num_variants = max(1, min(4, int(body.get("num_variants", 1))))
+    target_dims = body.get("target_dims")  # {width, height, thickness} or null
     job_id = queue.submit(filename, temp_path, client_ip=ip, num_variants=num_variants)
+    # Pass target dimensions to job for post-cleaning resize
+    job = queue.get(job_id)
+    if job and target_dims:
+        job._target_dims = target_dims
     logger.info("Pipeline queued: job_id=%s filename=%r ip=%s plan=%s variants=%d", job_id, filename, ip, plan, num_variants)
 
     # Set free trial cookie for guest users (marks the 1 free generation as used)
@@ -830,6 +835,50 @@ async def clean_mesh(file: UploadFile = File(...)):
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
     finally:
         Path(tmp.name).unlink(missing_ok=True)
+
+
+@app.post("/api/resize-mesh")
+async def resize_mesh_file(body: dict):
+    """Resize a previously uploaded mesh file in-place by target dimensions."""
+    import trimesh
+    temp_path = body.get("temp_path", "")
+    if not temp_path or not Path(temp_path).exists():
+        return JSONResponse({"error": "Mesh file not found"}, status_code=400)
+
+    tw = body.get("width")
+    th = body.get("height")
+    tt = body.get("thickness")
+    if not any([tw, th, tt]):
+        return JSONResponse({"error": "No target dimensions"}, status_code=400)
+
+    try:
+        loaded = trimesh.load(temp_path)
+        mesh = loaded.dump(concatenate=True) if hasattr(loaded, 'dump') else loaded
+        bbox_size = mesh.vertices.max(0) - mesh.vertices.min(0)
+        # Sort both target and actual dims largest→smallest to match them
+        target = sorted([tw or 0, th or 0, tt or 0], reverse=True)
+        actual = sorted(bbox_size.tolist(), reverse=True)
+        scales = [t / a if t and t > 0 and a > 0 else 1.0 for t, a in zip(target, actual)]
+        # Map scales back to XYZ by sorting actual dims' axis indices
+        axis_order = sorted(range(3), key=lambda i: -bbox_size[i])
+        scale_xyz = [1.0, 1.0, 1.0]
+        for i, ax in enumerate(axis_order):
+            scale_xyz[ax] = scales[i]
+
+        center = (mesh.vertices.max(0) + mesh.vertices.min(0)) / 2
+        mesh.vertices = (mesh.vertices - center) * scale_xyz + center
+        mesh.export(temp_path)
+
+        new_bbox = mesh.vertices.max(0) - mesh.vertices.min(0)
+        logger.info("Resized mesh: %s → scales=%s new_dims=%s", temp_path, scale_xyz, new_bbox.tolist())
+        return {
+            "status": "ok",
+            "dimensions": [round(d, 1) for d in sorted(new_bbox.tolist(), reverse=True)],
+            "scale_xyz": [round(s, 4) for s in scale_xyz],
+        }
+    except Exception as e:
+        logger.exception("Resize failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/api/clean/resize")

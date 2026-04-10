@@ -235,24 +235,24 @@ nav .links a:hover { color: var(--text); }
   overflow: hidden;
 }
 
-/* ── Demo grid (See it work) ── */
+/* ── Demo grid (See it work) — 2-column for video showcases ── */
 .demo-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.25rem;
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem;
+  max-width: 900px; margin: 0 auto;
 }
-@media (max-width: 900px) { .demo-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 500px) { .demo-grid { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .demo-grid { grid-template-columns: 1fr; } }
 .demo-card {
-  background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
   overflow: hidden; transition: border-color 0.3s, transform 0.2s;
 }
 .demo-card:hover { border-color: var(--accent-border); transform: translateY(-3px); }
-.demo-visual { aspect-ratio: 4/3; overflow: hidden; background: var(--bg); }
+.demo-visual { aspect-ratio: 16/10; overflow: hidden; background: var(--bg); }
 .demo-visual img, .demo-visual video { width: 100%; height: 100%; object-fit: cover; }
 .demo-label {
-  font-size: 1rem; font-weight: 600; padding: 0.75rem 1rem 0.25rem;
+  font-size: 1.05rem; font-weight: 600; padding: 0.85rem 1.25rem 0.3rem;
 }
 .demo-meta {
-  font-size: 0.8rem; color: var(--text-muted); padding: 0 1rem 0.75rem;
+  font-size: 0.85rem; color: var(--text-muted); padding: 0 1.25rem 0.85rem;
 }
 
 /* ── Cleaner cards ── */
@@ -732,10 +732,10 @@ footer {
     <a href="#" class="logo" style="text-decoration:none;display:flex;align-items:center;gap:8px;" onclick="window.location=document.cookie.includes('paramesh_token')?'/home':'#';return false;"><img src="/static/icon-192.png" alt="" style="width:48px;height:48px;display:block;position:relative;top:2px;">Paramesh<span>AI</span></a>
     <div class="links">
       <a href="#how">How It Works</a>
-      <a href="#pricing">Pricing</a>
+      <!-- <a href="#pricing">Pricing</a> --> <!-- TODO: uncomment on launch -->
       <a href="#faq">FAQ</a>
       <a href="/learn">Learn</a>
-      <a href="/login?next=/home" class="btn btn-secondary">Sign In</a>
+      <!-- <a href="/login?next=/home" class="btn btn-secondary">Sign In</a> --> <!-- TODO: uncomment on launch. Login still works at /login -->
       <a href="#waitlist" class="btn btn-primary">Join Waitlist</a>
     </div>
   </div>
@@ -749,10 +749,10 @@ footer {
       <h1>Mesh in.<br><span class="gradient">Parametric CAD</span> out.</h1>
       <p>Upload an STL, OBJ, or 3MF. Get back a fully editable STEP file with a real feature tree — sketches, extrusions, holes, chamfers, fillets — built from scratch in under 60 seconds.</p>
       <div class="hero-actions">
-        <a href="/app" class="btn btn-primary" style="padding:0.85rem 2rem; font-size:1.05rem;">Try Free — No Signup</a>
+        <a href="#waitlist" class="btn btn-primary" style="padding:0.85rem 2rem; font-size:1.05rem;">Join Waitlist</a>
         <a href="#see-it-work" class="btn btn-secondary" style="padding:0.85rem 2rem; font-size:1.05rem;">See It Work</a>
       </div>
-      <div class="hero-waitlist-label" style="margin-top:1rem;">1 free conversion. No signup. No credit card.</div>
+      <div class="hero-waitlist-label" style="margin-top:1rem;">Coming soon. Join the waitlist for early access.</div>
     </div>
     <!-- Hero demo video -->
     <div style="margin-top:3rem; width:100%; max-width:900px;">
@@ -765,7 +765,8 @@ footer {
   </div>
 </section>
 
-<!-- Demo Widget: Try It Now -->
+<!-- TODO: Remove display:none on launch -->
+<div style="display:none">
 <section id="demo" class="demo-widget">
   <div class="container">
     <div class="section-header fade-in">
@@ -863,6 +864,7 @@ footer {
     </div>
   </div>
 </section>
+</div> <!-- end display:none demo wrapper -->
 
 <!-- Social proof bar -->
 <section class="stats">
@@ -930,15 +932,15 @@ footer {
   <div class="sticky">
     <div class="text-card">
       <div class="text-overlay" id="scroll-text-0">
-        <h3>Intelligent segmentation</h3>
+        <h3 style="color:#fff">Intelligent segmentation</h3>
         <p>Clusters mesh faces into regions belonging to analytic surfaces — <span class="kw">planes</span>, <span class="kw">cylinders</span>, <span class="kw">cones</span>, <span class="kw">spheres</span>.</p>
       </div>
       <div class="text-overlay hidden" id="scroll-text-1">
-        <h3>Feature recognition</h3>
+        <h3 style="color:#fff">Feature recognition</h3>
         <p>Identifies <span class="kw">extrusions</span>, <span class="kw">through-holes</span>, <span class="kw">blind holes</span>, <span class="kw">chamfers</span>, and <span class="kw">fillets</span> from the surface topology graph.</p>
       </div>
       <div class="text-overlay hidden" id="scroll-text-2">
-        <h3>Parametric reconstruction</h3>
+        <h3 style="color:#fff">Parametric reconstruction</h3>
         <p>Builds a clean solid from scratch — <span class="kw">sketch</span>, <span class="kw">extrude</span>, <span class="kw">cut</span> — with proper engineering dimensions.</p>
       </div>
     </div>
@@ -1036,7 +1038,8 @@ footer {
   </div>
 </section>
 
-<!-- Pricing -->
+<!-- TODO: Remove display:none on launch -->
+<div style="display:none">
 <section id="pricing" style="padding: 6rem 0;">
   <div class="container">
     <h2 class="fade-in" style="margin-bottom: 0.75rem;">Simple, per-part pricing</h2>
@@ -1113,6 +1116,27 @@ footer {
     </p>
   </div>
 </section>
+</div>
+
+<!-- Waitlist CTA -->
+<section id="waitlist" class="waitlist">
+  <div class="container">
+    <h2 class="fade-in">Get early access</h2>
+    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">Join the waitlist. Be the first to convert meshes into parametric CAD models.</p>
+    <form class="waitlist-form fade-in" onsubmit="return handleWaitlist(event)">
+      <input type="email" id="waitlist-email" placeholder="you@company.com" required>
+      <button type="submit" class="btn btn-primary">Join</button>
+    </form>
+    <div class="waitlist-success" id="waitlist-success">You're on the list. We'll be in touch.</div>
+
+    <!-- Share -->
+    <div class="share-row fade-in">
+      <a class="share-btn" href="https://twitter.com/intent/tweet?text=Paramesh AI%20converts%20STL%20meshes%20into%20parametric%20CAD%20models%20with%20AI-powered%20feature%20recognition.&url=" target="_blank" title="Share on X">𝕏</a>
+      <a class="share-btn" href="https://www.linkedin.com/sharing/share-offsite/?url=" target="_blank" title="Share on LinkedIn">in</a>
+      <button class="share-btn" onclick="copyLink()" title="Copy link">🔗</button>
+    </div>
+  </div>
+</section>
 
 <!-- FAQ -->
 <section id="faq">
@@ -1132,37 +1156,17 @@ footer {
         <div class="faq-a">Typically under 3% volume error compared to the original CAD model. The pipeline detects all major features including through/blind holes, chamfers, and fillets. <a href="/learn/stl-to-parametric-cad-conversion" style="color:var(--accent)">See accuracy details →</a></div>
       </div>
       <div class="faq-item fade-in">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Does it require an API key?</div>
-        <div class="faq-a">No. AI features use the Claude CLI with OAuth authentication — no API key needed. Your Claude Max or Pro subscription handles the cost. <a href="/learn/ai-powered-cad-reconstruction" style="color:var(--accent)">How AI is used →</a></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Do I need to install anything?</div>
+        <div class="faq-a">No. Paramesh AI runs entirely in your browser. Upload a mesh, get a parametric CAD model back. No plugins, no downloads.</div>
       </div>
       <div class="faq-item fade-in">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I self-host it?</div>
-        <div class="faq-a">Yes. Install with pip, run the web viewer locally, and process meshes on your own hardware. A paid subscription is required for full functionality. No cloud dependency.</div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What export formats are available?</div>
+        <div class="faq-a">STEP is the primary export format — it works with SolidWorks, Fusion 360, Onshape, and all major CAD tools. The exported model includes a full parametric feature tree.</div>
       </div>
       <div class="faq-item fade-in">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How does the AI chatbot work?</div>
-        <div class="faq-a">The right-panel chat sends your message along with the current feature tree context to Claude. It can describe the part, suggest edits, and analyze dimensions. <a href="/learn/ai-powered-cad-reconstruction" style="color:var(--accent)">Learn about AI features →</a></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How does the AI assist the conversion?</div>
+        <div class="faq-a">AI analyzes your mesh to optimize the build order, suggest clean engineering dimensions, and plan the best construction strategy for the parametric model. <a href="/learn/ai-powered-cad-reconstruction" style="color:var(--accent)">Learn about AI features →</a></div>
       </div>
-    </div>
-  </div>
-</section>
-
-<!-- Waitlist CTA -->
-<section id="waitlist" class="waitlist">
-  <div class="container">
-    <h2 class="fade-in">Start converting parts today</h2>
-    <p class="fade-in" style="margin: 1rem auto 0; text-align: center;">1 free conversion, no signup. Join the waitlist for 5 bonus conversions with any paid plan.</p>
-    <form class="waitlist-form fade-in" onsubmit="return handleWaitlist(event)">
-      <input type="email" id="waitlist-email" placeholder="you@company.com" required>
-      <button type="submit" class="btn btn-primary">Join</button>
-    </form>
-    <div class="waitlist-success" id="waitlist-success">You're on the list. We'll be in touch.</div>
-
-    <!-- Share -->
-    <div class="share-row fade-in">
-      <a class="share-btn" href="https://twitter.com/intent/tweet?text=Paramesh AI%20converts%20STL%20meshes%20into%20parametric%20CAD%20models%20with%20AI-powered%20feature%20recognition.&url=" target="_blank" title="Share on X">𝕏</a>
-      <a class="share-btn" href="https://www.linkedin.com/sharing/share-offsite/?url=" target="_blank" title="Share on LinkedIn">in</a>
-      <button class="share-btn" onclick="copyLink()" title="Copy link">🔗</button>
     </div>
   </div>
 </section>
@@ -1172,9 +1176,7 @@ footer {
   <div class="container">
     <div style="margin-bottom:0.75rem;">Paramesh AI &mdash; mesh-to-parametric CAD conversion</div>
     <div style="display:flex; gap:1.5rem; justify-content:center; flex-wrap:wrap; font-size:0.8rem;">
-      <a href="/changelog" style="color:var(--text-muted); text-decoration:none;">Changelog</a>
       <a href="/contact" style="color:var(--text-muted); text-decoration:none;">Contact</a>
-      <a href="https://discord.gg/placeholder" style="color:var(--text-muted); text-decoration:none;">Discord</a>
       <a href="/privacy" style="color:var(--text-muted); text-decoration:none;">Privacy</a>
       <a href="/terms" style="color:var(--text-muted); text-decoration:none;">Terms</a>
       <a href="https://github.com/TrentIndeed/meshToParametric" style="color:var(--text-muted); text-decoration:none;">GitHub</a>

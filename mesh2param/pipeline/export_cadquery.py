@@ -343,23 +343,25 @@ def _extract_profile_and_holes(
                 outer = projected_polys[0]
 
                 # Check remaining polygons:
-                # - Large non-circular + inside outer = cutout (window/pocket)
-                # - Circular + inside outer = hole cross-section, DROP it
-                # - Small + inside outer = hole cross-section, DROP it
+                # - Large + inside outer = cutout (window/pocket/large hole)
+                # - Small circular + inside outer = bolt hole cross-section, DROP
                 # - Outside outer = split piece, union to extend boundary
                 cutouts = []
                 to_union = [outer]
                 for sp in projected_polys[1:]:
                     centroid = sp.centroid
                     if outer.contains(centroid):
-                        # Check if this is roughly circular (a hole cross-section).
-                        # Circularity = 4*pi*area / perimeter^2 — 1.0 for perfect circle.
                         circ = 4.0 * 3.14159 * sp.area / (sp.length ** 2) if sp.length > 0 else 0
                         is_circular = circ > 0.70
-                        if sp.area > outer.area * 0.10 and not is_circular:
-                            # Large non-circular polygon inside → cutout (window/pocket)
+                        area_ratio = sp.area / outer.area
+                        # Large features (>20% of outer) are always cutouts,
+                        # even if circular — they're structural (windows, large bores).
+                        # Small circular features (<10%) are bolt holes — drop them.
+                        if area_ratio > 0.20:
                             cutouts.append(sp)
-                        # else: hole cross-section or small feature, skip
+                        elif area_ratio > 0.10 and not is_circular:
+                            cutouts.append(sp)
+                        # else: small hole cross-section, skip
                     else:
                         # Outside the outer → union to extend boundary
                         to_union.append(sp)
@@ -424,7 +426,16 @@ def _extract_profile_and_holes(
     if len(best_profiles) > 1:
         largest_area = max(_polygon_area(p) for p in best_profiles)
         total_area = sum(_polygon_area(p) for p in best_profiles)
-        if largest_area < total_area * 0.7:
+        # Check if this is truly a frame split (outer boundary broken into pieces)
+        # vs a cutout (one large polygon contains another).
+        # If the largest profile contains the centroid of the 2nd largest,
+        # it's a cutout, not a split.
+        from shapely.geometry import Polygon as _SP, Point as _PT
+        sorted_by_area = sorted(best_profiles, key=lambda p: -abs(_polygon_area(p)))
+        outer_poly = _SP(sorted_by_area[0])
+        second_poly = _SP(sorted_by_area[1]) if len(sorted_by_area) > 1 else None
+        is_cutout = second_poly and outer_poly.contains(_PT(second_poly.centroid))
+        if largest_area < total_area * 0.7 and not is_cutout:
             # Frame is split — find a nearby slice where the frame is one
             # connected piece but total area is similar (not a filled cutout).
             from shapely.geometry import Polygon as SPoly, MultiPolygon

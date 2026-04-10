@@ -1151,13 +1151,16 @@ function _showRawMesh(previewRes, animateToFit = true) {
     geo.setIndex(faces);
     geo.computeVertexNormals();
 
-    // Wireframe look — show this is a raw mesh, not a CAD model
+    // Mesh preview — wireframe only for low-poly meshes, solid for dense scans
+    const numFaces = Math.floor(faces.length / 3);
     const mat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
     modelGroup.add(new THREE.Mesh(geo, mat));
-    modelGroup.add(new THREE.LineSegments(
-      new THREE.WireframeGeometry(geo),
-      new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
-    ));
+    if (numFaces < 20000) {
+      modelGroup.add(new THREE.LineSegments(
+        new THREE.WireframeGeometry(geo),
+        new THREE.LineBasicMaterial({ color: 0x30363D, linewidth: 1 })
+      ));
+    }
     console.debug('[_showRawMesh] created mesh + wireframe objects');
   } catch (e) {
     console.error('[_showRawMesh] geometry creation failed', e);
@@ -1229,7 +1232,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
   if (resizeOn) {
     const dims = await showDimGate(window._lastPreviewDims || []);
     if (!dims) return; // user cancelled
-    // TODO: pass dims to pipeline for scaling
+    window._editedDims = dims;
     console.debug('[analyze] resize dimensions:', dims);
   }
 
@@ -1263,6 +1266,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
         temp_path: pendingTempPath,
         filename: pendingFile?.name || 'mesh',
         num_variants: parseInt(document.getElementById('variant-slider')?.value || '1'),
+        target_dims: window._editedDims || null,
       }),
     });
     if (!res.ok) { console.error('[analyze] /api/run-pipeline HTTP', res.status); alert('Pipeline request failed: HTTP ' + res.status); loading.classList.remove('show'); return; }
@@ -1328,6 +1332,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     document.getElementById('preview-bar').style.display = 'none';
     document.getElementById('btn-analyze').style.display = 'none';
     document.getElementById('btn-upload').style.display = '';
+    window._lastTempPath = pendingTempPath; // keep for resize
     pendingTempPath = null;
 
     if (statusData.status === 'done') {
@@ -1340,7 +1345,11 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       if (chamfers > 0) summary += `, ${chamfers} chamfer${chamfers > 1 ? 's' : ''}`;
       if (fillets > 0) summary += `, ${fillets} fillet${fillets > 1 ? 's' : ''}`;
       addChatMessage('ai', summary);
-      addChatMessage('system', 'Click features in the tree to step through the build. Ask me about dimensions or features.');
+
+      // Populate model stats panel
+      document.getElementById('stat-features').textContent = statusData.num_steps + ' features';
+      document.getElementById('stat-volume').textContent = statusData.mesh_volume.toLocaleString() + ' mm³';
+      document.getElementById('model-stats').style.display = '';
 
       // Run slicer comparison in background and show accuracy
       if (currentJobId) {
@@ -1351,7 +1360,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
         }).then(comp => {
           if (comp.score !== undefined) {
             console.debug('[analyze] comparison score:', comp.score.toFixed(1), '%, slices:', comp.per_slice?.length);
-            addChatMessage('ai', `Cross-section accuracy: ${comp.score.toFixed(0)}% (${comp.per_slice?.length || 0} slices compared)`);
+            document.getElementById('stat-accuracy').textContent = comp.score.toFixed(0) + '% (' + (comp.per_slice?.length || 0) + ' slices)';
           }
         }).catch(e => { console.warn('[analyze] slicer comparison failed (non-critical):', e.message); });
       }
@@ -1441,9 +1450,13 @@ function finishLoad(statusData) {
   if (statusData.bbox_min && statusData.bbox_max) {
     populateDimPanel(buildDimsFromStatus(statusData));
   }
-  const partsCount = statusData.parts_used || statusData.tokens_used || 0;
-  document.getElementById('token-count').textContent = partsCount;
-  localStorage.setItem('paramesh_parts_count', partsCount);
+  // Update parts counter from usage endpoint
+  fetch('/api/usage').then(r => r.ok ? r.json() : null).then(u => {
+    if (!u) return;
+    const txt = u.parts_limit > 0 ? `${u.parts_used} / ${u.parts_limit}` : `${u.parts_used}`;
+    document.getElementById('token-count').textContent = txt;
+    localStorage.setItem('paramesh_parts_count', txt);
+  }).catch(() => {});
   document.getElementById('status-dot').className = 'status-dot done';
   document.getElementById('btn-export').disabled = false;
   document.getElementById('btn-rerun').style.display = pendingTempPath ? '' : 'none';
@@ -1457,6 +1470,11 @@ function finishLoad(statusData) {
 
   // Add system message to chat
   addChatMessage('system', `Model loaded: ${statusData.num_steps} features, ${statusData.mesh_volume.toLocaleString()} mm³`);
+
+  // Show model stats
+  document.getElementById('stat-features').textContent = statusData.num_steps + ' features';
+  document.getElementById('stat-volume').textContent = statusData.mesh_volume.toLocaleString() + ' mm³';
+  document.getElementById('model-stats').style.display = '';
 
   const loading = document.getElementById('loading');
   const progressBar = document.getElementById('progress-bar');
@@ -1534,7 +1552,21 @@ function populateDimPanel(analysis) {
   rows.innerHTML = '';
   const dims = analysis.suggested_dimensions || {};
   for (const [key, val] of Object.entries(dims)) {
-    const displayVal = Array.isArray(val) ? val.join(', ') : val;
+    // For hole_diameters: summarize as count × unique sizes instead of listing all
+    if (key === 'hole_diameters' && Array.isArray(val)) {
+      const nums = val.map(v => typeof v === 'number' ? v : parseFloat(v)).filter(v => !isNaN(v));
+      if (nums.length === 0) continue;
+      // Group by diameter: "4 × ø8, 2 × ø5"
+      const counts = {};
+      nums.forEach(d => { const k = d.toFixed(1); counts[k] = (counts[k] || 0) + 1; });
+      const summary = Object.entries(counts)
+        .sort((a, b) => parseFloat(b[0]) - parseFloat(a[0]))
+        .map(([d, n]) => `${n}× ø${d}`)
+        .join(', ');
+      rows.innerHTML += `<div class="dim-row"><span class="label">holes</span><span class="value" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-primary)">${summary} mm</span></div>`;
+      continue;
+    }
+    const displayVal = Array.isArray(val) ? val.map(v => typeof v === 'number' ? v : parseFloat(v)).join(', ') : val;
     rows.innerHTML += `<div class="dim-row"><span class="label">${key}</span><span class="value"><input class="dim-input" type="text" data-key="${key}" value="${displayVal}" readonly> mm</span></div>`;
   }
 
@@ -1553,10 +1585,66 @@ window.toggleDimPanel = function() {
   document.getElementById('dim-panel').classList.toggle('collapsed');
 };
 
-window.toggleDimEdit = function() {
+window.toggleDimEdit = async function() {
   const inputs = document.querySelectorAll('#dim-rows .dim-input');
   const btn = document.getElementById('dim-edit-btn');
   const isReadonly = inputs[0]?.readOnly;
+
+  // When clicking Done — resize the mesh live
+  if (!isReadonly) {
+    const dimValues = {};
+    inputs.forEach(inp => { dimValues[inp.dataset.key] = parseFloat(inp.value) || 0; });
+    window._editedDims = dimValues;
+    console.debug('[resize] dimValues:', dimValues, 'pendingTempPath:', pendingTempPath, '_lastTempPath:', window._lastTempPath);
+
+    const tempPath = pendingTempPath || window._lastTempPath;
+    if (tempPath && (dimValues.width || dimValues.height || dimValues.thickness)) {
+      btn.innerHTML = '<i class="ri-loader-4-line"></i> ...';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/resize-mesh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            temp_path: tempPath,
+            width: dimValues.width || null,
+            height: dimValues.height || null,
+            thickness: dimValues.thickness || null,
+          }),
+        });
+        const data = await res.json();
+        console.debug('[resize] response:', res.status, data);
+        if (res.ok && data.dimensions) {
+          // Update dimension inputs with actual resized values
+          const sorted = data.dimensions;
+          const keys = ['width', 'height', 'thickness'];
+          inputs.forEach(inp => {
+            const ki = keys.indexOf(inp.dataset.key);
+            if (ki >= 0 && ki < sorted.length) inp.value = sorted[ki];
+          });
+          // Apply per-axis scale to the 3D model (non-uniform)
+          if (data.scale_xyz) {
+            const s = data.scale_xyz;
+            modelGroup.scale.set(
+              modelGroup.scale.x * s[0],
+              modelGroup.scale.y * s[1],
+              modelGroup.scale.z * s[2]
+            );
+          }
+          window._lastPreviewDims = sorted;
+          addChatMessage('system', 'Resized to ' + sorted.map(d => d + 'mm').join(' × '));
+        } else {
+          addChatMessage('system', 'Resize failed: ' + (data.error || 'unknown'));
+        }
+      } catch (e) {
+        console.error('[resize] failed:', e);
+        addChatMessage('system', 'Resize failed: ' + e.message);
+      }
+      btn.disabled = false;
+    }
+  }
+
+  // Toggle readonly state
   inputs.forEach(inp => {
     inp.readOnly = !isReadonly;
     inp.style.background = isReadonly ? 'var(--bg-tertiary)' : 'transparent';
@@ -1774,11 +1862,17 @@ function saveViewerState(state) {
   localStorage.setItem('paramesh_viewer_state', state);
 }
 
-// Restore parts count from localStorage
+// Restore parts count from localStorage, then refresh from server
 try {
   const savedParts = localStorage.getItem('paramesh_parts_count');
   if (savedParts) document.getElementById('token-count').textContent = savedParts;
 } catch (e) {}
+fetch('/api/usage').then(r => r.ok ? r.json() : null).then(u => {
+  if (!u) return;
+  const txt = u.parts_limit > 0 ? `${u.parts_used} / ${u.parts_limit}` : `${u.parts_used}`;
+  document.getElementById('token-count').textContent = txt;
+  localStorage.setItem('paramesh_parts_count', txt);
+}).catch(() => {});
 
 async function autoLoad() {
   console.debug('[autoLoad] checking for saved state...');

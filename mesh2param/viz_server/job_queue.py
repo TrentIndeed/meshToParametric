@@ -88,6 +88,7 @@ class JobQueue:
         job_id = uuid.uuid4().hex[:12]
         job = Job(id=job_id, filename=filename, file_path=file_path, client_ip=client_ip)
         job._num_variants = max(1, min(4, num_variants))
+        job._target_dims = None
         logger.info("Job submitted: id=%s filename=%r ip=%s", job_id, filename, client_ip)
 
         with self._lock:
@@ -176,6 +177,26 @@ class JobQueue:
         job.progress_stage = "Ingesting mesh..."
         logger.debug("Job %s: stage=ingest file=%s", job.id, job.file_path)
         cleaned = ingest_mesh(job.file_path, IngestConfig(remesh=False))
+
+        # Resize mesh if target dimensions were specified
+        target_dims = getattr(job, '_target_dims', None)
+        if target_dims and any(v for v in target_dims.values() if v):
+            tw, th, tt = target_dims.get('width'), target_dims.get('height'), target_dims.get('thickness')
+            if any([tw, th, tt]):
+                bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+                target = sorted([tw or 0, th or 0, tt or 0], reverse=True)
+                actual = sorted(bbox_size.tolist(), reverse=True)
+                scales = [t / a if t and a > 0 else 1.0 for t, a in zip(target, actual)]
+                axis_order = sorted(range(3), key=lambda i: -bbox_size[i])
+                scale_xyz = np.array([1.0, 1.0, 1.0])
+                for i, ax in enumerate(axis_order):
+                    scale_xyz[ax] = scales[i]
+                center = (cleaned.bbox[0] + cleaned.bbox[1]) / 2
+                cleaned.vertices = (cleaned.vertices - center) * scale_xyz + center
+                cleaned.bbox = np.array([cleaned.vertices.min(axis=0), cleaned.vertices.max(axis=0)])
+                logger.info("Resized mesh after cleaning: scales=%s new_dims=%s",
+                            scale_xyz.tolist(), (cleaned.bbox[1] - cleaned.bbox[0]).tolist())
+
         _set_mesh_viz(cleaned)
 
         # Stage 2: Segment — color each region distinctly

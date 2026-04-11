@@ -673,7 +673,7 @@ def _find_fillets_and_chamfers(
                 # Small plane strips are chamfer faces
                 if f.surface_type == SurfaceType.PLANE and r.num_faces <= 50:
                     extent = f.params.get("extent", float("inf"))
-                    if extent < config.chamfer_width_ratio * r.vertices.ptp() * 2:
+                    if extent < config.chamfer_width_ratio * float(r.vertices.max() - r.vertices.min()) * 2:
                         chamfer_rids.add(rid)
 
     # Strategy 3: Unassigned small cylinders that form narrow curved strips

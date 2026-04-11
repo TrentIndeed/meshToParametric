@@ -550,6 +550,7 @@ async def job_status(job_id: str):
         "bbox_max": job.bbox_max,
         "token_cost": job.token_cost,
         "tokens_used": queue.tokens_spent,
+        "paused": job.paused,
         "variants": variants_info,
         "active_variant": getattr(job, 'active_variant', 0),
     }
@@ -572,6 +573,28 @@ async def job_status(job_id: str):
             result["progress_geometry"]["edge_colors"] = job.progress_edge_colors
 
     return result
+
+
+@app.post("/api/job/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a running job. Unpauses and marks as error so the worker moves on."""
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    job.paused = False
+    job.status = "error"
+    job.error = "Cancelled by user"
+    return {"status": "cancelled"}
+
+
+@app.post("/api/job/{job_id}/continue")
+async def job_continue(job_id: str):
+    """Resume a paused job (e.g. after body decomposition review)."""
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    job.paused = False
+    return {"status": "resumed"}
 
 
 @app.post("/api/job/{job_id}/variant/{variant_index}")

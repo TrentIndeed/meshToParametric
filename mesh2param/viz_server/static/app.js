@@ -1239,6 +1239,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
   _analyzeRunning = true;
   _lastProgressStage = '';
   window._pipelineRotate = true;
+  window._lastTempPath = pendingTempPath; // save before pipeline might clear it
   console.debug('[analyze] starting pipeline, temp_path:', pendingTempPath);
 
   // Hide UI elements during generation
@@ -1318,6 +1319,30 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             _renderProgressGeometry(d.progress_geometry);
           }
 
+          // Show Continue button when pipeline is paused
+          const cancelBtn = document.getElementById('btn-cancel');
+          if (d.paused && cancelBtn) {
+            if (!document.getElementById('btn-continue-pipeline')) {
+              const contBtn = document.createElement('button');
+              contBtn.id = 'btn-continue-pipeline';
+              contBtn.textContent = 'Continue';
+              contBtn.style.cssText = 'margin-left:8px;padding:4px 16px;border-radius:6px;border:none;background:var(--accent);color:#000;font-size:12px;font-weight:600;cursor:pointer;font-family:OpenAI Sans,sans-serif;';
+              contBtn.onclick = () => {
+                fetch(`/api/job/${currentJobId}/continue`, { method: 'POST' });
+                contBtn.remove();
+              };
+              cancelBtn.parentElement.appendChild(contBtn);
+            }
+            // Hide spinner during pause
+            const spinner = document.querySelector('#loading .spinner');
+            if (spinner) spinner.style.display = 'none';
+          } else {
+            const contBtn = document.getElementById('btn-continue-pipeline');
+            if (contBtn) contBtn.remove();
+            const spinner = document.querySelector('#loading .spinner');
+            if (spinner) spinner.style.display = '';
+          }
+
           if (_cancelledJobId === currentJobId) { clearInterval(poll); reject(new Error('Cancelled')); return; }
           if (d.status === 'done') { clearInterval(poll); resolve(d); }
           else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
@@ -1394,11 +1419,25 @@ window._cancelPipeline = function() {
   _cancelledJobId = currentJobId;
   _analyzeRunning = false;
   window._pipelineRotate = false;
-  modelGroup.rotation.y = 0;
+  // Unpause and cancel the job on the server
+  if (currentJobId) {
+    fetch(`/api/job/${currentJobId}/cancel`, { method: 'POST' }).catch(() => {});
+  }
   document.getElementById('loading').classList.remove('show');
   document.getElementById('actions').style.display = '';
   document.getElementById('timeline').style.display = '';
   document.getElementById('status-dot').className = 'status-dot';
+  // Remove continue button if present
+  const contBtn = document.getElementById('btn-continue-pipeline');
+  if (contBtn) contBtn.remove();
+  // Restore the raw mesh preview and re-enable Analyze button
+  if (savedMeshPreview) {
+    _showRawMesh(savedMeshPreview, false);
+    pendingTempPath = window._lastTempPath || pendingTempPath;
+    if (pendingTempPath) {
+      document.getElementById('btn-analyze').style.display = '';
+    }
+  }
   addChatMessage('system', 'Pipeline cancelled.');
 };
 

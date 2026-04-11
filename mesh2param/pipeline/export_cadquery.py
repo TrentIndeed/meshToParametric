@@ -82,6 +82,7 @@ def export_cadquery(
     output_path: str | Path | None = None,
     use_llm: bool = True,
     num_variants: int = 1,
+    body_results: list | None = None,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -123,7 +124,40 @@ def export_cadquery(
         logger.error("Failed to extract base profile from mesh")
         return CadQueryResult(mesh_volume=mesh_volume, status="FAIL")
 
-    # --- Build 4 variants with different construction orders ---
+    # --- Multi-body construction ---
+    # If body_results are provided, build each body and union them.
+    # Each body gets its own profile extraction and extrusion.
+    additional_bodies_data = []
+    if body_results and len(body_results) > 1:
+        logger.info("Multi-body export: %d bodies", len(body_results))
+        for bi, (body, sub_cleaned, body_tree) in enumerate(body_results[1:], 1):
+            try:
+                body_dir = body.extrude_direction
+                body_depth = body.depth
+                body_base = body_tree.features[0] if body_tree.features else None
+                if body_base:
+                    body_dir = np.array(body_base.direction)
+                    body_depth = body_base.depth
+                body_profiles, body_start, body_holes, body_chamfers, body_fillets = \
+                    _extract_profile_and_holes(body_tree, sub_cleaned, body_dir)
+                if body_profiles:
+                    additional_bodies_data.append({
+                        'profiles': body_profiles,
+                        'depth': body_depth,
+                        'extrude_dir': body_dir,
+                        'extrude_start': body_start,
+                        'holes': body_holes,
+                        'chamfers': body_chamfers,
+                        'fillets': body_fillets,
+                        'cleaned': sub_cleaned,
+                        'body': body,
+                    })
+                    logger.info("Body %d: %d profiles, depth=%.1f, dir=%s",
+                                bi, len(body_profiles), body_depth, body_dir.tolist())
+            except Exception:
+                logger.warning("Failed to extract profile for body %d, skipping", bi)
+
+    # --- Build variants with different construction orders ---
     build_args = dict(
         profiles=profiles, depth=depth, extrude_dir=extrude_dir,
         extrude_start=extrude_start, holes=hole_features,
@@ -158,6 +192,34 @@ def export_cadquery(
     # Build default variant immediately (no waiting for LLM)
     try:
         solid, script, steps = _build_stepwise(**build_args, build_order=llm_order)
+
+        # Multi-body: union additional bodies into the base solid
+        if additional_bodies_data and solid is not None:
+            import cadquery as cq
+            for abd in additional_bodies_data:
+                try:
+                    body_solid, body_script, body_steps = _build_stepwise(
+                        profiles=abd['profiles'], depth=abd['depth'],
+                        extrude_dir=abd['extrude_dir'], extrude_start=abd['extrude_start'],
+                        holes=abd['holes'], chamfers=abd['chamfers'],
+                        fillets=abd['fillets'], cleaned=abd['cleaned'],
+                    )
+                    if body_solid is not None:
+                        vol_before = abs(float(solid.val().Volume()))
+                        solid = solid.union(body_solid)
+                        vol_after = abs(float(solid.val().Volume()))
+                        v, f = _tessellate_solid(solid, fast=True)
+                        steps.append(ConstructionStep(
+                            name=f"Union Body ({abd['body'].body_id})",
+                            tess_vertices=v, tess_faces=f, volume=vol_after,
+                        ))
+                        script += f"\n# Union body {abd['body'].body_id}\n"
+                        script += body_script
+                        logger.info("Unioned body %d: vol %.0f -> %.0f",
+                                    abd['body'].body_id, vol_before, vol_after)
+                except Exception:
+                    logger.warning("Failed to union body %d", abd['body'].body_id)
+
         v1_name = "AI Optimized" if llm_order else "Default"
         v1_strategy = llm_order.strategy if llm_order else "Default heuristic ordering"
         try:

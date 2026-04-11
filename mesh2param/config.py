@@ -84,6 +84,7 @@ class RecognizeConfig(BaseModel):
     pocket_max_depth_ratio: float = 0.8  # max pocket depth as fraction of bbox diagonal
     boss_max_height_ratio: float = 0.8  # max boss height as fraction of bbox diagonal
     slot_max_width_ratio: float = 0.3  # max slot width as fraction of bbox diagonal
+    chamfer_width_ratio: float = 0.05  # max chamfer extent as fraction of bbox diagonal
     min_feature_faces: int = 3  # minimum faces for a feature
 
     def model_post_init(self, __context) -> None:
@@ -93,6 +94,15 @@ class RecognizeConfig(BaseModel):
             self.hole_max_radius_ratio,
             self.pocket_max_depth_ratio,
         )
+
+
+class DecomposeConfig(BaseModel):
+    """Configuration for Stage 1.5: Body Decomposition."""
+
+    axis_angle_threshold_deg: float = 20.0  # face normal to axis tolerance
+    min_body_faces: int = 20               # minimum faces for a sub-body
+    min_body_volume_ratio: float = 0.05    # minimum volume fraction
+    enabled: bool = False  # disabled — needs better algorithm for connected meshes
 
 
 class ExportConfig(BaseModel):

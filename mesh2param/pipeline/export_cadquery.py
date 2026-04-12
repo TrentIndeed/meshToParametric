@@ -172,10 +172,15 @@ def export_cadquery(
     variants: list[BuildVariant] = []
 
     # Variant 1: LLM-optimized (or default heuristic if LLM unavailable)
-    # Skip LLM for simple parts (<10 features) — not worth the 10-15s latency
+    # Skip LLM for simple parts (<10 features) — not worth the 10-15s latency.
+    # Also skip for multi-body parts since LLM only reorders body 0's features,
+    # which would break the multi-body feature tree.
     llm_order = None
     num_features = len(feature_tree.features)
-    if use_llm and num_features >= 10:
+    is_multi_body = body_results is not None and len(body_results) > 1
+    if is_multi_body:
+        llm_future = None
+    elif use_llm and num_features >= 10:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         # Start LLM call in background while building the default variant
         llm_future = ThreadPoolExecutor(1).submit(_llm_plan_build_order, feature_tree, cleaned)
@@ -193,9 +198,10 @@ def export_cadquery(
     try:
         solid, script, steps = _build_stepwise(**build_args, build_order=llm_order)
 
-        # Multi-body: union additional bodies into the base solid
+        # Multi-body: build each additional body and union into the base.
+        # Each body step shows the accumulated solid + this step's body geometry
+        # so the viewer displays progressive construction with all prior bodies.
         if additional_bodies_data and solid is not None:
-            import cadquery as cq
             for abd in additional_bodies_data:
                 try:
                     body_solid, body_script, body_steps = _build_stepwise(
@@ -204,21 +210,56 @@ def export_cadquery(
                         holes=abd['holes'], chamfers=abd['chamfers'],
                         fillets=abd['fillets'], cleaned=abd['cleaned'],
                     )
-                    if body_solid is not None:
-                        vol_before = abs(float(solid.val().Volume()))
-                        solid = solid.union(body_solid)
-                        vol_after = abs(float(solid.val().Volume()))
-                        v, f = _tessellate_solid(solid, fast=True)
-                        steps.append(ConstructionStep(
-                            name=f"Union Body ({abd['body'].body_id})",
-                            tess_vertices=v, tess_faces=f, volume=vol_after,
-                        ))
-                        script += f"\n# Union body {abd['body'].body_id}\n"
-                        script += body_script
-                        logger.info("Unioned body %d: vol %.0f -> %.0f",
-                                    abd['body'].body_id, vol_before, vol_after)
-                except Exception:
-                    logger.warning("Failed to union body %d", abd['body'].body_id)
+                    if body_solid is None:
+                        logger.warning("Body %d: _build_stepwise returned None",
+                                       abd['body'].body_id)
+                        continue
+
+                    # Snapshot the accumulated base tessellation — every
+                    # new body step gets merged with this so all prior
+                    # bodies stay visible in frame.
+                    base_v, base_f = _tessellate_solid(solid, fast=True)
+                    base_v_arr = np.asarray(base_v, dtype=np.float64)
+                    base_f_arr = np.asarray(base_f, dtype=np.int64)
+                    base_vert_count = len(base_v_arr)
+
+                    # Merge each body step's tessellation with the base
+                    for bstep in body_steps:
+                        if bstep.tess_vertices is None or bstep.tess_faces is None:
+                            steps.append(bstep)
+                            continue
+                        step_v = np.asarray(bstep.tess_vertices, dtype=np.float64)
+                        step_f = np.asarray(bstep.tess_faces, dtype=np.int64)
+                        if len(step_v) == 0 or len(step_f) == 0:
+                            steps.append(bstep)
+                            continue
+                        # Combine: stack vertices, offset body faces by base count
+                        combined_v = np.vstack([base_v_arr, step_v]) if base_vert_count > 0 else step_v
+                        combined_f = (
+                            np.vstack([base_f_arr, step_f + base_vert_count])
+                            if base_vert_count > 0 else step_f
+                        )
+                        bstep.tess_vertices = combined_v
+                        bstep.tess_faces = combined_f
+                        steps.append(bstep)
+
+                    # Union into the accumulated solid for the next body
+                    vol_before = abs(float(solid.val().Volume()))
+                    solid = solid.union(body_solid)
+                    vol_after = abs(float(solid.val().Volume()))
+                    v, f = _tessellate_solid(solid, fast=True)
+                    steps.append(ConstructionStep(
+                        name="Combine Bodies",
+                        tess_vertices=v, tess_faces=f, volume=vol_after,
+                    ))
+                    script += f"\n# Body {abd['body'].body_id}\n"
+                    script += body_script
+                    logger.info("Combined body %d: vol %.0f -> %.0f, added %d steps",
+                                abd['body'].body_id, vol_before, vol_after,
+                                len(body_steps) + 1)
+                except Exception as e:
+                    logger.warning("Failed to build body %d: %s",
+                                   abd['body'].body_id, e)
 
         v1_name = "AI Optimized" if llm_order else "Default"
         v1_strategy = llm_order.strategy if llm_order else "Default heuristic ordering"
@@ -255,8 +296,13 @@ def export_cadquery(
         except Exception:
             logger.debug("LLM build order timed out or failed, using default")
 
-    # Variants 2-N: Heuristic orderings (only if num_variants > 1)
-    heuristic_orders = _make_heuristic_orders(feature_tree.features) if num_variants > 1 else []
+    # Variants 2-N: Heuristic orderings (only if num_variants > 1).
+    # Skip for multi-body — heuristic variants only rebuild body 0.
+    heuristic_orders = (
+        _make_heuristic_orders(feature_tree.features)
+        if num_variants > 1 and not is_multi_body
+        else []
+    )
     for h_name, h_strategy, h_plan in heuristic_orders[:num_variants - 1]:
         try:
             h_solid, h_script, h_steps = _build_stepwise(**build_args, build_order=h_plan)
@@ -472,30 +518,14 @@ def _extract_profile_and_holes(
                     if merged.geom_type == 'MultiPolygon':
                         merged = max(merged.geoms, key=lambda g: g.area)
 
-                # Subtract cutouts from the merged boundary
-                for cut in cutouts:
-                    merged = merged.difference(cut)
-                    if merged.is_empty:
-                        break
-
-                if merged.is_empty:
-                    continue
-                if merged.geom_type == 'MultiPolygon':
-                    merged = max(merged.geoms, key=lambda g: g.area)
-
-                # Score by outer boundary area BEFORE subtracting cutouts.
-                # This way holes/pockets inside the slice don't penalize it.
+                # DON'T subtract cutouts from the profile — use the solid
+                # outer boundary. Cutouts (windows, pockets) become separate
+                # cut features applied after the base extrusion.
                 outer_boundary_area = merged.area
 
                 outer_coords = list(merged.exterior.coords)[:-1]
                 outer_coords = _simplify_profile(outer_coords, tolerance=0.1)
                 slice_profiles = [outer_coords] if len(outer_coords) >= 3 else []
-                # Add inner rings as separate profiles (cutouts)
-                for ring in merged.interiors:
-                    inner_coords = list(ring.coords)[:-1]
-                    inner_coords = _simplify_profile(inner_coords, tolerance=0.1)
-                    if len(inner_coords) >= 3:
-                        slice_profiles.append(inner_coords)
             else:
                 slice_profiles = []
 
@@ -689,6 +719,62 @@ def _extract_profile_and_holes(
                 continue  # skip — this is a hole cross-section
             filtered.append(p)
         best_profiles = filtered
+
+    # Validate profile area against expected area from bbox.
+    # If the slice-based profile is too small, fall back to projecting
+    # all mesh faces onto the profile plane (works for thin plates where
+    # slicing produces open contours instead of closed polygons).
+    if best_profiles:
+        from shapely.geometry import Polygon as _ValPoly
+        bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+        sorted_dims = sorted(bbox_size.tolist(), reverse=True)
+        expected_area = sorted_dims[0] * sorted_dims[1]
+        profile_area = abs(_polygon_area(best_profiles[0]))
+
+        if profile_area < expected_area * 0.3:
+            logger.warning(
+                "Profile area %.0f is <30%% of expected %.0f, "
+                "falling back to face projection",
+                profile_area, expected_area,
+            )
+            from shapely.geometry import Polygon as SProjPoly
+            from shapely.ops import unary_union as proj_union
+
+            # Only project faces that are roughly perpendicular to the
+            # extrude direction — these are the top/bottom faces of the
+            # extruded body. Faces parallel to the extrude direction are
+            # the side walls or cut cap and should not contribute to the
+            # profile outline.
+            ext = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
+            face_normals = cleaned.normals
+            dot = np.abs(face_normals @ ext)
+            top_bottom_mask = dot > 0.9  # faces whose normal is within ~25° of extrude dir
+
+            face_polys = []
+            for fi in np.where(top_bottom_mask)[0]:
+                tri = cleaned.faces[fi]
+                tri_pts = [
+                    (float(cleaned.vertices[v][ax_u]), float(cleaned.vertices[v][ax_v]))
+                    for v in tri
+                ]
+                try:
+                    p = SProjPoly(tri_pts)
+                    if p.is_valid and p.area > 0.001:
+                        face_polys.append(p)
+                except Exception:
+                    pass
+
+            if face_polys:
+                merged = proj_union(face_polys)
+                if merged.geom_type == 'MultiPolygon':
+                    merged = max(merged.geoms, key=lambda g: g.area)
+                if merged.area > profile_area:
+                    outer_coords = list(merged.exterior.coords)[:-1]
+                    outer_coords = _simplify_profile(outer_coords, tolerance=0.5)
+                    if len(outer_coords) >= 3:
+                        best_profiles = [outer_coords]
+                        logger.info("Face projection profile: area=%.0f (vs slice %.0f)",
+                                    merged.area, profile_area)
 
     return best_profiles, extrude_start, holes, chamfers, fillets
 
@@ -2596,6 +2682,13 @@ def _detect_mesh_chamfers(
             logger.debug(
                 "Cluster %d: chamfer too small (d1=%.3f, d2=%.3f, min=%.3f), skipping",
                 label, d1, d2, size_min,
+            )
+            continue
+        if d1 > size_max or d2 > size_max:
+            logger.debug(
+                "Cluster %d: chamfer too large (d1=%.2f, d2=%.2f, max=%.2f), "
+                "likely a window edge, skipping",
+                label, d1, d2, size_max,
             )
             continue
 

@@ -166,12 +166,11 @@ const axisCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
 axisCamera.position.set(3, 2, 3);
 axisCamera.lookAt(0, 0, 0);
 const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-axisRenderer.setSize(120, 120);
+axisRenderer.setSize(84, 84);
 axisRenderer.setClearColor(0x000000, 0);
 console.debug('[init] Axis gizmo renderer created');
 const axIsDark = document.documentElement.getAttribute('data-theme') === 'dark';
-axisRenderer.setSize(56, 56);
-axisRenderer.domElement.style.cssText = `position:fixed;bottom:12px;left:12px;z-index:60;pointer-events:none;border-radius:6px;`;
+axisRenderer.domElement.style.cssText = `position:fixed;top:56px;right:310px;z-index:60;pointer-events:none;border-radius:6px;`;
 document.body.appendChild(axisRenderer.domElement);
 
 // Axis lines with cone tips (short, in gizmo scene)
@@ -202,7 +201,199 @@ window._THREE = THREE;
 // ── Progress geometry renderer (live pipeline visualization) ──
 let _lastProgressStage = '';
 function _renderProgressGeometry(pg) {
-  if (!pg || !pg.vertices || !pg.faces) return;
+  if (!pg) return;
+  if (window._pipelineCancelled) return;
+
+  // If pieces are provided, render each as a separate mesh
+  if (pg.pieces && pg.pieces.length > 0) {
+    // Skip if same version already rendered
+    const pVer = pg.version || 0;
+    if (window._explodePiecesVersion === pVer) return;
+    window._explodePiecesVersion = pVer;
+
+    // Clear
+    while (modelGroup.children.length) {
+      const child = modelGroup.children[0];
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) { if (Array.isArray(child.material)) child.material.forEach(m => m.dispose()); else child.material.dispose(); }
+      modelGroup.remove(child);
+    }
+    // Compute overall center for explode directions
+    let allMin = [Infinity, Infinity, Infinity];
+    let allMax = [-Infinity, -Infinity, -Infinity];
+    for (const piece of pg.pieces) {
+      for (let i = 0; i < piece.vertices.length; i += 3) {
+        for (let a = 0; a < 3; a++) {
+          allMin[a] = Math.min(allMin[a], piece.vertices[i + a]);
+          allMax[a] = Math.max(allMax[a], piece.vertices[i + a]);
+        }
+      }
+    }
+    const overallCenter = allMin.map((mn, i) => (mn + allMax[i]) / 2);
+    const overallSize = allMax.map((mx, i) => mx - allMin[i]);
+
+    const pieceMeshes = [];
+    for (let pi = 0; pi < pg.pieces.length; pi++) {
+      const piece = pg.pieces[pi];
+      const verts = new Float32Array(piece.vertices);
+      const indices = piece.faces;
+      const hasPerFaceColors = piece.colors && piece.colors.length > 0;
+      const numFaces = Math.floor(indices.length / 3);
+
+      let geo;
+      if (hasPerFaceColors) {
+        // Build non-indexed geometry with per-face colors
+        const positions = new Float32Array(numFaces * 9);
+        const colors = new Float32Array(numFaces * 9);
+        for (let i = 0; i < numFaces; i++) {
+          const a = indices[i * 3], b = indices[i * 3 + 1], c = indices[i * 3 + 2];
+          const fR = piece.colors[i * 3], fG = piece.colors[i * 3 + 1], fB = piece.colors[i * 3 + 2];
+          for (let j = 0; j < 3; j++) {
+            const vi = [a, b, c][j];
+            positions[i * 9 + j * 3]     = verts[vi * 3];
+            positions[i * 9 + j * 3 + 1] = verts[vi * 3 + 1];
+            positions[i * 9 + j * 3 + 2] = verts[vi * 3 + 2];
+            colors[i * 9 + j * 3]     = fR;
+            colors[i * 9 + j * 3 + 1] = fG;
+            colors[i * 9 + j * 3 + 2] = fB;
+          }
+        }
+        geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geo.computeVertexNormals();
+      } else {
+        geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+        geo.setIndex(indices);
+        geo.computeVertexNormals();
+      }
+
+      if (hasPerFaceColors) {
+        // Stage viz: gray base + vivid per-face color overlay + edges
+        const baseMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.52, 0.55, 0.58),
+          metalness: 0.12, roughness: 0.65, side: THREE.FrontSide,
+        });
+        const mesh = new THREE.Mesh(geo, baseMat);
+        mesh.castShadow = true;
+        modelGroup.add(mesh);
+
+        const overlayMat = new THREE.MeshPhongMaterial({
+          vertexColors: true,
+          emissive: new THREE.Color(0.15, 0.15, 0.15),
+          specular: new THREE.Color(0.15, 0.15, 0.15),
+          shininess: 25, transparent: false, side: THREE.FrontSide,
+          polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+        });
+        mesh.add(new THREE.Mesh(geo.clone(), overlayMat));
+
+        const edges = new THREE.EdgesGeometry(geo, 8);
+        mesh.add(new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+          color: new THREE.Color(0.06, 0.06, 0.08), transparent: true, opacity: 0.85,
+        })));
+
+        const pBox = new THREE.Box3().setFromBufferAttribute(geo.attributes.position);
+        const pCenter = pBox.getCenter(new THREE.Vector3());
+        const dir = pCenter.clone().sub(new THREE.Vector3(...overallCenter)).normalize();
+        const pSize = pBox.getSize(new THREE.Vector3());
+        const explodeDist = Math.max(pSize.x, pSize.y, pSize.z) * 0.20;
+        pieceMeshes.push({ mesh, dir, explodeDist, restPos: mesh.position.clone() });
+      } else {
+        // Decomposition viz: gray base + solid tint overlay
+        const baseMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.52, 0.55, 0.58),
+          metalness: 0.12, roughness: 0.65,
+          transparent: true, opacity: 0.5, side: THREE.DoubleSide,
+        });
+        const mesh = new THREE.Mesh(geo, baseMat);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        modelGroup.add(mesh);
+
+        const tint = piece.color || [0.55, 0.58, 0.62];
+        const tintColor = new THREE.Color(tint[0], tint[1], tint[2]);
+        const overlayMat = new THREE.MeshPhongMaterial({
+          color: tintColor,
+          emissive: tintColor.clone().multiplyScalar(0.5),
+          specular: new THREE.Color(0.15, 0.15, 0.15),
+          shininess: 25, transparent: true, opacity: 0.85,
+          depthWrite: false, side: THREE.FrontSide,
+          polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+        });
+        mesh.add(new THREE.Mesh(geo.clone(), overlayMat));
+
+        const edgeColor = tintColor.clone().lerp(new THREE.Color(0, 0, 0), 0.55);
+        const edges = new THREE.EdgesGeometry(geo, 8);
+        mesh.add(new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+          color: edgeColor, transparent: true, opacity: 0.85,
+        })));
+
+        const pBox = new THREE.Box3().setFromBufferAttribute(geo.attributes.position);
+        const pCenter = pBox.getCenter(new THREE.Vector3());
+        const dir = pCenter.clone().sub(new THREE.Vector3(...overallCenter)).normalize();
+        const pSize = pBox.getSize(new THREE.Vector3());
+        const explodeDist = Math.max(pSize.x, pSize.y, pSize.z) * 0.20;
+        pieceMeshes.push({ mesh, dir, explodeDist, restPos: mesh.position.clone() });
+      }
+    }
+
+    // Center the group
+    modelGroup.position.set(0, 0, 0);
+    try {
+      const box = new THREE.Box3().setFromObject(modelGroup);
+      const center = box.getCenter(new THREE.Vector3());
+      modelGroup.position.sub(center);
+    } catch (e) {}
+    document.getElementById('empty-state').style.display = 'none';
+
+    // Explode animation: only for decomposition stage (no per-face colors)
+    const isDecompStage = pg.pieces[0] && !pg.pieces[0].colors;
+    if (pieceMeshes.length > 1 && isDecompStage) {
+      const duration = 2000;
+      const startTime = performance.now();
+      function animateExplode() {
+        const elapsed = performance.now() - startTime;
+        const t = Math.min(elapsed / duration, 1.0);
+        // Smooth sine wave: out and back with no pause
+        const factor = Math.sin(t * Math.PI);
+        for (const p of pieceMeshes) {
+          p.mesh.position.copy(p.restPos).addScaledVector(p.dir, p.explodeDist * factor);
+        }
+        if (t < 1.0) requestAnimationFrame(animateExplode);
+      }
+      requestAnimationFrame(animateExplode);
+    }
+
+    // Edge lines (topology stage) — also render when showing pieces
+    if (pg.edges && pg.edges.length >= 6) {
+      const edgeVerts = pg.edges;
+      const edgeColors = pg.edge_colors;
+      const pts = [];
+      const eCols = [];
+      for (let i = 0; i < edgeVerts.length; i += 3) {
+        pts.push(new THREE.Vector3(edgeVerts[i], edgeVerts[i+1], edgeVerts[i+2]));
+        if (edgeColors && edgeColors.length > i) {
+          eCols.push(edgeColors[i], edgeColors[i+1], edgeColors[i+2]);
+        }
+      }
+      const edgeGeo = new THREE.BufferGeometry().setFromPoints(pts);
+      if (eCols.length > 0) {
+        edgeGeo.setAttribute('color', new THREE.Float32BufferAttribute(eCols, 3));
+      }
+      const edgeMat = new THREE.LineBasicMaterial({
+        vertexColors: eCols.length > 0,
+        color: eCols.length > 0 ? 0xffffff : 0x58A6FF,
+        linewidth: 1,
+        depthTest: false,
+      });
+      modelGroup.add(new THREE.LineSegments(edgeGeo, edgeMat));
+    }
+
+    return;
+  }
+
+  if (!pg.vertices || !pg.faces) return;
 
   // Clear previous model
   while (modelGroup.children.length) {
@@ -255,15 +446,61 @@ function _renderProgressGeometry(pg) {
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geo.computeVertexNormals();
 
-  const mat = new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    metalness: 0.2,
-    roughness: 0.6,
-    side: THREE.FrontSide,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.castShadow = true;
-  modelGroup.add(mesh);
+  // Check if this is a colored stage (segmentation, fitting, features)
+  const isColoredStage = hasColors && pg.stage &&
+    (pg.stage.includes('Segment') || pg.stage.includes('Fitting') ||
+     pg.stage.includes('Recogniz') || pg.stage.includes('topology'));
+
+  if (isColoredStage) {
+    // Gray base mesh
+    const baseMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(0.52, 0.55, 0.58),
+      metalness: 0.12,
+      roughness: 0.65,
+      side: THREE.FrontSide,
+    });
+    const baseMesh = new THREE.Mesh(geo, baseMat);
+    baseMesh.castShadow = true;
+    modelGroup.add(baseMesh);
+
+    // Vivid color overlay with per-face vertex colors
+    const overlayGeo = geo.clone();
+    const overlayMat = new THREE.MeshPhongMaterial({
+      vertexColors: true,
+      emissive: new THREE.Color(0.15, 0.15, 0.15),
+      specular: new THREE.Color(0.15, 0.15, 0.15),
+      shininess: 25,
+      transparent: false,
+      side: THREE.FrontSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const overlay = new THREE.Mesh(overlayGeo, overlayMat);
+    baseMesh.add(overlay);
+
+    // Edge outlines
+    const edges = new THREE.EdgesGeometry(geo, 8);
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(0.06, 0.06, 0.08),
+      opacity: 0.85,
+      transparent: true,
+      linewidth: 1,
+    });
+    baseMesh.add(new THREE.LineSegments(edges, edgeMat));
+  } else {
+    const matOpts = {
+      metalness: 0.2,
+      roughness: 0.6,
+      side: THREE.FrontSide,
+    };
+    if (hasColors) matOpts.vertexColors = true;
+    else matOpts.color = new THREE.Color(0.55, 0.58, 0.62);
+    const mat = new THREE.MeshStandardMaterial(matOpts);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    modelGroup.add(mesh);
+  }
 
   // Edge lines (for topology stage)
   if (pg.edges && pg.edges.length >= 6) {
@@ -756,6 +993,8 @@ function populateUI(statusData) {
   if (compName && statusData.filename) {
     compName.textContent = statusData.filename.replace(/\.[^.]+$/, '');
   }
+  const fnLabel = document.getElementById('viewer-filename');
+  if (fnLabel && statusData.filename) fnLabel.textContent = statusData.filename;
 
   // Render thumbnails sequentially to avoid WebGL race conditions
   console.debug('[populateUI] queued', thumbQueue.length, 'thumbnails for rendering');
@@ -1043,6 +1282,10 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 
     console.debug('[upload] preview received:', previewRes.faces, 'faces,', previewRes.vertices, 'verts, complexity:', previewRes.complexity, 'score:', previewRes.complexity_score);
 
+    // Show filename under the viewer
+    const fnLabel = document.getElementById('viewer-filename');
+    if (fnLabel) fnLabel.textContent = previewRes.filename || pendingFile?.name || '';
+
     // AI thinking messages about the uploaded mesh
     addChatMessage('ai', `Loaded ${previewRes.filename || 'mesh'}: ${previewRes.faces.toLocaleString()} faces, ${previewRes.vertices.toLocaleString()} vertices`, true);
     addChatMessage('ai', `Dimensions: ${previewRes.dimensions.map(d => d + 'mm').join(' × ')}. ${previewRes.watertight ? 'Mesh is watertight.' : 'Mesh has gaps — will repair.'}`, true);
@@ -1238,7 +1481,9 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
 
   _analyzeRunning = true;
   _lastProgressStage = '';
+  window._pipelineCancelled = false;
   window._pipelineRotate = true;
+  window._explodePiecesVersion = -1;
   window._lastTempPath = pendingTempPath; // save before pipeline might clear it
   console.debug('[analyze] starting pipeline, temp_path:', pendingTempPath);
 
@@ -1292,6 +1537,11 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     currentJobId = data.job_id;
     console.debug('[analyze] job submitted, id:', currentJobId);
 
+    // Send step-through preference to backend
+    const stepCb = document.getElementById('step-through-cb');
+    const stepOn = stepCb ? stepCb.checked : true;
+    fetch(`/api/job/${currentJobId}/step-through/${stepOn ? '1' : '0'}`, { method: 'POST' });
+
     addChatMessage('system', 'Pipeline started — analyzing mesh...');
     let lastStage = '';
 
@@ -1299,6 +1549,11 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     const statusData = await new Promise((resolve, reject) => {
       const poll = setInterval(async () => {
         try {
+          if (!currentJobId || currentJobId === 'null') {
+            clearInterval(poll);
+            reject(new Error('Cancelled'));
+            return;
+          }
           const r = await fetch(`/api/job/${currentJobId}/status`);
           const d = await r.json();
           progressBar.style.width = d.progress + '%';
@@ -1330,6 +1585,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
               contBtn.onclick = () => {
                 fetch(`/api/job/${currentJobId}/continue`, { method: 'POST' });
                 contBtn.remove();
+                window._explodePiecesVersion = -1;
               };
               cancelBtn.parentElement.appendChild(contBtn);
             }
@@ -1400,8 +1656,12 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       document.getElementById('status-dot').className = 'status-dot';
     }
   } catch (err) {
-    console.error('[analyze] pipeline error:', err);
-    alert('Pipeline error: ' + err.message);
+    if (err.message === 'Cancelled') {
+      console.debug('[analyze] pipeline cancelled');
+    } else {
+      console.error('[analyze] pipeline error:', err);
+      alert('Pipeline error: ' + err.message);
+    }
     document.getElementById('status-dot').className = 'status-dot';
     loading.classList.remove('show');
   } finally {
@@ -1416,28 +1676,82 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
 // Cancel pipeline
 let _cancelledJobId = null;
 window._cancelPipeline = function() {
+  console.debug('[cancel] starting, currentJobId:', currentJobId,
+                'savedMeshPreview:', savedMeshPreview ? 'set' : 'null',
+                '_lastTempPath:', window._lastTempPath);
   _cancelledJobId = currentJobId;
+  window._pipelineCancelled = true;  // poll/render check this
   _analyzeRunning = false;
   window._pipelineRotate = false;
-  // Unpause and cancel the job on the server
+  window._idleDist = null;
+
+  // Fire-and-forget cancel on the server
   if (currentJobId) {
     fetch(`/api/job/${currentJobId}/cancel`, { method: 'POST' }).catch(() => {});
   }
+
+  // Reset UI
   document.getElementById('loading').classList.remove('show');
   document.getElementById('actions').style.display = '';
   document.getElementById('timeline').style.display = '';
+  const timeline = document.getElementById('timeline');
+  Array.from(timeline.children).forEach(ch => {
+    if (ch.classList && ch.classList.contains('timeline-step')) ch.remove();
+  });
   document.getElementById('status-dot').className = 'status-dot';
-  // Remove continue button if present
+  const spinner = document.querySelector('#loading .spinner');
+  if (spinner) spinner.style.display = '';
   const contBtn = document.getElementById('btn-continue-pipeline');
   if (contBtn) contBtn.remove();
-  // Restore the raw mesh preview and re-enable Analyze button
-  if (savedMeshPreview) {
-    _showRawMesh(savedMeshPreview, false);
-    pendingTempPath = window._lastTempPath || pendingTempPath;
+  document.getElementById('sidebar').classList.add('closed');
+  document.getElementById('feature-list').innerHTML = '';
+  document.getElementById('play-btn').style.display = 'none';
+
+  // Clear stored cad job so refresh doesn't restore old model
+  localStorage.removeItem('paramesh_last_step');
+  sessionStorage.removeItem('paramesh_mesh_compare');
+  currentJobId = null;
+
+  // Restore the viewer to the original uploaded mesh.
+  // Priority: in-memory savedMeshPreview → sessionStorage preview.
+  let preview = savedMeshPreview;
+  if (!preview) {
+    try {
+      const saved = sessionStorage.getItem('paramesh_preview');
+      if (saved) preview = JSON.parse(saved);
+    } catch (e) {}
+  }
+  console.debug('[cancel] preview to restore:', preview ? `${preview.mesh_vertices?.length} verts` : 'NONE');
+
+  // Clear modelGroup and rebuild the mesh
+  while (modelGroup.children.length) {
+    const child = modelGroup.children[0];
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+      else child.material.dispose();
+    }
+    modelGroup.remove(child);
+  }
+
+  if (preview && preview.mesh_vertices && preview.mesh_vertices.length > 0) {
+    savedMeshPreview = preview;
+    document.getElementById('empty-state').style.display = 'none';
+    _showRawMesh(preview, true);
+    pendingTempPath = window._lastTempPath || preview.temp_path || pendingTempPath;
     if (pendingTempPath) {
       document.getElementById('btn-analyze').style.display = '';
     }
+    // Persist preview so hard refresh restores it
+    try {
+      sessionStorage.setItem('paramesh_preview', JSON.stringify(preview));
+    } catch (e) {}
+    console.debug('[cancel] restored raw mesh, modelGroup children:', modelGroup.children.length);
+  } else {
+    console.warn('[cancel] no preview available to restore, showing empty state');
+    document.getElementById('empty-state').style.display = '';
   }
+
   addChatMessage('system', 'Pipeline cancelled.');
 };
 
@@ -1940,6 +2254,8 @@ async function autoLoad() {
             pendingTempPath = previewRes.temp_path;
             pendingFile = null;
             document.getElementById('btn-analyze').style.display = '';
+            const fnL = document.getElementById('viewer-filename');
+            if (fnL) fnL.textContent = previewRes.filename || '';
             return;
           }
         } catch (e) {
@@ -2070,6 +2386,22 @@ function bestCameraPos(box) {
   else pos.z = dist;
   return pos;
 }
+
+// Step-through toggle — live update during pipeline
+// Restore step-through preference from localStorage (default: on)
+(function restoreStepThrough() {
+  const cb = document.getElementById('step-through-cb');
+  if (!cb) return;
+  const saved = localStorage.getItem('paramesh_step_through');
+  if (saved !== null) cb.checked = saved === '1';
+})();
+
+document.getElementById('step-through-cb')?.addEventListener('change', (e) => {
+  localStorage.setItem('paramesh_step_through', e.target.checked ? '1' : '0');
+  if (currentJobId) {
+    fetch(`/api/job/${currentJobId}/step-through/${e.target.checked ? '1' : '0'}`, { method: 'POST' });
+  }
+});
 
 autoLoad();
 

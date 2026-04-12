@@ -79,6 +79,31 @@ def ingest_mesh(
     return result
 
 
+def clean_trimesh_piece(mesh: trimesh.Trimesh, config: IngestConfig | None = None) -> CleanedMesh:
+    """Clean a trimesh piece (e.g. from a planar cut) into a CleanedMesh.
+
+    Runs the same cleanup pipeline as ingest_mesh but on an in-memory mesh.
+    """
+    if config is None:
+        config = IngestConfig()
+
+    mesh = _remove_degenerate_faces(mesh, config.min_face_area)
+    mesh = _merge_vertices(mesh, config.merge_tolerance)
+    mesh = _fix_normals(mesh)
+    mesh = _fill_holes(mesh, config.max_hole_edges)
+    if config.remesh:
+        mesh = _remesh(mesh, config.target_edge_ratio)
+    mesh = _fix_normals(mesh)
+
+    return CleanedMesh(
+        vertices=np.array(mesh.vertices, dtype=np.float64),
+        faces=np.array(mesh.faces, dtype=np.int64),
+        normals=np.array(mesh.face_normals, dtype=np.float64),
+        is_watertight=mesh.is_watertight,
+        bbox=np.array(mesh.bounds, dtype=np.float64),
+    )
+
+
 def _validate_file(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Mesh file not found: {path}")

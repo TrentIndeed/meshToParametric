@@ -40,6 +40,7 @@ class Job:
     progress: int = 0
     progress_stage: str = "Queued"
     paused: bool = False  # True when waiting for user to press Continue
+    step_through: bool = True  # pause after each visual stage
     error: str | None = None
     # Pipeline results
     features: object = None
@@ -132,12 +133,20 @@ class JobQueue:
             try:
                 self._run_pipeline(job)
             except Exception as e:
+                # Preserve "Cancelled by user" if it was set by the cancel endpoint
+                if job.error != "Cancelled by user":
+                    job.error = str(e)
                 job.status = "error"
-                job.error = str(e)
                 logger.exception("Job %s failed", job_id)
             finally:
-                # Only clean up temp file for completed jobs, not cancelled ones
-                if job.error != "Cancelled by user":
+                # Keep temp file for cancelled jobs so user can re-run.
+                # Also keep if it looks like a cancel (pipeline raised mid-way).
+                cancelled = (
+                    job.error == "Cancelled by user"
+                    or job.error == "Job cancelled"
+                    or "cancel" in (job.error or "").lower()
+                )
+                if not cancelled:
                     Path(job.file_path).unlink(missing_ok=True)
 
     def _run_pipeline(self, job: Job):
@@ -158,6 +167,17 @@ class JobQueue:
         def _check_cancelled():
             if job.status == "error":
                 raise RuntimeError("Job cancelled")
+
+        def _pause_for_review():
+            """Pause pipeline so the user can review the current visualization."""
+            if not job.step_through:
+                return
+            job.paused = True
+            while job.paused:
+                if job.status == "error":
+                    break
+                time.sleep(0.2)
+            job.paused = False
 
         # Helper: set mesh visualization on the job for live progress
         def _set_mesh_viz(cleaned_mesh, face_colors=None, edge_pts=None, edge_colors=None):
@@ -181,6 +201,26 @@ class JobQueue:
                         len(job.progress_vertices), len(job.progress_faces),
                         'yes' if job.progress_colors else 'no',
                         'yes' if job.progress_edges else 'no')
+
+        def _set_body_viz(body_colors_list):
+            """Unified viz for one or more bodies. Each entry is (body, sub_cleaned, face_colors).
+            Single body: renders on its own mesh. Multi body: renders each as a piece."""
+            if len(body_colors_list) == 1:
+                body, sub_cleaned, fc = body_colors_list[0]
+                _set_mesh_viz(sub_cleaned, face_colors=fc)
+            else:
+                pieces = []
+                for bi, (body, sub_cleaned, fc) in enumerate(body_colors_list):
+                    pieces.append({
+                        "vertices": sub_cleaned.vertices.flatten().tolist(),
+                        "faces": sub_cleaned.faces.flatten().tolist(),
+                        "colors": fc.flatten().tolist() if fc is not None else None,
+                        "color": body_colors[bi % len(body_colors)],
+                    })
+                job.progress_colors = None
+                job.progress_colors_per_face = False
+                job._decomp_pieces = pieces
+                job.progress_version += 1
 
         # Stage 1: Ingest
         job.progress = 5
@@ -218,202 +258,225 @@ class JobQueue:
         decomposition = decompose_bodies(cleaned, DecomposeConfig())
 
         if decomposition.is_multi_body:
-            body_palette = [
-                [1.0, 0.3, 0.3],   # bright red
-                [0.3, 0.5, 1.0],   # bright blue
-                [0.3, 1.0, 0.3],   # bright green
-                [1.0, 0.8, 0.2],   # yellow
-                [0.8, 0.3, 1.0],   # purple
-                [1.0, 0.5, 0.2],   # orange
+            # Fixed rotation: warm/cool alternating, punchy saturated
+            body_colors = [
+                [0.0, 0.55, 1.0],  # 1 vivid blue
+                [1.0, 0.35, 0.0],  # 2 orange (no green channel = no yellow)
+                [0.0, 1.0, 0.25],  # 3 neon green
+                [1.0, 0.0, 0.55],  # 4 hot pink
+                [0.0, 0.15, 0.9],  # 5 deep blue
+                [0.0, 0.9, 0.8],   # 6 cyan
+                [0.7, 0.0, 1.0],   # 7 purple
+                [1.0, 0.2, 0.0],   # 8 red-orange
             ]
-            face_colors_body = np.full((len(cleaned.faces), 3), 0.6)
+            # Send the cut pieces as separate meshes to the frontend
+            pieces = []
             for bi, body in enumerate(decomposition.bodies):
-                color = body_palette[bi % len(body_palette)]
-                for fi in body.face_indices:
-                    if fi < len(face_colors_body):
-                        face_colors_body[fi] = color
+                piece = body.metadata.get("piece_mesh")
+                if piece is None:
+                    continue
+                pieces.append({
+                    "vertices": piece.vertices.flatten().tolist(),
+                    "faces": piece.faces.flatten().tolist(),
+                    "color": body_colors[bi % len(body_colors)],
+                })
             job.progress_stage = f"Decomposed into {len(decomposition.bodies)} bodies"
-            _set_mesh_viz(cleaned, face_colors=face_colors_body)
+            job.progress_vertices = cleaned.vertices.flatten().tolist()
+            job.progress_faces = cleaned.faces.flatten().tolist()
+            job.progress_colors = None
+            job.progress_colors_per_face = False
+            job._decomp_pieces = pieces  # separate meshes for frontend
+            job.progress_version += 1
             logger.info("Multi-body: %d bodies detected", len(decomposition.bodies))
-            job.paused = True
-            pause_start = time.time()
-            while job.paused and (time.time() - pause_start) < 60:
-                if job.status == "error":  # cancelled
-                    break
-                time.sleep(0.2)
-            job.paused = False
+            if job.step_through:
+                _pause_for_review()
+            else:
+                # Step mode off — still let the explode animation play (3s)
+                for _ in range(15):
+                    if job.status == "error":
+                        break
+                    time.sleep(0.2)
         else:
             logger.info("Single body detected")
 
+        # Keep decomp pieces visible until segmentation viz overwrites them
+        # (_set_body_viz will replace them with stage-colored pieces)
         # Store decomposition for export stage
         job._decomposition = decomposition
 
         # ── Stages 2-5: run per body (or full mesh for single-body) ──
 
         palette = [
-            [0.36, 0.67, 0.93], [0.93, 0.46, 0.36], [0.40, 0.85, 0.55],
-            [0.90, 0.75, 0.30], [0.70, 0.45, 0.85], [0.95, 0.55, 0.65],
-            [0.30, 0.80, 0.80], [0.85, 0.60, 0.40], [0.55, 0.70, 0.35],
-            [0.65, 0.55, 0.90], [0.45, 0.65, 0.75], [0.80, 0.40, 0.50],
+            [0.0, 0.55, 1.0],  [1.0, 0.35, 0.0],  [0.0, 1.0, 0.25],
+            [1.0, 0.0, 0.55],  [0.0, 0.15, 0.9],   [0.0, 0.9, 0.8],
+            [0.7, 0.0, 1.0],   [1.0, 0.2, 0.0],    [0.2, 0.8, 0.2],
+            [0.9, 0.0, 0.9],   [0.0, 0.7, 0.5],    [1.0, 0.6, 0.0],
         ]
         type_colors = {
-            'PLANE': [0.36, 0.56, 0.93], 'CYLINDER': [0.30, 0.78, 0.40],
-            'CONE': [0.93, 0.65, 0.30], 'SPHERE': [0.93, 0.35, 0.35],
+            'PLANE': [0.0, 0.55, 1.0], 'CYLINDER': [0.0, 1.0, 0.25],
+            'CONE': [1.0, 0.35, 0.0], 'SPHERE': [1.0, 0.0, 0.55],
         }
         edge_type_colors = {
             'SHARP': [1.0, 1.0, 1.0], 'FILLET': [0.35, 0.65, 1.0],
             'CHAMFER': [1.0, 0.85, 0.25], 'SMOOTH': [0.5, 0.5, 0.5],
         }
         feature_type_colors = {
-            FeatureType.BASE_EXTRUSION: [0.35, 0.55, 0.90],
-            FeatureType.THROUGH_HOLE: [0.30, 0.80, 0.40],
-            FeatureType.BLIND_HOLE: [0.25, 0.70, 0.50],
-            FeatureType.CHAMFER: [1.00, 0.85, 0.25],
-            FeatureType.FILLET: [0.95, 0.55, 0.25],
-            FeatureType.POCKET: [0.70, 0.35, 0.80],
-            FeatureType.BOSS: [0.85, 0.45, 0.45],
+            FeatureType.BASE_EXTRUSION: [0.0, 0.55, 1.0],
+            FeatureType.THROUGH_HOLE: [0.0, 1.0, 0.25],
+            FeatureType.BLIND_HOLE: [0.0, 0.9, 0.8],
+            FeatureType.CHAMFER: [1.0, 0.35, 0.0],
+            FeatureType.FILLET: [1.0, 0.0, 0.55],
+            FeatureType.POCKET: [0.7, 0.0, 1.0],
+            FeatureType.BOSS: [1.0, 0.2, 0.0],
         }
 
         bodies_to_process = decomposition.bodies
         all_body_results = []  # list of (body, sub_cleaned, tree)
+        n_bodies = len(bodies_to_process)
 
-        # Base colors: inactive bodies match the frontend's default material color
-        # so they look like the normal untouched mesh
-        base_body_colors = np.zeros((len(cleaned.faces), 3))
-        base_body_colors[:, 0] = 0.55
-        base_body_colors[:, 1] = 0.58
-        base_body_colors[:, 2] = 0.62
+        def _face_edges(faces):
+            """Get set of edge tuples (v0, v1) from face array."""
+            edges_set = set()
+            for f in faces:
+                for i in range(3):
+                    edges_set.add(tuple(sorted((int(f[i]), int(f[(i+1) % 3])))))
+            return edges_set
 
-        for bi, body in enumerate(bodies_to_process):
-            body_label = f" (body {bi+1}/{len(bodies_to_process)})" if decomposition.is_multi_body else ""
-
-            # Get sub-mesh for this body (or full mesh for single-body)
-            if decomposition.is_multi_body:
-                sub_cleaned = extract_sub_mesh(cleaned, body.face_indices)
-            else:
-                sub_cleaned = cleaned
-
-            # Stage 2: Segment
+        # ── Process each body through the single-body pipeline ──
+        # Run all bodies in parallel, then show visualizations per stage.
+        def _process_single_body(bi, body):
+            sub_cleaned = extract_sub_mesh(cleaned, body.face_indices, body=body)
             _check_cancelled()
-            job.progress = 8 + bi * 5
-            job.progress_stage = f"Segmenting surfaces...{body_label}"
-            logger.debug("Job %s: stage=segment%s faces=%d", job.id, body_label, sub_cleaned.num_faces)
             regions = segment_mesh(sub_cleaned, SegmentConfig())
-
-            # Viz: start from base body colors, overlay active body's stage colors
-            face_colors_seg = base_body_colors.copy()
-            if decomposition.is_multi_body:
-                parent_fi = body.face_indices
-                for ri, region in enumerate(regions):
-                    color = palette[ri % len(palette)]
-                    for fi in region.face_indices:
-                        orig_fi = parent_fi[fi] if fi < len(parent_fi) else -1
-                        if 0 <= orig_fi < len(face_colors_seg):
-                            face_colors_seg[orig_fi] = color
-            else:
-                for ri, region in enumerate(regions):
-                    color = palette[ri % len(palette)]
-                    for fi in region.face_indices:
-                        if fi < len(face_colors_seg):
-                            face_colors_seg[fi] = color
-            _set_mesh_viz(cleaned, face_colors=face_colors_seg)
-
-            # Stage 3: Fit
-            job.progress = 10 + bi * 5
-            job.progress_stage = f"Fitting primitives...{body_label}"
-            logger.debug("Job %s: stage=fit%s regions=%d", job.id, body_label, len(regions))
+            _check_cancelled()
             fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
-
-            face_colors_fit = base_body_colors.copy()
-            fitted_lookup = {f.region_id: f for f in fitted}
-            if decomposition.is_multi_body:
-                parent_fi = body.face_indices
-                for region in regions:
-                    f = fitted_lookup.get(region.region_id)
-                    if f:
-                        color = type_colors.get(f.surface_type.name, [0.6, 0.6, 0.6])
-                        for fi in region.face_indices:
-                            orig_fi = parent_fi[fi] if fi < len(parent_fi) else -1
-                            if 0 <= orig_fi < len(face_colors_fit):
-                                face_colors_fit[orig_fi] = color
-            else:
-                for region in regions:
-                    f = fitted_lookup.get(region.region_id)
-                    if f:
-                        color = type_colors.get(f.surface_type.name, [0.6, 0.6, 0.6])
-                        for fi in region.face_indices:
-                            if fi < len(face_colors_fit):
-                                face_colors_fit[fi] = color
-            _set_mesh_viz(cleaned, face_colors=face_colors_fit)
-
-            # Stage 4: Topology
-            job.progress = 14 + bi * 5
-            job.progress_stage = f"Building topology...{body_label}"
-            logger.debug("Job %s: stage=topology%s fitted=%d", job.id, body_label, len(fitted))
+            _check_cancelled()
             graph, edges_list = build_topology(regions, fitted, sub_cleaned, TopologyConfig())
+            _check_cancelled()
+            body_tree = recognize_features(regions, fitted, graph, edges_list, sub_cleaned, RecognizeConfig())
+            return (body, sub_cleaned, regions, fitted, graph, edges_list, body_tree)
 
-            edge_pts_list = []
-            edge_col_list = []
+        job.progress = 8
+        job.progress_stage = "Analyzing surfaces..."
+
+        if n_bodies > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            body_stage_data = [None] * n_bodies
+            executor = ThreadPoolExecutor(max_workers=n_bodies)
+            try:
+                futures = {executor.submit(_process_single_body, bi, b): bi
+                           for bi, b in enumerate(bodies_to_process)}
+                for future in as_completed(futures):
+                    _check_cancelled()
+                    bi = futures[future]
+                    body_stage_data[bi] = future.result()
+            except Exception:
+                # Cancel pending futures on error/cancel
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            body_stage_data = [_process_single_body(0, bodies_to_process[0])]
+
+        all_body_results = [(body, sub_cleaned, body_tree)
+                            for body, sub_cleaned, _, _, _, _, body_tree in body_stage_data]
+
+        # ── Show per-stage visualizations ──
+        # Each body's sub_cleaned is the mesh used for that body's pipeline.
+        # Colors are per-face on that sub_cleaned.
+
+        # Stage 2: Segmentation
+        job.progress = 15
+        job.progress_stage = "Segmenting surfaces..."
+        seg_colors = []
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+            fc = np.full((len(sub_cleaned.faces), 3), 0.55)
+            for ri, region in enumerate(regions):
+                color = palette[ri % len(palette)]
+                for fi in region.face_indices:
+                    if fi < len(fc):
+                        fc[fi] = color
+            seg_colors.append((body, sub_cleaned, fc))
+        _set_body_viz(seg_colors)
+        _pause_for_review()
+
+        # Stage 3: Fitting
+        job.progress = 20
+        job.progress_stage = "Fitting primitives..."
+        fit_colors = []
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+            fc = np.full((len(sub_cleaned.faces), 3), 0.55)
+            fitted_lookup = {f.region_id: f for f in fitted}
+            for region in regions:
+                f = fitted_lookup.get(region.region_id)
+                if f:
+                    color = type_colors.get(f.surface_type.name, [0.6, 0.6, 0.6])
+                    for fi in region.face_indices:
+                        if fi < len(fc):
+                            fc[fi] = color
+            fit_colors.append((body, sub_cleaned, fc))
+        _set_body_viz(fit_colors)
+        _pause_for_review()
+
+        # Stage 4: Topology — same face colors as fitting + edge lines
+        job.progress = 23
+        job.progress_stage = "Building topology..."
+        edge_pts_list = []
+        edge_col_list = []
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
             region_lookup = {r.region_id: r for r in regions}
             for edge in edges_list:
                 ra = region_lookup.get(edge.surface_a_id)
                 rb = region_lookup.get(edge.surface_b_id)
                 if ra is None or rb is None:
                     continue
-                set_a = set(sub_cleaned.faces[ra.face_indices].flatten()) if len(ra.face_indices) > 0 else set()
-                set_b = set(sub_cleaned.faces[rb.face_indices].flatten()) if len(rb.face_indices) > 0 else set()
-                shared = set_a & set_b
-                if len(shared) < 2:
+                faces_a = sub_cleaned.faces[ra.face_indices] if len(ra.face_indices) > 0 else np.array([])
+                faces_b = sub_cleaned.faces[rb.face_indices] if len(rb.face_indices) > 0 else np.array([])
+                if len(faces_a) == 0 or len(faces_b) == 0:
                     continue
-                shared_verts = sub_cleaned.vertices[list(shared)]
-                extent = shared_verts.max(axis=0) - shared_verts.min(axis=0)
-                ax = int(np.argmax(extent))
-                sorted_idx = np.argsort(shared_verts[:, ax])
-                p0 = shared_verts[sorted_idx[0]]
-                p1 = shared_verts[sorted_idx[-1]]
+                shared_edges = _face_edges(faces_a) & _face_edges(faces_b)
+                if not shared_edges:
+                    continue
                 color = edge_type_colors.get(edge.transition_type.name, [0.5, 0.5, 0.5])
-                edge_pts_list.extend([p0, p1])
-                edge_col_list.extend([color, color])
-            edge_pts = np.array(edge_pts_list) if edge_pts_list else None
-            edge_cols = np.array(edge_col_list) if edge_col_list else None
-            _set_mesh_viz(cleaned, face_colors=face_colors_fit, edge_pts=edge_pts, edge_colors=edge_cols)
+                for v0, v1 in shared_edges:
+                    edge_pts_list.extend([sub_cleaned.vertices[v0], sub_cleaned.vertices[v1]])
+                    edge_col_list.extend([color, color])
+        edge_pts = np.array(edge_pts_list) if edge_pts_list else None
+        edge_cols = np.array(edge_col_list) if edge_col_list else None
+        job.progress_edges = edge_pts.flatten().tolist() if edge_pts is not None else None
+        job.progress_edge_colors = edge_cols.flatten().tolist() if edge_cols is not None else None
+        _set_body_viz(fit_colors)
+        _pause_for_review()
 
-            # Stage 5: Recognize features
-            job.progress = 18 + bi * 5
-            job.progress_stage = f"Recognizing features...{body_label}"
-            logger.debug("Job %s: stage=recognize%s edges=%d", job.id, body_label, len(edges_list))
-            body_tree = recognize_features(regions, fitted, graph, edges_list, sub_cleaned, RecognizeConfig())
-
-            all_body_results.append((body, sub_cleaned, body_tree))
-
-        # Use the first (base) body's tree as the primary feature tree
-        # For single-body, this is just the full mesh tree
-        tree = all_body_results[0][2]
-        job.features = tree
-        job.cleaned = cleaned
-        job.mesh_volume = self._estimate_volume(cleaned)
-        job.bbox_min = cleaned.bbox[0].tolist()
-        job.bbox_max = cleaned.bbox[1].tolist()
-
-        # Stage 5 visualization: feature colors on full mesh
-        face_colors_feat = base_body_colors.copy()
-        for body, sub_cleaned, body_tree in all_body_results:
-            parent_fi = body.face_indices
+        # Stage 5: Feature recognition
+        job.progress = 26
+        job.progress_stage = "Recognizing features..."
+        job.progress_edges = None
+        job.progress_edge_colors = None
+        feat_colors = []
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+            fc = np.full((len(sub_cleaned.faces), 3), 0.55)
             for feat in body_tree.features:
                 color = feature_type_colors.get(feat.type, [0.55, 0.55, 0.55])
                 try:
                     fi_arr = feat.face_indices
                     if fi_arr is not None and hasattr(fi_arr, '__len__') and len(fi_arr) > 0:
                         for fi in fi_arr:
-                            if decomposition.is_multi_body:
-                                orig_fi = int(parent_fi[int(fi)]) if int(fi) < len(parent_fi) else -1
-                            else:
-                                orig_fi = int(fi)
-                            if 0 <= orig_fi < len(face_colors_feat):
-                                face_colors_feat[orig_fi] = color
+                            if 0 <= int(fi) < len(fc):
+                                fc[int(fi)] = color
                 except Exception:
                     pass
-        _set_mesh_viz(cleaned, face_colors=face_colors_feat, edge_pts=edge_pts, edge_colors=edge_cols)
+            feat_colors.append((body, sub_cleaned, fc))
+        _set_body_viz(feat_colors)
+        _pause_for_review()
+
+        tree = all_body_results[0][2]
+        job.features = tree
+        job.cleaned = cleaned
+        job.mesh_volume = self._estimate_volume(cleaned)
+        job.bbox_min = cleaned.bbox[0].tolist()
+        job.bbox_max = cleaned.bbox[1].tolist()
 
         # Clear edges for build stage, keep feature colors
         job.progress_edges = None

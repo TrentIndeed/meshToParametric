@@ -332,21 +332,44 @@ def _find_holes(
             proj = verts @ axis_dir
             height = float(proj.max() - proj.min())
 
-        # Snap hole axis to nearest principal direction if close (within 15°)
-        # This fixes holes whose fitted axis is slightly off due to mesh noise
+        # Snap hole axis to nearest principal direction. Reject holes whose
+        # axis is more than 30° from any principal direction — these are
+        # artifacts from cut-piece cap geometry, not real holes.
         principal_axes = [
             np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1]),
             np.array([-1, 0, 0]), np.array([0, -1, 0]), np.array([0, 0, -1]),
         ]
+        best_dot = 0
+        best_pa = None
         for pa in principal_axes:
-            if abs(np.dot(axis_dir, pa)) > np.cos(np.radians(15)):
-                axis_dir = pa * np.sign(np.dot(axis_dir, pa))
-                break
+            d = abs(np.dot(axis_dir, pa))
+            if d > best_dot:
+                best_dot = d
+                best_pa = pa
+        if best_pa is None or best_dot < np.cos(np.radians(30)):
+            continue  # axis too far from any principal direction
+        axis_dir = best_pa * np.sign(np.dot(axis_dir, best_pa))
 
-        # Determine through vs blind: compare hole height to part extent along axis
-        part_proj = cleaned.vertices @ axis_dir
-        part_extent = float(part_proj.max() - part_proj.min())
-        is_through = height > part_extent * 0.8
+        # Determine through vs blind: compare hole height to the LOCAL
+        # part thickness at the hole location (not the full part extent).
+        # Use vertices near the hole center to measure local thickness.
+        hole_verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
+        hole_center = hole_verts.mean(axis=0)
+        # Find all mesh vertices within 2x hole radius of the hole center
+        # projected onto the plane perpendicular to the hole axis
+        perp_dist = np.linalg.norm(
+            cleaned.vertices - hole_center -
+            np.outer(((cleaned.vertices - hole_center) @ axis_dir), axis_dir),
+            axis=1
+        )
+        nearby_mask = perp_dist < max(radius * 3, 10.0)
+        if nearby_mask.sum() > 2:
+            local_proj = cleaned.vertices[nearby_mask] @ axis_dir
+            local_extent = float(local_proj.max() - local_proj.min())
+        else:
+            local_proj = cleaned.vertices @ axis_dir
+            local_extent = float(local_proj.max() - local_proj.min())
+        is_through = height > local_extent * 0.5
 
         hole_type = FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
 

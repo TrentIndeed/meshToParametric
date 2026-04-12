@@ -567,6 +567,8 @@ async def job_status(job_id: str):
         if job.progress_colors:
             result["progress_geometry"]["colors"] = job.progress_colors
             result["progress_geometry"]["colors_per_face"] = getattr(job, 'progress_colors_per_face', False)
+        if getattr(job, '_decomp_pieces', None):
+            result["progress_geometry"]["pieces"] = job._decomp_pieces
         if job.progress_edges:
             result["progress_geometry"]["edges"] = job.progress_edges
         if job.progress_edge_colors:
@@ -595,6 +597,19 @@ async def job_continue(job_id: str):
         return JSONResponse({"error": "Job not found"}, status_code=404)
     job.paused = False
     return {"status": "resumed"}
+
+
+@app.post("/api/job/{job_id}/step-through/{enabled}")
+async def set_step_through(job_id: str, enabled: str):
+    """Toggle step-through mode (pause after each visual stage)."""
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    job.step_through = enabled == "1"
+    # If turning off while paused, unpause immediately
+    if not job.step_through and job.paused:
+        job.paused = False
+    return {"step_through": job.step_through}
 
 
 @app.post("/api/job/{job_id}/variant/{variant_index}")
@@ -721,13 +736,19 @@ async def job_compare(job_id: str, n_slices: int = 7):
 
 @app.get("/api/status")
 async def status_legacy():
-    """Legacy: return status of the most recent job."""
+    """Legacy: return status of the most recent completed job."""
     with queue._lock:
         if not queue._jobs:
             return {"status": "idle", "tokens_used": 0, "num_steps": 0, "steps": [],
                     "mesh_volume": 0, "cad_volume": 0, "error": None,
                     "bbox_min": [0,0,0], "bbox_max": [0,0,0]}
-        job = list(queue._jobs.values())[-1]
+        # Find the most recent "done" job (skip errored/cancelled ones)
+        done_jobs = [j for j in queue._jobs.values() if j.status == "done"]
+        if not done_jobs:
+            return {"status": "idle", "tokens_used": 0, "num_steps": 0, "steps": [],
+                    "mesh_volume": 0, "cad_volume": 0, "error": None,
+                    "bbox_min": [0,0,0], "bbox_max": [0,0,0]}
+        job = done_jobs[-1]
 
     steps_info = [{"index": i, "name": s.name, "volume": round(s.volume, 1),
                    "has_geometry": s.tess_vertices is not None and len(s.tess_vertices) > 0}

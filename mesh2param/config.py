@@ -102,7 +102,7 @@ class DecomposeConfig(BaseModel):
     axis_angle_threshold_deg: float = 20.0  # face normal to axis tolerance
     min_body_faces: int = 20               # minimum faces for a sub-body
     min_body_volume_ratio: float = 0.05    # minimum volume fraction
-    enabled: bool = False  # disabled — needs better algorithm for connected meshes
+    enabled: bool = True
 
 
 class ExportConfig(BaseModel):

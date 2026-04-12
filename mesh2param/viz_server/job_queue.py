@@ -371,11 +371,14 @@ class JobQueue:
                     bi = futures[future]
                     body_stage_data[bi] = future.result()
             except Exception:
-                # Cancel pending futures on error/cancel
-                executor.shutdown(wait=False, cancel_futures=True)
+                # Cancel pending futures first, then wait for running ones
+                # to check their own cancel flags and exit cleanly. This
+                # prevents zombie threads from running stages in the
+                # background and blocking subsequent jobs.
+                executor.shutdown(wait=True, cancel_futures=True)
                 raise
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
         else:
             body_stage_data = [_process_single_body(0, bodies_to_process[0])]
 

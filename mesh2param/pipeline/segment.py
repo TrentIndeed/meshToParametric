@@ -388,6 +388,19 @@ def _curvature_split(
         if curv_var < config.curvature_variance_threshold:
             continue
 
+        # A uniform cylinder has all faces at the same curvature (=1/radius)
+        # but with rotating normals. Don't split it — keep it as one region
+        # so the cylinder fitter sees a full ring of faces.
+        # Test: if the curvature values are tightly clustered (coefficient
+        # of variation < 0.3), this is a single analytic surface and
+        # should stay whole.
+        curv_mean = float(np.mean(np.abs(region_curvatures)))
+        if curv_mean > 1e-10:
+            curv_cv = float(np.std(region_curvatures)) / curv_mean
+            if curv_cv < 0.3:
+                # Uniform curvature → single cylinder/sphere/cone, don't split
+                continue
+
         # Build feature vectors: (nx, ny, nz, curvature)
         region_normals = cleaned.normals[mask]
         features = np.column_stack([region_normals, region_curvatures])
@@ -497,69 +510,107 @@ def _merge_adjacent_cylinder_fragments(
     cleaned: CleanedMesh,
     adjacency: dict[int, set[int]],
 ) -> np.ndarray:
-    """Merge small adjacent regions that together form cylindrical holes.
+    """Merge adjacent regions that together form cylindrical holes.
 
-    After segmentation, hole walls often get split into many tiny regions
-    (2-10 faces each). This function detects spatially clustered small regions
-    with non-planar normals and merges them into unified hole regions.
+    After segmentation, hole walls often get split into many regions
+    (e.g. 4 quarters for a cylinder). This pass finds small regions that
+    are MESH-ADJACENT to each other and whose normals suggest they're
+    part of a single curved surface (normals span a range of directions,
+    suggesting they wrap around an axis). Merges them into one region.
     """
-    from sklearn.cluster import DBSCAN
-
     labels = labels.copy()
     normals = cleaned.normals
 
-    # Find small regions with non-axis-aligned normals (potential hole fragments)
-    region_info = {}
+    # Build region→faces map and collect region-level adjacency via shared faces
+    region_faces: dict[int, np.ndarray] = {}
     for label in np.unique(labels):
-        face_idx = np.where(labels == label)[0]
-        if len(face_idx) > 30:
-            continue  # skip large regions
-        avg_n = normals[face_idx].mean(axis=0)
-        avg_norm = np.linalg.norm(avg_n)
-        if avg_norm < 0.01:
-            continue
-        avg_n /= avg_norm
-        # Non-planar: average normal not closely aligned with any axis
-        if np.max(np.abs(avg_n)) < 0.85:
-            center = np.mean([
-                cleaned.vertices[cleaned.faces[fi]].mean(axis=0) for fi in face_idx
-            ], axis=0)
-            region_info[label] = {
-                "faces": face_idx,
-                "center": center,
-                "normal": avg_n,
-                "count": len(face_idx),
-            }
+        region_faces[int(label)] = np.where(labels == label)[0]
 
-    if len(region_info) < 2:
+    # Build region-level adjacency from face adjacency
+    region_adj: dict[int, set[int]] = defaultdict(set)
+    for fi, neighbors in adjacency.items():
+        li = int(labels[fi])
+        for nb in neighbors:
+            ln = int(labels[nb])
+            if li != ln:
+                region_adj[li].add(ln)
+                region_adj[ln].add(li)
+
+    # Identify "fragment" regions: small (<= 50 faces) AND curved-ish
+    # (normals span a range of directions, indicating part of a curved surface)
+    def _is_fragment(label: int) -> bool:
+        faces = region_faces[label]
+        if len(faces) > 50:
+            return False
+        if len(faces) < 2:
+            return True  # tiny regions always candidates
+        region_n = normals[faces]
+        avg_n = region_n.mean(axis=0)
+        avg_norm = np.linalg.norm(avg_n)
+        if avg_norm < 1e-10:
+            return True
+        avg_n /= avg_norm
+        # Normal spread: how much do the normals deviate from their mean?
+        # High spread → curved surface fragment (quarter of a cylinder etc.)
+        # Low spread → flat face
+        dots = region_n @ avg_n
+        spread = float(1.0 - dots.min())  # 0 = all aligned, 2 = opposing
+        return spread > 0.05  # at least ~18° max deviation → curved
+
+    fragments = {l for l in region_faces if _is_fragment(l)}
+    if len(fragments) < 2:
         return labels
 
-    # Cluster these small regions spatially
-    region_labels = list(region_info.keys())
-    centers = np.array([region_info[l]["center"] for l in region_labels])
-
-    part_size = float((cleaned.bbox[1] - cleaned.bbox[0]).min())  # smallest dim
-    eps = max(part_size * 0.4, 8.0)
-
-    clustering = DBSCAN(eps=eps, min_samples=2).fit(centers)
-
+    # Group fragments by connected components in region adjacency
+    # (only walking through fragment regions)
+    visited = set()
     next_label = int(labels.max()) + 1
-    for cl in set(clustering.labels_):
-        if cl == -1:
+    for start in list(fragments):
+        if start in visited:
             continue
-        cl_mask = clustering.labels_ == cl
-        group_labels = [region_labels[i] for i in range(len(region_labels)) if cl_mask[i]]
+        # BFS through fragment neighbors
+        group = set()
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            if node not in fragments:
+                continue
+            group.add(node)
+            for nb in region_adj.get(node, set()):
+                if nb not in visited and nb in fragments:
+                    queue.append(nb)
 
-        # Merge all faces in this spatial cluster into one region
-        if len(group_labels) < 2:
-            continue
-        total_faces = sum(region_info[l]["count"] for l in group_labels)
-        if total_faces < 4:
+        if len(group) < 2:
             continue
 
-        for l in group_labels:
-            for fi in region_info[l]["faces"]:
-                labels[fi] = next_label
+        # Verify this group looks like a cylindrical surface by checking
+        # that the combined faces fit a cylinder. If not, skip.
+        all_faces = np.concatenate([region_faces[l] for l in group])
+        if len(all_faces) < 4 or len(all_faces) > 200:
+            continue
+        combined_normals = normals[all_faces]
+        # Check normal variety: if normals span many directions, it's curved
+        mean_n = combined_normals.mean(axis=0)
+        mean_norm = np.linalg.norm(mean_n)
+        if mean_norm < 0.01:
+            normal_spread = 2.0  # pointing in opposite directions
+        else:
+            mean_n /= mean_norm
+            dots = combined_normals @ mean_n
+            normal_spread = float(1.0 - dots.min())
+        # A cylinder quarter group has spread > 0.3, a full cylinder > 1.0
+        if normal_spread < 0.2:
+            continue  # too flat, not a cylinder
+
+        logger.info(
+            "Merging %d cylinder fragment regions: %d total faces, spread=%.2f",
+            len(group), len(all_faces), normal_spread,
+        )
+        for l in group:
+            labels[region_faces[l]] = next_label
         next_label += 1
 
     # Renumber contiguously

@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 data/
+
+# Generated mesh-vs-CAD comparison images
+mesh2param/viz_server/static/compare/

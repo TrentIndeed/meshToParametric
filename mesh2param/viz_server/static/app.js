@@ -1546,15 +1546,25 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     let lastStage = '';
 
     // Poll progress and stream thinking to chat
+    // Capture this invocation's job ID so zombie polls from previous analyze
+    // calls don't interfere when this job gets cancelled/replaced
+    const myJobId = currentJobId;
     const statusData = await new Promise((resolve, reject) => {
       const poll = setInterval(async () => {
         try {
-          if (!currentJobId || currentJobId === 'null') {
+          // Exit if this poll's job is no longer the current one
+          // (either cancelled or replaced by a newer analyze)
+          if (myJobId !== currentJobId) {
             clearInterval(poll);
             reject(new Error('Cancelled'));
             return;
           }
-          const r = await fetch(`/api/job/${currentJobId}/status`);
+          if (!myJobId || myJobId === 'null') {
+            clearInterval(poll);
+            reject(new Error('Cancelled'));
+            return;
+          }
+          const r = await fetch(`/api/job/${myJobId}/status`);
           const d = await r.json();
           progressBar.style.width = d.progress + '%';
           loadingText.textContent = d.stage || 'Processing...';
@@ -1585,7 +1595,6 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
               contBtn.onclick = () => {
                 fetch(`/api/job/${currentJobId}/continue`, { method: 'POST' });
                 contBtn.remove();
-                window._explodePiecesVersion = -1;
               };
               cancelBtn.parentElement.appendChild(contBtn);
             }
@@ -1599,7 +1608,7 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             if (spinner) spinner.style.display = '';
           }
 
-          if (_cancelledJobId === currentJobId) { clearInterval(poll); reject(new Error('Cancelled')); return; }
+          if (_cancelledJobId === myJobId) { clearInterval(poll); reject(new Error('Cancelled')); return; }
           if (d.status === 'done') { clearInterval(poll); resolve(d); }
           else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
         } catch (e) { console.warn('[analyze] poll error:', e); }

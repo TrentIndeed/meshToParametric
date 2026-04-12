@@ -105,14 +105,31 @@ def export_cadquery(
     )
     mesh_volume = _estimate_mesh_volume(cleaned)
 
-    # Extract base profile (needed by both LLM and heuristic paths)
+    # Extract base profile (needed by both LLM and heuristic paths).
+    # For multi-body parts, use the primary body's sub_cleaned mesh so the
+    # profile/extrude_start reflect that body alone, not the full assembly.
     base_feature = feature_tree.features[0]
     extrude_dir = np.array(base_feature.direction)
     depth = base_feature.depth
 
+    if body_results and len(body_results) > 0:
+        primary_body, primary_sub, primary_tree = body_results[0]
+        primary_base = primary_tree.features[0] if primary_tree.features else None
+        if primary_base is not None:
+            extrude_dir = np.array(primary_base.direction)
+            depth = primary_base.depth
+        else:
+            extrude_dir = primary_body.extrude_direction
+            depth = primary_body.depth
+        profile_mesh = primary_sub
+        profile_tree = primary_tree
+    else:
+        profile_mesh = cleaned
+        profile_tree = feature_tree
+
     try:
         profiles, extrude_start, hole_features, chamfer_features, fillet_features = \
-            _extract_profile_and_holes(feature_tree, cleaned, extrude_dir)
+            _extract_profile_and_holes(profile_tree, profile_mesh, extrude_dir)
     except Exception:
         logger.exception(
             "Stage 6b failed extracting profile: extrude_dir=%s, depth=%.2f",
@@ -158,10 +175,14 @@ def export_cadquery(
                 logger.warning("Failed to extract profile for body %d, skipping", bi)
 
     # --- Build variants with different construction orders ---
+    # For multi-body, pass the primary body's sub_cleaned as `cleaned` so
+    # all downstream logic (chamfer detection, hole cutting bbox, etc.)
+    # operates on that body's geometry, not the full assembly.
+    build_cleaned = profile_mesh
     build_args = dict(
         profiles=profiles, depth=depth, extrude_dir=extrude_dir,
         extrude_start=extrude_start, holes=hole_features,
-        chamfers=chamfer_features, fillets=fillet_features, cleaned=cleaned,
+        chamfers=chamfer_features, fillets=fillet_features, cleaned=build_cleaned,
     )
 
     logger.debug(
@@ -225,6 +246,13 @@ def export_cadquery(
 
                     # Merge each body step's tessellation with the base
                     for bstep in body_steps:
+                        is_sketch = "sketch" in bstep.name.lower()
+                        # If the step already has a sketch_overlay set (e.g.
+                        # "Sketch Cutout" from profile-based cuts), its tess
+                        # is already the solid state — just offset it.
+                        already_has_overlay = (
+                            getattr(bstep, "sketch_overlay", None) is not None
+                        )
                         if bstep.tess_vertices is None or bstep.tess_faces is None:
                             steps.append(bstep)
                             continue
@@ -233,14 +261,46 @@ def export_cadquery(
                         if len(step_v) == 0 or len(step_f) == 0:
                             steps.append(bstep)
                             continue
-                        # Combine: stack vertices, offset body faces by base count
-                        combined_v = np.vstack([base_v_arr, step_v]) if base_vert_count > 0 else step_v
-                        combined_f = (
-                            np.vstack([base_f_arr, step_f + base_vert_count])
-                            if base_vert_count > 0 else step_f
-                        )
-                        bstep.tess_vertices = combined_v
-                        bstep.tess_faces = combined_f
+
+                        if already_has_overlay:
+                            # Step's tess is a solid (base of the current body)
+                            # and overlay is already set. Combine the body's
+                            # solid with the accumulated base like a normal
+                            # step, keep the overlay untouched.
+                            if base_vert_count > 0:
+                                combined_v = np.vstack([base_v_arr, step_v])
+                                combined_f = np.vstack(
+                                    [base_f_arr, step_f + base_vert_count]
+                                )
+                                bstep.tess_vertices = combined_v
+                                bstep.tess_faces = combined_f
+                            steps.append(bstep)
+                            continue
+
+                        if is_sketch and base_vert_count > 0:
+                            # For sketch steps: show the base solid with the
+                            # sketch edges drawn on top as a blue overlay.
+                            # Convert sketch face triangles (degenerate = edges)
+                            # into point pairs for sketch_overlay.
+                            overlay_pts = []
+                            for fi in range(len(step_f)):
+                                a, b = int(step_f[fi, 0]), int(step_f[fi, 1])
+                                overlay_pts.append(step_v[a])
+                                overlay_pts.append(step_v[b])
+                            bstep.tess_vertices = base_v_arr
+                            bstep.tess_faces = base_f_arr
+                            bstep.sketch_overlay = np.array(overlay_pts, dtype=np.float64) if overlay_pts else None
+                            # Rename so frontend treats it as a solid+overlay, not pure sketch
+                            # (the endpoint checks "sketch" in name.lower() for is_sketch)
+                        else:
+                            # Combine: stack vertices, offset body faces by base count
+                            combined_v = np.vstack([base_v_arr, step_v]) if base_vert_count > 0 else step_v
+                            combined_f = (
+                                np.vstack([base_f_arr, step_f + base_vert_count])
+                                if base_vert_count > 0 else step_f
+                            )
+                            bstep.tess_vertices = combined_v
+                            bstep.tess_faces = combined_f
                         steps.append(bstep)
 
                     # Union into the accumulated solid for the next body
@@ -776,6 +836,133 @@ def _extract_profile_and_holes(
                         logger.info("Face projection profile: area=%.0f (vs slice %.0f)",
                                     merged.area, profile_area)
 
+    # ── 2D-based hole detection ──
+    # The canonical way to detect holes in a plate: project all top/bottom
+    # faces (those perpendicular to the extrude direction) onto the 2D
+    # profile plane, union them into a polygon, and any INTERIOR RINGS in
+    # that polygon are physical holes through the plate. This is simpler
+    # and more reliable than 3D cylinder fitting because holes always
+    # appear as inner rings of the cross-section regardless of mesh noise.
+    #
+    # This REPLACES the recognition-based holes with 2D-detected ones
+    # whenever the 2D detection produces results — that way we always get
+    # holes that are perpendicular to the plate face (not random Y/Z axes
+    # from misidentified cylindrical features).
+    try:
+        from shapely.geometry import Polygon as _HolePoly, Point as _PointP
+        from shapely.ops import unary_union as _HoleUnion
+        from mesh2param.models.feature import Feature, FeatureType as _FType
+
+        ext_norm = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
+        face_dots = np.abs(cleaned.normals @ ext_norm)
+        top_bot_mask = face_dots > 0.9
+        top_bot_faces = np.where(top_bot_mask)[0]
+
+        face_polys = []
+        for fi in top_bot_faces:
+            tri = cleaned.faces[fi]
+            tri_pts = [
+                (float(cleaned.vertices[v][ax_u]), float(cleaned.vertices[v][ax_v]))
+                for v in tri
+            ]
+            try:
+                p = _HolePoly(tri_pts)
+                if p.is_valid and p.area > 0.01:
+                    face_polys.append(p)
+            except Exception:
+                pass
+
+        detected_holes = []
+        if face_polys:
+            merged = _HoleUnion(face_polys)
+            # If multiple components, pick the largest
+            if merged.geom_type == 'MultiPolygon':
+                merged = max(merged.geoms, key=lambda g: g.area)
+
+            # Replace the outer profile with face-projection's clean exterior
+            # whenever we detect interior rings. The slice-based profile
+            # sometimes traces cutouts as slits connected to the outer
+            # boundary, which baked the cutout into the initial sketch.
+            if merged.geom_type == 'Polygon' and merged.interiors:
+                clean_outer = list(merged.exterior.coords)[:-1]
+                clean_outer = _simplify_profile(clean_outer, tolerance=0.5)
+                if len(clean_outer) >= 3:
+                    # Keep any extra profiles (they'll be replaced/re-added below)
+                    extras = best_profiles[1:] if len(best_profiles) > 1 else []
+                    best_profiles = [clean_outer] + extras
+                    logger.info(
+                        "Replaced outer profile with clean exterior: %d pts",
+                        len(clean_outer),
+                    )
+
+            if merged.geom_type == 'Polygon' and merged.interiors:
+                for ring in merged.interiors:
+                    inner = _HolePoly(ring)
+                    if not inner.is_valid or inner.area < 1.0:
+                        continue
+                    area = float(inner.area)
+                    perimeter = float(ring.length)
+                    if perimeter < 1e-6:
+                        continue
+                    circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+                    est_radius = float((area / np.pi) ** 0.5)
+
+                    # Non-circular OR large interior rings are polygonal
+                    # cutouts (windows, pockets). Append them as additional
+                    # profiles so _build_stepwise cuts them from the base
+                    # with their own Sketch Profile + Extrude.
+                    if circularity < 0.5 or est_radius > 30.0:
+                        if area > 10.0:  # ignore tiny noise
+                            cutout_coords = list(ring.coords)[:-1]
+                            cutout_coords = _simplify_profile(cutout_coords, tolerance=0.5)
+                            if len(cutout_coords) >= 3:
+                                best_profiles.append(cutout_coords)
+                                logger.info(
+                                    "Polygon cutout profile: %d pts, area=%.0f",
+                                    len(cutout_coords), area,
+                                )
+                        continue
+                    if est_radius < 1.5:
+                        continue
+
+                    # Compute hole center in 3D
+                    c_2d = inner.centroid
+                    hole_center_3d = np.zeros(3)
+                    hole_center_3d[ax_u] = c_2d.x
+                    hole_center_3d[ax_v] = c_2d.y
+                    # Use the body's midpoint along the extrude axis
+                    hole_center_3d[primary_axis] = (
+                        float(cleaned.bbox[0][primary_axis]) +
+                        float(cleaned.bbox[1][primary_axis])
+                    ) / 2
+
+                    hole_depth = extent  # full thickness (through hole)
+                    detected_holes.append(Feature(
+                        type=_FType.THROUGH_HOLE,
+                        face_indices=np.array([], dtype=np.int64),
+                        sketch_geometry={
+                            "type": "circle",
+                            "radius": est_radius,
+                            "center": hole_center_3d.tolist(),
+                        },
+                        direction=ext_norm,
+                        depth=hole_depth,
+                    ))
+                    logger.info(
+                        "2D-profile hole: r=%.2f at %s, circularity=%.2f",
+                        est_radius, np.round(hole_center_3d, 1).tolist(), circularity,
+                    )
+
+        # If 2D detection found holes, REPLACE the recognition-based ones.
+        # 2D detection guarantees holes go perpendicular to the plate face,
+        # whereas recognition often picks up sideways cylindrical features.
+        if detected_holes:
+            logger.info("2D detection replaced %d recognition holes with %d 2D holes",
+                        len(holes), len(detected_holes))
+            holes = detected_holes
+    except Exception as e:
+        logger.debug("2D profile hole detection failed: %s", e)
+
     return best_profiles, extrude_start, holes, chamfers, fillets
 
 
@@ -1245,7 +1432,7 @@ def _build_stepwise(
     steps: list[ConstructionStep] = []
     script_lines = ["import cadquery as cq", ""]
 
-    # --- Step 0: Sketch (2D profile wires — outer + inner contours) ---
+    # --- Step 0: Sketch (outer profile only — cutouts get their own steps) ---
     axes = [0, 1, 2]
     axes.remove(primary_axis)
     ax_u, ax_v = axes
@@ -1254,7 +1441,11 @@ def _build_stepwise(
     all_sketch_faces = []
     vert_offset = 0
 
-    for profile in profiles:
+    # Only the first profile (outer boundary) goes in the initial sketch.
+    # Any additional profiles (cutouts) will emit their own Sketch + Cut
+    # Extrude steps later in the function so the feature tree shows them
+    # as separate editable features.
+    for profile in profiles[:1]:
         n_pts = len(profile)
         verts = np.zeros((n_pts, 3))
         for pi, (u, v_coord) in enumerate(profile):
@@ -1305,24 +1496,6 @@ def _build_stepwise(
     else:
         wp = wp_pos
         extrude_sign = depth
-    # Additional profiles: union outer bodies, cut inner holes.
-    # A profile is "inner" if its centroid falls inside the main profile polygon.
-    from shapely.geometry import Polygon, Point
-    main_poly = Polygon(profiles[0])
-    for profile in profiles[1:]:
-        try:
-            centroid = np.mean(profile, axis=0)
-            is_inner = main_poly.contains(Point(centroid[0], centroid[1]))
-            extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
-            extra = extra.polyline(profile).close().extrude(extrude_sign)
-            if is_inner:
-                wp = wp.cut(extra)
-                logger.info("Cut inner profile (%d pts) from base", len(profile))
-            else:
-                wp = wp.union(extra)
-                logger.info("Unioned outer profile (%d pts) with base", len(profile))
-        except Exception:
-            pass
 
     script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
     script_lines.append(f"result = result.extrude({depth})")
@@ -1332,6 +1505,65 @@ def _build_stepwise(
     steps.append(ConstructionStep(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
+
+    # Additional profiles: each becomes its own Sketch + Extrude step.
+    # Inner profiles (centroid inside the main outer) are cut as pockets,
+    # outer profiles are unioned as additional material.
+    from shapely.geometry import Polygon, Point
+    main_poly = Polygon(profiles[0])
+    for pi, profile in enumerate(profiles[1:], 1):
+        try:
+            centroid = np.mean(profile, axis=0)
+            is_inner = main_poly.contains(Point(centroid[0], centroid[1]))
+
+            # Build the sketch wireframe points for overlay display
+            n_pts = len(profile)
+            overlay_pts = []
+            for pj in range(n_pts):
+                u1, v1 = profile[pj]
+                u2, v2 = profile[(pj + 1) % n_pts]
+                p1 = [0.0, 0.0, 0.0]
+                p2 = [0.0, 0.0, 0.0]
+                p1[ax_u] = u1; p1[ax_v] = v1; p1[primary_axis] = extrude_start
+                p2[ax_u] = u2; p2[ax_v] = v2; p2[primary_axis] = extrude_start
+                overlay_pts.append(p1)
+                overlay_pts.append(p2)
+            overlay_arr = np.array(overlay_pts, dtype=np.float64)
+
+            # For the sketch step, show the CURRENT solid with the sketch
+            # drawn as a blue overlay on top (not the sketch alone).
+            base_v_now, base_f_now = _tessellate_solid(wp, fast=True)
+            sketch_name = "Sketch Cutout" if is_inner else "Sketch Extra"
+            steps.append(ConstructionStep(
+                name=sketch_name,
+                tess_vertices=np.asarray(base_v_now, dtype=np.float64),
+                tess_faces=np.asarray(base_f_now, dtype=np.int64),
+                volume=abs(float(wp.val().Volume())),
+                sketch_overlay=overlay_arr,
+            ))
+
+            # Apply the cut or union and emit the step
+            extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
+            extra = extra.polyline(profile).close().extrude(extrude_sign)
+            vol_before = abs(float(wp.val().Volume()))
+            if is_inner:
+                wp = wp.cut(extra)
+                op_name = "Cut Extrude"
+            else:
+                wp = wp.union(extra)
+                op_name = "Union Extrude"
+            vol_after = abs(float(wp.val().Volume()))
+            v2, f2 = _tessellate_solid(wp, fast=True)
+            steps.append(ConstructionStep(
+                name=op_name, tess_vertices=v2, tess_faces=f2, volume=vol_after,
+            ))
+            logger.info(
+                "%s profile %d (%d pts): vol %.0f -> %.0f",
+                "Cut" if is_inner else "Union", pi, len(profile),
+                vol_before, vol_after,
+            )
+        except Exception as e:
+            logger.warning("Failed to apply profile %d: %s", pi, e)
 
     # --- Chamfers BEFORE holes ---
     # Detect chamfer faces from mesh geometry. For each chamfer:

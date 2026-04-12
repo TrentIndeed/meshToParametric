@@ -110,8 +110,122 @@ def fit_surfaces(
             region.region_id, fitted.surface_type.value, fitted.rms_error, rms_tol,
         )
 
+    # Post-process: merge adjacent cylinder regions with matching params.
+    # Segmentation often splits a single cylindrical hole into 4-5 rectangular
+    # clusters due to KMeans on rotating normals. This merges them back.
+    results = _merge_coincident_cylinders(results, regions, cleaned, bbox_diag)
+
     logger.debug("fit_surfaces completed: %d surfaces fitted", len(results))
     return results
+
+
+def _merge_coincident_cylinders(
+    fitted: list[FittedSurface],
+    regions: list[FaceRegion],
+    cleaned: CleanedMesh,
+    bbox_diag: float,
+) -> list[FittedSurface]:
+    """Merge cylinder fits whose axis/radius/center are nearly identical.
+
+    When a cylindrical hole is split into multiple regions by segmentation
+    (e.g. KMeans clustering on the normal directions around the cylinder),
+    each piece gets its own cylinder fit with similar parameters. This
+    merges them back into a single fit representing the whole cylinder.
+    """
+    region_lookup = {r.region_id: r for r in regions}
+    cyl_fits = [f for f in fitted if f.surface_type == SurfaceType.CYLINDER]
+    other_fits = [f for f in fitted if f.surface_type != SurfaceType.CYLINDER]
+
+    if len(cyl_fits) < 2:
+        return fitted
+
+    # Group cylinders by similar params
+    pos_tol = bbox_diag * 0.003  # 0.3% of bbox — cylinders must share the same axis line
+    radius_tol_ratio = 0.08  # 8% radius tolerance
+    axis_dot_tol = 0.98  # within ~11° axis alignment
+
+    groups: list[list] = []
+    used = set()
+    for i, ci in enumerate(cyl_fits):
+        if i in used:
+            continue
+        axis_i = np.array(ci.params.get("axis_dir", [0, 0, 1]))
+        axis_i = axis_i / (np.linalg.norm(axis_i) + 1e-15)
+        center_i = np.array(ci.params.get("axis_point", [0, 0, 0]))
+        radius_i = ci.params.get("radius", 0)
+        if radius_i <= 0:
+            continue
+
+        group = [ci]
+        used.add(i)
+        for j in range(i + 1, len(cyl_fits)):
+            if j in used:
+                continue
+            cj = cyl_fits[j]
+            axis_j = np.array(cj.params.get("axis_dir", [0, 0, 1]))
+            axis_j = axis_j / (np.linalg.norm(axis_j) + 1e-15)
+            center_j = np.array(cj.params.get("axis_point", [0, 0, 0]))
+            radius_j = cj.params.get("radius", 0)
+            if radius_j <= 0:
+                continue
+            # Axis match (parallel, same direction or opposite)
+            axis_match = abs(float(np.dot(axis_i, axis_j))) > axis_dot_tol
+            # Radius match
+            radius_match = abs(radius_i - radius_j) < max(radius_i, radius_j) * radius_tol_ratio
+            # Center match: cylinders must share the same axis LINE (not just
+            # a parallel axis), AND overlap axially within a few radii.
+            delta = center_j - center_i
+            axial = float(np.dot(delta, axis_i))
+            perp = delta - axial * axis_i
+            perp_dist = float(np.linalg.norm(perp))
+            # Must be on the same axis line (perpendicular distance tiny)
+            # AND axially close (within 3x the radius — same physical hole)
+            center_match = perp_dist < pos_tol and abs(axial) < radius_i * 3.0
+            if axis_match and radius_match and center_match:
+                group.append(cj)
+                used.add(j)
+        groups.append(group)
+
+    # Merge each group into one fit
+    merged_cyls = []
+    for group in groups:
+        if len(group) == 1:
+            merged_cyls.append(group[0])
+            continue
+        # Pick the group member with the most region faces as the "primary"
+        primary = max(
+            group,
+            key=lambda f: len(region_lookup.get(f.region_id).face_indices)
+            if region_lookup.get(f.region_id) else 0,
+        )
+        # Collect all face indices from this group into the primary's region
+        primary_region = region_lookup.get(primary.region_id)
+        if primary_region is None:
+            merged_cyls.append(primary)
+            continue
+        all_face_idx = set(primary_region.face_indices.tolist())
+        for f in group:
+            if f.region_id == primary.region_id:
+                continue
+            r = region_lookup.get(f.region_id)
+            if r is not None:
+                all_face_idx.update(r.face_indices.tolist())
+        merged_face_idx = np.array(sorted(all_face_idx), dtype=np.int64)
+        # Mutate the primary's region in place to contain all faces
+        primary_region.face_indices = merged_face_idx
+        # Refresh derived fields
+        try:
+            primary_region.vertices = cleaned.vertices[cleaned.faces[merged_face_idx].flatten()]
+            primary_region.normals = cleaned.normals[merged_face_idx]
+        except Exception:
+            pass
+        logger.info(
+            "Merged %d cylinder regions into region %d: %d total faces",
+            len(group), primary.region_id, len(merged_face_idx),
+        )
+        merged_cyls.append(primary)
+
+    return other_fits + merged_cyls
 
 
 def _fit_region(

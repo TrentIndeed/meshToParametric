@@ -313,6 +313,10 @@ def _find_holes(
             radius = (sorted_dims[0] + sorted_dims[1]) / 4
         if radius <= 0 or radius > config.hole_max_radius_ratio * bbox_diag:
             continue
+        # Reject tiny cylinders — these are edge radii/fillets, not holes.
+        # Minimum 1.5mm radius for a real hole.
+        if radius < 1.5:
+            continue
 
         region = region_lookup.get(f.region_id)
         if region is None:
@@ -322,6 +326,17 @@ def _find_holes(
         span = _cylinder_angular_span(f, region)
         if span < 270.0:
             continue  # partial arc, not a hole
+
+        # Reject cylinders that span the entire body along their axis —
+        # these are edge fillets running the full length, not holes
+        height_pre = f.params.get("height", 0)
+        if height_pre > 0:
+            axis_pre = np.array(f.params.get("axis_dir", [0, 0, 1]))
+            part_proj_pre = cleaned.vertices @ axis_pre
+            part_extent_pre = float(part_proj_pre.max() - part_proj_pre.min())
+            if part_extent_pre > 0 and height_pre > part_extent_pre * 0.9:
+                # Cylinder runs the full length → edge fillet, not a hole
+                continue
 
         height = f.params.get("height", 0)
         axis_dir = np.array(f.params.get("axis_dir", [0, 0, 1]))
@@ -333,7 +348,7 @@ def _find_holes(
             height = float(proj.max() - proj.min())
 
         # Snap hole axis to nearest principal direction. Reject holes whose
-        # axis is more than 30° from any principal direction — these are
+        # axis is more than 15° from any principal direction — these are
         # artifacts from cut-piece cap geometry, not real holes.
         principal_axes = [
             np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1]),
@@ -346,30 +361,18 @@ def _find_holes(
             if d > best_dot:
                 best_dot = d
                 best_pa = pa
-        if best_pa is None or best_dot < np.cos(np.radians(30)):
+        if best_pa is None or best_dot < np.cos(np.radians(15)):
             continue  # axis too far from any principal direction
         axis_dir = best_pa * np.sign(np.dot(axis_dir, best_pa))
 
-        # Determine through vs blind: compare hole height to the LOCAL
-        # part thickness at the hole location (not the full part extent).
-        # Use vertices near the hole center to measure local thickness.
-        hole_verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
-        hole_center = hole_verts.mean(axis=0)
-        # Find all mesh vertices within 2x hole radius of the hole center
-        # projected onto the plane perpendicular to the hole axis
-        perp_dist = np.linalg.norm(
-            cleaned.vertices - hole_center -
-            np.outer(((cleaned.vertices - hole_center) @ axis_dir), axis_dir),
-            axis=1
-        )
-        nearby_mask = perp_dist < max(radius * 3, 10.0)
-        if nearby_mask.sum() > 2:
-            local_proj = cleaned.vertices[nearby_mask] @ axis_dir
-            local_extent = float(local_proj.max() - local_proj.min())
-        else:
-            local_proj = cleaned.vertices @ axis_dir
-            local_extent = float(local_proj.max() - local_proj.min())
-        is_through = height > local_extent * 0.5
+        # Determine through vs blind. A cylindrical region that wraps
+        # more than 270° of arc (already checked above) and has a
+        # drill-hole-sized radius is almost always a through-hole.
+        # Blind holes have a distinct bottom cap that gets segmented
+        # as a separate planar region, leaving the cylindrical region
+        # smaller. We already filter span >= 270 above, so at this point
+        # we can safely classify as through for reasonable radii.
+        is_through = radius < bbox_diag * 0.1  # drill holes are small
 
         hole_type = FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
 

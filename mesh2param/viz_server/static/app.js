@@ -660,24 +660,11 @@ async function loadStep(index) {
           modelGroup.add(tube);
         }
 
-        // Also draw semi-transparent filled triangle
-        if (pts.length >= 6) {
-          const triGeo = new THREE.BufferGeometry();
-          const triVerts = new Float32Array([
-            pts[0].x, pts[0].y, pts[0].z,
-            pts[2].x, pts[2].y, pts[2].z,
-            pts[4].x, pts[4].y, pts[4].z,
-          ]);
-          triGeo.setAttribute('position', new THREE.BufferAttribute(triVerts, 3));
-          triGeo.computeVertexNormals();
-          const triMat = new THREE.MeshBasicMaterial({
-            color: 0x58A6FF, transparent: true, opacity: 0.25,
-            side: THREE.DoubleSide, depthTest: false,
-          });
-          const triMesh = new THREE.Mesh(triGeo, triMat);
-          triMesh.renderOrder = 1;
-          modelGroup.add(triMesh);
-        }
+        // (Removed: the old code drew a translucent triangle from the first
+        // three overlay vertices as a visual cue. For rectangular/polygonal
+        // sketches those first three vertices are corners on the sketch
+        // outline, and the triangle cut across the interior — showing up
+        // in the viewer as spurious "spikes" or bumps crossing the sketch.)
 
         console.debug('[loadStep] added sketch overlay:', pts.length / 2, 'edges');
       }

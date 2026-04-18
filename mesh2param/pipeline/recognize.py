@@ -702,168 +702,303 @@ def _find_fillets_and_chamfers(
                     if extent < config.chamfer_width_ratio * float(r.vertices.max() - r.vertices.min()) * 2:
                         chamfer_rids.add(rid)
 
-    # Strategy 3: Unassigned small cylinders that form narrow curved strips
-    # between two principal faces → FILLET.
+    # Strategy 3: Topology-driven fillet blend detection.
     #
-    # Validates:
-    #   a) The cylinder radius is small relative to the part (< 5% of
-    #      bbox diagonal), ruling out large cylindrical features.
-    #   b) The cylinder is a partial arc (angular span < 200 deg), not a
-    #      full hole or boss.
-    #   c) The cylinder is adjacent to at least two principal faces (PLANE
-    #      or large CYLINDER) in the surface graph — a fillet must sit
-    #      between two faces, not float alone.
-    #   d) The faces form a connected strip (narrow aspect ratio or small
-    #      face count) — not scattered noise faces.
-    #   e) Fillet radius is derived from the fitted cylinder parameters
-    #      (not just the region bbox).
-    fillet_candidates: list[int] = []
-    for f in fitted:
-        if f.region_id in assigned or f.region_id in chamfer_rids:
-            continue
-        if f.surface_type != SurfaceType.CYLINDER:
-            continue
-        r = region_lookup.get(f.region_id)
-        if r is None:
-            continue
+    # A fillet is a rolling-ball blend sitting tangent to two or more
+    # principal faces. Geometrically that means: a non-planar region whose
+    # boundary to neighboring regions is near-tangent (the stage-4 dihedral
+    # classifier calls those SMOOTH or FILLET edges). It does not matter
+    # whether the segmenter/fitter happened to fit the blend as a cylinder,
+    # cone, or sphere — what matters is the topological role it plays.
+    #
+    # For each candidate region we reconstruct the cylinder axis from a
+    # closed-form 2D circle fit on the vertex cross-section (project the
+    # vertices perpendicular to the SVD length direction and fit a circle
+    # by least squares). A closed-form 2D fit is far more stable than a
+    # 6-parameter 3D cylinder fit on the handful of faces a fillet strip
+    # contains, which is where the previous approach broke down.
+    fillet_fit_lookup: dict[int, dict] = {}  # rid -> fitted cylinder params
 
-        radius = f.params.get("radius", 0)
+    def _fit_strip_as_cylinder(pts: np.ndarray, face_normals: np.ndarray | None):
+        """Fit a cylinder to a curved strip via normal-covariance + 2D circle.
+
+        The cylinder axis is recovered from the *face normals* of the
+        region, not from the vertex positions: on a cylinder all surface
+        normals are perpendicular to the axis, so the axis is the
+        direction along which the normal covariance is smallest. Using
+        vertex SVD instead (as a previous version did) can pick the
+        wrong axis when the region spans the length of the part but is
+        actually a blend around a shorter direction.
+
+        Returns (axis_point, axis_dir, radius, rms) or None if the fit
+        is degenerate.
+        """
+        if pts is None or len(pts) < 4:
+            return None
+        if face_normals is None or len(face_normals) < 2:
+            return None
+        if not np.all(np.isfinite(pts)) or not np.all(np.isfinite(face_normals)):
+            return None
+        mean_p = pts.mean(axis=0)
+        rel = pts - mean_p
+        if not np.all(np.isfinite(rel)):
+            return None
+
+        # Axis direction from face normals: for a cylinder with axis d,
+        # every surface normal is perpendicular to d. So d is the
+        # eigenvector of N^T N with the smallest eigenvalue.
+        n_norms = np.linalg.norm(face_normals, axis=1)
+        valid = n_norms > 1e-8
+        if valid.sum() < 2:
+            return None
+        n_unit = face_normals[valid] / n_norms[valid, None]
+        M = n_unit.T @ n_unit  # (3, 3)
+        try:
+            eig_vals, eig_vecs = np.linalg.eigh(M)
+        except np.linalg.LinAlgError:
+            return None
+        # eigenvalues in ascending order
+        axis_dir = eig_vecs[:, 0]
+        # The smallest eigenvalue measures how non-perpendicular the
+        # normals are to the axis. For a genuine cylindrical region it
+        # should be near zero; for a saddle or corner cap it is large.
+        # Rank the three eigenvalues — for a cylinder we expect roughly
+        # one tiny eigenvalue and two comparable larger ones.
+        lam = np.sort(np.abs(eig_vals))
+        if lam[2] < 1e-10:
+            return None
+        # The smallest eigenvalue must be ~0 — i.e. all normals lie
+        # in a plane. For a cylinder, that plane is perpendicular to
+        # the axis.
+        if lam[0] / lam[2] > 0.2:
+            return None
+        # The middle eigenvalue must be smaller than the largest. For
+        # a partial-arc cylinder the normal spread within the plane is
+        # anisotropic (middle ≪ max). For two perpendicular planes
+        # meeting at a sharp interior edge the two directions are
+        # evenly populated and middle/max ≈ 1 — that is the signature
+        # of a phantom that we need to reject.
+        if lam[1] / lam[2] > 0.85:
+            return None
+        n = float(np.linalg.norm(axis_dir))
+        if n < 1e-12:
+            return None
+        axis_dir = axis_dir / n
+
+        # Orthonormal 2D basis in the plane perpendicular to axis_dir.
+        tmp = np.array([0.0, 0.0, 1.0]) if abs(axis_dir[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        u_vec = np.cross(axis_dir, tmp)
+        nu = float(np.linalg.norm(u_vec))
+        if nu < 1e-12:
+            return None
+        u_vec = u_vec / nu
+        v_vec = np.cross(axis_dir, u_vec)
+
+        x2 = rel @ u_vec
+        y2 = rel @ v_vec
+        # A cylindrical strip has a genuinely two-dimensional cross-section
+        # in the perpendicular plane: a quarter-arc spans comparable width
+        # in both directions. A strip that is effectively one-dimensional
+        # in cross-section (all vertices on a line) is a flat band, not a
+        # cylinder, and the Kasa circle fit below is rank-deficient on it.
+        try:
+            _, sv2, _ = np.linalg.svd(np.column_stack([x2, y2]), full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None
+        if sv2[0] < 1e-6:
+            return None
+        if sv2[1] / sv2[0] < 0.1:
+            return None
+
+        # Kasa algebraic circle fit gives a closed-form cheap estimate.
+        # We then follow with a Levenberg-Marquardt geometric refinement
+        # of the residuals sqrt((x-a)^2 + (y-b)^2) - r, which is what we
+        # actually care about. If the geometric fit blows up (e.g. on a
+        # near-line cross-section), we fall back to the algebraic answer
+        # — both are reported in the RMS check below.
+        A = np.column_stack([2 * x2, 2 * y2, np.ones_like(x2)])
+        rhs = x2 ** 2 + y2 ** 2
+        try:
+            sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+        except Exception:
+            return None
+        a2d, b2d, c_val = sol
+        r_sq = c_val + a2d * a2d + b2d * b2d
+        if r_sq <= 0:
+            return None
+        radius_seed = float(np.sqrt(r_sq))
+
+        from scipy.optimize import least_squares
+
+        def _circle_residuals(params):
+            ax_, bx_, rr = params
+            return np.sqrt((x2 - ax_) ** 2 + (y2 - bx_) ** 2) - rr
+
+        radius = radius_seed
+        try:
+            lsq = least_squares(
+                _circle_residuals,
+                np.array([a2d, b2d, radius_seed]),
+                method="lm",
+                max_nfev=200,
+            )
+            # Only accept the refined fit if it stays close to the
+            # algebraic seed — a 10× explosion means LM wandered off.
+            r_lm = float(abs(lsq.x[2]))
+            if 0.25 * radius_seed <= r_lm <= 4.0 * radius_seed:
+                a2d = float(lsq.x[0])
+                b2d = float(lsq.x[1])
+                radius = r_lm
+        except Exception:
+            pass
         if radius <= 0:
+            return None
+
+        # Recover the 3D axis point: lift the 2D circle center back through
+        # the (u_vec, v_vec) basis relative to mean_p.
+        axis_point = mean_p + a2d * u_vec + b2d * v_vec
+
+        # RMS of perpendicular distance residuals.
+        vecs = pts - axis_point
+        proj_along = vecs @ axis_dir
+        perp = vecs - np.outer(proj_along, axis_dir)
+        perp_d = np.linalg.norm(perp, axis=1)
+        rms = float(np.sqrt(np.mean((perp_d - radius) ** 2)))
+        return axis_point, axis_dir, radius, rms
+
+    for f in fitted:
+        rid = f.region_id
+        if rid in assigned or rid in chamfer_rids:
+            continue
+        if f.surface_type == SurfaceType.PLANE:
+            continue  # planes are principal faces, not blends
+        region = region_lookup.get(rid)
+        if region is None or graph is None or not graph.has_node(rid):
             continue
 
-        # (a) Scale check: radius must be small relative to part
-        if radius > bbox_diag * 0.05:
-            logger.debug(
-                "Strategy 3: cyl rid=%d radius=%.2f too large (> 5%% of bbox_diag=%.2f), skipping",
-                f.region_id, radius, bbox_diag,
-            )
+        # Tangent-blend adjacency: the region must share at least two
+        # near-tangent (SMOOTH or FILLET) boundaries with its neighbors.
+        # Any neighbor counts — plane, cylinder, cone, whatever — because
+        # a fillet's defining trait is that its boundary to the rest of
+        # the part is smooth, not that those neighbors are planar.
+        tangent_neighbors = 0
+        for nbr in graph.neighbors(rid):
+            edge_data = graph.get_edge_data(rid, nbr) or {}
+            ttype = str(edge_data.get("transition_type", "")).upper()
+            if ttype in ("SMOOTH", "FILLET"):
+                tangent_neighbors += 1
+        if tangent_neighbors < 2:
             continue
 
-        # (b) Partial arc check: full cylinders are holes/bosses, not fillets
-        span = _cylinder_angular_span(f, r)
-        if span >= 200:
-            logger.debug(
-                "Strategy 3: cyl rid=%d angular span=%.0f° >= 200°, not a fillet",
-                f.region_id, span,
-            )
-            continue
+        pts = np.asarray(region.vertices, dtype=float)
+        # Per-face normals for the region (defined on the full mesh).
+        if cleaned is not None:
+            face_normals = cleaned.normals[region.face_indices]
+        else:
+            face_normals = None
 
-        # (c) Adjacency check: must border at least 2 principal faces
-        if not _adjacent_to_two_principal(f.region_id):
-            logger.debug(
-                "Strategy 3: cyl rid=%d not adjacent to 2 principal faces, skipping",
-                f.region_id,
-            )
-            continue
-
-        # (d) Strip shape check: fillet faces should form a narrow strip.
-        # Compute the axis-aligned extent along the cylinder axis vs the
-        # perpendicular extent (width across the fillet arc).
-        axis_dir = np.array(f.params.get("axis_dir", [0, 0, 1]))
-        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
-        proj_along = r.vertices @ axis_dir
-        strip_length = float(proj_along.max() - proj_along.min())
-
-        # Width across the arc: project vertices onto the plane perpendicular
-        # to the cylinder axis, then measure the span
-        axis_point = np.array(f.params.get("axis_point", [0, 0, 0]))
-        vecs = r.vertices - axis_point
-        along = np.outer(vecs @ axis_dir, axis_dir)
-        perp = vecs - along
-        perp_extent = float(np.linalg.norm(perp, axis=1).max() - np.linalg.norm(perp, axis=1).min())
-        # Also use the arc width: 2 * radius * sin(span/2) as an upper bound
-        arc_width = 2.0 * radius * np.sin(np.radians(min(span, 180)) / 2)
-
-        # For a legitimate fillet strip: length >> width.
-        # Use the smaller of perp_extent and arc_width as the width estimate.
-        strip_width = min(perp_extent, arc_width) if arc_width > 0 else perp_extent
-        if strip_length > 1e-10 and strip_width > 1e-10:
-            aspect = strip_length / strip_width
-            if aspect < 1.5 and r.num_faces > 20:
+        # Connectivity check: a segmented region ought to be a single
+        # connected patch (triangles linked via shared edges). When the
+        # segmenter merges disjoint pieces of the mesh into one region
+        # — e.g. the two front/back corners of a pocket — fitting a
+        # single cylinder to the union is nonsense, and the resulting
+        # "phantom fillet" ends up applied as a stripe that does not
+        # exist in the reference mesh. We reject non-connected regions.
+        if cleaned is not None and len(region.face_indices) > 1:
+            face_to_idx = {
+                int(fi): local_i
+                for local_i, fi in enumerate(region.face_indices)
+            }
+            edge_to_local: dict[tuple[int, int], list[int]] = defaultdict(list)
+            region_faces = cleaned.faces[region.face_indices]
+            for local_i, tri in enumerate(region_faces):
+                for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[0], tri[2])):
+                    key = (min(int(a), int(b)), max(int(a), int(b)))
+                    edge_to_local[key].append(local_i)
+            adj: dict[int, set[int]] = defaultdict(set)
+            for locs in edge_to_local.values():
+                if len(locs) < 2:
+                    continue
+                for i in range(len(locs)):
+                    for j in range(i + 1, len(locs)):
+                        adj[locs[i]].add(locs[j])
+                        adj[locs[j]].add(locs[i])
+            seen: set[int] = set()
+            stack = [0]
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(adj[cur] - seen)
+            if len(seen) != len(region.face_indices):
                 logger.debug(
-                    "Strategy 3: cyl rid=%d aspect=%.1f < 1.5 and %d faces — "
-                    "not a narrow strip, skipping",
-                    f.region_id, aspect, r.num_faces,
+                    "Strategy 3: rid=%d is %d/%d connected — region "
+                    "is split across multiple pieces, skipping",
+                    rid, len(seen), len(region.face_indices),
                 )
                 continue
 
-        # (e) Connectivity check via surface graph (fillet faces should be in
-        # a contiguous strip, not scattered).  For small regions (< 30 faces)
-        # we skip this check since they are almost always a single strip.
-        if r.num_faces >= 30 and graph is not None and graph.has_node(f.region_id):
-            # If this region is a single region_id, it's already connected by
-            # definition (the segmenter ensures that).  So we just verify it
-            # isn't too many faces (which would suggest a large feature, not
-            # a fillet).
-            max_fillet_faces = max(50, int(0.02 * len(cleaned.faces))) if cleaned else 200
-            if r.num_faces > max_fillet_faces:
-                logger.debug(
-                    "Strategy 3: cyl rid=%d has %d faces > max %d for fillet, skipping",
-                    f.region_id, r.num_faces, max_fillet_faces,
-                )
-                continue
+        fit_res = _fit_strip_as_cylinder(pts, face_normals)
+        if fit_res is None:
+            continue
+        axis_point, axis_dir, radius, rms = fit_res
+        if radius <= 0.2 or radius > bbox_diag * 0.15:
+            continue
+        if rms > 0.35 * radius:
+            logger.debug(
+                "Strategy 3: rid=%d cylinder fit rms=%.2f vs radius=%.2f — "
+                "not a clean cylindrical blend, skipping",
+                rid, rms, radius,
+            )
+            continue
 
-        logger.debug(
-            "Strategy 3: cyl rid=%d accepted as fillet (r=%.2f, span=%.0f°, "
-            "strip L=%.2f W=%.2f, %d faces)",
-            f.region_id, radius, span, strip_length, strip_width, r.num_faces,
-        )
-        fillet_candidates.append(f.region_id)
+        # Snap axis direction so the stored axis_point sits at the
+        # midpoint of the strip along its length — makes downstream edge
+        # matching more predictable.
+        vecs = pts - axis_point
+        along = vecs @ axis_dir
+        mid = 0.5 * (float(along.max()) + float(along.min()))
+        axis_point = axis_point + mid * axis_dir
+        strip_length = float(along.max() - along.min())
 
-    # Also check edges with fillet/smooth transitions — their adjacent small
-    # cylinders may not have been caught above if they were already partially
-    # assigned.  This is the original Strategy 3 edge-based fallback.
-    for e in edges:
-        if e.transition_type in (TransitionType.FILLET, TransitionType.SMOOTH):
-            for rid in (e.surface_a_id, e.surface_b_id):
-                if rid in assigned or rid in chamfer_rids or rid in fillet_candidates:
-                    continue
-                f = fitted_lookup.get(rid)
-                r = region_lookup.get(rid)
-                if f is None or r is None:
-                    continue
-                if f.surface_type != SurfaceType.CYLINDER:
-                    continue
-                radius = f.params.get("radius", 0)
-                if radius <= 0 or radius > bbox_diag * 0.05:
-                    continue
-                span = _cylinder_angular_span(f, r)
-                if span >= 200:
-                    continue
-                if not _adjacent_to_two_principal(rid):
-                    continue
-                logger.debug(
-                    "Strategy 3 (edge fallback): cyl rid=%d accepted as fillet "
-                    "(r=%.2f, span=%.0f°, edge type=%s)",
-                    rid, radius, span, e.transition_type.name,
-                )
-                fillet_candidates.append(rid)
-
-    # Deduplicate and add to fillet_rids
-    for rid in fillet_candidates:
         fillet_rids.add(rid)
+        fillet_fit_lookup[rid] = {
+            "radius": float(radius),
+            "axis_dir": [float(x) for x in axis_dir],
+            "axis_point": [float(x) for x in axis_point],
+            "length": strip_length,
+            "rms": rms,
+        }
+        logger.debug(
+            "Strategy 3: rid=%d accepted as fillet (r=%.2f, rms=%.2f, "
+            "len=%.1f, %d faces, %d tangent neighbors)",
+            rid, radius, rms, strip_length, region.num_faces,
+            tangent_neighbors,
+        )
 
-    # Build features — use the fitted cylinder radius (not bbox) for
-    # the fillet radius, and include axis info for downstream export.
+    # Build features — use the fitted cylinder params from the topology
+    # pass above, which reflect the actual rolling-ball blend geometry.
     for rid in fillet_rids:
         if rid in assigned:
             continue
         region = region_lookup.get(rid)
-        f = fitted_lookup.get(rid)
-        if region is None or f is None:
+        if region is None:
             continue
-        fillet_radius = f.params.get("radius", 0)
-        axis_dir = f.params.get("axis_dir", [0, 0, 1])
-        axis_point = f.params.get("axis_point", [0, 0, 0])
+        fit = fillet_fit_lookup.get(rid)
+        if fit is None:
+            # Fell through without a cylinder fit — skip silently.
+            continue
         results.append((
             Feature(
                 type=FeatureType.FILLET,
                 face_indices=region.face_indices.copy(),
                 sketch_geometry={
                     "type": "arc",
-                    "radius": round(fillet_radius, 3),
-                    "axis_dir": [round(float(x), 4) for x in axis_dir],
-                    "axis_point": [round(float(x), 4) for x in axis_point],
+                    "radius": round(fit["radius"], 3),
+                    "axis_dir": [round(float(x), 4) for x in fit["axis_dir"]],
+                    "axis_point": [round(float(x), 4) for x in fit["axis_point"]],
+                    "length": round(fit["length"], 3),
                 },
                 depth=0.0,
                 operation="REMOVE",

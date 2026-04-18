@@ -159,7 +159,7 @@ def _merge_vertices(mesh: trimesh.Trimesh, tolerance: float) -> trimesh.Trimesh:
     mesh.merge_vertices(merge_tex=True, merge_norm=True)
     post_count = len(mesh.vertices)
     if pre_count != post_count:
-        logger.info("Merged vertices: %d → %d", pre_count, post_count)
+        logger.info("Merged vertices: %d -> %d", pre_count, post_count)
     return mesh
 
 

@@ -83,6 +83,7 @@ def export_cadquery(
     use_llm: bool = True,
     num_variants: int = 1,
     body_results: list | None = None,
+    peeled_fillets: list[dict] | None = None,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -217,7 +218,12 @@ def export_cadquery(
 
     # Build default variant immediately (no waiting for LLM)
     try:
-        solid, script, steps = _build_stepwise(**build_args, build_order=llm_order)
+        # Multi-body: skip per-body fillet application so the union doesn't
+        # freeze fillets at body boundaries. Fillets get applied once to the
+        # combined solid below, after all bodies are unioned.
+        solid, script, steps = _build_stepwise(
+            **build_args, build_order=llm_order, skip_fillets=is_multi_body,
+        )
 
         # Multi-body: build each additional body and union into the base.
         # Each body step shows the accumulated solid + this step's body geometry
@@ -230,6 +236,7 @@ def export_cadquery(
                         extrude_dir=abd['extrude_dir'], extrude_start=abd['extrude_start'],
                         holes=abd['holes'], chamfers=abd['chamfers'],
                         fillets=abd['fillets'], cleaned=abd['cleaned'],
+                        skip_fillets=True,
                     )
                     if body_solid is None:
                         logger.warning("Body %d: _build_stepwise returned None",
@@ -320,6 +327,56 @@ def export_cadquery(
                 except Exception as e:
                     logger.warning("Failed to build body %d: %s",
                                    abd['body'].body_id, e)
+
+        # --- Post-union / single-body fillet pass ---
+        # Prefer the pre-peeled fillet list (stage 1.75) — those were
+        # detected on the full, un-decomposed mesh so each fillet record
+        # has the TRUE edge length and radius, not a fragment chopped by
+        # a body boundary. Fall back to per-body mesh cluster detection
+        # only if peeled_fillets wasn't supplied (legacy path / testing).
+        try:
+            if solid is not None:
+                if peeled_fillets:
+                    clusters_from_peel = [
+                        {
+                            "radius": float(f["radius"]),
+                            "axis_dir": np.asarray(f["axis_dir"], dtype=float),
+                            "centroid": np.asarray(f["axis_point"], dtype=float),
+                            "length": float(f.get("length", 0.0)),
+                            "num_faces": int(f.get("num_faces", 0)),
+                        }
+                        for f in peeled_fillets
+                    ]
+                    solid, fillet_steps, fillet_script = (
+                        _apply_recognized_fillets_to_solid(
+                            solid, body_contexts=None,
+                            override_clusters=clusters_from_peel,
+                        )
+                    )
+                    source = f"{len(peeled_fillets)} peeled fillet(s)"
+                else:
+                    body_contexts: list[tuple[object, CleanedMesh]] = []
+                    if body_results:
+                        for body, body_cleaned, body_tree in body_results:
+                            body_contexts.append((body_tree, body_cleaned))
+                    else:
+                        body_contexts.append((feature_tree, profile_mesh))
+                    solid, fillet_steps, fillet_script = (
+                        _apply_recognized_fillets_to_solid(solid, body_contexts)
+                    )
+                    source = f"{len(body_contexts)} body context(s) (fallback detection)"
+
+                for fs in fillet_steps:
+                    steps.append(fs)
+                if fillet_script:
+                    script += "\n# --- Recognized fillets ---\n"
+                    script += "\n".join(fillet_script) + "\n"
+                logger.info(
+                    "Fillet pass: %d fillet(s) applied from %s",
+                    len(fillet_steps), source,
+                )
+        except Exception as fil_exc:
+            logger.warning("Recognized fillet pass failed: %s", fil_exc)
 
         v1_name = "AI Optimized" if llm_order else "Default"
         v1_strategy = llm_order.strategy if llm_order else "Default heuristic ordering"
@@ -1397,6 +1454,7 @@ def _build_stepwise(
     fillets: list[Feature] | None = None,
     build_order: BuildPlan | None = None,
     cleaned: object = None,
+    skip_fillets: bool = False,
 ) -> tuple[object, str, list[ConstructionStep]]:
     """Build a clean CAD solid from scratch, step by step.
 
@@ -1834,6 +1892,49 @@ def _build_stepwise(
             )
             hole_solid = cq.Workplane(hole_plane).circle(radius).extrude(cut_length)
 
+            # Emit a "Sketch Hole" step showing the circle outline on the
+            # pre-cut solid. This mirrors the Sketch Cutout -> Cut Extrude
+            # pair used for non-circular cutouts and gives the viewer an
+            # explicit sketch step for every hole.
+            try:
+                # Build a pair of 3D perpendiculars to the hole axis so we
+                # can sample N points around the circle's rim.
+                tmp_axis = np.array([0.0, 0.0, 1.0])
+                if abs(np.dot(h_dir, tmp_axis)) > 0.95:
+                    tmp_axis = np.array([1.0, 0.0, 0.0])
+                u_perp = np.cross(h_dir, tmp_axis)
+                u_perp = u_perp / (np.linalg.norm(u_perp) + 1e-15)
+                v_perp = np.cross(h_dir, u_perp)
+                v_perp = v_perp / (np.linalg.norm(v_perp) + 1e-15)
+                # Sample the circle rim at the hole's entry surface. For a
+                # through hole the entry is at cut_start + small offset;
+                # for a blind hole it's the same cut_start.
+                N_SAMPLES = 48
+                sketch_plane_origin = np.asarray(cut_start, dtype=float)
+                overlay_pts = []
+                prev_pt = None
+                for k in range(N_SAMPLES + 1):
+                    theta = 2 * np.pi * k / N_SAMPLES
+                    pt = (
+                        sketch_plane_origin
+                        + radius * (np.cos(theta) * u_perp + np.sin(theta) * v_perp)
+                    )
+                    if prev_pt is not None:
+                        overlay_pts.append(prev_pt)
+                        overlay_pts.append(pt)
+                    prev_pt = pt
+                circle_overlay = np.asarray(overlay_pts, dtype=np.float64)
+                v_pre, f_pre = _tessellate_solid(wp, fast=True)
+                steps.append(ConstructionStep(
+                    name=f"Sketch {hole_name}",
+                    tess_vertices=np.asarray(v_pre, dtype=np.float64),
+                    tess_faces=np.asarray(f_pre, dtype=np.int64),
+                    volume=abs(float(wp.val().Volume())),
+                    sketch_overlay=circle_overlay,
+                ))
+            except Exception as _sk_exc:
+                logger.debug("Could not build hole sketch overlay: %s", _sk_exc)
+
             # Try the cut; if it removes little/no material, the hole
             # center is likely outside the solid (e.g., on a flange/tab
             # not captured by the profile cross-section).  In that case,
@@ -1981,7 +2082,10 @@ def _build_stepwise(
         if not applied:
             logger.debug("Fillet %s: all attempts failed, skipping", label)
 
-    # (No fallback fillets — only mesh-detected fillets are applied)
+    # Fillet application is handled by the caller via
+    # _apply_recognized_fillets_to_solid, which runs AFTER all bodies have
+    # been unioned (or once for single-body parts). _build_stepwise no
+    # longer emits fillet steps itself.
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
     return wp, "\n".join(script_lines), steps
@@ -2939,7 +3043,7 @@ def _detect_mesh_chamfers(
             "Chamfer cluster %d: %d faces, normal=[%.2f,%.2f,%.2f], "
             "d1=%.2f d2=%.2f, edge=|%s, selector='%s', "
             "strip L=%.2f W=%.2f aspect=%.1f coverage=%.0f%% "
-            "face_coverage=%.0f%% → %s",
+            "face_coverage=%.0f%% -> %s",
             label, len(cluster_idx), *avg_normal, d1, d2,
             edge_axis, selector,
             strip_length, strip_width, aspect_ratio, coverage * 100,
@@ -2972,6 +3076,1045 @@ def _detect_mesh_chamfers(
 
     logger.debug("Detected %d chamfer(s) total", len(results))
     return results
+
+
+def _detect_mesh_fillet_clusters(
+    cleaned: CleanedMesh,
+) -> list[dict]:
+    """Find filleted edges in the mesh by clustering off-axis faces.
+
+    Uses DBSCAN on face centroids + PCA on each cluster to get
+    (axis_dir, radius, centroid, length).
+    """
+    from sklearn.cluster import DBSCAN
+
+    normals = cleaned.normals
+    abs_normals = np.abs(normals)
+    max_component = abs_normals.max(axis=1)
+
+    off_axis_mask = max_component < 0.97
+    sorted_abs = np.sort(abs_normals, axis=1)
+    chamfer_like = (
+        (sorted_abs[:, 1] > 0.25)
+        & (sorted_abs[:, 2] > 0.25)
+        & (sorted_abs[:, 0] < 0.25)
+    )
+    cand_mask = off_axis_mask & ~chamfer_like
+    if cand_mask.sum() < 5:
+        return []
+
+    cand_indices = np.where(cand_mask)[0]
+    face_centroids = cleaned.vertices[cleaned.faces[cand_indices]].mean(axis=1)
+
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    spatial_eps = bbox_diag * 0.02
+
+    clustering = DBSCAN(eps=spatial_eps, min_samples=3).fit(face_centroids)
+    labels = clustering.labels_
+    unique_labels = set(labels) - {-1}
+    if not unique_labels:
+        return []
+
+    results = []
+    for label in unique_labels:
+        cluster_face_idx = cand_indices[labels == label]
+        if len(cluster_face_idx) < 3:
+            continue
+
+        verts = cleaned.vertices[cleaned.faces[cluster_face_idx].flatten()]
+        cluster_centroid = verts.mean(axis=0)
+
+        rel = verts - cluster_centroid
+        try:
+            _, sv, vt = np.linalg.svd(rel, full_matrices=False)
+            axis_dir = vt[0]
+        except np.linalg.LinAlgError:
+            continue
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+
+        along = rel @ axis_dir
+        strip_length = float(along.max() - along.min())
+
+        perp = rel - np.outer(along, axis_dir)
+        perp_dist = np.linalg.norm(perp, axis=1)
+        radius = float(perp_dist.max())
+
+        if radius < 0.3 or radius > 20.0:
+            continue
+        if strip_length < radius * 0.5:
+            continue
+
+        results.append({
+            "axis_dir": axis_dir,
+            "centroid": cluster_centroid,
+            "radius": radius,
+            "num_faces": int(len(cluster_face_idx)),
+            "length": strip_length,
+        })
+
+    logger.info(
+        "Mesh fillet clusters: %d detected (radii %s)",
+        len(results),
+        [f"{c['radius']:.2f}" for c in results[:10]],
+    )
+    return results
+
+
+def _detect_fillet_strips_from_mesh(cleaned: CleanedMesh) -> list[dict]:
+    """Detect filleted edges directly from the triangle mesh.
+
+    Works purely from the triangle mesh — no segmenter regions are
+    involved — so it is not vulnerable to mis-segmentation that merges
+    disjoint corners or fragments a single fillet into unrelated
+    pieces.
+
+    For every interior mesh edge we compute the dihedral angle of the
+    two adjacent triangles. A curved fillet surface is tessellated by
+    triangles whose adjacent dihedrals are a few degrees below 180°
+    (the flatter the triangle step, the larger the dihedral). For one
+    such edge of length s whose neighbors turn by (180° − θ), the
+    local radius of curvature is
+
+            R ≈ s / ((180° − θ) · π / 180°)
+
+    because a curved strip of N tessellated quads of step length s
+    around a cylinder of radius R has an angular step of s/R radians.
+    This gives us a per-edge radius estimate that is local, robust to
+    noise, and completely independent of any fitting.
+
+    We then cluster the curved edges spatially (DBSCAN on edge
+    midpoints), take the median R-estimate within each cluster as the
+    fillet radius, and recover the cylinder axis from the normal
+    covariance (axis = direction orthogonal to every face normal in
+    the cluster, i.e. the least eigenvector of Nᵀ N). The axis point
+    is the cluster centroid projected onto that axis line.
+
+    We reject clusters whose normals don't lie in a plane (not a
+    cylinder — e.g. spherical corner caps) and clusters whose median
+    radius estimate is wildly inconsistent across their members.
+    """
+    from collections import defaultdict
+    from sklearn.cluster import DBSCAN
+
+    normals = cleaned.normals
+    vertices = cleaned.vertices
+    faces = cleaned.faces
+
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi, tri in enumerate(faces):
+        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[0], tri[2])):
+            key = (int(min(a, b)), int(max(a, b)))
+            edge_to_faces[key].append(fi)
+
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    max_fillet_radius = bbox_diag * 0.10
+
+    # Per-edge radius estimates for every "fillet-ish" interior edge.
+    ec_list: list[np.ndarray] = []
+    f0_list: list[int] = []
+    f1_list: list[int] = []
+    r_list: list[float] = []
+    for key, flist in edge_to_faces.items():
+        if len(flist) != 2:
+            continue
+        n1 = normals[flist[0]]
+        n2 = normals[flist[1]]
+        dot = float(np.clip(np.dot(n1, n2), -1.0, 1.0))
+        dihed = float(np.degrees(np.pi - np.arccos(dot)))
+        if not (168.0 < dihed < 179.5):
+            continue
+        v0, v1 = vertices[key[0]], vertices[key[1]]
+        s = float(np.linalg.norm(v1 - v0))
+        if s < 1e-6:
+            continue
+        turn = np.radians(180.0 - dihed)
+        if turn < 1e-6:
+            continue
+        r_est = s / turn
+        # Discard edges whose local curvature implies a radius far
+        # outside the plausible fillet range for this part.
+        if r_est < 0.3 or r_est > max_fillet_radius:
+            continue
+        ec_list.append(0.5 * (v0 + v1))
+        f0_list.append(flist[0])
+        f1_list.append(flist[1])
+        r_list.append(r_est)
+
+    if len(ec_list) < 5:
+        return []
+
+    edge_centers = np.asarray(ec_list, dtype=float)
+    r_vals = np.asarray(r_list, dtype=float)
+    face0_arr = np.asarray(f0_list, dtype=np.int64)
+    face1_arr = np.asarray(f1_list, dtype=np.int64)
+
+    eps = bbox_diag * 0.02
+    cl = DBSCAN(eps=eps, min_samples=5).fit(edge_centers)
+    labels = cl.labels_
+
+    results: list[dict] = []
+    for lbl in sorted(set(labels) - {-1}):
+        member_idx = np.where(labels == lbl)[0]
+        if len(member_idx) < 5:
+            continue
+
+        r_cluster = r_vals[member_idx]
+        r_median = float(np.median(r_cluster))
+        if r_median < 0.3 or r_median > max_fillet_radius:
+            continue
+        # Reject clusters whose per-edge radius estimates scatter
+        # wildly — that's a sign the cluster isn't really a single
+        # cylindrical patch of constant radius.
+        mad = float(np.median(np.abs(r_cluster - r_median)))
+        if mad > 0.35 * r_median:
+            continue
+
+        face_ids_local = np.unique(np.concatenate([
+            face0_arr[member_idx], face1_arr[member_idx],
+        ]))
+        cluster_normals = normals[face_ids_local]
+        n_norms = np.linalg.norm(cluster_normals, axis=1)
+        valid = n_norms > 1e-8
+        if valid.sum() < 5:
+            continue
+        n_unit = cluster_normals[valid] / n_norms[valid, None]
+        M = n_unit.T @ n_unit
+        try:
+            eig_vals, eig_vecs = np.linalg.eigh(M)
+        except np.linalg.LinAlgError:
+            continue
+        order = np.argsort(np.abs(eig_vals))
+        lam = np.abs(eig_vals[order])
+        if lam[2] < 1e-10:
+            continue
+        # Normals must lie close to a plane — that's the geometric
+        # definition of a cylinder. Regions where the normals spread
+        # substantially in 3D are spherical corner caps (where three
+        # faces blend together), not rolling-ball edge fillets, and
+        # trying to apply them produces the "tapered corner" artefact.
+        if lam[0] / lam[2] > 0.55:
+            continue
+        axis_dir = eig_vecs[:, order[0]]
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+
+        # A cylindrical edge fillet runs parallel to the straight edge
+        # it rounds off. In a prismatic part those straight edges are
+        # axis-aligned, so the fillet axis should be close to one of
+        # ±X, ±Y, ±Z. A direction that is substantially diagonal
+        # (e.g. (0, 0.71, 0.71)) describes a 3D corner blend, not an
+        # edge fillet — applying it as a fillet produces the "weird
+        # tapered corner" the user saw, so reject it here.
+        if float(np.max(np.abs(axis_dir))) < 0.96:
+            continue
+
+        # Rolling-ball axis line for a convex fillet sits one radius
+        # inside the material, measured from the mesh surface along
+        # the mean outward normal.
+        cluster_centroid = edge_centers[member_idx].mean(axis=0)
+        mean_normal = cluster_normals[valid].mean(axis=0)
+        mn_norm = float(np.linalg.norm(mean_normal))
+        if mn_norm < 1e-8:
+            continue
+        mean_normal = mean_normal / mn_norm
+        axis_point = cluster_centroid - r_median * mean_normal
+
+        along = (edge_centers[member_idx] - axis_point) @ axis_dir
+        length = float(along.max() - along.min())
+
+        results.append({
+            "radius": r_median,
+            "axis_dir": axis_dir.astype(float),
+            "axis_point": axis_point.astype(float),
+            "length": length,
+            "num_edges": int(len(member_idx)),
+        })
+
+    logger.info(
+        "Mesh-edge fillet detection: %d raw clusters, %d accepted",
+        len(set(labels) - {-1}),
+        len(results),
+    )
+    return results
+
+
+def _apply_recognized_fillets_to_solid(
+    wp: object,
+    body_contexts: list[tuple[object, CleanedMesh]] | None = None,
+    override_clusters: list[dict] | None = None,
+) -> tuple[object, list[object], list[str]]:
+    """Apply the FILLET features recognized in Stage 5 to the CAD solid.
+
+    body_contexts is a list of (feature_tree, cleaned_mesh) pairs. Each
+    feature_tree carries the FILLET features found by Stage 5, with a
+    proper cylinder fit (axis line + radius) stored in sketch_geometry.
+    This function matches each such fillet to exactly one sharp edge on
+    the CAD solid and applies the measured radius.
+
+    The geometric match works as follows: a fillet between two planes
+    replaces a sharp edge with a cylindrical surface tangent to both
+    planes. The cylinder's axis runs parallel to the sharp edge and sits
+    one radius away from it (the rolling-ball center line). So for a
+    stored fillet with axis direction D, axis point P, and radius R, the
+    matching sharp edge on the solid is the edge whose direction is
+    parallel to D and whose perpendicular distance to the line (P, D) is
+    approximately R.
+    """
+    import time as _time
+
+    pass_start = _time.time()
+    applied_steps: list = []
+    applied_script: list = []
+
+    def _enumerate_edges(workplane):
+        out = []
+        try:
+            for edge in workplane.edges().vals():
+                try:
+                    sp = edge.startPoint(); ep = edge.endPoint()
+                except Exception:
+                    continue
+                start = np.array([sp.x, sp.y, sp.z])
+                end = np.array([ep.x, ep.y, ep.z])
+                direction = end - start
+                length = float(np.linalg.norm(direction))
+                if length < 1e-6:
+                    continue
+                direction = direction / length
+                mid = 0.5 * (start + end)
+                out.append({
+                    "obj": edge, "mid": mid, "dir": direction, "len": length,
+                    "start": start, "end": end,
+                })
+        except Exception as exc:
+            logger.debug("Edge enumeration failed: %s", exc)
+        return out
+
+    # --- Phase 1: collect fillet candidates ---
+    # Preferred source: the peel_fillets output (stage 1.75). Those
+    # records were detected on the full, un-decomposed mesh so each
+    # fillet has its true (un-fragmented) radius, axis, and length.
+    # When supplied, they replace both the Stage 5 recognition pass
+    # and the per-body mesh-strip detector — filter-first means the
+    # export consumes a single authoritative fillet list.
+    recognized: list[dict] = []
+    if override_clusters:
+        for c in override_clusters:
+            ad = np.asarray(c["axis_dir"], dtype=float)
+            n = float(np.linalg.norm(ad))
+            if n < 1e-12:
+                continue
+            ap = np.asarray(
+                c.get("centroid", c.get("axis_point", [0, 0, 0])), dtype=float,
+            )
+            recognized.append({
+                "radius": float(c["radius"]),
+                "axis_dir": ad / n,
+                "axis_point": ap,
+                "length": float(c.get("length", 0.0)),
+            })
+        logger.info(
+            "Fillet pass: using %d peeled fillet record(s) (filter-first)",
+            len(recognized),
+        )
+
+    # Legacy fallback: collect from per-body Stage 5 features + mesh
+    # strip detection. Only runs when override_clusters is None/empty.
+    if not recognized and body_contexts:
+        for tree, _cleaned in body_contexts:
+            if tree is None:
+                continue
+            for feat in getattr(tree, "features", []) or []:
+                if feat.type != FeatureType.FILLET:
+                    continue
+                sg = feat.sketch_geometry or {}
+                radius = float(sg.get("radius", 0) or 0)
+                axis_dir_list = sg.get("axis_dir")
+                axis_pt_list = sg.get("axis_point")
+                if radius <= 0 or axis_dir_list is None or axis_pt_list is None:
+                    continue
+                axis_dir = np.asarray(axis_dir_list, dtype=float)
+                norm = float(np.linalg.norm(axis_dir))
+                if norm < 1e-8:
+                    continue
+                axis_dir = axis_dir / norm
+                axis_point = np.asarray(axis_pt_list, dtype=float)
+                length = float(sg.get("length", 0) or 0)
+                recognized.append({
+                    "radius": radius,
+                    "axis_dir": axis_dir,
+                    "axis_point": axis_point,
+                    "length": length,
+                })
+
+        # Mesh-strip backup for per-body context (curved triangle strips).
+        for _tree, cleaned in body_contexts:
+            if cleaned is None:
+                continue
+            try:
+                strips = _detect_fillet_strips_from_mesh(cleaned)
+            except Exception as exc:
+                logger.debug("Mesh-edge fillet detection failed: %s", exc)
+                strips = []
+            for strip in strips:
+                recognized.append({
+                    "radius": float(strip["radius"]),
+                    "axis_dir": np.asarray(strip["axis_dir"], dtype=float),
+                    "axis_point": np.asarray(strip["axis_point"], dtype=float),
+                    "length": float(strip["length"]),
+                })
+
+        # DBSCAN-cluster backup. The strip detector only triggers on edges
+        # with long continuous curved-triangle strips (the base plate's
+        # long outer edges often don't form a single strip because of
+        # mesh-noise breaks). _detect_mesh_fillet_clusters groups off-axis
+        # face centroids into spatial clusters and fits a cylinder to each,
+        # which catches edge fillets whose triangulation is fragmented.
+        # We keep axis-aligned clusters (max|axis|>0.85) — diagonal ones
+        # are usually corner blends or false positives.
+        for _tree, cleaned in body_contexts:
+            if cleaned is None:
+                continue
+            try:
+                clusters = _detect_mesh_fillet_clusters(cleaned)
+            except Exception as exc:
+                logger.debug("Cluster fillet detection failed: %s", exc)
+                clusters = []
+            for cluster in clusters:
+                ad = np.asarray(cluster["axis_dir"], dtype=float)
+                if float(np.max(np.abs(ad))) < 0.85:
+                    continue
+                recognized.append({
+                    "radius": float(cluster["radius"]),
+                    "axis_dir": ad,
+                    "axis_point": np.asarray(cluster["centroid"], dtype=float),
+                    "length": float(cluster.get("length", 0.0)),
+                })
+
+    if not recognized:
+        logger.info("Fillet pass: no fillets to apply")
+        return wp, [], []
+
+    logger.info(
+        "Fillet pass: %d fillets to apply (%d body context(s), override=%s)",
+        len(recognized),
+        len(body_contexts) if body_contexts else 0,
+        bool(override_clusters),
+    )
+
+    # --- Phase 2: match each recognized fillet to a solid edge ---
+    solid_edges = _enumerate_edges(wp)
+    if not solid_edges:
+        return wp, [], []
+
+    matches: list[dict] = []
+    used_edge_indices: set[int] = set()
+    for fillet in recognized:
+        r = fillet["radius"]
+        ad = fillet["axis_dir"]
+        ap = fillet["axis_point"]
+        best_idx = None
+        best_score = float("inf")
+        for i, se in enumerate(solid_edges):
+            if i in used_edge_indices:
+                continue
+            dot = abs(float(np.dot(se["dir"], ad)))
+            if dot < 0.95:
+                continue
+            # Perpendicular distance from the edge midpoint to the
+            # (axis_point, axis_dir) line.
+            offset = se["mid"] - ap
+            along = float(np.dot(offset, ad))
+            perp_vec = offset - along * ad
+            perp_dist = float(np.linalg.norm(perp_vec))
+            # The sharp edge we're filleting sits one radius away from
+            # the rolling-ball axis — inside the solid material. So we
+            # want perp_dist ≈ r. Score by how close it is to that,
+            # plus a small along-axis penalty for edges whose midpoint
+            # is far from the recorded axis_point.
+            score = abs(perp_dist - r) + 0.05 * abs(along)
+            if score < best_score:
+                best_score = score
+                best_idx = i
+        if best_idx is None:
+            continue
+        # Reject if even the best candidate is not near radius distance.
+        best = solid_edges[best_idx]
+        offset = best["mid"] - ap
+        along = float(np.dot(offset, ad))
+        perp_vec = offset - along * ad
+        perp_dist = float(np.linalg.norm(perp_vec))
+        if perp_dist > 2.0 * r + 1.0 or perp_dist < 0.2 * r:
+            continue
+        used_edge_indices.add(best_idx)
+        matches.append({"radius": r, "edge_idx": best_idx})
+
+    logger.info(
+        "Fillet matching: %d/%d recognized fillets matched to edges, elapsed=%.1fs",
+        len(matches), len(recognized), _time.time() - pass_start,
+    )
+    if not matches:
+        return wp, [], []
+
+    # --- Phase 3: group matches by radius for batched fillet calls ---
+    matches.sort(key=lambda m: m["radius"])
+    buckets: list[dict] = []
+    BUCKET_WIDTH = 0.3  # mm
+    for m in matches:
+        if buckets:
+            curr_r = buckets[-1]["radius_sum"] / buckets[-1]["count"]
+            if abs(m["radius"] - curr_r) < BUCKET_WIDTH:
+                b = buckets[-1]
+                b["radius_sum"] += m["radius"]
+                b["count"] += 1
+                b["edges"].append(solid_edges[m["edge_idx"]]["obj"])
+                continue
+        buckets.append({
+            "radius_sum": m["radius"],
+            "count": 1,
+            "edges": [solid_edges[m["edge_idx"]]["obj"]],
+        })
+
+    # --- Phase 4: apply one OCC fillet call per bucket ---
+    for bi, bucket in enumerate(buckets):
+        mean_r = bucket["radius_sum"] / bucket["count"]
+        edges = bucket["edges"]
+        t_bucket = _time.time()
+        try:
+            vol_before = abs(float(wp.val().Volume()))
+            wp_test = wp.newObject(edges).fillet(mean_r)
+            vol_after = abs(float(wp_test.val().Volume()))
+            if vol_after <= 0 or vol_after > vol_before * 1.01:
+                logger.debug(
+                    "Bucket %d r=%.2f on %d edges rejected: vol %.0f -> %.0f",
+                    bi, mean_r, len(edges), vol_before, vol_after,
+                )
+                continue
+            wp = wp_test
+            v, f = _tessellate_solid(wp, fast=True)
+            step = ConstructionStep(
+                name=f"Fillet (r={mean_r:.2f}mm) x{len(edges)}",
+                tess_vertices=v, tess_faces=f, volume=vol_after,
+            )
+            applied_steps.append(step)
+            applied_script.append(
+                f'# Fillet r={mean_r:.3f} on {len(edges)} recognized edge(s)'
+            )
+            logger.info(
+                "Bucket %d: fillet r=%.2fmm on %d edges, vol %.0f -> %.0f (dt=%.1fs)",
+                bi, mean_r, len(edges), vol_before, vol_after,
+                _time.time() - t_bucket,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Bucket %d fillet r=%.2f failed after %.1fs: %s",
+                bi, mean_r, _time.time() - t_bucket, exc,
+            )
+            continue
+
+    logger.info(
+        "Fillet pass done: %d recognized, %d matched, %d buckets, %.1fs",
+        len(recognized), len(matches), len(buckets), _time.time() - pass_start,
+    )
+    return wp, applied_steps, applied_script
+
+
+def _find_body_top_face(
+    wp: object,
+    cleaned: CleanedMesh,
+    extrude_dir: np.ndarray,
+):
+    """Locate the face in wp that corresponds to this body's outer profile
+    face — the face whose normal aligns with the body's extrude direction
+    AND whose center sits within the body's bbox.
+
+    For multi-body parts, a body's "outer" face may be at either the max
+    OR min of the primary axis depending on how the body is oriented in
+    the assembly. We try both and pick whichever has the most outer-wire
+    edges (profile face > side wall strip). Among faces with similar edge
+    counts, we pick the one whose YZ-plane centroid is closest to the
+    body's centroid — ensuring we pick Body 0's face vs. Body 1's face.
+    """
+    import cadquery as cq
+
+    abs_dir = np.abs(extrude_dir)
+    primary_axis = int(np.argmax(abs_dir))
+    body_max = float(cleaned.bbox[1][primary_axis])
+    body_min = float(cleaned.bbox[0][primary_axis])
+    body_center = ((cleaned.bbox[0] + cleaned.bbox[1]) / 2).tolist()
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    tol = max(1.0, bbox_diag * 0.03)
+
+    # The two candidate planes: body_min and body_max
+    candidate_planes = [body_min, body_max]
+
+    try:
+        all_faces = wp.faces().vals()
+    except Exception:
+        return None
+
+    # Other two axes for centroid matching
+    other_axes = [a for a in range(3) if a != primary_axis]
+
+    candidates = []  # list of (face, edge_count, centroid_dist, plane_dist)
+    for face in all_faces:
+        try:
+            center = face.Center()
+            normal = face.normalAt(center)
+        except Exception:
+            continue
+        c_coords = [center.x, center.y, center.z]
+        n_coords = [normal.x, normal.y, normal.z]
+        c_primary = c_coords[primary_axis]
+        n_primary = n_coords[primary_axis]
+
+        # Must be nearly perpendicular to the primary axis (i.e. a profile
+        # face), not a side wall.
+        if abs(n_primary) < 0.8:
+            continue
+
+        # Must sit near one of the two candidate planes
+        dist_to_min = abs(c_primary - body_min)
+        dist_to_max = abs(c_primary - body_max)
+        plane_dist = min(dist_to_min, dist_to_max)
+        if plane_dist > tol:
+            continue
+
+        # Centroid in the other two axes — used to pick the right body
+        # when multiple bodies share the same primary-axis range.
+        centroid_dist = float(np.linalg.norm(
+            np.array([c_coords[a] - body_center[a] for a in other_axes])
+        ))
+        # Must be within the body's footprint in the other two axes.
+        footprint_extent = max(
+            float(cleaned.bbox[1][other_axes[0]] - cleaned.bbox[0][other_axes[0]]),
+            float(cleaned.bbox[1][other_axes[1]] - cleaned.bbox[0][other_axes[1]]),
+        )
+        if centroid_dist > footprint_extent:
+            continue
+
+        # Count outer wire edges (rough proxy for "profile face")
+        try:
+            edge_count = len(face.outerWire().Edges())
+        except Exception:
+            edge_count = 0
+
+        candidates.append((face, edge_count, centroid_dist, plane_dist))
+
+    if not candidates:
+        return None
+
+    # Prefer: many outer-wire edges (profile face, not side strip),
+    # then closest centroid to body center, then closest plane match.
+    candidates.sort(
+        key=lambda c: (-c[1], c[2], c[3])
+    )
+    logger.debug(
+        "Top face candidates (%d): top=[edges=%d, centroid_d=%.1f, plane_d=%.2f]",
+        len(candidates),
+        candidates[0][1], candidates[0][2], candidates[0][3],
+    )
+    return candidates[0][0]
+
+
+def _apply_top_fillet_to_solid(
+    wp: object,
+    cleaned: CleanedMesh,
+    extrude_dir: np.ndarray,
+) -> tuple[object, object | None, str | None]:
+    """Apply a fillet to the top-face outer wire edges of the current solid.
+
+    Detects the fillet radius from the mesh, filters edges to those that
+    actually have rounded fillet faces nearby (excluding flat back edges),
+    and applies the fillet with a layered fallback strategy:
+
+      1. Full kept set at primary/reduced radii (works when OCC can blend
+         all edges at once — typical side plates).
+      2. Long edges only (>5mm).
+      3. Per-edge loop: re-find each long edge on the updated solid after
+         every successful fillet (for complex bodies where OCC can't blend
+         all edges simultaneously).
+      4. Tiny fallback: small radius on the full set.
+
+    Returns (wp_new, construction_step, script_line). If no fillet was
+    applied, wp_new == wp, and construction_step / script_line are None.
+    This helper is intentionally idempotent-safe on the input wp: if a
+    fillet can't be applied, it returns the input unchanged.
+    """
+    import cadquery as cq
+
+    abs_dir = np.abs(extrude_dir)
+    primary_axis = int(np.argmax(abs_dir))
+    axis_names = ["X", "Y", "Z"]
+    primary_axis_name = axis_names[primary_axis]
+    want_sign = "+" if extrude_dir[primary_axis] >= 0 else "-"
+    face_label = f"{want_sign}{primary_axis_name}"
+
+    r_estimate = _estimate_fillet_radius_from_mesh(cleaned, extrude_dir)
+    if r_estimate <= 0.3:
+        return wp, None, None
+
+    # Find this body's specific top face on the (possibly combined) solid.
+    # Using a location-aware lookup is necessary for multi-body parts where
+    # CadQuery's `>X` selector returns a face from the wrong body.
+    top_face_val = _find_body_top_face(wp, cleaned, extrude_dir)
+    if top_face_val is None:
+        logger.debug(
+            "No top face found for body at axis=%s bbox=%s",
+            face_label, cleaned.bbox.tolist(),
+        )
+        return wp, None, None
+
+    # Gather the outer wire edges of that face
+    outer_edges = []
+    try:
+        outer_wire = top_face_val.outerWire()
+        outer_edges = [cq.Edge(e.wrapped) if not isinstance(e, cq.Edge) else e
+                       for e in outer_wire.Edges()]
+        logger.info(
+            "[%s] Top face outer wire: %d edges, lengths=%s",
+            face_label, len(outer_edges),
+            [f"{e.Length():.2f}" for e in outer_edges[:10]],
+        )
+    except Exception as e:
+        logger.debug("Failed to get outer wire edges: %s", e)
+        return wp, None, None
+
+    if not outer_edges:
+        return wp, None, None
+
+    # Filter by per-edge mesh fillet support
+    outer_edges, _rejected = _filter_edges_by_mesh_fillets(outer_edges, cleaned)
+    if not outer_edges:
+        return wp, None, None
+
+    def _try_fillet(edges_subset, radii_to_try, label):
+        for attempt_r in radii_to_try:
+            if attempt_r < 0.3:
+                return None, None
+            try:
+                vol_before = abs(float(wp.val().Volume()))
+                wp_test = wp.newObject(edges_subset).fillet(attempt_r)
+                vol_after = abs(float(wp_test.val().Volume()))
+                if vol_after <= 0 or vol_after > vol_before * 1.01:
+                    logger.debug(
+                        "Fillet r=%.2f [%s] rejected: vol %.0f -> %.0f",
+                        attempt_r, label, vol_before, vol_after,
+                    )
+                    continue
+                return wp_test, attempt_r
+            except Exception as exc:
+                logger.debug(
+                    "Outer wire fillet r=%.2f [%s] failed: %s",
+                    attempt_r, label, exc,
+                )
+                continue
+        return None, None
+
+    primary_radii = [r_estimate, r_estimate * 0.85, r_estimate * 0.7,
+                     r_estimate * 0.6]
+    wp_test, achieved_r = _try_fillet(outer_edges, primary_radii, "full")
+    edges_used = outer_edges
+
+    if wp_test is None or (achieved_r is not None and achieved_r < r_estimate * 0.5):
+        long_edges = [e for e in outer_edges if e.Length() > 5.0]
+        if long_edges:
+            long_radii = [r_estimate, r_estimate * 0.85, r_estimate * 0.7,
+                          r_estimate * 0.5, r_estimate * 0.35, r_estimate * 0.2]
+            wp_long, r_long = _try_fillet(
+                long_edges, long_radii, f"long-only ({len(long_edges)} edges)",
+            )
+            if wp_long is not None and (
+                wp_test is None or (r_long or 0) > (achieved_r or 0)
+            ):
+                wp_test, achieved_r = wp_long, r_long
+                edges_used = long_edges
+
+    # Per-edge loop fallback
+    if wp_test is None or (achieved_r is not None and achieved_r < r_estimate * 0.5):
+        long_edges_initial = [e for e in outer_edges if e.Length() > 5.0]
+        if long_edges_initial:
+            targets = []
+            for e in long_edges_initial:
+                try:
+                    sp = e.startPoint(); ep = e.endPoint()
+                    mid = np.array([(sp.x + ep.x) / 2,
+                                    (sp.y + ep.y) / 2,
+                                    (sp.z + ep.z) / 2])
+                    targets.append((mid, e.Length()))
+                except Exception:
+                    pass
+
+            wp_iter = wp
+            applied_count = 0
+            r_target = r_estimate
+            for mid, _orig_len in targets:
+                # Re-find this body's top face on the updated solid (OCCT
+                # face handles get invalidated by each fillet call).
+                try:
+                    iter_top_face = _find_body_top_face(
+                        wp_iter, cleaned, extrude_dir,
+                    )
+                    all_edges = (
+                        iter_top_face.outerWire().Edges()
+                        if iter_top_face is not None else []
+                    )
+                except Exception:
+                    all_edges = []
+                best_edge = None
+                best_dist = 1.5
+                for ce in all_edges:
+                    try:
+                        csp = ce.startPoint(); cep = ce.endPoint()
+                        cmid = np.array([(csp.x + cep.x) / 2,
+                                         (csp.y + cep.y) / 2,
+                                         (csp.z + cep.z) / 2])
+                        d = float(np.linalg.norm(cmid - mid))
+                        if d < best_dist:
+                            best_dist = d
+                            best_edge = ce
+                    except Exception:
+                        continue
+                if best_edge is None:
+                    continue
+
+                for r_try in [r_target, r_target * 0.8, r_target * 0.6,
+                              r_target * 0.4, r_target * 0.25]:
+                    if r_try < 0.3:
+                        break
+                    try:
+                        wp_cand = wp_iter.newObject([best_edge]).fillet(r_try)
+                        vb = abs(float(wp_iter.val().Volume()))
+                        va = abs(float(wp_cand.val().Volume()))
+                        if va > 0 and va <= vb * 1.01:
+                            wp_iter = wp_cand
+                            applied_count += 1
+                            if achieved_r is None or r_try > (achieved_r or 0):
+                                achieved_r = r_try
+                            logger.debug(
+                                "Per-edge fillet r=%.2f ok on mid=%s",
+                                r_try, mid.round(1).tolist(),
+                            )
+                            break
+                    except Exception as exc:
+                        logger.debug(
+                            "Per-edge fillet r=%.2f failed on mid=%s: %s",
+                            r_try, mid.round(1).tolist(), exc,
+                        )
+                        continue
+
+            if applied_count > 0:
+                wp_test = wp_iter
+                edges_used = [None] * applied_count
+                logger.info(
+                    "Per-edge fillet loop: %d/%d long edges filleted",
+                    applied_count, len(targets),
+                )
+
+    # Tiny fallback on full set
+    if wp_test is None:
+        tiny_radii = [r_estimate * 0.4, r_estimate * 0.25,
+                      r_estimate * 0.15, r_estimate * 0.08]
+        wp_test, achieved_r = _try_fillet(outer_edges, tiny_radii, "tiny")
+        edges_used = outer_edges
+
+    if wp_test is None or achieved_r is None:
+        logger.warning(
+            "All outer wire fillet attempts failed (est r=%.2f, %d edges)",
+            r_estimate, len(outer_edges),
+        )
+        return wp, None, None
+
+    vol_before = abs(float(wp.val().Volume()))
+    vol_after = abs(float(wp_test.val().Volume()))
+    v, f = _tessellate_solid(wp_test, fast=True)
+    step = ConstructionStep(
+        name=f"Fillet {face_label} (r={achieved_r:.2f}mm)",
+        tess_vertices=v, tess_faces=f, volume=vol_after,
+    )
+    # Script line is illustrative — the runtime uses newObject(edges) with
+    # the body-specific top face lookup, which can't be expressed as a plain
+    # CadQuery selector string for multi-body parts.
+    script_line = (
+        f'# fillet body top face (r={achieved_r:.3f}) — applied via _apply_top_fillet_to_solid'
+    )
+    logger.info(
+        "Applied fillet r=%.2fmm [%s] to %d edges, vol %.0f -> %.0f",
+        achieved_r, face_label, len(edges_used), vol_before, vol_after,
+    )
+    return wp_test, step, script_line
+
+
+def _filter_edges_by_mesh_fillets(
+    outer_edges: list,
+    cleaned: CleanedMesh,
+) -> tuple[list, list]:
+    """Return (kept_edges, rejected_edges) split by whether each outer wire
+    edge has rounded fillet faces running along it in the mesh.
+
+    For each CadQuery edge, we check if there are off-axis (non-principal,
+    non-chamfer) mesh faces whose centroids project onto this edge with
+    small perpendicular distance. Edges with enough supporting faces are
+    kept; edges with no nearby rounded faces are rejected (they stay sharp).
+    """
+    if not outer_edges:
+        return [], []
+
+    normals = cleaned.normals
+    abs_normals = np.abs(normals)
+    max_component = abs_normals.max(axis=1)
+    off_axis_mask = max_component < 0.97
+    # Exclude chamfer-like faces (diagonal in 2 components + 1 small)
+    sorted_abs = np.sort(abs_normals, axis=1)
+    chamfer_like = (
+        (sorted_abs[:, 1] > 0.25)
+        & (sorted_abs[:, 2] > 0.25)
+        & (sorted_abs[:, 0] < 0.25)
+    )
+    fillet_mask = off_axis_mask & ~chamfer_like
+
+    if fillet_mask.sum() == 0:
+        logger.info("No mesh fillet faces at all — rejecting all edges")
+        return [], list(outer_edges)
+
+    fillet_face_indices = np.where(fillet_mask)[0]
+    face_centroids = cleaned.vertices[cleaned.faces[fillet_face_indices]].mean(axis=1)
+
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    # Perpendicular distance threshold: the fillet face centroids sit
+    # on the rounded surface, offset from the sharp edge by ~r. For a
+    # 1-10mm radius part, 5% of bbox diag is a reasonable envelope.
+    perp_thresh = bbox_diag * 0.05
+
+    kept = []
+    rejected = []
+    for edge in outer_edges:
+        try:
+            sp = edge.startPoint()
+            ep = edge.endPoint()
+            start = np.array([sp.x, sp.y, sp.z], dtype=float)
+            end = np.array([ep.x, ep.y, ep.z], dtype=float)
+        except Exception as exc:
+            logger.debug("Edge endpoints failed (%s) — keeping by default", exc)
+            kept.append(edge)
+            continue
+
+        edge_vec = end - start
+        edge_len = float(np.linalg.norm(edge_vec))
+        if edge_len < 1e-6:
+            rejected.append(edge)
+            continue
+        edge_dir = edge_vec / edge_len
+
+        # Project fillet centroids onto the edge line
+        rel = face_centroids - start
+        along = rel @ edge_dir
+        perp_vecs = rel - np.outer(along, edge_dir)
+        perp_dist = np.linalg.norm(perp_vecs, axis=1)
+
+        # A face belongs to this edge if it projects within the edge's
+        # extent AND its perpendicular distance is within one fillet radius
+        margin = max(1.0, perp_thresh)
+        in_extent = (along > -margin) & (along < edge_len + margin)
+        close = perp_dist < perp_thresh
+        near_count = int((in_extent & close).sum())
+
+        # Require at least 3 supporting mesh faces. Corner-adjacent short
+        # polyline edges may hit the corner cluster too but get filtered
+        # naturally — they have few faces projecting onto their short span.
+        if near_count >= 3:
+            kept.append(edge)
+            logger.debug(
+                "Edge len=%.2f mid=%s kept (%d nearby fillet faces)",
+                edge_len, ((start + end) / 2).round(1).tolist(), near_count,
+            )
+        else:
+            rejected.append(edge)
+            logger.debug(
+                "Edge len=%.2f mid=%s rejected (%d nearby fillet faces)",
+                edge_len, ((start + end) / 2).round(1).tolist(), near_count,
+            )
+
+    logger.info(
+        "Per-edge fillet filter: %d/%d outer wire edges have mesh fillets",
+        len(kept), len(outer_edges),
+    )
+    return kept, rejected
+
+
+def _estimate_fillet_radius_from_mesh(
+    cleaned: CleanedMesh, extrude_dir: np.ndarray,
+) -> float:
+    """Estimate a single fillet radius from any rounded edges in the mesh.
+
+    Looks at faces whose normals are off-axis (neither aligned with a
+    principal direction nor chamfer-flat). Clusters them spatially and
+    measures the smallest cluster's characteristic radius. Returns the
+    radius in mm, or 0 if no rounded edges are found.
+
+    This is a simpler, more forgiving version of _detect_mesh_fillets that
+    works on corner fillets and patches that don't form long narrow strips.
+    """
+    from sklearn.cluster import DBSCAN
+
+    normals = cleaned.normals
+    abs_normals = np.abs(normals)
+    max_component = abs_normals.max(axis=1)
+
+    # Off-axis faces: more than ~15° off any principal axis
+    off_axis_mask = max_component < 0.97
+    # Exclude chamfer-like faces (~2 principal components + 1 small)
+    sorted_abs = np.sort(abs_normals, axis=1)
+    chamfer_like = (
+        (sorted_abs[:, 1] > 0.25)
+        & (sorted_abs[:, 2] > 0.25)
+        & (sorted_abs[:, 0] < 0.25)
+    )
+    cand_mask = off_axis_mask & ~chamfer_like
+    if cand_mask.sum() < 5:
+        return 0.0
+
+    cand_indices = np.where(cand_mask)[0]
+    # Compute centroids
+    face_centroids = cleaned.vertices[cleaned.faces[cand_indices]].mean(axis=1)
+
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    spatial_eps = bbox_diag * 0.015
+
+    clustering = DBSCAN(eps=spatial_eps, min_samples=3).fit(face_centroids)
+    labels = clustering.labels_
+    unique_labels = set(labels) - {-1}
+    if not unique_labels:
+        return 0.0
+
+    # For each cluster, measure the characteristic radius as:
+    # min(bbox dimensions of the cluster). For a fillet of radius r, the
+    # cluster patch is roughly r x r x small. min(L, W, H) ≈ r.
+    radii = []
+    for label in unique_labels:
+        cluster_faces = cand_indices[labels == label]
+        if len(cluster_faces) < 3:
+            continue
+        verts = cleaned.vertices[cleaned.faces[cluster_faces].flatten()]
+        cluster_bbox = verts.max(axis=0) - verts.min(axis=0)
+        # Sort dimensions ascending — the two smallest approximate r
+        sorted_dims = sorted(cluster_bbox.tolist())
+        # For a long edge fillet: [small, small, long] → radius ≈ avg of smalls
+        # For a corner fillet: [small, small, small-ish] → radius ≈ avg of smalls
+        est_r = (sorted_dims[0] + sorted_dims[1]) / 2
+        if 0.3 < est_r < 20.0:
+            radii.append(est_r)
+
+    if not radii:
+        return 0.0
+
+    # Use the median to avoid outliers
+    radii.sort()
+    median_r = radii[len(radii) // 2]
+    logger.info(
+        "Estimated fillet radius %.2fmm from %d mesh clusters (range %.2f-%.2f)",
+        median_r, len(radii), radii[0], radii[-1],
+    )
+    return float(median_r)
 
 
 def _detect_mesh_fillets(

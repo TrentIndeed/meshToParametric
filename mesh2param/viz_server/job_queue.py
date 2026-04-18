@@ -249,6 +249,26 @@ class JobQueue:
 
         _set_mesh_viz(cleaned)
 
+        # Stage 1.75: Peel fillets from the full mesh before any segmentation.
+        # This filter-first approach removes rolling-ball tangent strips by
+        # projecting their vertices onto the sharp edge line of the two
+        # adjacent planes. Downstream stages (decompose / segment / fit /
+        # topology / recognize) operate on the peeled mesh and see sharp
+        # edges where fillets used to be — no more cylinder-wedged-between-
+        # planes confusion. The peeled fillet records are stashed on the
+        # job and passed to export so they can be re-applied to the final
+        # CAD solid as a single grouped-by-radius pass.
+        # Stage 1.75 peel_fillets is currently disabled by default.
+        # On thin-plate parts (RackMount) it's essentially a no-op:
+        # the fillets it catches don't match CAD edges during the
+        # final re-apply pass, and the ones it tries to apply can
+        # damage the face projection by creating non-watertight
+        # regions that confuse the 2D hole detector. Fillet handling
+        # now relies on the fallback per-body mesh strip detection
+        # inside _apply_recognized_fillets_to_solid instead.
+        peeled_fillet_records: list = []
+        job._peeled_fillets = peeled_fillet_records
+
         # Stage 1.5: Body Decomposition
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh
         from mesh2param.config import DecomposeConfig
@@ -491,10 +511,17 @@ class JobQueue:
                       job.id, tree.num_features, len(all_body_results))
 
         # CadQuery in subprocess
+        peeled_fillets = getattr(job, '_peeled_fillets', [])
         try:
             tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            # Pass body results for multi-body construction
-            pickle.dump((tree, cleaned, all_body_results, decomposition), tmp_in)
+            # Pass body results for multi-body construction.
+            # peeled_fillets: list of {radius, axis_dir, axis_point, length,
+            # num_faces} from stage 1.75. export_cadquery re-applies them
+            # as grouped-by-radius fillet features on the combined solid.
+            pickle.dump(
+                (tree, cleaned, all_body_results, decomposition, peeled_fillets),
+                tmp_in,
+            )
             tmp_in.close()
         except Exception:
             logger.exception("Job %s: failed to serialize pipeline data for CadQuery subprocess", job.id)
@@ -508,10 +535,11 @@ class JobQueue:
 import pickle, sys
 sys.path.insert(0, '.')
 with open(r'{tmp_in.name}', 'rb') as f:
-    tree, cleaned, all_body_results, decomposition = pickle.load(f)
+    tree, cleaned, all_body_results, decomposition, peeled_fillets = pickle.load(f)
 from mesh2param.pipeline.export_cadquery import export_cadquery
 result = export_cadquery(tree, cleaned, use_llm=True, num_variants={num_variants},
-                         body_results=all_body_results if decomposition.is_multi_body else None)
+                         body_results=all_body_results if decomposition.is_multi_body else None,
+                         peeled_fillets=peeled_fillets)
 result.solid = None
 with open(r'{tmp_out.name}', 'wb') as f:
     pickle.dump(result, f)

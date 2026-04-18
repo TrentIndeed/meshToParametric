@@ -504,6 +504,8 @@ class JobQueue:
 
         # ── Process each body through the single-body pipeline ──
         # Run all bodies in parallel, then show visualizations per stage.
+        from mesh2param.pipeline.peel_via_topology import identify_blends_from_topology
+
         def _process_single_body(bi, body):
             sub_cleaned = extract_sub_mesh(cleaned, body.face_indices, body=body)
             _check_cancelled()
@@ -513,8 +515,21 @@ class JobQueue:
             _check_cancelled()
             graph, edges_list = build_topology(regions, fitted, sub_cleaned, TopologyConfig())
             _check_cancelled()
+            # Stage 4.5: topology-based blend identification. Walks the
+            # surface adjacency graph (cleaner & faster than the triangle-
+            # by-triangle peel), finding cylinder regions classified as
+            # FILLET and narrow plane regions classified as CHAMFER.
+            try:
+                topology_blends = identify_blends_from_topology(
+                    regions, fitted, edges_list, sub_cleaned,
+                )
+            except Exception:
+                logger.exception("identify_blends_from_topology failed for body %d", bi)
+                topology_blends = []
+            _check_cancelled()
             body_tree = recognize_features(regions, fitted, graph, edges_list, sub_cleaned, RecognizeConfig())
-            return (body, sub_cleaned, regions, fitted, graph, edges_list, body_tree)
+            return (body, sub_cleaned, regions, fitted, graph, edges_list,
+                    body_tree, topology_blends)
 
         job.progress = 8
         job.progress_stage = "Analyzing surfaces..."
@@ -543,7 +558,7 @@ class JobQueue:
             body_stage_data = [_process_single_body(0, bodies_to_process[0])]
 
         all_body_results = [(body, sub_cleaned, body_tree)
-                            for body, sub_cleaned, _, _, _, _, body_tree in body_stage_data]
+                            for body, sub_cleaned, _, _, _, _, body_tree, _ in body_stage_data]
 
         # ── Show per-stage visualizations ──
         # Each body's sub_cleaned is the mesh used for that body's pipeline.
@@ -553,7 +568,7 @@ class JobQueue:
         job.progress = 15
         job.progress_stage = "Segmenting surfaces..."
         seg_colors = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
             for ri, region in enumerate(regions):
                 color = palette[ri % len(palette)]
@@ -568,7 +583,7 @@ class JobQueue:
         job.progress = 20
         job.progress_stage = "Fitting primitives..."
         fit_colors = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
             fitted_lookup = {f.region_id: f for f in fitted}
             for region in regions:
@@ -587,7 +602,7 @@ class JobQueue:
         job.progress_stage = "Building topology..."
         edge_pts_list = []
         edge_col_list = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
             region_lookup = {r.region_id: r for r in regions}
             for edge in edges_list:
                 ra = region_lookup.get(edge.surface_a_id)
@@ -612,13 +627,49 @@ class JobQueue:
         _set_body_viz(fit_colors)
         _pause_for_review()
 
+        # Stage 4.5: Blend graph — highlight each plane-to-plane
+        # connection that was classified as a fillet or chamfer. Unlike
+        # the topology viz which draws every inter-region edge, this
+        # stage paints the BLEND REGIONS themselves (the small cylinder
+        # or narrow plane sitting between two larger planes), so it's
+        # obvious which surfaces are going to be handled as blends.
+        try:
+            blend_face_colors_by_body = []
+            total_fil = 0
+            total_cha = 0
+            for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, topo_blends in body_stage_data:
+                fc = np.full((len(sub_cleaned.faces), 3), 0.60)
+                for rec in topo_blends:
+                    idx = rec.get("face_indices")
+                    if idx is None or len(idx) == 0:
+                        continue
+                    if rec.get("kind") == "fillet":
+                        fc[idx] = [0.0, 0.9, 0.95]   # cyan
+                        total_fil += 1
+                    else:
+                        fc[idx] = [1.0, 0.55, 0.0]   # orange
+                        total_cha += 1
+                blend_face_colors_by_body.append((body, sub_cleaned, fc))
+
+            job.progress = 25
+            job.progress_stage = (
+                f"Blend graph: {total_fil} fillet + {total_cha} chamfer "
+                f"plane-to-plane connection(s)"
+            )
+            job.progress_edges = None
+            job.progress_edge_colors = None
+            _set_body_viz(blend_face_colors_by_body)
+            _pause_for_review()
+        except Exception as _bg_exc:
+            logger.debug("Blend graph viz failed: %s", _bg_exc)
+
         # Stage 5: Feature recognition
         job.progress = 26
         job.progress_stage = "Recognizing features..."
         job.progress_edges = None
         job.progress_edge_colors = None
         feat_colors = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree in body_stage_data:
+        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
             for feat in body_tree.features:
                 color = feature_type_colors.get(feat.type, [0.55, 0.55, 0.55])
@@ -650,8 +701,22 @@ class JobQueue:
         logger.debug("Job %s: stage=cadquery features=%d bodies=%d",
                       job.id, tree.num_features, len(all_body_results))
 
-        # CadQuery in subprocess
-        peeled_fillets = getattr(job, '_peeled_fillets', [])
+        # CadQuery in subprocess. Combine blends from both peel passes:
+        #   (a) Pre-decompose triangle-based peel_blends (fillets + chamfers
+        #       on the raw mesh).
+        #   (b) Per-body topology-based identify_blends_from_topology (cleaner,
+        #       uses region adjacency — catches fillets the triangle peeler
+        #       missed and gives symmetric detection across mirror features).
+        peeled_fillets = list(getattr(job, '_peeled_fillets', []) or [])
+        for _bst in body_stage_data:
+            topo_blends = _bst[7] if len(_bst) > 7 else []
+            for rec in topo_blends:
+                rec_copy = {k: v for k, v in rec.items() if k not in ("face_indices",)}
+                peeled_fillets.append(rec_copy)
+        logger.info(
+            "peel summary: %d blend record(s) feeding export (triangle + topology)",
+            len(peeled_fillets),
+        )
         try:
             tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             # Pass body results for multi-body construction.

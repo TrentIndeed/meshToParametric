@@ -65,6 +65,12 @@ renderer.domElement.addEventListener('wheel', (e) => {
   const dist = _zoomTargetDist ?? camera.position.distanceTo(controls.target);
   const sign = e.deltaY > 0 ? 1 : -1;
   _zoomTargetDist = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, dist * (1 + sign * ZOOM_FACTOR)));
+  // Invalidate the cached orbit distance used by the pipeline idle-rotate
+  // block. Without this, the rotate block overwrites camera.position
+  // every frame using the OLD _idleDist and the zoom gets undone on the
+  // next animate() tick — the user only sees the zoom "take effect" once
+  // they interact (e.g. click) and stop the idle loop.
+  window._idleDist = null;
 }, { passive: false });
 
 // ── Studio Lighting — bright, even illumination ──

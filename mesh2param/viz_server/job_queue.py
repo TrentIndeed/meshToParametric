@@ -266,8 +266,82 @@ class JobQueue:
         # peel_blends projects each strip's vertices onto the sharp edge
         # line of the two neighbouring planes and emits records so the
         # export stage can re-add them as features on the final CAD.
-        from mesh2param.pipeline.peel_fillets import peel_blends
+        from mesh2param.pipeline.peel_fillets import (
+            peel_blends, peel_fillets as _pf_detect, peel_chamfers as _pc_detect,
+        )
         job.progress = 5
+
+        # --- 1.75a: Fillet strips detected (after all validators) ---
+        # Run peel_fillets on a copy so we have the validated strip face
+        # indices but can still use the original mesh for viz. The
+        # records contain face_indices mapped to the ORIGINAL mesh.
+        try:
+            _, fillet_dry = _pf_detect(cleaned)
+            fc_fil = np.full((len(cleaned.faces), 3), 0.65)
+            for rec in fillet_dry:
+                idx = rec.get("face_indices")
+                if idx is not None and len(idx) > 0:
+                    fc_fil[idx] = [0.0, 0.9, 0.95]  # cyan
+            total_fil_faces = sum(len(rec.get("face_indices", [])) for rec in fillet_dry)
+            job.progress_stage = (
+                f"Fillet strips detected: {len(fillet_dry)} "
+                f"({total_fil_faces} faces across strips)"
+            )
+            _set_mesh_viz(cleaned, face_colors=fc_fil)
+            if job.step_through:
+                _pause_for_review()
+            else:
+                time.sleep(1.0)
+        except Exception as _vc_exc:
+            logger.debug("Fillet-strip viz failed: %s", _vc_exc)
+            fillet_dry = []
+
+        # --- 1.75b: Chamfer strips detected ---
+        try:
+            _, chamfer_dry = _pc_detect(cleaned)
+            fc_cham = np.full((len(cleaned.faces), 3), 0.65)
+            for rec in chamfer_dry:
+                idx = rec.get("face_indices")
+                if idx is not None and len(idx) > 0:
+                    fc_cham[idx] = [1.0, 0.55, 0.0]  # orange
+            total_cham_faces = sum(len(rec.get("face_indices", [])) for rec in chamfer_dry)
+            job.progress_stage = (
+                f"Chamfer strips detected: {len(chamfer_dry)} "
+                f"({total_cham_faces} faces across strips)"
+            )
+            _set_mesh_viz(cleaned, face_colors=fc_cham)
+            if job.step_through:
+                _pause_for_review()
+            else:
+                time.sleep(1.0)
+        except Exception as _vc_exc:
+            logger.debug("Chamfer-strip viz failed: %s", _vc_exc)
+            chamfer_dry = []
+
+        # --- 1.75c: Both sets overlaid on same mesh ---
+        try:
+            fc_both = np.full((len(cleaned.faces), 3), 0.65)
+            for rec in fillet_dry:
+                idx = rec.get("face_indices")
+                if idx is not None and len(idx) > 0:
+                    fc_both[idx] = [0.0, 0.9, 0.95]  # cyan
+            for rec in chamfer_dry:
+                idx = rec.get("face_indices")
+                if idx is not None and len(idx) > 0:
+                    fc_both[idx] = [1.0, 0.55, 0.0]  # orange
+            job.progress_stage = (
+                f"All peel targets: {len(fillet_dry)} fillet strip(s), "
+                f"{len(chamfer_dry)} chamfer strip(s)"
+            )
+            _set_mesh_viz(cleaned, face_colors=fc_both)
+            if job.step_through:
+                _pause_for_review()
+            else:
+                time.sleep(1.0)
+        except Exception:
+            pass
+
+        # --- 1.75d: Run peel and visualize what actually got peeled ---
         job.progress_stage = "Peeling fillets/chamfers..."
         pre_peel_face_count = len(cleaned.faces)
         pre_peel_vert_count = len(cleaned.vertices)

@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 def peel_fillets(
     cleaned: CleanedMesh,
     *,
-    dihedral_min_deg: float = 168.0,
+    dihedral_min_deg: float = 162.0,
     dihedral_max_deg: float = 179.5,
-    max_radius_ratio: float = 0.08,
+    max_radius_ratio: float = 0.06,
     min_strip_faces: int = 5,
     normal_plane_ratio: float = 0.15,
     axis_alignment: float = 0.96,
@@ -132,14 +132,87 @@ def peel_fillets(
                     stack.append(nbr)
         next_label += 1
 
+    # --- 3.5. Merge fragmented strips ---
+    # A single real fillet arc often breaks into 2-4 connected components
+    # because a few triangles in the arc have dihedrals that cross the
+    # 162°/179.5° thresholds (due to triangulation noise). Individually
+    # those fragments are too short to pass length >= 2R; merged, they
+    # form the true strip. Merge criterion: two components are the same
+    # logical strip if they share a dominant PCA axis direction AND
+    # their centroids lie roughly along each other's axis line.
+    def _strip_axis(strip_f):
+        verts = vertices[faces[strip_f].flatten()]
+        centroid = verts.mean(axis=0)
+        rel = verts - centroid
+        try:
+            _, _, vt = np.linalg.svd(rel, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None, centroid
+        return vt[0], centroid
+
+    strip_axes: list[tuple[np.ndarray | None, np.ndarray]] = []
+    strip_face_lists: list[np.ndarray] = []
+    for sid in range(next_label):
+        sf = np.where(labels == sid)[0]
+        strip_face_lists.append(sf)
+        if len(sf) < 3:
+            strip_axes.append((None, np.zeros(3)))
+            continue
+        strip_axes.append(_strip_axis(sf))
+
+    # Union-find to merge compatible strips.
+    parent = list(range(next_label))
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    bbox_diag_for_merge = bbox_diag
+    for i in range(next_label):
+        ai, ci = strip_axes[i]
+        if ai is None:
+            continue
+        for j in range(i + 1, next_label):
+            aj, cj = strip_axes[j]
+            if aj is None:
+                continue
+            # Axes must be parallel (or anti-parallel).
+            if abs(float(np.dot(ai, aj))) < 0.95:
+                continue
+            # Centroid j must lie close to the line through ci along ai
+            # (both components share the same underlying sharp edge).
+            offset = cj - ci
+            along = float(np.dot(offset, ai))
+            perp_vec = offset - along * ai
+            perp_dist = float(np.linalg.norm(perp_vec))
+            # Allow merge if perp distance is small relative to the part
+            # size (heuristic: 2% of bbox diag, ~4.6mm on a 230mm part).
+            if perp_dist > bbox_diag_for_merge * 0.02:
+                continue
+            _union(i, j)
+
+    merged_groups: dict[int, list[int]] = defaultdict(list)
+    for sid in range(next_label):
+        merged_groups[_find(sid)].append(sid)
+
+    # Build final strip face lists by concatenating merged groups.
+    final_strips: list[np.ndarray] = []
+    for _root, members in merged_groups.items():
+        combined = np.concatenate([strip_face_lists[m] for m in members])
+        final_strips.append(combined)
+
     # --- 4. Per-strip: validate cylinder hypothesis, then peel. ---
     fillets_out: list[dict] = []
     # vertex_id -> list of candidate new positions (usually 1, sometimes
     # more if a vertex straddles two strips — we average).
     vertex_new_pos: dict[int, list[np.ndarray]] = defaultdict(list)
 
-    for sid in range(next_label):
-        strip_faces = np.where(labels == sid)[0]
+    for strip_faces in final_strips:
         if len(strip_faces) < min_strip_faces:
             continue
 
@@ -383,6 +456,7 @@ def peel_fillets(
             "axis_point": line_point.astype(float),
             "length": length,
             "num_faces": int(len(strip_faces)),
+            "face_indices": np.asarray(strip_faces, dtype=np.int64).copy(),
         })
 
     # --- 5. Apply the vertex moves. ---
@@ -734,6 +808,7 @@ def peel_chamfers(
             "axis_point": line_point.astype(float),
             "length": length,
             "num_faces": int(len(cluster_face_idx)),
+            "face_indices": np.asarray(cluster_face_idx, dtype=np.int64).copy(),
             "kind": "chamfer",
         })
 
@@ -792,3 +867,63 @@ def peel_blends(cleaned: CleanedMesh) -> tuple[CleanedMesh, list[dict]]:
         f.setdefault("kind", "fillet")
     cmesh, chamfers = peel_chamfers(fmesh)
     return cmesh, fillets + chamfers
+
+
+def detect_blend_candidates(
+    cleaned: CleanedMesh,
+    *,
+    dihedral_min_deg: float = 168.0,
+    dihedral_max_deg: float = 179.5,
+    diag_threshold: float = 0.25,
+) -> dict:
+    """Identify per-face candidates for visualization only — no peeling.
+
+    Returns a dict with:
+        fillet_face_mask: bool array, faces incident to a curved
+            interior edge (potential fillet strip member).
+        chamfer_face_mask: bool array, faces whose normal has two
+            components above diag_threshold and one below (diagonal
+            normal — potential chamfer bevel surface).
+
+    Useful for pre-peel visualization so the user can see what peel
+    is about to consider before it runs.
+    """
+    faces = np.asarray(cleaned.faces, dtype=np.int64)
+    normals = np.asarray(cleaned.normals, dtype=float)
+    n_faces = int(faces.shape[0])
+
+    # Fillet candidates: faces on at least one curved-dihedral edge.
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi in range(n_faces):
+        tri = faces[fi]
+        for a, b in ((int(tri[0]), int(tri[1])),
+                     (int(tri[1]), int(tri[2])),
+                     (int(tri[0]), int(tri[2]))):
+            edge_to_faces[(min(a, b), max(a, b))].append(fi)
+
+    fillet_mask = np.zeros(n_faces, dtype=bool)
+    for flist in edge_to_faces.values():
+        if len(flist) != 2:
+            continue
+        f0, f1 = flist
+        n1, n2 = normals[f0], normals[f1]
+        dot = float(np.clip(np.dot(n1, n2), -1.0, 1.0))
+        dihed = float(np.degrees(np.pi - np.arccos(dot)))
+        if dihedral_min_deg < dihed < dihedral_max_deg:
+            fillet_mask[f0] = True
+            fillet_mask[f1] = True
+
+    # Chamfer candidates: faces whose normals are diagonal (2 components
+    # significant, 1 small).
+    abs_normals = np.abs(normals)
+    sorted_abs = np.sort(abs_normals, axis=1)
+    chamfer_mask = (
+        (sorted_abs[:, 1] > diag_threshold)
+        & (sorted_abs[:, 2] > diag_threshold)
+        & (sorted_abs[:, 0] < diag_threshold)
+    )
+
+    return {
+        "fillet_face_mask": fillet_mask,
+        "chamfer_face_mask": chamfer_mask,
+    }

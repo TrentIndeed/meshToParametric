@@ -227,3 +227,113 @@ def identify_blends_from_topology(
         n_fil, n_cha, len(surface_edges),
     )
     return records
+
+
+def apply_blend_peel(
+    cleaned: CleanedMesh,
+    records: list[dict],
+) -> CleanedMesh:
+    """Project each blend region's vertices onto its plane-intersection
+    line, drop the resulting degenerate triangles, and return a cleaned
+    mesh that has sharp edges where the blends used to be.
+
+    Records must include axis_dir, axis_point, and face_indices (as
+    returned by identify_blends_from_topology).
+    """
+    import trimesh
+
+    if not records:
+        return cleaned
+
+    vertices = np.asarray(cleaned.vertices, dtype=float).copy()
+    faces = np.asarray(cleaned.faces, dtype=np.int64)
+    bbox_diag = cleaned.bbox_diagonal
+
+    # vertex_id -> list of candidate new positions (we average if a
+    # vertex straddles two blends).
+    vertex_new_pos: dict[int, list[np.ndarray]] = defaultdict(list)
+
+    for rec in records:
+        face_idx = rec.get("face_indices")
+        if face_idx is None or len(face_idx) == 0:
+            continue
+        axis_dir = np.asarray(rec["axis_dir"], dtype=float)
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+        axis_point = np.asarray(rec["axis_point"], dtype=float)
+
+        blend_vert_ids = np.unique(faces[face_idx].flatten())
+        pts = vertices[blend_vert_ids]
+        rel = pts - axis_point
+        t_along = rel @ axis_dir
+        projections = axis_point + np.outer(t_along, axis_dir)
+        for idx_local, vi in enumerate(blend_vert_ids):
+            vertex_new_pos[int(vi)].append(projections[idx_local])
+
+    moved_count = 0
+    for vi, positions in vertex_new_pos.items():
+        vertices[vi] = np.mean(positions, axis=0)
+        moved_count += 1
+
+    # Drop degenerate triangles and merge coincident vertices.
+    t = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    try:
+        t.merge_vertices()
+    except Exception:
+        pass
+    try:
+        areas = t.area_faces
+        keep = areas > (bbox_diag * 1e-6) ** 2
+        t.update_faces(keep)
+        t.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    new_vertices = np.asarray(t.vertices, dtype=float)
+    new_faces = np.asarray(t.faces, dtype=np.int64)
+    new_normals = np.asarray(t.face_normals, dtype=float)
+    new_bbox = np.array([new_vertices.min(axis=0), new_vertices.max(axis=0)])
+
+    peeled = CleanedMesh(
+        vertices=new_vertices,
+        faces=new_faces,
+        normals=new_normals,
+        is_watertight=bool(t.is_watertight),
+        bbox=new_bbox,
+        metadata={
+            **(cleaned.metadata or {}),
+            "peeled_blend_count": len(records),
+        },
+    )
+    logger.info(
+        "apply_blend_peel: projected %d vertex(es) across %d blend(s), "
+        "faces %d -> %d",
+        moved_count, len(records), len(faces), len(new_faces),
+    )
+    return peeled
+
+
+def detect_and_peel_blends_whole_mesh(
+    cleaned: CleanedMesh,
+) -> tuple[CleanedMesh, list[dict]]:
+    """End-to-end: run segment / fit / topology on the whole mesh,
+    identify every plane-to-plane blend (fillet cylinder or chamfer
+    strip), and peel them all at once.
+
+    This is the preferred path for the pre-decompose peel stage: it
+    only touches mesh regions that the segmenter classified as planes
+    connected by topology-classified blend edges, so the peel matches
+    actual flat-face-to-flat-face fillets / chamfers and never acts on
+    noisy curved strips in isolation.
+    """
+    # Local imports to avoid circulars at module load time.
+    from mesh2param.pipeline.segment import segment_mesh
+    from mesh2param.pipeline.fit import fit_surfaces
+    from mesh2param.pipeline.topology import build_topology
+    from mesh2param.config import SegmentConfig, FitConfig, TopologyConfig
+
+    regions = segment_mesh(cleaned, SegmentConfig())
+    fitted = fit_surfaces(regions, cleaned, FitConfig())
+    _graph, edges = build_topology(regions, fitted, cleaned, TopologyConfig())
+    records = identify_blends_from_topology(regions, fitted, edges, cleaned)
+    peeled = apply_blend_peel(cleaned, records)
+    return peeled, records

@@ -249,165 +249,134 @@ class JobQueue:
 
         _set_mesh_viz(cleaned)
 
-        # Stage 1.75: Peel fillets from the full mesh before any segmentation.
-        # This filter-first approach removes rolling-ball tangent strips by
-        # projecting their vertices onto the sharp edge line of the two
-        # adjacent planes. Downstream stages (decompose / segment / fit /
-        # topology / recognize) operate on the peeled mesh and see sharp
-        # edges where fillets used to be — no more cylinder-wedged-between-
-        # planes confusion. The peeled fillet records are stashed on the
-        # job and passed to export so they can be re-applied to the final
-        # CAD solid as a single grouped-by-radius pass.
-        # Stage 1.75: Peel fillets AND chamfers from the full mesh before
-        # any segmentation. Both are "blend" strips between two planes —
-        # a fillet is a smooth cylindrical arc, a chamfer is a flat bevel.
-        # Left in the mesh, they each confuse downstream segmentation by
-        # adding extra regions between what should be adjacent planes.
-        # peel_blends projects each strip's vertices onto the sharp edge
-        # line of the two neighbouring planes and emits records so the
-        # export stage can re-add them as features on the final CAD.
-        from mesh2param.pipeline.peel_fillets import (
-            peel_blends, peel_fillets as _pf_detect, peel_chamfers as _pc_detect,
+        # Stage 1.75: Region-based fillet / chamfer peel.
+        #
+        # Runs a full segment → fit → topology pass on the WHOLE mesh,
+        # then identifies each plane-to-plane blend (fillet cylinder or
+        # chamfer strip) from the adjacency graph and peels only those
+        # specific regions. Unlike the old triangle-level detector, this
+        # only touches surfaces that the segmenter classified as planes
+        # connected by a blend region — so it never acts on random curved
+        # patches or cylinder walls, and is naturally symmetric.
+        from mesh2param.pipeline.peel_via_topology import (
+            detect_and_peel_blends_whole_mesh,
+            identify_blends_from_topology,
         )
+        from mesh2param.pipeline.segment import segment_mesh
+        from mesh2param.pipeline.fit import fit_surfaces
+        from mesh2param.pipeline.topology import build_topology
+        from mesh2param.config import SegmentConfig, FitConfig, TopologyConfig
+
         job.progress = 5
 
-        # --- 1.75a: Fillet strips detected (after all validators) ---
-        # Run peel_fillets on a copy so we have the validated strip face
-        # indices but can still use the original mesh for viz. The
-        # records contain face_indices mapped to the ORIGINAL mesh.
-        try:
-            _, fillet_dry = _pf_detect(cleaned)
-            fc_fil = np.full((len(cleaned.faces), 3), 0.65)
-            for rec in fillet_dry:
-                idx = rec.get("face_indices")
-                if idx is not None and len(idx) > 0:
-                    fc_fil[idx] = [0.0, 0.9, 0.95]  # cyan
-            total_fil_faces = sum(len(rec.get("face_indices", [])) for rec in fillet_dry)
-            job.progress_stage = (
-                f"Fillet strips detected: {len(fillet_dry)} "
-                f"({total_fil_faces} faces across strips)"
-            )
-            _set_mesh_viz(cleaned, face_colors=fc_fil)
-            if job.step_through:
-                _pause_for_review()
-            else:
-                time.sleep(1.0)
-        except Exception as _vc_exc:
-            logger.debug("Fillet-strip viz failed: %s", _vc_exc)
-            fillet_dry = []
-
-        # --- 1.75b: Chamfer strips detected ---
-        try:
-            _, chamfer_dry = _pc_detect(cleaned)
-            fc_cham = np.full((len(cleaned.faces), 3), 0.65)
-            for rec in chamfer_dry:
-                idx = rec.get("face_indices")
-                if idx is not None and len(idx) > 0:
-                    fc_cham[idx] = [1.0, 0.55, 0.0]  # orange
-            total_cham_faces = sum(len(rec.get("face_indices", [])) for rec in chamfer_dry)
-            job.progress_stage = (
-                f"Chamfer strips detected: {len(chamfer_dry)} "
-                f"({total_cham_faces} faces across strips)"
-            )
-            _set_mesh_viz(cleaned, face_colors=fc_cham)
-            if job.step_through:
-                _pause_for_review()
-            else:
-                time.sleep(1.0)
-        except Exception as _vc_exc:
-            logger.debug("Chamfer-strip viz failed: %s", _vc_exc)
-            chamfer_dry = []
-
-        # --- 1.75c: Both sets overlaid on same mesh ---
-        try:
-            fc_both = np.full((len(cleaned.faces), 3), 0.65)
-            for rec in fillet_dry:
-                idx = rec.get("face_indices")
-                if idx is not None and len(idx) > 0:
-                    fc_both[idx] = [0.0, 0.9, 0.95]  # cyan
-            for rec in chamfer_dry:
-                idx = rec.get("face_indices")
-                if idx is not None and len(idx) > 0:
-                    fc_both[idx] = [1.0, 0.55, 0.0]  # orange
-            job.progress_stage = (
-                f"All peel targets: {len(fillet_dry)} fillet strip(s), "
-                f"{len(chamfer_dry)} chamfer strip(s)"
-            )
-            _set_mesh_viz(cleaned, face_colors=fc_both)
-            if job.step_through:
-                _pause_for_review()
-            else:
-                time.sleep(1.0)
-        except Exception:
-            pass
-
-        # --- 1.75d: Run peel and visualize what actually got peeled ---
-        job.progress_stage = "Peeling fillets/chamfers..."
         pre_peel_face_count = len(cleaned.faces)
         pre_peel_vert_count = len(cleaned.vertices)
+
+        # --- 1.75a: Whole-mesh analysis (segment + fit + topology) ---
+        # This produces the region graph the peel will walk. Step through
+        # users see the mesh colored by primitive type (plane vs cylinder
+        # vs cone vs sphere) so the "what are the flat faces" step is
+        # explicit.
         try:
-            peeled_cleaned, peeled_records = peel_blends(cleaned)
+            job.progress_stage = "Pre-peel: segmenting whole mesh..."
+            pp_regions = segment_mesh(cleaned, SegmentConfig())
+            pp_fitted = fit_surfaces(pp_regions, cleaned, FitConfig())
+            _pp_graph, pp_edges = build_topology(
+                pp_regions, pp_fitted, cleaned, TopologyConfig(),
+            )
+
+            # Face colors by surface primitive type.
+            st_colors = {
+                'PLANE': [0.0, 0.55, 1.0],
+                'CYLINDER': [0.0, 1.0, 0.25],
+                'CONE': [1.0, 0.35, 0.0],
+                'SPHERE': [1.0, 0.0, 0.55],
+            }
+            fc_regions = np.full((len(cleaned.faces), 3), 0.55)
+            for r, f in zip(pp_regions, pp_fitted):
+                color = st_colors.get(f.surface_type.name, [0.55, 0.55, 0.55])
+                if len(r.face_indices) > 0:
+                    fc_regions[r.face_indices] = color
+            n_plane = sum(1 for f in pp_fitted if f.surface_type.name == 'PLANE')
+            n_cyl = sum(1 for f in pp_fitted if f.surface_type.name == 'CYLINDER')
+            job.progress_stage = (
+                f"Pre-peel analysis: {len(pp_regions)} regions "
+                f"({n_plane} planes, {n_cyl} cylinders), {len(pp_edges)} adjacencies"
+            )
+            _set_mesh_viz(cleaned, face_colors=fc_regions)
+            if job.step_through:
+                _pause_for_review()
+            else:
+                time.sleep(0.8)
+        except Exception:
+            logger.exception("Pre-peel whole-mesh analysis failed")
+            pp_regions, pp_fitted, pp_edges = [], [], []
+
+        # --- 1.75b: Identify blend regions between flat faces ---
+        peeled_records: list = []
+        try:
+            peeled_records = identify_blends_from_topology(
+                pp_regions, pp_fitted, pp_edges, cleaned,
+            )
+            n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
+            n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
+
+            # Show the blend regions highlighted on the mesh.
+            fc_blends = np.full((len(cleaned.faces), 3), 0.65)
+            for rec in peeled_records:
+                idx = rec.get("face_indices")
+                if idx is None or len(idx) == 0:
+                    continue
+                color = (
+                    [1.0, 0.55, 0.0] if rec.get("kind") == "chamfer"
+                    else [0.0, 0.9, 0.95]
+                )
+                fc_blends[idx] = color
+            job.progress_stage = (
+                f"Blend regions: {n_fil} fillet + {n_cha} chamfer "
+                f"(plane-to-plane connections)"
+            )
+            _set_mesh_viz(cleaned, face_colors=fc_blends)
+            if job.step_through:
+                _pause_for_review()
+            else:
+                time.sleep(0.8)
+        except Exception:
+            logger.exception("identify_blends_from_topology failed")
+
+        # --- 1.75c: Apply the peel (modify the mesh) ---
+        try:
+            from mesh2param.pipeline.peel_via_topology import apply_blend_peel
+            peeled_cleaned = apply_blend_peel(cleaned, peeled_records)
             n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
             n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
             logger.info(
-                "Peeled %d fillet(s) + %d chamfer(s) pre-decompose: "
-                "verts %d -> %d, faces %d -> %d",
+                "Whole-mesh peel: %d fillet + %d chamfer, verts %d -> %d, "
+                "faces %d -> %d",
                 n_fil, n_cha,
                 pre_peel_vert_count, len(peeled_cleaned.vertices),
                 pre_peel_face_count, len(peeled_cleaned.faces),
             )
             cleaned = peeled_cleaned
         except Exception:
-            logger.exception("peel_blends failed — continuing with original mesh")
-            peeled_records = []
+            logger.exception("apply_blend_peel failed — continuing with original mesh")
+
+        # Store for export re-apply.
         job._peeled_fillets = peeled_records
 
-        # --- Peel stage visualization ---
-        # Show the peeled mesh with any faces that got modified highlighted
-        # in orange (chamfer) or cyan (fillet). Faces around peeled vertices
-        # whose vertices moved during the peel are the visible evidence that
-        # a strip was removed. We flag a face as "peeled" if at least one of
-        # its vertices sits on a near-projection sharp-edge line from any of
-        # the peel records.
+        # --- 1.75d: Show peeled mesh ---
         try:
             job.progress_stage = (
-                f"Peeled {n_fil} fillet(s) + {n_cha} chamfer(s) "
+                f"Peeled mesh: {n_fil} fillet(s) + {n_cha} chamfer(s) "
                 f"({pre_peel_face_count - len(cleaned.faces)} faces removed)"
             )
-            fc = np.full((len(cleaned.faces), 3), 0.65)
-            for r in peeled_records:
-                try:
-                    axis_dir = np.asarray(r["axis_dir"], dtype=float)
-                    axis_pt = np.asarray(r["axis_point"], dtype=float)
-                    size = float(r["radius"])
-                    # Face centroid distance to sharp line: faces whose
-                    # vertices project within ~size of the line and lie
-                    # along the strip's length were part of the peeled
-                    # strip. Color them.
-                    face_centroids = cleaned.vertices[cleaned.faces].mean(axis=1)
-                    rel = face_centroids - axis_pt
-                    along = rel @ axis_dir
-                    perp = rel - np.outer(along, axis_dir)
-                    perp_dist = np.linalg.norm(perp, axis=1)
-                    half_len = max(r.get("length", 0.0), 1.0) / 2 + 2.0
-                    mask = (perp_dist < size * 1.5) & (np.abs(along) < half_len)
-                    if r.get("kind") == "chamfer":
-                        fc[mask] = [1.0, 0.55, 0.0]   # orange
-                    else:
-                        fc[mask] = [0.0, 0.9, 0.95]   # cyan
-                except Exception:
-                    continue
-            _set_mesh_viz(cleaned, face_colors=fc)
+            _set_mesh_viz(cleaned)
             if job.step_through:
                 _pause_for_review()
             else:
-                # Allow a brief beat so the explode transition is visible
-                for _ in range(10):
-                    if job.status == "error":
-                        break
-                    time.sleep(0.2)
+                time.sleep(0.6)
         except Exception as _viz_exc:
-            logger.debug("peel viz failed: %s", _viz_exc)
+            logger.debug("peel result viz failed: %s", _viz_exc)
 
         # Stage 1.5: Body Decomposition
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh

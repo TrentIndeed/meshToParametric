@@ -437,9 +437,11 @@ def peel_chamfers(
     *,
     diag_threshold: float = 0.25,
     min_cluster_faces: int = 5,
-    normal_eps: float = 0.20,
-    max_size_ratio: float = 0.10,
-    axis_alignment: float = 0.85,
+    normal_eps: float = 0.08,
+    max_size_ratio: float = 0.03,
+    axis_alignment: float = 0.95,
+    cluster_normal_spread: float = 0.05,
+    bisector_tolerance: float = 0.12,
 ) -> tuple[CleanedMesh, list[dict]]:
     """Virtually remove flat bevel (chamfer) strips from a mesh.
 
@@ -578,6 +580,29 @@ def peel_chamfers(
     for cluster_face_idx in split_clusters:
         if len(cluster_face_idx) < min_cluster_faces:
             continue
+
+        # Tight normal variation check: a real flat chamfer has a single
+        # shared normal direction across ALL its faces. Curved fillet
+        # arcs sneak into DBSCAN as small spatial clusters whose normals
+        # span a range around the arc. Require cluster_normal_spread so
+        # we only peel actual planar bevels, not fillet fragments.
+        cluster_norms = normals[cluster_face_idx]
+        cluster_norms_n = np.linalg.norm(cluster_norms, axis=1)
+        okmask = cluster_norms_n > 1e-8
+        if int(okmask.sum()) < min_cluster_faces:
+            continue
+        u_cluster = cluster_norms[okmask] / cluster_norms_n[okmask, None]
+        mean_n = u_cluster.mean(axis=0)
+        mean_n_norm = float(np.linalg.norm(mean_n))
+        if mean_n_norm < 1e-6:
+            continue
+        mean_n = mean_n / mean_n_norm
+        dots = u_cluster @ mean_n
+        # Every face normal must be within cos(arcsin(spread)) of the mean.
+        # With spread=0.05, faces within ~3° of the shared normal — tight.
+        if float(np.min(dots)) < 1.0 - cluster_normal_spread:
+            continue
+        chamfer_normal = mean_n
         strip_set = set(int(f) for f in cluster_face_idx)
 
         # Boundary faces: neighbours of cluster faces not in the cluster.
@@ -627,6 +652,24 @@ def peel_chamfers(
 
         # Each side's mean normal. Reject if they aren't distinct planes.
         if abs(float(np.dot(mu_a, mu_b))) > 0.9:
+            continue
+
+        # A real chamfer's flat normal sits at the angular bisector of
+        # the two adjacent plane normals (the chamfer bevels exactly
+        # halfway between them). Check: chamfer_normal should have
+        # equal dot products with both mu_a and mu_b. The difference
+        # |dot(n, mu_a) - dot(n, mu_b)| must be small. This rejects
+        # cylinder walls, where a single "cluster normal" is NOT the
+        # bisector of the two plate faces on either side.
+        dot_a = float(chamfer_normal @ mu_a)
+        dot_b = float(chamfer_normal @ mu_b)
+        if abs(dot_a - dot_b) > bisector_tolerance:
+            continue
+        # And the normal must be roughly diagonal between the two plane
+        # normals — dot with each plane's normal ≈ cos(bevel_half_angle).
+        # For a 45° chamfer between perpendicular planes, both dots are
+        # ~0.707. Must be < 0.95 (otherwise it's coplanar with a plane).
+        if abs(dot_a) > 0.95 or abs(dot_b) > 0.95:
             continue
 
         ids_a = bn_ids[side_a]

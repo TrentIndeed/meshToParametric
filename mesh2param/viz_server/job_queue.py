@@ -269,6 +269,8 @@ class JobQueue:
         from mesh2param.pipeline.peel_fillets import peel_blends
         job.progress = 5
         job.progress_stage = "Peeling fillets/chamfers..."
+        pre_peel_face_count = len(cleaned.faces)
+        pre_peel_vert_count = len(cleaned.vertices)
         try:
             peeled_cleaned, peeled_records = peel_blends(cleaned)
             n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
@@ -277,14 +279,61 @@ class JobQueue:
                 "Peeled %d fillet(s) + %d chamfer(s) pre-decompose: "
                 "verts %d -> %d, faces %d -> %d",
                 n_fil, n_cha,
-                len(cleaned.vertices), len(peeled_cleaned.vertices),
-                len(cleaned.faces), len(peeled_cleaned.faces),
+                pre_peel_vert_count, len(peeled_cleaned.vertices),
+                pre_peel_face_count, len(peeled_cleaned.faces),
             )
             cleaned = peeled_cleaned
         except Exception:
             logger.exception("peel_blends failed — continuing with original mesh")
             peeled_records = []
         job._peeled_fillets = peeled_records
+
+        # --- Peel stage visualization ---
+        # Show the peeled mesh with any faces that got modified highlighted
+        # in orange (chamfer) or cyan (fillet). Faces around peeled vertices
+        # whose vertices moved during the peel are the visible evidence that
+        # a strip was removed. We flag a face as "peeled" if at least one of
+        # its vertices sits on a near-projection sharp-edge line from any of
+        # the peel records.
+        try:
+            job.progress_stage = (
+                f"Peeled {n_fil} fillet(s) + {n_cha} chamfer(s) "
+                f"({pre_peel_face_count - len(cleaned.faces)} faces removed)"
+            )
+            fc = np.full((len(cleaned.faces), 3), 0.65)
+            for r in peeled_records:
+                try:
+                    axis_dir = np.asarray(r["axis_dir"], dtype=float)
+                    axis_pt = np.asarray(r["axis_point"], dtype=float)
+                    size = float(r["radius"])
+                    # Face centroid distance to sharp line: faces whose
+                    # vertices project within ~size of the line and lie
+                    # along the strip's length were part of the peeled
+                    # strip. Color them.
+                    face_centroids = cleaned.vertices[cleaned.faces].mean(axis=1)
+                    rel = face_centroids - axis_pt
+                    along = rel @ axis_dir
+                    perp = rel - np.outer(along, axis_dir)
+                    perp_dist = np.linalg.norm(perp, axis=1)
+                    half_len = max(r.get("length", 0.0), 1.0) / 2 + 2.0
+                    mask = (perp_dist < size * 1.5) & (np.abs(along) < half_len)
+                    if r.get("kind") == "chamfer":
+                        fc[mask] = [1.0, 0.55, 0.0]   # orange
+                    else:
+                        fc[mask] = [0.0, 0.9, 0.95]   # cyan
+                except Exception:
+                    continue
+            _set_mesh_viz(cleaned, face_colors=fc)
+            if job.step_through:
+                _pause_for_review()
+            else:
+                # Allow a brief beat so the explode transition is visible
+                for _ in range(10):
+                    if job.status == "error":
+                        break
+                    time.sleep(0.2)
+        except Exception as _viz_exc:
+            logger.debug("peel viz failed: %s", _viz_exc)
 
         # Stage 1.5: Body Decomposition
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh

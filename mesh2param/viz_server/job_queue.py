@@ -258,16 +258,33 @@ class JobQueue:
         # planes confusion. The peeled fillet records are stashed on the
         # job and passed to export so they can be re-applied to the final
         # CAD solid as a single grouped-by-radius pass.
-        # Stage 1.75 peel_fillets is currently disabled by default.
-        # On thin-plate parts (RackMount) it's essentially a no-op:
-        # the fillets it catches don't match CAD edges during the
-        # final re-apply pass, and the ones it tries to apply can
-        # damage the face projection by creating non-watertight
-        # regions that confuse the 2D hole detector. Fillet handling
-        # now relies on the fallback per-body mesh strip detection
-        # inside _apply_recognized_fillets_to_solid instead.
-        peeled_fillet_records: list = []
-        job._peeled_fillets = peeled_fillet_records
+        # Stage 1.75: Peel fillets AND chamfers from the full mesh before
+        # any segmentation. Both are "blend" strips between two planes —
+        # a fillet is a smooth cylindrical arc, a chamfer is a flat bevel.
+        # Left in the mesh, they each confuse downstream segmentation by
+        # adding extra regions between what should be adjacent planes.
+        # peel_blends projects each strip's vertices onto the sharp edge
+        # line of the two neighbouring planes and emits records so the
+        # export stage can re-add them as features on the final CAD.
+        from mesh2param.pipeline.peel_fillets import peel_blends
+        job.progress = 5
+        job.progress_stage = "Peeling fillets/chamfers..."
+        try:
+            peeled_cleaned, peeled_records = peel_blends(cleaned)
+            n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
+            n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
+            logger.info(
+                "Peeled %d fillet(s) + %d chamfer(s) pre-decompose: "
+                "verts %d -> %d, faces %d -> %d",
+                n_fil, n_cha,
+                len(cleaned.vertices), len(peeled_cleaned.vertices),
+                len(cleaned.faces), len(peeled_cleaned.faces),
+            )
+            cleaned = peeled_cleaned
+        except Exception:
+            logger.exception("peel_blends failed — continuing with original mesh")
+            peeled_records = []
+        job._peeled_fillets = peeled_records
 
         # Stage 1.5: Body Decomposition
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh

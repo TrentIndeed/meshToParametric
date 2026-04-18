@@ -430,3 +430,322 @@ def peel_fillets(
         len(fillets_out), moved_count, n_faces, len(new_faces),
     )
     return peeled, fillets_out
+
+
+def peel_chamfers(
+    cleaned: CleanedMesh,
+    *,
+    diag_threshold: float = 0.25,
+    min_cluster_faces: int = 5,
+    normal_eps: float = 0.20,
+    max_size_ratio: float = 0.10,
+    axis_alignment: float = 0.85,
+) -> tuple[CleanedMesh, list[dict]]:
+    """Virtually remove flat bevel (chamfer) strips from a mesh.
+
+    A chamfer between two plane faces is a single flat surface tilted
+    roughly 45° from each plane. The face normals inside the chamfer
+    cluster share a single diagonal direction, not a curved sweep (which
+    is what distinguishes it from a rolling-ball fillet and requires a
+    different detector). Like fillets, chamfers corrupt the segmenter:
+    the chamfer surface gets fit as its own plane, the topology graph
+    inserts a plane-to-plane transition where a sharp edge should be,
+    and downstream recognition re-fits the chamfer as an extra feature.
+
+    This peeler finds diagonal-normal face clusters, identifies the two
+    adjacent planes (one on each side of the chamfer), computes their
+    intersection line, and projects each chamfer vertex onto that line
+    — same peel operation as for fillets, just a different way of
+    gathering the strip.
+
+    Args:
+        cleaned: Input mesh.
+        diag_threshold: how far off-axis a normal component must be to
+            count as "diagonal". A value of 0.25 corresponds to ~14.5°.
+            A chamfer surface has two components above this threshold
+            and one below, covering 30°-60° bevel angles.
+        min_cluster_faces: minimum faces in a single-normal cluster to
+            be considered a real chamfer (not noise).
+        normal_eps: DBSCAN epsilon on the unit normal sphere. 0.20 keeps
+            same-normal faces together while separating different bevels.
+        max_size_ratio: reject chamfers whose size (cluster bbox short
+            axis) exceeds this fraction of the mesh bbox diagonal.
+        axis_alignment: require the recovered sharp-edge line direction
+            to be roughly aligned to a principal axis.
+
+    Returns:
+        (peeled_mesh, chamfers) — same shape as peel_fillets' return.
+        Each chamfer record carries radius=size (the chamfer width),
+        axis_dir (the sharp-edge direction), axis_point (on the line),
+        length, num_faces.
+    """
+    import trimesh
+    from sklearn.cluster import DBSCAN
+
+    vertices = np.asarray(cleaned.vertices, dtype=float).copy()
+    faces = np.asarray(cleaned.faces, dtype=np.int64)
+    normals = np.asarray(cleaned.normals, dtype=float)
+    n_faces = int(faces.shape[0])
+    bbox_diag = cleaned.bbox_diagonal
+    max_size = bbox_diag * max_size_ratio
+
+    # --- 1. Find diagonal-normal candidate faces (potential chamfers). ---
+    abs_normals = np.abs(normals)
+    sorted_abs = np.sort(abs_normals, axis=1)
+    diagonal_mask = (
+        (sorted_abs[:, 1] > diag_threshold)
+        & (sorted_abs[:, 2] > diag_threshold)
+        & (sorted_abs[:, 0] < diag_threshold)
+    )
+    if int(diagonal_mask.sum()) < min_cluster_faces:
+        return cleaned, []
+
+    diag_indices = np.where(diagonal_mask)[0]
+    diag_normals = normals[diag_indices]
+
+    # --- 2. Cluster diagonal faces by normal direction. ---
+    clustering = DBSCAN(eps=normal_eps, min_samples=3).fit(diag_normals)
+    labels = clustering.labels_
+    unique_labels = sorted(set(labels) - {-1})
+
+    # --- 3. Adjacency map (all mesh faces). ---
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi in range(n_faces):
+        tri = faces[fi]
+        for a, b in ((int(tri[0]), int(tri[1])),
+                     (int(tri[1]), int(tri[2])),
+                     (int(tri[0]), int(tri[2]))):
+            edge_to_faces[(min(a, b), max(a, b))].append(fi)
+
+    # Build face-to-neighbour adjacency among diagonal faces, limited to
+    # edges within the SAME normal cluster. This is critical: DBSCAN by
+    # normal alone lumps every chamfer with the same orientation across
+    # the whole part into one huge cluster (e.g. all "top-front 45°"
+    # chamfers from different tabs share a normal). We need to split
+    # each normal cluster into spatially-connected components so each
+    # physical chamfer strip is peeled independently.
+    diag_face_to_cluster: dict[int, int] = {
+        int(diag_indices[i]): int(labels[i])
+        for i in range(len(diag_indices))
+        if labels[i] != -1
+    }
+
+    def _split_cluster_by_connectivity(cluster_faces: np.ndarray) -> list[np.ndarray]:
+        """Split a set of faces into connected components via shared edges."""
+        member = set(int(f) for f in cluster_faces)
+        face_adj: dict[int, list[int]] = defaultdict(list)
+        for fid in cluster_faces:
+            tri = faces[int(fid)]
+            for a, b in ((int(tri[0]), int(tri[1])),
+                         (int(tri[1]), int(tri[2])),
+                         (int(tri[0]), int(tri[2]))):
+                for nbr in edge_to_faces[(min(a, b), max(a, b))]:
+                    nbr_i = int(nbr)
+                    if nbr_i != int(fid) and nbr_i in member:
+                        face_adj[int(fid)].append(nbr_i)
+        comps: list[list[int]] = []
+        visited: set[int] = set()
+        for f0 in member:
+            if f0 in visited:
+                continue
+            stack = [f0]
+            comp = []
+            while stack:
+                cur = stack.pop()
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                comp.append(cur)
+                for nb in face_adj[cur]:
+                    if nb not in visited:
+                        stack.append(nb)
+            comps.append(np.array(comp, dtype=np.int64))
+        return comps
+
+    # Expand unique_labels into spatially-connected sub-clusters
+    split_clusters: list[np.ndarray] = []
+    for lbl in unique_labels:
+        cluster_face_idx = diag_indices[labels == lbl]
+        if len(cluster_face_idx) < min_cluster_faces:
+            continue
+        comps = _split_cluster_by_connectivity(cluster_face_idx)
+        split_clusters.extend(comps)
+
+    chamfers_out: list[dict] = []
+    vertex_new_pos: dict[int, list[np.ndarray]] = defaultdict(list)
+
+    # --- 4. For each connected strip, walk to boundary faces and peel. ---
+    for cluster_face_idx in split_clusters:
+        if len(cluster_face_idx) < min_cluster_faces:
+            continue
+        strip_set = set(int(f) for f in cluster_face_idx)
+
+        # Boundary faces: neighbours of cluster faces not in the cluster.
+        boundary_faces: set[int] = set()
+        for fid in cluster_face_idx:
+            tri = faces[fid]
+            for a, b in ((int(tri[0]), int(tri[1])),
+                         (int(tri[1]), int(tri[2])),
+                         (int(tri[0]), int(tri[2]))):
+                for nbr in edge_to_faces[(min(a, b), max(a, b))]:
+                    if nbr != int(fid) and int(nbr) not in strip_set:
+                        boundary_faces.add(int(nbr))
+        if len(boundary_faces) < 4:
+            continue
+
+        bn_ids = np.array(sorted(boundary_faces))
+        bn = normals[bn_ids]
+        bn_norms = np.linalg.norm(bn, axis=1)
+        ok = bn_norms > 1e-8
+        if int(ok.sum()) < 4:
+            continue
+        bn_unit = bn[ok] / bn_norms[ok, None]
+        bn_ids = bn_ids[ok]
+
+        # Expected: the two adjacent planes of a chamfer have normals at
+        # ~45° from the chamfer's own normal. K=2 cluster the boundary
+        # normals using the most-opposite pair as seed.
+        dots = bn_unit @ bn_unit.T
+        i_seed, j_seed = np.unravel_index(np.argmin(dots), dots.shape)
+        mu_a = bn_unit[i_seed].copy()
+        mu_b = bn_unit[j_seed].copy()
+        for _ in range(5):
+            side_a = (bn_unit @ mu_a) >= (bn_unit @ mu_b)
+            side_b = ~side_a
+            if side_a.sum() < 2 or side_b.sum() < 2:
+                break
+            na = bn_unit[side_a].mean(axis=0)
+            nb = bn_unit[side_b].mean(axis=0)
+            la = float(np.linalg.norm(na))
+            lb = float(np.linalg.norm(nb))
+            if la > 1e-8:
+                mu_a = na / la
+            if lb > 1e-8:
+                mu_b = nb / lb
+        if side_a.sum() < 2 or side_b.sum() < 2:
+            continue
+
+        # Each side's mean normal. Reject if they aren't distinct planes.
+        if abs(float(np.dot(mu_a, mu_b))) > 0.9:
+            continue
+
+        ids_a = bn_ids[side_a]
+        ids_b = bn_ids[side_b]
+        verts_a_ids = np.unique(faces[ids_a].flatten())
+        verts_b_ids = np.unique(faces[ids_b].flatten())
+        p_A = vertices[verts_a_ids].mean(axis=0)
+        p_B = vertices[verts_b_ids].mean(axis=0)
+
+        # Intersection line direction and a point on it.
+        line_dir = np.cross(mu_a, mu_b)
+        ld_norm = float(np.linalg.norm(line_dir))
+        if ld_norm < 1e-8:
+            continue
+        line_dir = line_dir / ld_norm
+        if float(np.max(np.abs(line_dir))) < axis_alignment:
+            continue
+
+        M_sys = np.array([mu_a, mu_b, line_dir])
+        rhs = np.array([float(mu_a @ p_A), float(mu_b @ p_B), 0.0])
+        try:
+            line_point = np.linalg.solve(M_sys, rhs)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Sanity check: line_point must be inside or near the mesh.
+        mesh_min = cleaned.bbox[0]
+        mesh_max = cleaned.bbox[1]
+        margin = bbox_diag * 0.1
+        if (
+            line_point[0] < mesh_min[0] - margin
+            or line_point[0] > mesh_max[0] + margin
+            or line_point[1] < mesh_min[1] - margin
+            or line_point[1] > mesh_max[1] + margin
+            or line_point[2] < mesh_min[2] - margin
+            or line_point[2] > mesh_max[2] + margin
+        ):
+            continue
+
+        # Measure chamfer size from strip vertex distances to the line.
+        strip_vertex_ids = np.unique(faces[cluster_face_idx].flatten())
+        pts = vertices[strip_vertex_ids]
+        rel = pts - line_point
+        t_along = rel @ line_dir
+        perp = rel - np.outer(t_along, line_dir)
+        perp_dist = np.linalg.norm(perp, axis=1)
+        size = float(np.median(perp_dist))
+        if size < 0.2 or size > max_size:
+            continue
+        length = float(t_along.max() - t_along.min())
+        if length < size * 2.0:
+            continue
+
+        # Project every strip vertex onto the sharp edge line.
+        projections = np.outer(t_along, line_dir) + line_point
+        for idx_local, vi in enumerate(strip_vertex_ids):
+            vertex_new_pos[int(vi)].append(projections[idx_local])
+
+        chamfers_out.append({
+            "radius": size,
+            "axis_dir": line_dir.astype(float),
+            "axis_point": line_point.astype(float),
+            "length": length,
+            "num_faces": int(len(cluster_face_idx)),
+            "kind": "chamfer",
+        })
+
+    # --- 5. Apply vertex moves. ---
+    moved_count = 0
+    for vi, positions in vertex_new_pos.items():
+        vertices[vi] = np.mean(positions, axis=0)
+        moved_count += 1
+
+    # --- 6. Clean up degenerate triangles. ---
+    t = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    try:
+        t.merge_vertices()
+    except Exception:
+        pass
+    try:
+        areas = t.area_faces
+        keep = areas > (bbox_diag * 1e-6) ** 2
+        t.update_faces(keep)
+        t.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    new_vertices = np.asarray(t.vertices, dtype=float)
+    new_faces = np.asarray(t.faces, dtype=np.int64)
+    new_normals = np.asarray(t.face_normals, dtype=float)
+    new_bbox = np.array([new_vertices.min(axis=0), new_vertices.max(axis=0)])
+
+    peeled = CleanedMesh(
+        vertices=new_vertices,
+        faces=new_faces,
+        normals=new_normals,
+        is_watertight=bool(t.is_watertight),
+        bbox=new_bbox,
+        metadata={**(cleaned.metadata or {}), "peeled_chamfers": len(chamfers_out)},
+    )
+
+    logger.info(
+        "peel_chamfers: %d chamfers peeled, %d vertex moves, faces %d -> %d",
+        len(chamfers_out), moved_count, n_faces, len(new_faces),
+    )
+    return peeled, chamfers_out
+
+
+def peel_blends(cleaned: CleanedMesh) -> tuple[CleanedMesh, list[dict]]:
+    """Peel both fillets and chamfers from a mesh in two passes.
+
+    Fillets first (so the fillet strips don't leak into the chamfer
+    diagonal-normal classifier), then chamfers on the already-peeled
+    mesh. Returns the combined list of records; each carries a "kind"
+    field ("fillet" or "chamfer") so the export stage can re-apply
+    them differently if needed.
+    """
+    fmesh, fillets = peel_fillets(cleaned)
+    for f in fillets:
+        f.setdefault("kind", "fillet")
+    cmesh, chamfers = peel_chamfers(fmesh)
+    return cmesh, fillets + chamfers

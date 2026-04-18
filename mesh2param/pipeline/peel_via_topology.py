@@ -89,28 +89,37 @@ def identify_blends_from_topology(
             continue
 
         kind: str | None = None
-        if f.surface_type == SurfaceType.CYLINDER:
-            # Fillet candidate — topology tagged at least one edge FILLET.
-            # A partial-arc cylinder between two planes will typically have
-            # two FILLET-tagged edges, but the segmenter sometimes splits
-            # the arc into subregions where only one of them shows a
-            # FILLET tag. Accept >=1 and we'll still require TWO distinct
-            # plane neighbors further down.
-            fillet_edges = [e for e in neighbors
-                            if e.transition_type == TransitionType.FILLET]
-            if not fillet_edges:
+        # A fillet-like blend region is small, curved, adjacent to
+        # plane regions. The EDGE-tag from topology is unreliable here
+        # because topology's fillet-tag requires the cylinder region
+        # to itself be a `_is_fillet_candidate` (partial-arc cylinder),
+        # which fit.py sometimes doesn't produce — it'll classify the
+        # arc as a sphere or cone instead, or merge the through-hole
+        # cylinder so it spans 360°. Both make topology tag the
+        # neighboring edges as CHAMFER or SHARP instead of FILLET.
+        # So we use shape + size + plane-adjacency as the filter, and
+        # skip the edge-tag check entirely.
+        if f.surface_type in (
+            SurfaceType.CYLINDER, SurfaceType.SPHERE, SurfaceType.CONE,
+        ):
+            # Small curved region likely to be a fillet. Exclude huge-
+            # radius fit-noise (the fitter sometimes assigns a cylinder
+            # with r=10000mm to a large plate face).
+            radius_raw = f.params.get("radius", 0) or 0
+            if radius_raw > 0 and radius_raw > bbox_diag * 0.08:
+                continue
+            # Cap region size — a real edge-fillet strip has on the
+            # order of tens-to-hundreds of faces, not thousands.
+            if region.num_faces > 300:
                 continue
             kind = "fillet"
-            # Include all plane-facing edges on this cylinder so we find
-            # both adjacent planes (not just the FILLET-tagged side).
             neighbor_edges = list(neighbors)
         elif f.surface_type == SurfaceType.PLANE:
-            # Chamfer candidate — topology tagged at least one CHAMFER edge.
+            # Narrow plane strip — possible chamfer between two planes.
             chamfer_edges = [e for e in neighbors
                              if e.transition_type == TransitionType.CHAMFER]
             if not chamfer_edges:
                 continue
-            # Must be narrow — real chamfer strip, not a main face.
             if region.num_faces > 40:
                 continue
             kind = "chamfer"

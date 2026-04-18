@@ -2428,26 +2428,29 @@ function animate() {
   }
 
   // Idle rotation during pipeline — orbit camera around Z axis (vertical spin).
-  // Recompute the orbit distance EACH frame from the actual camera position
-  // so wheel-zoom stays applied. (Previously this was cached on the first
-  // idle frame and any subsequent zoom lerp got undone on the next tick.)
+  // Stateless: all orbit parameters (distance, theta, Z) are recomputed
+  // from the actual camera position each frame, so:
+  //   - wheel-zoom is respected (distance updates flow through immediately)
+  //   - drag-release is respected (theta and Z match wherever the user
+  //     orbited to; no snap-back to a cached orientation)
+  //   - we never write an orbit position that contradicts what the user
+  //     just did with the mouse
   if (window._pipelineRotate && !window._userDragging) {
-    if (window._idleTheta === undefined || window._idleTheta === null) {
-      window._idleTheta = Math.atan2(camera.position.y - controls.target.y, camera.position.x - controls.target.x);
-      window._idleZ = camera.position.z;
-    }
-    window._idleTheta += 0.00075;
     const curDist = camera.position.distanceTo(controls.target);
-    const zOff = window._idleZ - controls.target.z;
+    const curZ = camera.position.z;
+    const curTheta = Math.atan2(
+      camera.position.y - controls.target.y,
+      camera.position.x - controls.target.x,
+    );
+    const newTheta = curTheta + 0.00075;
+    const zOff = curZ - controls.target.z;
     const r = Math.sqrt(Math.max(0.1, curDist * curDist - zOff * zOff));
     camera.position.set(
-      controls.target.x + r * Math.cos(window._idleTheta),
-      controls.target.y + r * Math.sin(window._idleTheta),
-      window._idleZ
+      controls.target.x + r * Math.cos(newTheta),
+      controls.target.y + r * Math.sin(newTheta),
+      curZ,
     );
     camera.lookAt(controls.target);
-  } else if (!window._pipelineRotate) {
-    window._idleTheta = null;
   }
 
   controls.update();

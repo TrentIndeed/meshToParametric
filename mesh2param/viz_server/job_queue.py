@@ -313,36 +313,86 @@ class JobQueue:
             pp_regions, pp_fitted, pp_edges = [], [], []
 
         # --- 1.75b: Identify blend regions between flat faces ---
+        # Two sources:
+        #   A) Region-based: identify_blends_from_topology walks the
+        #      plane-to-plane adjacency graph, clean and symmetric when
+        #      the segmenter isolates fillet arcs as their own regions.
+        #   B) Triangle-based: peel_fillets + peel_chamfers walk curved
+        #      dihedral edges directly, catches fillets the segmenter
+        #      fit as full-hole cylinders (span=360°, topology rejects
+        #      those as fillet candidates).
+        # Use both so well-segmented meshes get the clean region-based
+        # result, and meshes where segmentation merges arcs into holes
+        # still get their fillets peeled.
         peeled_records: list = []
         try:
-            peeled_records = identify_blends_from_topology(
+            region_based = identify_blends_from_topology(
                 pp_regions, pp_fitted, pp_edges, cleaned,
             )
-            n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
-            n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
-
-            # Show the blend regions highlighted on the mesh.
-            fc_blends = np.full((len(cleaned.faces), 3), 0.65)
-            for rec in peeled_records:
-                idx = rec.get("face_indices")
-                if idx is None or len(idx) == 0:
-                    continue
-                color = (
-                    [1.0, 0.55, 0.0] if rec.get("kind") == "chamfer"
-                    else [0.0, 0.9, 0.95]
-                )
-                fc_blends[idx] = color
-            job.progress_stage = (
-                f"Blend regions: {n_fil} fillet + {n_cha} chamfer "
-                f"(plane-to-plane connections)"
-            )
-            _set_mesh_viz(cleaned, face_colors=fc_blends)
-            if job.step_through:
-                _pause_for_review()
-            else:
-                time.sleep(0.8)
+            peeled_records.extend(region_based)
         except Exception:
             logger.exception("identify_blends_from_topology failed")
+            region_based = []
+
+        try:
+            from mesh2param.pipeline.peel_fillets import (
+                peel_fillets as _pf_detect, peel_chamfers as _pc_detect,
+            )
+            _, tri_fillets = _pf_detect(cleaned)
+            _, tri_chamfers = _pc_detect(cleaned)
+            for rec in tri_fillets:
+                rec.setdefault("kind", "fillet")
+            for rec in tri_chamfers:
+                rec.setdefault("kind", "chamfer")
+            # Merge triangle-based records that don't overlap existing
+            # region-based records (by axis direction + axis point proximity).
+            def _overlaps(new, existing_list):
+                n_ad = np.asarray(new["axis_dir"], dtype=float)
+                n_ad = n_ad / (np.linalg.norm(n_ad) + 1e-15)
+                n_ap = np.asarray(new["axis_point"], dtype=float)
+                for ex in existing_list:
+                    e_ad = np.asarray(ex["axis_dir"], dtype=float)
+                    e_ad = e_ad / (np.linalg.norm(e_ad) + 1e-15)
+                    if abs(float(np.dot(n_ad, e_ad))) < 0.9:
+                        continue
+                    e_ap = np.asarray(ex["axis_point"], dtype=float)
+                    rel = n_ap - e_ap
+                    along = float(rel @ e_ad)
+                    perp = rel - along * e_ad
+                    if float(np.linalg.norm(perp)) < max(new["radius"], ex["radius"]) * 2:
+                        return True
+                return False
+            for rec in tri_fillets + tri_chamfers:
+                if not _overlaps(rec, peeled_records):
+                    peeled_records.append(rec)
+        except Exception:
+            logger.exception("triangle-based blend detection failed")
+
+        n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
+        n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
+        n_rb = len(region_based)
+        n_tb = len(peeled_records) - n_rb
+
+        # Show all identified blend regions on the mesh.
+        fc_blends = np.full((len(cleaned.faces), 3), 0.65)
+        for rec in peeled_records:
+            idx = rec.get("face_indices")
+            if idx is None or len(idx) == 0:
+                continue
+            color = (
+                [1.0, 0.55, 0.0] if rec.get("kind") == "chamfer"
+                else [0.0, 0.9, 0.95]
+            )
+            fc_blends[idx] = color
+        job.progress_stage = (
+            f"Blend regions: {n_fil} fillet + {n_cha} chamfer "
+            f"({n_rb} region-graph + {n_tb} curved-strip)"
+        )
+        _set_mesh_viz(cleaned, face_colors=fc_blends)
+        if job.step_through:
+            _pause_for_review()
+        else:
+            time.sleep(0.8)
 
         # --- 1.75c: Apply the peel (modify the mesh) ---
         try:

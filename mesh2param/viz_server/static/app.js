@@ -65,12 +65,6 @@ renderer.domElement.addEventListener('wheel', (e) => {
   const dist = _zoomTargetDist ?? camera.position.distanceTo(controls.target);
   const sign = e.deltaY > 0 ? 1 : -1;
   _zoomTargetDist = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, dist * (1 + sign * ZOOM_FACTOR)));
-  // Invalidate the cached orbit distance used by the pipeline idle-rotate
-  // block. Without this, the rotate block overwrites camera.position
-  // every frame using the OLD _idleDist and the zoom gets undone on the
-  // next animate() tick — the user only sees the zoom "take effect" once
-  // they interact (e.g. click) and stop the idle loop.
-  window._idleDist = null;
 }, { passive: false });
 
 // ── Studio Lighting — bright, even illumination ──
@@ -2433,16 +2427,19 @@ function animate() {
     camera.position.copy(controls.target).add(dir);
   }
 
-  // Idle rotation during pipeline — orbit camera around Z axis (vertical spin)
+  // Idle rotation during pipeline — orbit camera around Z axis (vertical spin).
+  // Recompute the orbit distance EACH frame from the actual camera position
+  // so wheel-zoom stays applied. (Previously this was cached on the first
+  // idle frame and any subsequent zoom lerp got undone on the next tick.)
   if (window._pipelineRotate && !window._userDragging) {
-    if (!window._idleDist) {
-      window._idleDist = camera.position.distanceTo(controls.target);
+    if (window._idleTheta === undefined || window._idleTheta === null) {
       window._idleTheta = Math.atan2(camera.position.y - controls.target.y, camera.position.x - controls.target.x);
       window._idleZ = camera.position.z;
     }
     window._idleTheta += 0.00075;
+    const curDist = camera.position.distanceTo(controls.target);
     const zOff = window._idleZ - controls.target.z;
-    const r = Math.sqrt(Math.max(0.1, window._idleDist * window._idleDist - zOff * zOff));
+    const r = Math.sqrt(Math.max(0.1, curDist * curDist - zOff * zOff));
     camera.position.set(
       controls.target.x + r * Math.cos(window._idleTheta),
       controls.target.y + r * Math.sin(window._idleTheta),
@@ -2450,7 +2447,7 @@ function animate() {
     );
     camera.lookAt(controls.target);
   } else if (!window._pipelineRotate) {
-    window._idleDist = null;
+    window._idleTheta = null;
   }
 
   controls.update();

@@ -389,24 +389,6 @@ def peel_fillets(
         except np.linalg.LinAlgError:
             continue
 
-        # Sanity check: the sharp edge's closest point to the strip
-        # must be roughly inside the mesh. Strips whose plane-intersection
-        # point ends up far outside the bbox come from numerically
-        # ill-conditioned fits (nearly parallel planes) and will project
-        # strip vertices to nonsense positions.
-        mesh_min = cleaned.bbox[0]
-        mesh_max = cleaned.bbox[1]
-        margin = bbox_diag * 0.1
-        if (
-            line_point[0] < mesh_min[0] - margin
-            or line_point[0] > mesh_max[0] + margin
-            or line_point[1] < mesh_min[1] - margin
-            or line_point[1] > mesh_max[1] + margin
-            or line_point[2] < mesh_min[2] - margin
-            or line_point[2] > mesh_max[2] + margin
-        ):
-            continue
-
         # Strip vertices and their distances to the sharp line.
         strip_vertex_ids = np.unique(faces[strip_faces].flatten())
         pts = vertices[strip_vertex_ids]
@@ -414,6 +396,26 @@ def peel_fillets(
         t_along = rel @ line_dir
         perp = rel - np.outer(t_along, line_dir)
         perp_dist = np.linalg.norm(perp, axis=1)
+
+        # Sanity check on the computed sharp edge: it should sit near
+        # the strip itself (within a small multiple of the fillet radius,
+        # which is what perp_dist will converge to). If line_point lands
+        # far from the strip's centroid, the plane fits were ill-
+        # conditioned and projecting will warp geometry far outside the
+        # mesh. Compare strip_centroid-to-line_point in the perpendicular
+        # plane with the radius estimate.
+        strip_centroid = pts.mean(axis=0)
+        centroid_rel = strip_centroid - line_point
+        centroid_along = float(centroid_rel @ line_dir)
+        centroid_perp = centroid_rel - centroid_along * line_dir
+        centroid_perp_dist = float(np.linalg.norm(centroid_perp))
+        est_radius_rough = float(np.median(perp_dist))
+        # For a real fillet the centroid-to-sharp-edge perp distance is
+        # ~radius (centroid sits on the arc, which is R from the line).
+        # Reject if more than 3*R — that means the "sharp edge" is nowhere
+        # near the strip.
+        if centroid_perp_dist > max(3.0 * est_radius_rough, 3.0):
+            continue
         # For a true fillet, the perpendicular distance from a strip
         # vertex to the sharp edge line is equal to the fillet radius
         # at the tangent lines (distance R) and up to R/sin(half-angle)
@@ -769,20 +771,6 @@ def peel_chamfers(
         except np.linalg.LinAlgError:
             continue
 
-        # Sanity check: line_point must be inside or near the mesh.
-        mesh_min = cleaned.bbox[0]
-        mesh_max = cleaned.bbox[1]
-        margin = bbox_diag * 0.1
-        if (
-            line_point[0] < mesh_min[0] - margin
-            or line_point[0] > mesh_max[0] + margin
-            or line_point[1] < mesh_min[1] - margin
-            or line_point[1] > mesh_max[1] + margin
-            or line_point[2] < mesh_min[2] - margin
-            or line_point[2] > mesh_max[2] + margin
-        ):
-            continue
-
         # Measure chamfer size from strip vertex distances to the line.
         strip_vertex_ids = np.unique(faces[cluster_face_idx].flatten())
         pts = vertices[strip_vertex_ids]
@@ -792,6 +780,17 @@ def peel_chamfers(
         perp_dist = np.linalg.norm(perp, axis=1)
         size = float(np.median(perp_dist))
         if size < 0.2 or size > max_size:
+            continue
+
+        # Sanity check: sharp edge must sit near the chamfer strip. If
+        # the plane fit is ill-conditioned, line_point can land far from
+        # the actual chamfer — projecting there creates geometry outside
+        # the mesh.
+        strip_centroid = pts.mean(axis=0)
+        centroid_rel = strip_centroid - line_point
+        centroid_along = float(centroid_rel @ line_dir)
+        centroid_perp = centroid_rel - centroid_along * line_dir
+        if float(np.linalg.norm(centroid_perp)) > max(3.0 * size, 3.0):
             continue
         length = float(t_along.max() - t_along.min())
         if length < size * 2.0:

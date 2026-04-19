@@ -373,20 +373,44 @@ class JobQueue:
         n_rb = len(region_based)
         n_tb = len(peeled_records) - n_rb
 
-        # Show all identified blend regions on the mesh.
+        # Build the viz by starting from the SAME data as pre-peel analysis
+        # (every non-plane segmentation region, excluding obvious fit-noise)
+        # so the user sees the same fillet highlights carried over. Then
+        # overlay the confirmed blend records on top in a brighter color
+        # to indicate which regions the peel will actually act on.
         fc_blends = np.full((len(cleaned.faces), 3), 0.65)
+        # Base layer: non-plane regions from segmentation, drawn in muted
+        # cyan/orange so they're visible as candidate blends.
+        try:
+            from mesh2param.models.region import SurfaceType as _ST
+            bbox_diag_local = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+            for r, f in zip(pp_regions, pp_fitted):
+                if f.surface_type == _ST.PLANE:
+                    continue
+                # Skip huge-radius fit noise (the fitter sometimes lands a
+                # "cylinder" with r=14000+ on a large plate face).
+                rr = float(f.params.get("radius", 0) or 0)
+                if rr > bbox_diag_local * 0.15:
+                    continue
+                if r.num_faces > 600:
+                    continue
+                # Muted cyan for curved strip candidates.
+                fc_blends[r.face_indices] = [0.25, 0.55, 0.75]
+        except Exception:
+            pass
+        # Top layer: validated blend records — brighter so they stand out.
         for rec in peeled_records:
             idx = rec.get("face_indices")
             if idx is None or len(idx) == 0:
                 continue
             color = (
                 [1.0, 0.55, 0.0] if rec.get("kind") == "chamfer"
-                else [0.0, 0.9, 0.95]
+                else [0.0, 0.95, 1.0]
             )
             fc_blends[idx] = color
         job.progress_stage = (
-            f"Blend regions: {n_fil} fillet + {n_cha} chamfer "
-            f"({n_rb} region-graph + {n_tb} curved-strip)"
+            f"Blend regions: {n_fil} fillet + {n_cha} chamfer confirmed "
+            f"(bright) — muted cyan = other curved regions"
         )
         _set_mesh_viz(cleaned, face_colors=fc_blends)
         if job.step_through:

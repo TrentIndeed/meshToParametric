@@ -313,17 +313,97 @@ class JobQueue:
             pp_regions, pp_fitted, pp_edges = [], [], []
 
         # --- 1.75b: Identify blend regions between flat faces ---
-        # Two sources:
-        #   A) Region-based: identify_blends_from_topology walks the
-        #      plane-to-plane adjacency graph, clean and symmetric when
-        #      the segmenter isolates fillet arcs as their own regions.
-        #   B) Triangle-based: peel_fillets + peel_chamfers walk curved
-        #      dihedral edges directly, catches fillets the segmenter
-        #      fit as full-hole cylinders (span=360°, topology rejects
-        #      those as fillet candidates).
-        # Use both so well-segmented meshes get the clean region-based
-        # result, and meshes where segmentation merges arcs into holes
-        # still get their fillets peeled.
+        # A blend region is, by definition, a non-plane region that is
+        # adjacent to plane regions. That's it. Segmentation + fit has
+        # already classified every region as PLANE / CYLINDER / SPHERE /
+        # CONE; topology has already built the adjacency graph. We just
+        # walk that graph and classify each non-plane region as:
+        #     fillet  — cylinder, sphere, or cone next to planes
+        #     chamfer — small narrow plane next to larger planes (bevel
+        #               strip between flat faces)
+        # Two filters to reject obvious noise:
+        #   - radius <= 15% of bbox_diag (drops the 10000+ mm cylinder
+        #     fits that are really misfit plate faces)
+        #   - face count <= 600 (drops whole-plate misfits)
+        # Everything else that qualifies as a blend gets highlighted.
+        # The PEEL runs silently afterwards and modifies the mesh only
+        # for blends where it can compute a valid plane-intersection
+        # line — any blend it can't peel still shows up in the viz.
+        from mesh2param.models.region import SurfaceType as _ST
+        from collections import defaultdict as _dd
+
+        region_lookup = {r.region_id: r for r in pp_regions}
+        fitted_lookup = {f.region_id: f for f in pp_fitted}
+        adj_by_region: dict[int, list[int]] = _dd(list)
+        for e in pp_edges:
+            adj_by_region[e.surface_a_id].append(e.surface_b_id)
+            adj_by_region[e.surface_b_id].append(e.surface_a_id)
+
+        bbox_diag_local = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+        fc_blends = np.full((len(cleaned.faces), 3), 0.65)
+        blend_region_ids: list[tuple[int, str]] = []  # (rid, kind)
+
+        for r in pp_regions:
+            f = fitted_lookup.get(r.region_id)
+            if f is None:
+                continue
+            # Count plane neighbors through the adjacency graph.
+            plane_nbr_count = sum(
+                1 for nbr_rid in adj_by_region.get(r.region_id, [])
+                if fitted_lookup.get(nbr_rid)
+                and fitted_lookup[nbr_rid].surface_type == _ST.PLANE
+            )
+            if plane_nbr_count < 1:
+                continue
+            rr = float(f.params.get("radius", 0) or 0)
+            if rr > bbox_diag_local * 0.15:
+                continue
+            if r.num_faces > 600:
+                continue
+
+            if f.surface_type in (_ST.CYLINDER, _ST.SPHERE, _ST.CONE):
+                kind = "fillet"
+                color = [0.0, 0.9, 0.95]  # cyan
+            elif f.surface_type == _ST.PLANE:
+                # Narrow plane strip between larger planes = chamfer.
+                # Require small region + at least 2 plane neighbors.
+                if r.num_faces > 40 or plane_nbr_count < 2:
+                    continue
+                # And at least one adjacent plane must be much bigger.
+                larger_nbr = any(
+                    region_lookup.get(nbr).num_faces > r.num_faces * 3
+                    for nbr in adj_by_region.get(r.region_id, [])
+                    if nbr in region_lookup
+                )
+                if not larger_nbr:
+                    continue
+                kind = "chamfer"
+                color = [1.0, 0.55, 0.0]  # orange
+            else:
+                continue
+
+            fc_blends[r.face_indices] = color
+            blend_region_ids.append((r.region_id, kind))
+
+        n_fil = sum(1 for _, k in blend_region_ids if k == "fillet")
+        n_cha = sum(1 for _, k in blend_region_ids if k == "chamfer")
+        logger.info(
+            "Blend regions: %d fillet + %d chamfer (from segmentation regions)",
+            n_fil, n_cha,
+        )
+        job.progress_stage = (
+            f"Blend regions: {n_fil} fillet + {n_cha} chamfer "
+            f"(non-plane regions adjacent to planes)"
+        )
+        _set_mesh_viz(cleaned, face_colors=fc_blends)
+        if job.step_through:
+            _pause_for_review()
+        else:
+            time.sleep(0.8)
+
+        # Peel records collected AFTER the viz — now try to actually peel
+        # each highlighted region. Use the geometric validators internally
+        # but don't let them change what the viz showed.
         peeled_records: list = []
         try:
             region_based = identify_blends_from_topology(
@@ -344,8 +424,6 @@ class JobQueue:
                 rec.setdefault("kind", "fillet")
             for rec in tri_chamfers:
                 rec.setdefault("kind", "chamfer")
-            # Merge triangle-based records that don't overlap existing
-            # region-based records (by axis direction + axis point proximity).
             def _overlaps(new, existing_list):
                 n_ad = np.asarray(new["axis_dir"], dtype=float)
                 n_ad = n_ad / (np.linalg.norm(n_ad) + 1e-15)
@@ -367,56 +445,6 @@ class JobQueue:
                     peeled_records.append(rec)
         except Exception:
             logger.exception("triangle-based blend detection failed")
-
-        n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
-        n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
-        n_rb = len(region_based)
-        n_tb = len(peeled_records) - n_rb
-
-        # Build the viz by starting from the SAME data as pre-peel analysis
-        # (every non-plane segmentation region, excluding obvious fit-noise)
-        # so the user sees the same fillet highlights carried over. Then
-        # overlay the confirmed blend records on top in a brighter color
-        # to indicate which regions the peel will actually act on.
-        fc_blends = np.full((len(cleaned.faces), 3), 0.65)
-        # Base layer: non-plane regions from segmentation, drawn in muted
-        # cyan/orange so they're visible as candidate blends.
-        try:
-            from mesh2param.models.region import SurfaceType as _ST
-            bbox_diag_local = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
-            for r, f in zip(pp_regions, pp_fitted):
-                if f.surface_type == _ST.PLANE:
-                    continue
-                # Skip huge-radius fit noise (the fitter sometimes lands a
-                # "cylinder" with r=14000+ on a large plate face).
-                rr = float(f.params.get("radius", 0) or 0)
-                if rr > bbox_diag_local * 0.15:
-                    continue
-                if r.num_faces > 600:
-                    continue
-                # Muted cyan for curved strip candidates.
-                fc_blends[r.face_indices] = [0.25, 0.55, 0.75]
-        except Exception:
-            pass
-        # Top layer: validated blend records — brighter so they stand out.
-        for rec in peeled_records:
-            idx = rec.get("face_indices")
-            if idx is None or len(idx) == 0:
-                continue
-            color = (
-                [1.0, 0.55, 0.0] if rec.get("kind") == "chamfer"
-                else [0.0, 0.95, 1.0]
-            )
-            fc_blends[idx] = color
-        job.progress_stage = (
-            f"Blend regions: {n_fil} fillet + {n_cha} chamfer confirmed "
-            f"(bright) — muted cyan = other curved regions"
-        )
-        _set_mesh_viz(cleaned, face_colors=fc_blends)
-        if job.step_through:
-            _pause_for_review()
-        else:
-            time.sleep(0.8)
 
         # --- 1.75c: Apply the peel (modify the mesh) ---
         try:

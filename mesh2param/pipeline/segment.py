@@ -8,7 +8,7 @@ classification.
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -57,13 +57,58 @@ def segment_mesh(
         logger.debug("Region growing produced %d unique labels", len(np.unique(labels)))
         labels = _merge_small_regions(labels, adjacency, cleaned.normals, config.min_region_faces)
         labels = _split_flat_from_curved(labels, cleaned.normals, adjacency)
-        # Use a smaller min_faces for the post-split merge so that small flat
-        # strips (e.g. 2-4 face plane regions between cylinder holes) don't get
-        # re-absorbed into the adjacent cylinder region they were just split from.
+        # _split_flat_from_curved peels flat faces out of a mixed
+        # region but leaves the remaining "curved" faces under one
+        # label even when they form mesh-disconnected components
+        # (e.g. after peeling the plate, the bore cylinder wall and
+        # the perimeter rolled fillets end up in one label despite
+        # being physically separated by the now-extracted plate).
+        # Split labels into one-per-connected-component so each
+        # feature gets its own highlight.
+        labels = _split_disconnected_components(labels, adjacency)
         labels = _merge_small_regions(labels, adjacency, cleaned.normals, min(config.min_region_faces, 2))
         labels = _curvature_split(labels, cleaned, adjacency, config)
         labels = _split_cylinders_from_planes(labels, cleaned, adjacency)
         labels = _merge_adjacent_cylinder_fragments(labels, cleaned, adjacency)
+        # Final pass: every spatially-contiguous cylindrical
+        # feature (detected via local rank-2 normal structure)
+        # becomes one region, regardless of how prior passes may
+        # have split it. This specifically fixes the "inner bore
+        # surface split into 4-5 regions" case where flood-fill
+        # seeds pick different cardinal positions.
+        labels = _unify_cylinder_features(labels, cleaned, adjacency)
+        # Re-split: DBSCAN inside the unifier can bridge
+        # mesh-disconnected components (e.g. the front rim fillet
+        # of a through-hole and the back rim fillet, separated by
+        # the plate's thickness but within DBSCAN's eps). They
+        # share a label but are physically separate features —
+        # they must be distinct regions so each can be rendered
+        # and fitted independently. Only split components that
+        # would each be substantial (>=50 faces) so we don't
+        # fragment tabs where the bore wall and the local
+        # through-hole rim are intentionally one region.
+        labels = _split_disconnected_components(labels, adjacency, min_component_faces=50)
+        # Final cleanup: peel axial "tangent-strip" faces that got
+        # into curved regions. The first row of a rim fillet has
+        # normals so close to the plate's normal (within 5–10°
+        # of pure axial) that region growing absorbs them with
+        # the rim, leaving each rim region with a ring of flat
+        # faces tangent to the adjacent plate. Visually they
+        # render as if the rim is "connected to the flat face
+        # next to it". Peel those into their own region.
+        labels = _peel_axial_tangents_from_curves(
+            labels, cleaned.normals, adjacency,
+        )
+        # Peel rim fillets out of plate-spanning frame regions.
+        # Small through-holes' rim fillets end up mesh-connected
+        # to the rolled-edge perimeter of the plate, so region
+        # growing assigns them to the big frame-half region that
+        # spans the whole plate. Visually the rim fillet then
+        # paints with the same color as the outer rolled edge
+        # ("connected to the outside flat plane"). This pass
+        # extracts hole-local rim fillet faces into their own
+        # per-hole regions.
+        labels = _peel_hole_rim_fillets(labels, cleaned, adjacency)
     except Exception:
         logger.exception(
             "Stage 2 failed during segmentation passes: faces=%d, labels_shape=%s",
@@ -270,6 +315,293 @@ def _merge_small_regions(
     return labels
 
 
+def _peel_hole_rim_fillets(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Peel each through-hole's rim fillet into its own region
+    when it's absorbed into a plate-spanning frame region.
+
+    Detects through-holes by clustering radial-normal faces
+    (perpendicular to a world axis) via DBSCAN. For each hole,
+    finds nearby faces with rim-fillet normal signature
+    (|n · axis| in [0.3, 0.95]) — those are the torus arc from
+    the bore wall to the plate. Splits them by front vs back
+    face side (sign of n · axis) and, for each side, reassigns
+    the hole-local faces to their own new label — but only when
+    the dominant source label is plate-spanning (its bbox is much
+    larger than the hole). When the rim already sits in a
+    hole-local region, this pass is a no-op.
+    """
+    from sklearn.cluster import DBSCAN
+
+    labels = labels.copy()
+    normals = cleaned.normals
+    verts = cleaned.vertices
+    n_faces = len(normals)
+
+    centroids = np.array([
+        verts[cleaned.faces[fi]].mean(axis=0) for fi in range(n_faces)
+    ])
+    next_label = int(labels.max()) + 1
+
+    for axis_idx, axis_vec in enumerate(np.eye(3)):
+        radial = np.where(np.abs(normals[:, axis_idx]) < 0.25)[0]
+        if len(radial) < 10:
+            continue
+        perp_idx = [i for i in range(3) if i != axis_idx]
+        proj = centroids[radial][:, perp_idx]
+        db = DBSCAN(eps=3.0, min_samples=10).fit(proj)
+
+        for cl in set(db.labels_):
+            if cl == -1:
+                continue
+            mask = db.labels_ == cl
+            hole_faces = radial[mask]
+            hc = centroids[hole_faces]
+            hole_bb = hc.max(axis=0) - hc.min(axis=0)
+            # Cylindrical through-hole criteria (filter out plate
+            # surfaces that happen to have faces with a small
+            # component along this axis):
+            #   1. Both perpendicular dims > 1mm (not a slit)
+            #   2. Perpendicular dims are similar — the cluster
+            #      is ROUND, not an elongated rectangle. Ratio
+            #      short/long >= 0.6 admits circles with some
+            #      tessellation noise but excludes plate top
+            #      surfaces (ratio << 0.5 for 146x75 plates).
+            #   3. Both perpendicular dims bounded (< 50mm).
+            #      No real through-hole in this model is that
+            #      wide. This is the gate that prevents the
+            #      bottom plate's own flat top from being treated
+            #      as a "hole" and having spurious rim regions
+            #      peeled out of it.
+            perp_dims = sorted([hole_bb[p] for p in perp_idx])
+            if perp_dims[0] < 1.0:
+                continue
+            if perp_dims[0] / perp_dims[1] < 0.6:
+                continue  # not round enough
+            if perp_dims[1] > 50.0:
+                continue  # too big to be a through-hole
+            # Genuine 360° cylindrical feature: normals cover all
+            # directions around the axis → their mean magnitude
+            # is near zero. A partial rolled edge of the plate's
+            # own perimeter covers only ~90-180° (mean magnitude
+            # 0.6+) and must NOT be treated as a through-hole.
+            mean_n = normals[hole_faces].mean(axis=0)
+            if float(np.linalg.norm(mean_n)) > 0.35:
+                continue
+            hole_center = hc.mean(axis=0)
+            hole_diam = perp_dims[1]
+
+            # Rim fillet candidates: near the hole in the
+            # perpendicular plane AND normal tilted (0.3–0.95 of
+            # axis component). "Near" = within 1.2× hole radius.
+            dyz = np.linalg.norm(
+                centroids[:, perp_idx] - hole_center[perp_idx], axis=1
+            )
+            near_mask = dyz < hole_diam * 0.8
+            axial = np.abs(normals[:, axis_idx])
+            rim_mask = near_mask & (axial > 0.3) & (axial < 0.95)
+            rim_faces = np.where(rim_mask)[0]
+            if len(rim_faces) < 10:
+                continue
+
+            # Split front / back by sign of the axial component.
+            signed_axial = normals[rim_faces, axis_idx]
+            for side_sign, _name in [(1, "front"), (-1, "back")]:
+                side_faces = rim_faces[
+                    np.sign(signed_axial) == side_sign
+                ]
+                if len(side_faces) < 10:
+                    continue
+
+                # Check if the dominant source label is
+                # plate-spanning (bbox in perpendicular plane
+                # > 2× hole diameter). If not, the rim is
+                # already local — nothing to peel.
+                src_labels = Counter(
+                    int(labels[fi]) for fi in side_faces
+                )
+                dominant_lbl, dominant_n = src_labels.most_common(1)[0]
+                if dominant_n < len(side_faces) * 0.5:
+                    # Rim already split; don't intervene
+                    continue
+                lbl_faces = np.where(labels == dominant_lbl)[0]
+                lbl_centroids = centroids[lbl_faces]
+                lbl_bb = lbl_centroids.max(axis=0) - lbl_centroids.min(axis=0)
+                lbl_max_perp = max(lbl_bb[p] for p in perp_idx)
+                if lbl_max_perp <= hole_diam * 2.0:
+                    continue  # dominant source is already local
+
+                # Reassign side_faces to a new label.
+                for fi in side_faces:
+                    labels[fi] = next_label
+                next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    return labels
+
+
+def _peel_axial_tangents_from_curves(
+    labels: np.ndarray,
+    normals: np.ndarray,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Peel nearly-axial faces out of curved regions.
+
+    When a region classified as "curved" (mean-normal magnitude
+    ≤ 0.9) contains a connected component of faces whose normals
+    are nearly parallel to a principal axis (|n·axis| ≥ 0.95),
+    those faces are the tangent edge of the fillet meeting a flat
+    plate — NOT part of the rim fillet arc proper. Leaving them
+    inside the rim region makes the rim visually "connect to the
+    flat face next to it" and conflates two distinct features
+    (flat tangent + fillet arc) under one highlight. This pass
+    extracts them into their own region so each feature renders
+    and fits independently.
+
+    Only peels components of ≥10 mesh-connected axial faces
+    (noise-level slivers stay in place).
+    """
+    labels = labels.copy()
+    next_label = int(labels.max()) + 1
+    # Tight threshold (~10° from axis = dot ≥ 0.985): catches
+    # only the truly axis-aligned first row of a fillet — faces
+    # whose normal is essentially the same as the adjacent
+    # plate's. Looser thresholds (32° / 0.85) caught mid-fillet
+    # faces too and split rolled-edge fillets into 2-3 segments
+    # along their length. Rim-fillet vs plate separation for
+    # through-holes is handled instead by _peel_hole_rim_fillets,
+    # which is hole-targeted and doesn't fragment rolled edges.
+    axis_cos_threshold = np.cos(np.radians(10.0))  # ≥ ~0.985
+
+    for old_label in np.unique(labels):
+        face_indices = np.where(labels == old_label)[0]
+        if len(face_indices) < 20:
+            continue
+        region_normals = normals[face_indices]
+        mean_n = region_normals.mean(axis=0)
+        mean_mag = float(np.linalg.norm(mean_n))
+        if mean_mag >= 0.9:
+            continue  # already a tight planar cluster, nothing to peel
+        if mean_mag <= 0.3:
+            continue  # 360° rotating feature (bore wall) — its
+            # cardinal-axis rows ARE part of the cylinder, not
+            # tangent-to-plate strips. Leave them.
+
+        # Flag faces whose normal is very close to a principal axis.
+        axial_mask = np.max(np.abs(region_normals), axis=1) >= axis_cos_threshold
+        if axial_mask.sum() < 10:
+            continue
+
+        axial_face_set = set(face_indices[axial_mask].tolist())
+        # Connected components of axial faces within this region.
+        visited: set[int] = set()
+        for seed in axial_face_set:
+            if seed in visited:
+                continue
+            component = {seed}
+            queue = [seed]
+            visited.add(seed)
+            while queue:
+                cur = queue.pop()
+                for nb in adjacency.get(cur, ()):
+                    if nb in axial_face_set and nb not in visited:
+                        visited.add(nb)
+                        component.add(nb)
+                        queue.append(nb)
+            if len(component) < 10:
+                continue
+            # Verify the component IS coherently pointing at one
+            # axis (mean-normal magnitude ≥ 0.95 ≈ within ~18° of
+            # one direction). This excludes axial-ish noise that
+            # happens to cluster but covers multiple axis
+            # directions, while still admitting genuine
+            # near-tangent first-row strips of a fillet.
+            comp_normals = normals[list(component)]
+            comp_mag = float(np.linalg.norm(comp_normals.mean(axis=0)))
+            if comp_mag < 0.95:
+                continue
+            for fi in component:
+                labels[fi] = next_label
+            next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    return labels
+
+
+def _split_disconnected_components(
+    labels: np.ndarray,
+    adjacency: dict[int, set[int]],
+    min_component_faces: int = 1,
+) -> np.ndarray:
+    """Split each label into one label per mesh-connected component,
+    subject to a minimum component size.
+
+    Earlier passes (specifically _split_flat_from_curved, which
+    pulls out flat faces without re-labelling the remaining curved
+    ones) can leave a single label referring to multiple
+    mesh-disconnected face clusters. Downstream fits and visuals
+    treat a label as a single region, so two physically separate
+    features sharing a label would render as one highlight spanning
+    both.
+
+    `min_component_faces` gates how aggressive the split is — tiny
+    disconnected slivers (< threshold) stay with the largest
+    component's label so a multi-feature region (like a bottom
+    plate with 4 tabs) doesn't explode into dozens of noise regions.
+    """
+    labels = labels.copy()
+    next_label = int(labels.max()) + 1
+    for old_label in np.unique(labels):
+        face_indices = np.where(labels == old_label)[0]
+        if len(face_indices) <= 1:
+            continue
+        # Find all components
+        remaining = set(face_indices.tolist())
+        components: list[set[int]] = []
+        while remaining:
+            seed = next(iter(remaining))
+            component = {seed}
+            queue = [seed]
+            remaining.discard(seed)
+            while queue:
+                cur = queue.pop()
+                for nb in adjacency.get(cur, ()):
+                    if nb in remaining:
+                        remaining.discard(nb)
+                        component.add(nb)
+                        queue.append(nb)
+            components.append(component)
+        if len(components) <= 1:
+            continue
+        # Largest component keeps old_label. Only components ≥
+        # min_component_faces become their own region; smaller ones
+        # stay under old_label (joined with the largest component,
+        # which merges them visually under the same color).
+        components.sort(key=len, reverse=True)
+        for comp in components[1:]:
+            if len(comp) >= min_component_faces:
+                for fi in comp:
+                    labels[fi] = next_label
+                next_label += 1
+            # else: keep old_label (same as components[0]) — tiny
+            # slivers don't get their own region
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    return labels
+
+
 def _split_flat_from_curved(
     labels: np.ndarray,
     normals: np.ndarray,
@@ -305,6 +637,21 @@ def _split_flat_from_curved(
             # Already a tight planar cluster — skip
             continue
 
+        # Cylinder-parent guard: if the region's normals are rank-2
+        # (a single rotating-normal arc like a bore wall), its
+        # ±cardinal-direction strips are axis-aligned faces that
+        # happen to land where the arc crosses a principal axis —
+        # they're geometrically part of the cylinder and must NOT
+        # be peeled off as "flat" sub-regions. Without this guard,
+        # a 360° bore becomes 1 curved region + 4 cardinal strips.
+        if len(region_normals) >= 3:
+            centered_n = region_normals - avg_n
+            _, s_vals, _ = np.linalg.svd(centered_n, full_matrices=False)
+            if s_vals[0] > 1e-12:
+                s_norm = s_vals / s_vals[0]
+                if s_norm[1] > 0.3 and s_norm[2] < 0.2:
+                    continue  # cylinder-like — preserve whole
+
         # Classify each face as flat or curved
         # A face is flat if its normal is within ~15° of a principal axis
         axis_threshold = np.cos(np.radians(15.0))
@@ -336,14 +683,18 @@ def _split_flat_from_curved(
                     if ni in flat_faces and ni not in visited:
                         queue.append(ni)
 
-            if len(component) >= 2:
-                # Split this flat component into its own region, but only
-                # if the flat faces share a similar normal direction
+            # Only peel substantial flat components. Tiny slivers
+            # (<10 faces) are usually noise at the fillet-to-flat
+            # boundary — splitting them creates dozens of 2-6 face
+            # regions on complex bodies (the bottom plate's 4 tabs
+            # was the motivating case). Leaving them with the
+            # curved majority means they paint as part of the fillet
+            # instead of as their own highlight.
+            if len(component) >= 10:
                 comp_normals = normals[component]
                 comp_avg = comp_normals.mean(axis=0)
                 comp_norm = np.linalg.norm(comp_avg)
                 if comp_norm > 0.9:
-                    # Reasonably tight cluster — split it out
                     for fi in component:
                         labels[fi] = next_label
                     next_label += 1
@@ -391,18 +742,39 @@ def _curvature_split(
         # A uniform cylinder has all faces at the same curvature (=1/radius)
         # but with rotating normals. Don't split it — keep it as one region
         # so the cylinder fitter sees a full ring of faces.
-        # Test: if the curvature values are tightly clustered (coefficient
-        # of variation < 0.3), this is a single analytic surface and
-        # should stay whole.
+        #
+        # Protection 1 — uniform curvature: loose (cv < 0.6) because
+        # per-face Gaussian curvature estimates are noisy on real
+        # meshes; a true cylinder has cv ≈ 0 analytically but 0.3–0.5
+        # in practice. At cv < 0.6 we avoid splitting real cylinders
+        # whose noise is within expected bounds.
         curv_mean = float(np.mean(np.abs(region_curvatures)))
         if curv_mean > 1e-10:
             curv_cv = float(np.std(region_curvatures)) / curv_mean
-            if curv_cv < 0.3:
-                # Uniform curvature → single cylinder/sphere/cone, don't split
+            if curv_cv < 0.6:
                 continue
 
-        # Build feature vectors: (nx, ny, nz, curvature)
+        # Protection 2 — rank-2 normals: a cylinder/rolled-arc's
+        # normals all lie in the plane perpendicular to the axis of
+        # rotation. SVD of centered normals has BOTH a near-zero
+        # third singular value AND a substantial second singular
+        # value (real arc spread in the plane, not just plate
+        # noise). Require s[2]/s[0] < 0.2 AND s[1]/s[0] > 0.3:
+        # KMeans on a single rotating-normal feature would chop
+        # the arc into cardinal quadrants (the "every 90°" split
+        # we want to avoid), while a mostly-plate region with a
+        # small tangent attached has low s[1]/s[0] and correctly
+        # proceeds to splitting.
         region_normals = cleaned.normals[mask]
+        if len(region_normals) >= 3:
+            centered_n = region_normals - region_normals.mean(axis=0)
+            _, s_vals, _ = np.linalg.svd(centered_n, full_matrices=False)
+            if s_vals[0] > 1e-12:
+                s_norm = s_vals / s_vals[0]
+                if s_norm[1] > 0.3 and s_norm[2] < 0.2:
+                    continue  # rank-2 rotating-normal arc → protect
+
+        # Build feature vectors: (nx, ny, nz, curvature)
         features = np.column_stack([region_normals, region_curvatures])
 
         # Try 2 to max_clusters and pick the best silhouette
@@ -502,6 +874,182 @@ def _split_cylinders_from_planes(
     remap = {old: new for new, old in enumerate(unique)}
     labels = np.array([remap[l] for l in labels], dtype=np.int64)
 
+    return labels
+
+
+def _unify_cylinder_features(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Find every connected cylindrical feature in the mesh and
+    collapse it into a single region, overriding whatever label
+    assignment the prior passes produced.
+
+    A "cylinder face" is identified locally: its 2-hop mesh
+    neighborhood has rank-2 normal structure (s[1] substantial,
+    s[2] near zero) — i.e. normals that rotate in a single plane,
+    the signature of any cylindrical surface (bore wall, rolled
+    edge, rim fillet) regardless of direction. These faces are
+    clustered spatially; each spatial cluster becomes one region.
+
+    Fixes the "one through-hole ends up split across 4-5 regions"
+    issue: flood-fill + per-region splitters fragment a single
+    cylinder whenever the flood-fill picks seeds at different
+    cardinal positions, and the existing fragment merger is too
+    restrictive (sub-50-face candidates only). This pass works
+    from the geometry outwards rather than trying to clean up
+    after mesh-adjacency flood-fill.
+    """
+    from sklearn.cluster import DBSCAN
+
+    labels = labels.copy()
+    normals = cleaned.normals
+    n_faces = len(normals)
+
+    # 1. Identify cylinder-face candidates via 2-hop SVD rank-2.
+    is_cylinder_face = np.zeros(n_faces, dtype=bool)
+    for fi in range(n_faces):
+        hop1 = adjacency.get(fi, set())
+        hop2: set[int] = set()
+        for f1 in hop1:
+            hop2.update(adjacency.get(f1, set()))
+        nbrhd = list(hop1 | hop2 | {fi})
+        if len(nbrhd) < 6:
+            continue
+        nb_n = normals[nbrhd]
+        centered = nb_n - nb_n.mean(axis=0)
+        _, s, _ = np.linalg.svd(centered, full_matrices=False)
+        if s[0] < 1e-10:
+            continue
+        s_n = s / s[0]
+        # Rank-2: enough in-plane spread (s[1] > 0.2) AND
+        # little out-of-plane spread (s[2] < 0.3). Loose enough
+        # to catch faces at the bore-rim junction where the 2-hop
+        # neighborhood samples both the bore's arc AND the rim
+        # fillet's arc, making strict rank-2 fail. Plates still
+        # fail because s[1] ≈ 0 there.
+        if s_n[1] > 0.2 and s_n[2] < 0.3:
+            is_cylinder_face[fi] = True
+
+    cyl_indices = np.where(is_cylinder_face)[0]
+    if len(cyl_indices) < 4:
+        return labels
+
+    # 2. Cluster cylinder faces spatially (DBSCAN on centroids).
+    # Each connected cylindrical feature forms one cluster.
+    centroids = np.array([
+        cleaned.vertices[cleaned.faces[fi]].mean(axis=0)
+        for fi in cyl_indices
+    ])
+    bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+    # eps tuned to be larger than face size but smaller than the
+    # distance between distinct features. 2% of bbox diagonal works
+    # empirically for brackets and plates.
+    eps = max(bbox_diag * 0.02, 2.0)
+    clustering = DBSCAN(eps=eps, min_samples=3).fit(centroids)
+
+    # For each DBSCAN cluster, find the cluster's dominant
+    # rotation axis (direction of smallest variance in normals,
+    # i.e. 3rd right singular vector) and filter to PURE-CYLINDER
+    # faces whose normal is perpendicular to that axis. This
+    # excludes rim-fillet (torus) faces that mingle with the bore
+    # wall in the same spatial cluster but whose normals have an
+    # axial component — they need to remain in their own region
+    # so downstream fillet detection can see them.
+    next_label = int(labels.max()) + 1
+    face_centroid_cache: dict[int, np.ndarray] = {}
+
+    def _face_centroid(fi: int) -> np.ndarray:
+        c = face_centroid_cache.get(fi)
+        if c is None:
+            c = cleaned.vertices[cleaned.faces[fi]].mean(axis=0)
+            face_centroid_cache[fi] = c
+        return c
+
+    for cl in set(clustering.labels_):
+        if cl == -1:
+            continue
+        cluster_faces = cyl_indices[clustering.labels_ == cl]
+        if len(cluster_faces) < 4:
+            continue
+
+        # Find cluster rotation axis. Prefer world axes (X/Y/Z) —
+        # prismatic parts have bore/roll axes aligned to the part
+        # frame. Choose the world axis with the MOST cluster-face
+        # normals perpendicular to it (|n·axis| < 0.25). If no
+        # world axis beats the SVD's 3rd direction by a clear
+        # margin, fall back to SVD (for non-axis-aligned bores).
+        cn = normals[cluster_faces]
+        best_axis = None
+        best_count = 0
+        for candidate in np.eye(3):
+            count = int((np.abs(cn @ candidate) < 0.25).sum())
+            if count > best_count:
+                best_count = count
+                best_axis = candidate
+        # SVD fallback
+        centered_cn = cn - cn.mean(axis=0)
+        _, _, vh = np.linalg.svd(centered_cn, full_matrices=False)
+        svd_axis = vh[2]
+        svd_count = int((np.abs(cn @ svd_axis) < 0.25).sum())
+        if svd_count > best_count * 1.1:
+            axis = svd_axis
+        else:
+            axis = best_axis
+
+        # Keep only faces whose normal is perpendicular to axis
+        # (|n · axis| < 0.25 ≈ > 75° from axis). Bore-wall
+        # normals are radial, rim-fillet normals tilt toward the
+        # axis — this discriminates them.
+        axial_dots = np.abs(cn @ axis)
+        pure_cyl_mask = axial_dots < 0.25
+        pure_cyl_faces = cluster_faces[pure_cyl_mask]
+        if len(pure_cyl_faces) < 4:
+            continue
+
+        # Cluster bbox for adjacency-based grow (only extends to
+        # neighbors within the cluster's spatial footprint).
+        cc = np.array([_face_centroid(int(fi)) for fi in pure_cyl_faces])
+        c_min = cc.min(axis=0) - eps
+        c_max = cc.max(axis=0) + eps
+
+        # Grow by mesh adjacency: absorb mesh-neighbor faces that
+        # are ALSO perpendicular-to-axis AND within the bbox.
+        # Absorbs bore-wall faces the initial SVD rank check
+        # missed (e.g. at the rim-wall junction) without
+        # swallowing the rim fillet itself.
+        absorbed = set(int(fi) for fi in pure_cyl_faces)
+        frontier = set(absorbed)
+        for _hop in range(2):
+            next_frontier: set[int] = set()
+            for fi in frontier:
+                for nb in adjacency.get(fi, ()):
+                    if nb in absorbed:
+                        continue
+                    nb_axial = abs(float(normals[nb] @ axis))
+                    if nb_axial >= 0.25:
+                        continue  # not a bore-wall normal
+                    c = _face_centroid(int(nb))
+                    if np.all(c >= c_min) and np.all(c <= c_max):
+                        absorbed.add(int(nb))
+                        next_frontier.add(int(nb))
+            frontier = next_frontier
+
+        existing_labels = Counter(int(labels[fi]) for fi in absorbed)
+        best_existing, best_count = existing_labels.most_common(1)[0]
+        if best_count / len(absorbed) >= 0.8:
+            target_label = best_existing
+        else:
+            target_label = next_label
+            next_label += 1
+        for fi in absorbed:
+            labels[fi] = target_label
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
     return labels
 
 

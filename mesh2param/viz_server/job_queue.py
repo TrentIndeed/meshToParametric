@@ -30,6 +30,70 @@ logger = logging.getLogger(__name__)
 MAX_JOBS = 50  # max completed jobs to keep in memory
 
 
+def _color_regions_no_adjacent_match(regions, sub_cleaned, palette):
+    """Assign each region a color from the palette such that no two
+    mesh-adjacent regions share the same color.
+
+    Greedy graph-coloring: visit regions in size order (largest
+    first), and pick the first palette entry that none of its
+    already-colored adjacent neighbors are using. If every palette
+    color is taken (shouldn't happen with a 12-color palette since
+    a 3D mesh region rarely has 12 distinct neighbors), fall back
+    to the next palette index by region order.
+
+    Returns a dict region_id -> [r, g, b].
+    """
+    from collections import defaultdict
+
+    # Build region adjacency from face adjacency.
+    face_to_region: dict[int, int] = {}
+    for r in regions:
+        for fi in r.face_indices:
+            face_to_region[int(fi)] = r.region_id
+
+    # Edge-shared face adjacency
+    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for fi, face in enumerate(sub_cleaned.faces):
+        for i in range(3):
+            v0, v1 = int(face[i]), int(face[(i + 1) % 3])
+            edge = (min(v0, v1), max(v0, v1))
+            edge_to_faces[edge].append(fi)
+
+    region_neighbors: dict[int, set[int]] = defaultdict(set)
+    for face_list in edge_to_faces.values():
+        for i in range(len(face_list)):
+            ri = face_to_region.get(face_list[i])
+            if ri is None:
+                continue
+            for j in range(i + 1, len(face_list)):
+                rj = face_to_region.get(face_list[j])
+                if rj is None or rj == ri:
+                    continue
+                region_neighbors[ri].add(rj)
+                region_neighbors[rj].add(ri)
+
+    # Greedy color assignment, largest regions first (so big visual
+    # blobs get the most-distinct colors).
+    sorted_regions = sorted(regions, key=lambda r: -r.num_faces)
+    color_idx_for: dict[int, int] = {}
+    for r in sorted_regions:
+        used = {
+            color_idx_for[n]
+            for n in region_neighbors.get(r.region_id, set())
+            if n in color_idx_for
+        }
+        chosen = None
+        for ci in range(len(palette)):
+            if ci not in used:
+                chosen = ci
+                break
+        if chosen is None:
+            # Palette exhausted by neighbors — fallback to round-robin
+            chosen = r.region_id % len(palette)
+        color_idx_for[r.region_id] = chosen
+    return {rid: palette[ci] for rid, ci in color_idx_for.items()}
+
+
 @dataclass
 class Job:
     id: str
@@ -249,236 +313,18 @@ class JobQueue:
 
         _set_mesh_viz(cleaned)
 
-        # Stage 1.75: Region-based fillet / chamfer peel.
-        #
-        # Runs a full segment → fit → topology pass on the WHOLE mesh,
-        # then identifies each plane-to-plane blend (fillet cylinder or
-        # chamfer strip) from the adjacency graph and peels only those
-        # specific regions. Unlike the old triangle-level detector, this
-        # only touches surfaces that the segmenter classified as planes
-        # connected by a blend region — so it never acts on random curved
-        # patches or cylinder walls, and is naturally symmetric.
-        from mesh2param.pipeline.peel_via_topology import (
-            detect_and_peel_blends_whole_mesh,
-            identify_blends_from_topology,
-        )
+        # Whole-mesh segment + peel was REMOVED. It modified `cleaned`
+        # in-place before decomposition, so per-body segmentation saw
+        # an already-peeled mesh with no fillets left to find. Blend
+        # records now come from the per-body pass and get cross-body
+        # reconciliation (see reconcile_fillets.py).
         from mesh2param.pipeline.segment import segment_mesh
         from mesh2param.pipeline.fit import fit_surfaces
         from mesh2param.pipeline.topology import build_topology
         from mesh2param.config import SegmentConfig, FitConfig, TopologyConfig
 
-        job.progress = 5
-
-        pre_peel_face_count = len(cleaned.faces)
-        pre_peel_vert_count = len(cleaned.vertices)
-
-        # --- 1.75a: Whole-mesh analysis (segment + fit + topology) ---
-        # This produces the region graph the peel will walk. Step through
-        # users see the mesh colored by primitive type (plane vs cylinder
-        # vs cone vs sphere) so the "what are the flat faces" step is
-        # explicit.
-        try:
-            job.progress_stage = "Pre-peel: segmenting whole mesh..."
-            pp_regions = segment_mesh(cleaned, SegmentConfig())
-            pp_fitted = fit_surfaces(pp_regions, cleaned, FitConfig())
-            _pp_graph, pp_edges = build_topology(
-                pp_regions, pp_fitted, cleaned, TopologyConfig(),
-            )
-
-            # Face colors by surface primitive type.
-            st_colors = {
-                'PLANE': [0.0, 0.55, 1.0],
-                'CYLINDER': [0.0, 1.0, 0.25],
-                'CONE': [1.0, 0.35, 0.0],
-                'SPHERE': [1.0, 0.0, 0.55],
-            }
-            fc_regions = np.full((len(cleaned.faces), 3), 0.55)
-            for r, f in zip(pp_regions, pp_fitted):
-                color = st_colors.get(f.surface_type.name, [0.55, 0.55, 0.55])
-                if len(r.face_indices) > 0:
-                    fc_regions[r.face_indices] = color
-            n_plane = sum(1 for f in pp_fitted if f.surface_type.name == 'PLANE')
-            n_cyl = sum(1 for f in pp_fitted if f.surface_type.name == 'CYLINDER')
-            job.progress_stage = (
-                f"Pre-peel analysis: {len(pp_regions)} regions "
-                f"({n_plane} planes, {n_cyl} cylinders), {len(pp_edges)} adjacencies"
-            )
-            _set_mesh_viz(cleaned, face_colors=fc_regions)
-            if job.step_through:
-                _pause_for_review()
-            else:
-                time.sleep(0.8)
-        except Exception:
-            logger.exception("Pre-peel whole-mesh analysis failed")
-            pp_regions, pp_fitted, pp_edges = [], [], []
-
-        # --- 1.75b: Identify blend regions between flat faces ---
-        # A blend region is, by definition, a non-plane region that is
-        # adjacent to plane regions. That's it. Segmentation + fit has
-        # already classified every region as PLANE / CYLINDER / SPHERE /
-        # CONE; topology has already built the adjacency graph. We just
-        # walk that graph and classify each non-plane region as:
-        #     fillet  — cylinder, sphere, or cone next to planes
-        #     chamfer — small narrow plane next to larger planes (bevel
-        #               strip between flat faces)
-        # Two filters to reject obvious noise:
-        #   - radius <= 15% of bbox_diag (drops the 10000+ mm cylinder
-        #     fits that are really misfit plate faces)
-        #   - face count <= 600 (drops whole-plate misfits)
-        # Everything else that qualifies as a blend gets highlighted.
-        # The PEEL runs silently afterwards and modifies the mesh only
-        # for blends where it can compute a valid plane-intersection
-        # line — any blend it can't peel still shows up in the viz.
-        from mesh2param.models.region import SurfaceType as _ST
-        from collections import defaultdict as _dd
-
-        region_lookup = {r.region_id: r for r in pp_regions}
-        fitted_lookup = {f.region_id: f for f in pp_fitted}
-        adj_by_region: dict[int, list[int]] = _dd(list)
-        for e in pp_edges:
-            adj_by_region[e.surface_a_id].append(e.surface_b_id)
-            adj_by_region[e.surface_b_id].append(e.surface_a_id)
-
-        bbox_diag_local = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
-        fc_blends = np.full((len(cleaned.faces), 3), 0.65)
-        blend_region_ids: list[tuple[int, str]] = []  # (rid, kind)
-
-        for r in pp_regions:
-            f = fitted_lookup.get(r.region_id)
-            if f is None:
-                continue
-            # Count plane neighbors through the adjacency graph.
-            plane_nbr_count = sum(
-                1 for nbr_rid in adj_by_region.get(r.region_id, [])
-                if fitted_lookup.get(nbr_rid)
-                and fitted_lookup[nbr_rid].surface_type == _ST.PLANE
-            )
-            if plane_nbr_count < 1:
-                continue
-            rr = float(f.params.get("radius", 0) or 0)
-            if rr > bbox_diag_local * 0.15:
-                continue
-            if r.num_faces > 600:
-                continue
-
-            if f.surface_type in (_ST.CYLINDER, _ST.SPHERE, _ST.CONE):
-                kind = "fillet"
-                color = [0.0, 0.9, 0.95]  # cyan
-            elif f.surface_type == _ST.PLANE:
-                # Narrow plane strip between larger planes = chamfer.
-                # Require small region + at least 2 plane neighbors.
-                if r.num_faces > 40 or plane_nbr_count < 2:
-                    continue
-                # And at least one adjacent plane must be much bigger.
-                larger_nbr = any(
-                    region_lookup.get(nbr).num_faces > r.num_faces * 3
-                    for nbr in adj_by_region.get(r.region_id, [])
-                    if nbr in region_lookup
-                )
-                if not larger_nbr:
-                    continue
-                kind = "chamfer"
-                color = [1.0, 0.55, 0.0]  # orange
-            else:
-                continue
-
-            fc_blends[r.face_indices] = color
-            blend_region_ids.append((r.region_id, kind))
-
-        n_fil = sum(1 for _, k in blend_region_ids if k == "fillet")
-        n_cha = sum(1 for _, k in blend_region_ids if k == "chamfer")
-        logger.info(
-            "Blend regions: %d fillet + %d chamfer (from segmentation regions)",
-            n_fil, n_cha,
-        )
-        job.progress_stage = (
-            f"Blend regions: {n_fil} fillet + {n_cha} chamfer "
-            f"(non-plane regions adjacent to planes)"
-        )
-        _set_mesh_viz(cleaned, face_colors=fc_blends)
-        if job.step_through:
-            _pause_for_review()
-        else:
-            time.sleep(0.8)
-
-        # Peel records collected AFTER the viz — now try to actually peel
-        # each highlighted region. Use the geometric validators internally
-        # but don't let them change what the viz showed.
-        peeled_records: list = []
-        try:
-            region_based = identify_blends_from_topology(
-                pp_regions, pp_fitted, pp_edges, cleaned,
-            )
-            peeled_records.extend(region_based)
-        except Exception:
-            logger.exception("identify_blends_from_topology failed")
-            region_based = []
-
-        try:
-            from mesh2param.pipeline.peel_fillets import (
-                peel_fillets as _pf_detect, peel_chamfers as _pc_detect,
-            )
-            _, tri_fillets = _pf_detect(cleaned)
-            _, tri_chamfers = _pc_detect(cleaned)
-            for rec in tri_fillets:
-                rec.setdefault("kind", "fillet")
-            for rec in tri_chamfers:
-                rec.setdefault("kind", "chamfer")
-            def _overlaps(new, existing_list):
-                n_ad = np.asarray(new["axis_dir"], dtype=float)
-                n_ad = n_ad / (np.linalg.norm(n_ad) + 1e-15)
-                n_ap = np.asarray(new["axis_point"], dtype=float)
-                for ex in existing_list:
-                    e_ad = np.asarray(ex["axis_dir"], dtype=float)
-                    e_ad = e_ad / (np.linalg.norm(e_ad) + 1e-15)
-                    if abs(float(np.dot(n_ad, e_ad))) < 0.9:
-                        continue
-                    e_ap = np.asarray(ex["axis_point"], dtype=float)
-                    rel = n_ap - e_ap
-                    along = float(rel @ e_ad)
-                    perp = rel - along * e_ad
-                    if float(np.linalg.norm(perp)) < max(new["radius"], ex["radius"]) * 2:
-                        return True
-                return False
-            for rec in tri_fillets + tri_chamfers:
-                if not _overlaps(rec, peeled_records):
-                    peeled_records.append(rec)
-        except Exception:
-            logger.exception("triangle-based blend detection failed")
-
-        # --- 1.75c: Apply the peel (modify the mesh) ---
-        try:
-            from mesh2param.pipeline.peel_via_topology import apply_blend_peel
-            peeled_cleaned = apply_blend_peel(cleaned, peeled_records)
-            n_fil = sum(1 for r in peeled_records if r.get("kind") == "fillet")
-            n_cha = sum(1 for r in peeled_records if r.get("kind") == "chamfer")
-            logger.info(
-                "Whole-mesh peel: %d fillet + %d chamfer, verts %d -> %d, "
-                "faces %d -> %d",
-                n_fil, n_cha,
-                pre_peel_vert_count, len(peeled_cleaned.vertices),
-                pre_peel_face_count, len(peeled_cleaned.faces),
-            )
-            cleaned = peeled_cleaned
-        except Exception:
-            logger.exception("apply_blend_peel failed — continuing with original mesh")
-
-        # Store for export re-apply.
-        job._peeled_fillets = peeled_records
-
-        # --- 1.75d: Show peeled mesh ---
-        try:
-            job.progress_stage = (
-                f"Peeled mesh: {n_fil} fillet(s) + {n_cha} chamfer(s) "
-                f"({pre_peel_face_count - len(cleaned.faces)} faces removed)"
-            )
-            _set_mesh_viz(cleaned)
-            if job.step_through:
-                _pause_for_review()
-            else:
-                time.sleep(0.6)
-        except Exception as _viz_exc:
-            logger.debug("peel result viz failed: %s", _viz_exc)
+        # Per-body blends populate job._peeled_fillets after decomposition.
+        job._peeled_fillets = []
 
         # Stage 1.5: Body Decomposition
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh
@@ -605,28 +451,33 @@ class JobQueue:
         job.progress = 8
         job.progress_stage = "Analyzing surfaces..."
 
-        if n_bodies > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            body_stage_data = [None] * n_bodies
-            executor = ThreadPoolExecutor(max_workers=n_bodies)
-            try:
-                futures = {executor.submit(_process_single_body, bi, b): bi
-                           for bi, b in enumerate(bodies_to_process)}
-                for future in as_completed(futures):
-                    _check_cancelled()
-                    bi = futures[future]
-                    body_stage_data[bi] = future.result()
-            except Exception:
-                # Cancel pending futures first, then wait for running ones
-                # to check their own cancel flags and exit cleanly. This
-                # prevents zombie threads from running stages in the
-                # background and blocking subsequent jobs.
-                executor.shutdown(wait=True, cancel_futures=True)
-                raise
-            else:
-                executor.shutdown(wait=True)
-        else:
-            body_stage_data = [_process_single_body(0, bodies_to_process[0])]
+        # Sequential body processing. Earlier this used a
+        # ThreadPoolExecutor with one worker per body, but scipy's
+        # least_squares / minpack and sklearn's KMeans/DBSCAN call
+        # into MKL/BLAS routines that are not thread-safe on
+        # Windows — concurrent calls across bodies produced
+        # "Windows fatal exception: access violation" crashes
+        # (sometimes in _fit_sphere, sometimes in _fit_cone, and
+        # they persisted even with a lock around fit_surfaces
+        # because segmentation on the other threads was still
+        # hitting BLAS at the same time). Sequential processing
+        # adds ~1-2s on a 3-body part but eliminates the crash.
+        body_stage_data = []
+        for bi, b in enumerate(bodies_to_process):
+            _check_cancelled()
+            body_stage_data.append(_process_single_body(bi, b))
+
+        # Cross-body fillet reconciliation: per-body fits give each fillet
+        # its own slightly-different radius. Any two fillets that are
+        # actually the same underlying edge (parallel axes, coincident
+        # axis lines, comparable radii) get a unified_radius so the
+        # downstream CAD export produces a seamless joined edge.
+        try:
+            from mesh2param.pipeline.reconcile_fillets import reconcile_blend_radii
+            per_body_blends = [bsd[7] for bsd in body_stage_data]
+            reconcile_blend_radii(per_body_blends)
+        except Exception:
+            logger.exception("reconcile_blend_radii failed — continuing")
 
         all_body_results = [(body, sub_cleaned, body_tree)
                             for body, sub_cleaned, _, _, _, _, body_tree, _ in body_stage_data]
@@ -641,8 +492,11 @@ class JobQueue:
         seg_colors = []
         for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
-            for ri, region in enumerate(regions):
-                color = palette[ri % len(palette)]
+            color_for_region = _color_regions_no_adjacent_match(
+                regions, sub_cleaned, palette,
+            )
+            for region in regions:
+                color = color_for_region[region.region_id]
                 for fi in region.face_indices:
                     if fi < len(fc):
                         fc[fi] = color

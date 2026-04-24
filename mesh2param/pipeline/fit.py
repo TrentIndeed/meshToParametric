@@ -7,6 +7,7 @@ segmented region via SVD, RANSAC, and least-squares refinement.
 from __future__ import annotations
 
 import logging
+import threading
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -17,6 +18,14 @@ from mesh2param.models.region import FaceRegion, SurfaceType
 from mesh2param.models.surface import FittedSurface
 
 logger = logging.getLogger(__name__)
+
+# Serialize fit_surfaces across threads. scipy's least_squares calls
+# into MKL/BLAS routines via minpack, which on Windows crashes with
+# an access violation when two threads hit _fit_sphere / _fit_cone
+# at the same time (the viz server runs one body per worker thread,
+# so 3-body parts trigger it reliably). The lock only wraps this
+# stage — segmentation and topology continue to run in parallel.
+_FIT_LOCK = threading.Lock()
 
 # Ordered by simplicity for alternative-type fallback
 _FITTERS = {
@@ -55,65 +64,81 @@ def fit_surfaces(
     inlier_thresh = config.ransac_inlier_threshold_ratio * bbox_diag
     logger.debug("Fit tolerances: rms_tol=%.6f, inlier_thresh=%.6f", rms_tol, inlier_thresh)
 
-    results = []
-    for region in regions:
-        points = region.vertices
-        normals = region.normals
-        logger.debug(
-            "Fitting region %d: type=%s, points=%d, normals=%d",
-            region.region_id, region.surface_type.value, len(points), len(normals),
-        )
-
-        try:
-            fitted = _fit_region(region, points, normals, config, rms_tol, inlier_thresh)
-        except Exception:
-            logger.exception(
-                "Stage 3 failed fitting region %d (type=%s, points=%d)",
-                region.region_id, region.surface_type.value, len(points),
+    # Serialize the scipy-heavy body of this stage. See _FIT_LOCK
+    # comment at module top for why (MKL/BLAS minpack crash when
+    # two threads run _fit_sphere / _fit_cone simultaneously on
+    # Windows). The lock is held only while this call runs its
+    # per-region fits; concurrent callers queue up and run one at
+    # a time.
+    with _FIT_LOCK:
+        results = []
+        for region in regions:
+            points = region.vertices
+            normals = region.normals
+            logger.debug(
+                "Fitting region %d: type=%s, points=%d, normals=%d",
+                region.region_id, region.surface_type.value, len(points), len(normals),
             )
-            raise
 
-        # Try alternative types if RMS exceeds tolerance
-        if config.try_alternative_types and fitted.rms_error > rms_tol:
-            fitted = _try_alternatives(region, points, normals, config, rms_tol, inlier_thresh, fitted)
+            try:
+                fitted = _fit_region(region, points, normals, config, rms_tol, inlier_thresh)
+            except Exception:
+                logger.exception(
+                    "Stage 3 failed fitting region %d (type=%s, points=%d)",
+                    region.region_id, region.surface_type.value, len(points),
+                )
+                raise
 
-        # Check if a non-plane fit should really be a plane:
-        # If the plane fit has near-zero RMS AND near-zero normal spread,
-        # prefer plane over cylinder/sphere/cone.
-        if fitted.surface_type != SurfaceType.PLANE:
-            plane_params, plane_rms = _fit_plane(points, normals, config, inlier_thresh)
-            avg_n = normals.mean(axis=0)
-            n_norm = np.linalg.norm(avg_n)
-            if n_norm > 1e-15:
-                avg_n /= n_norm
-            n_spread = float(1.0 - np.mean(normals @ avg_n))
-            # Accept plane if RMS is essentially zero and normals are consistent
-            if plane_rms < 0.01 and n_spread < 0.15:
-                fitted = FittedSurface(
-                    region_id=region.region_id, surface_type=SurfaceType.PLANE,
-                    params=plane_params, rms_error=plane_rms,
+            # Try alternative types if RMS exceeds tolerance
+            if config.try_alternative_types and fitted.rms_error > rms_tol:
+                fitted = _try_alternatives(region, points, normals, config, rms_tol, inlier_thresh, fitted)
+
+            # Check if a non-plane fit should really be a plane:
+            # If the plane fit has near-zero RMS AND near-zero normal spread,
+            # prefer plane over cylinder/sphere/cone.
+            if fitted.surface_type != SurfaceType.PLANE:
+                plane_params, plane_rms = _fit_plane(points, normals, config, inlier_thresh)
+                avg_n = normals.mean(axis=0)
+                n_norm = np.linalg.norm(avg_n)
+                if n_norm > 1e-15:
+                    avg_n /= n_norm
+                n_spread = float(1.0 - np.mean(normals @ avg_n))
+                # Accept plane if RMS is essentially zero and normals are consistent
+                if plane_rms < 0.01 and n_spread < 0.15:
+                    fitted = FittedSurface(
+                        region_id=region.region_id, surface_type=SurfaceType.PLANE,
+                        params=plane_params, rms_error=plane_rms,
+                    )
+
+            # Disambiguate sphere vs cylinder: both can fit hole surfaces with
+            # near-zero RMS, but cylinder is the correct type for holes.
+            if config.try_alternative_types and fitted.surface_type in (SurfaceType.SPHERE, SurfaceType.CYLINDER):
+                fitted = _disambiguate_sphere_cylinder(
+                    region, points, normals, config, inlier_thresh, fitted,
                 )
 
-        # Disambiguate sphere vs cylinder: both can fit hole surfaces with
-        # near-zero RMS, but cylinder is the correct type for holes.
-        if config.try_alternative_types and fitted.surface_type in (SurfaceType.SPHERE, SurfaceType.CYLINDER):
-            fitted = _disambiguate_sphere_cylinder(
-                region, points, normals, config, inlier_thresh, fitted,
+            # Disambiguate sphere vs cone: a countersink (truncated cone) fits
+            # as a sphere almost as well, and different triangulation of the
+            # same cone can flip the type. Check normal-spread geometry: cone
+            # normals span a 2D band (sphere spans 3D).
+            if config.try_alternative_types and fitted.surface_type in (SurfaceType.SPHERE, SurfaceType.CONE):
+                fitted = _disambiguate_sphere_cone(
+                    region, points, normals, config, inlier_thresh, fitted,
+                )
+
+            # Snap parameters
+            fitted.snapped_params = _snap_params(fitted.params, fitted.surface_type, config)
+
+            results.append(fitted)
+            logger.info(
+                "Region %d: %s, RMS=%.6f (tol=%.6f)",
+                region.region_id, fitted.surface_type.value, fitted.rms_error, rms_tol,
             )
 
-        # Snap parameters
-        fitted.snapped_params = _snap_params(fitted.params, fitted.surface_type, config)
-
-        results.append(fitted)
-        logger.info(
-            "Region %d: %s, RMS=%.6f (tol=%.6f)",
-            region.region_id, fitted.surface_type.value, fitted.rms_error, rms_tol,
-        )
-
-    # Post-process: merge adjacent cylinder regions with matching params.
-    # Segmentation often splits a single cylindrical hole into 4-5 rectangular
-    # clusters due to KMeans on rotating normals. This merges them back.
-    results = _merge_coincident_cylinders(results, regions, cleaned, bbox_diag)
+        # Post-process: merge adjacent cylinder regions with matching params.
+        # Segmentation often splits a single cylindrical hole into 4-5 rectangular
+        # clusters due to KMeans on rotating normals. This merges them back.
+        results = _merge_coincident_cylinders(results, regions, cleaned, bbox_diag)
 
     logger.debug("fit_surfaces completed: %d surfaces fitted", len(results))
     return results
@@ -277,8 +302,18 @@ def _try_alternatives(
     inlier_thresh: float,
     current_best: FittedSurface,
 ) -> FittedSurface:
-    """Try fitting with alternative surface types and keep the best."""
+    """Try fitting with alternative surface types and keep the best.
+
+    Uses hysteresis on the RMS comparison: the current type wins ties
+    within ~15%. Without this, two geometrically-identical features
+    (e.g. four countersinks on symmetric tabs) can flip between
+    SPHERE and CONE on floating-point noise, breaking symmetry in
+    the downstream region graph.
+    """
     best = current_best
+    # Alternative must beat current by a meaningful margin, unless
+    # the current fit is clearly bad (RMS well above tolerance).
+    hysteresis = 0.85 if current_best.rms_error < rms_tol * 1.5 else 1.0
 
     for stype, fname in _FITTERS.items():
         if stype == current_best.surface_type:
@@ -287,7 +322,7 @@ def _try_alternatives(
         try:
             fitter = _get_fitter(stype)
             params, rms = fitter(points, normals, config, inlier_thresh)
-            if rms < best.rms_error:
+            if rms < best.rms_error * hysteresis:
                 best = FittedSurface(
                     region_id=region.region_id,
                     surface_type=stype,
@@ -296,6 +331,9 @@ def _try_alternatives(
                 )
                 if rms < rms_tol:
                     break
+                # Once we switch, further alternatives must beat the
+                # new best by the same margin.
+                hysteresis = 0.85
         except Exception:
             continue
 
@@ -363,6 +401,67 @@ def _disambiguate_sphere_cylinder(
                              params=sph_params, rms_error=sph_rms)
 
     return current
+
+
+def _disambiguate_sphere_cone(
+    region: FaceRegion,
+    points: np.ndarray,
+    normals: np.ndarray,
+    config: FitConfig,
+    inlier_thresh: float,
+    current: FittedSurface,
+) -> FittedSurface:
+    """Disambiguate sphere vs cone when both fit well.
+
+    A cone section and a sphere cap have similar RMS on short segments,
+    so raw RMS alone flip-flops between symmetric features whose
+    triangulation differs slightly. Geometric tiebreaker:
+    - Cone normals span a 2D fan (one principal direction along the
+      axis, one wrapping around it) — 3rd SVD singular value is small.
+    - Sphere normals spread uniformly in 3D.
+    We prefer cone whenever that 2D-fan signature is clear, because
+    countersinks (the main case here) are overwhelmingly more common
+    than spherical caps in mechanical parts.
+    """
+    try:
+        cone_params, cone_rms = _fit_cone(points, normals, config, inlier_thresh)
+        sph_params, sph_rms = _fit_sphere(points, normals, config, inlier_thresh)
+    except Exception:
+        return current
+
+    # If either fit is clearly bad, defer.
+    if cone_rms > inlier_thresh * 3 or sph_rms > inlier_thresh * 3:
+        return current
+
+    centered_n = normals - normals.mean(axis=0)
+    if len(centered_n) < 3:
+        return current
+    _, s_vals, _ = np.linalg.svd(centered_n, full_matrices=False)
+    s_norm = s_vals / (s_vals[0] + 1e-15)
+
+    # Cone signature: third singular value noticeably smaller than
+    # second (normals fan in a plane around the axis).
+    if s_norm[2] < 0.35 and s_norm[1] > 0.3:
+        logger.debug(
+            "Region %d: normal SVD [%.3f, %.3f, %.3f] → cone (fan signature)",
+            region.region_id, *s_norm,
+        )
+        return FittedSurface(
+            region_id=region.region_id, surface_type=SurfaceType.CONE,
+            params=cone_params, rms_error=cone_rms,
+        )
+
+    # Otherwise keep whatever has smaller RMS, with slight cone bias
+    # (countersinks dominate the use case).
+    if cone_rms <= sph_rms * 1.1:
+        return FittedSurface(
+            region_id=region.region_id, surface_type=SurfaceType.CONE,
+            params=cone_params, rms_error=cone_rms,
+        )
+    return FittedSurface(
+        region_id=region.region_id, surface_type=SurfaceType.SPHERE,
+        params=sph_params, rms_error=sph_rms,
+    )
 
 
 def _get_fitter(stype: SurfaceType):
@@ -457,7 +556,16 @@ def _fit_sphere(
 
     x0 = np.array([*center, radius])
     try:
-        result = least_squares(residuals, x0, method="lm")
+        if not np.all(np.isfinite(x0)) or not np.all(np.isfinite(points)):
+            raise ValueError("non-finite inputs")
+        # method="lm" (Levenberg-Marquardt / minpack) crashed
+        # scipy with Windows access-violation on some degenerate
+        # inputs (e.g. narrow tangent-strip regions fitted as
+        # spheres during sphere/cylinder disambiguation). Switched
+        # to method="trf" which handles singular Jacobians by
+        # trust-region reflective iteration instead of calling
+        # into unsafe C minpack.
+        result = least_squares(residuals, x0, method="trf")
         center = result.x[:3]
         radius = abs(result.x[3])
     except Exception:
@@ -592,7 +700,9 @@ def _refine_cylinder(
 
     x0 = np.array([*axis_point, theta, phi, radius])
     try:
-        result = least_squares(residuals, x0, method="lm", max_nfev=200)
+        if not np.all(np.isfinite(x0)):
+            raise ValueError("non-finite x0")
+        result = least_squares(residuals, x0, method="trf", max_nfev=200)
         p = result.x
         axis_point = p[:3]
         th, ph = p[3], p[4]
@@ -722,7 +832,9 @@ def _refine_cone(
 
     x0 = np.array([*apex, theta, phi, half_angle])
     try:
-        result = least_squares(residuals, x0, method="lm", max_nfev=200)
+        if not np.all(np.isfinite(x0)):
+            raise ValueError("non-finite x0")
+        result = least_squares(residuals, x0, method="trf", max_nfev=200)
         p = result.x
         apex = p[:3]
         th, ph = p[3], p[4]

@@ -1474,6 +1474,15 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
   window._lastTempPath = pendingTempPath; // save before pipeline might clear it
   console.debug('[analyze] starting pipeline, temp_path:', pendingTempPath);
 
+  // Clear any stale mesh from a previous pipeline run (e.g. peeled +
+  // decomposed bodies) and redraw the uploaded preview. Ingest can take
+  // 20+ seconds due to isotropic remeshing; without this the old
+  // pipeline's final geometry lingers on screen, which looks like the
+  // pre-peel stage is showing a peeled mesh.
+  if (savedMeshPreview) {
+    _showRawMesh(savedMeshPreview, false);
+  }
+
   // Hide UI elements during generation
   document.getElementById('actions').style.display = 'none';
   document.getElementById('timeline').style.display = 'none';

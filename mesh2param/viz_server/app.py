@@ -18,9 +18,16 @@ Endpoints:
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
+import sys
 import tempfile
+
+# Dump a Python stack trace if the process segfaults. Writes to stderr
+# which is merged into out.txt. Invaluable for diagnosing native-code
+# crashes (VTK / OCP / trimesh C extensions).
+faulthandler.enable(file=sys.stderr, all_threads=True)
 from contextlib import asynccontextmanager
 from pathlib import Path
 

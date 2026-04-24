@@ -3509,7 +3509,11 @@ def _apply_recognized_fillets_to_solid(
     matches: list[dict] = []
     used_edge_indices: set[int] = set()
     for fillet in recognized:
-        r = fillet["radius"]
+        # Prefer the cross-body reconciled radius over the per-body fit
+        # so fillets that wrap around a bend come out with one consistent
+        # size, not one value on each side. Falls through to raw radius
+        # when reconciliation didn't tag this record (e.g. single-body).
+        r = float(fillet.get("unified_radius", fillet["radius"]))
         ad = fillet["axis_dir"]
         ap = fillet["axis_point"]
         best_idx = None

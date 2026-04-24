@@ -190,37 +190,108 @@ def _fill_holes(mesh: trimesh.Trimesh, max_hole_edges: int) -> trimesh.Trimesh:
     return mesh
 
 
-def _remesh(mesh: trimesh.Trimesh, target_edge_ratio: float) -> trimesh.Trimesh:
-    """Isotropic remeshing via PyMeshFix for better triangle quality."""
+def _subdivide_long_edges(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Split triangles whose longest edge exceeds a fraction of the
+    bounding-box diagonal.
+
+    New vertices land exactly on parent edges (no smoothing / no
+    reprojection), so each child triangle is coplanar with its
+    parent — child normals are identical to the parent's, which
+    keeps downstream axis-class segmentation stable.
+    """
     try:
-        import pymeshfix
-    except ImportError:
-        logger.warning("pymeshfix not installed — skipping remesh step")
+        bbox_diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+        max_edge = bbox_diag * 0.12
+        new_verts, new_faces = trimesh.remesh.subdivide_to_size(
+            mesh.vertices, mesh.faces, max_edge=max_edge,
+        )
+        # process=False: do not merge / reorder vertices or recompute
+        # normals. Preserves the coplanarity guarantee.
+        subdivided = trimesh.Trimesh(
+            vertices=new_verts, faces=new_faces, process=False,
+        )
+        logger.info(
+            "Subdivided long edges: %d → %d faces (max edge %.3f)",
+            len(mesh.faces), len(subdivided.faces), max_edge,
+        )
+        return subdivided
+    except Exception as e:
+        logger.warning("Edge subdivision failed (%s) — using original", e)
         return mesh
 
+
+def _remesh(mesh: trimesh.Trimesh, target_edge_ratio: float) -> trimesh.Trimesh:
+    """Topology repair (pymeshfix) + isotropic explicit remesh (pymeshlab).
+
+    The isotropic pass is the key step: without it, the source mesh's
+    triangle density varies across geometrically-identical features, and
+    downstream region-growing + primitive-fitting thresholds produce
+    different regions for features that should be symmetric.
+    """
     bbox_diag = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
     target_edge_length = bbox_diag * target_edge_ratio
 
+    # Pass 1: topology repair (fills holes, fixes non-manifold).
     try:
+        import pymeshfix
         fixer = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
-        fixer.repair(verbose=False)
+        fixer.repair()
+        # pymeshfix exposes output arrays as .points / .faces (older
+        # versions used .v / .f).
+        verts = getattr(fixer, "points", None)
+        if verts is None:
+            verts = getattr(fixer, "v")
+        faces = getattr(fixer, "faces", None)
+        if faces is None:
+            faces = getattr(fixer, "f")
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+    except ImportError:
+        logger.warning("pymeshfix not installed — skipping topology repair")
+    except Exception as e:
+        logger.warning("pymeshfix repair failed (%s) — continuing", e)
 
-        repaired = trimesh.Trimesh(
-            vertices=fixer.v,
-            faces=fixer.f,
+    # Pass 2: isotropic explicit remesh to uniform edge length.
+    # This is what makes symmetric features produce symmetric regions
+    # downstream. Source STL/3MF triangle layouts are rarely symmetric
+    # even when the underlying geometry is.
+    try:
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=np.asarray(mesh.vertices),
+            face_matrix=np.asarray(mesh.faces),
+        ))
+        ms.meshing_isotropic_explicit_remeshing(
+            iterations=3,
+            targetlen=pymeshlab.PureValue(float(target_edge_length)),
+            featuredeg=30.0,
+            smoothflag=False,          # don't move vertices tangentially
+            reprojectflag=True,        # snap new vertices onto original surface
+            checksurfdist=True,        # enforce max deviation from surface
+            maxsurfdist=pymeshlab.PercentageValue(0.5),  # 0.5% of bbox diag
+        )
+        out = ms.current_mesh()
+        remeshed = trimesh.Trimesh(
+            vertices=np.asarray(out.vertex_matrix()),
+            faces=np.asarray(out.face_matrix()),
             process=True,
         )
         logger.info(
-            "Remeshed: %d → %d vertices, %d → %d faces (target edge %.4f)",
-            len(mesh.vertices),
-            len(repaired.vertices),
-            len(mesh.faces),
-            len(repaired.faces),
+            "Isotropic remesh: %d → %d vertices, %d → %d faces "
+            "(target edge %.4f)",
+            len(mesh.vertices), len(remeshed.vertices),
+            len(mesh.faces), len(remeshed.faces),
             target_edge_length,
         )
-        return repaired
+        return remeshed
+    except ImportError:
+        logger.warning(
+            "pymeshlab not installed — skipping isotropic remesh "
+            "(symmetric features may segment asymmetrically)"
+        )
+        return mesh
     except Exception as e:
-        logger.warning("Remeshing failed (%s) — using original mesh", e)
+        logger.warning("Isotropic remesh failed (%s) — using repaired mesh", e)
         return mesh
 
 

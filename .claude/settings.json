@@ -18,6 +18,7 @@
       "Bash(python -m pytest tests/test_stage6_export.py -v --tb=short -q)",
       "Bash(python -m pytest tests/test_stage6_export.py -q --tb=short)",
       "Bash(python tests/debug_holes.py)"
-    ]
+    ],
+      "showThinkingSummaries": true
   }
 }

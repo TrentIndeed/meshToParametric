@@ -99,21 +99,68 @@ def identify_blends_from_topology(
         # neighboring edges as CHAMFER or SHARP instead of FILLET.
         # So we use shape + size + plane-adjacency as the filter, and
         # skip the edge-tag check entirely.
+        # Collect plane neighbors (weak signal — we don't require any
+        # specific count, just used later for chamfer bisector check).
+        plane_nbr_fits: list = []
+        for e in neighbors:
+            other = e.surface_b_id if e.surface_a_id == rid else e.surface_a_id
+            of = fitted_lookup.get(other)
+            if of is not None and of.surface_type == SurfaceType.PLANE:
+                plane_nbr_fits.append(of)
+
+        def _pn(fit):
+            n = np.asarray(fit.params.get("normal", [0, 0, 1]), dtype=float)
+            nn = np.linalg.norm(n)
+            return n / nn if nn > 1e-12 else n
+
         if f.surface_type in (
             SurfaceType.CYLINDER, SurfaceType.SPHERE, SurfaceType.CONE,
         ):
-            # Small curved region likely to be a fillet. Exclude huge-
-            # radius fit-noise (the fitter sometimes assigns a cylinder
-            # with r=10000mm to a large plate face).
+            # A fillet is a LONG THIN CYLINDER STRIP. The positive
+            # signature is geometric, not topological:
+            #   - small radius (mm-scale, not plate-scale)
+            #   - reasonable face count (tens to a few hundred)
+            #   - axis doesn't pierce any adjacent plane (hole bores,
+            #     boss walls, and countersinks pierce)
+            #   - length much larger than radius (strip, not ring)
+            # We intentionally don't require ≥2 non-parallel planes:
+            # a rolled-over edge on a thin plate sits between two
+            # parallel plate faces, and a through-hole rim fillet only
+            # has one plane neighbor (the plate face — the other side
+            # is the hole cylinder).
             radius_raw = f.params.get("radius", 0) or 0
-            if radius_raw > 0 and radius_raw > bbox_diag * 0.08:
+            if radius_raw > 0 and radius_raw > bbox_diag * 0.1:
                 continue
-            # Cap region size — a real edge-fillet strip has on the
-            # order of tens-to-hundreds of faces, not thousands.
             if region.num_faces > 300:
                 continue
+            if f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE):
+                axis = np.asarray(
+                    f.params.get("axis_dir") or f.params.get("axis")
+                    or [0, 0, 1], dtype=float,
+                )
+                an = np.linalg.norm(axis)
+                if an < 1e-12:
+                    continue
+                axis = axis / an
+                # Require ≥1 plane neighbor whose normal is
+                # perpendicular to the axis (axis·n < 0.5). That's the
+                # positive signature of an edge fillet: the fillet
+                # runs ALONG the edge of at least one flat face.
+                # A hole bore has all neighbors piercing (axis parallel
+                # to plate normal, axis·n ≈ 1) — no perpendicular
+                # neighbors — so this rejects it. A corner fillet can
+                # have mixed neighbors (some pierce top/bottom plates,
+                # some are perpendicular vertical walls) and still
+                # passes as long as any one is perpendicular.
+                has_perp = any(
+                    abs(float(np.dot(axis, _pn(pn)))) < 0.5
+                    for pn in plane_nbr_fits
+                )
+                if not has_perp:
+                    continue
             kind = "fillet"
             neighbor_edges = list(neighbors)
+            bis_ni = bis_nj = None  # chamfer-only, unused for fillets
         elif f.surface_type == SurfaceType.PLANE:
             # Narrow plane strip — possible chamfer between two planes.
             chamfer_edges = [e for e in neighbors
@@ -122,65 +169,112 @@ def identify_blends_from_topology(
                 continue
             if region.num_faces > 40:
                 continue
+            if len(plane_nbr_fits) < 2:
+                continue
+            # Find a non-parallel pair so we can build the bisector.
+            bis_ni = bis_nj = None
+            for i in range(len(plane_nbr_fits)):
+                ni = _pn(plane_nbr_fits[i])
+                for j in range(i + 1, len(plane_nbr_fits)):
+                    nj = _pn(plane_nbr_fits[j])
+                    if abs(float(np.dot(ni, nj))) < 0.9:
+                        bis_ni, bis_nj = ni, nj
+                        break
+                if bis_ni is not None:
+                    break
+            if bis_ni is None:
+                continue
+            # Chamfer face normal should roughly bisect its plane
+            # neighbors — thin flat strips alongside a rounded edge
+            # fail this because their normal matches the plate.
+            cn = _pn(f)
+            bis = bis_ni + bis_nj
+            bis_n = np.linalg.norm(bis)
+            if bis_n < 1e-9:
+                continue
+            bis = bis / bis_n
+            if abs(float(np.dot(cn, bis))) < 0.85:
+                continue
             kind = "chamfer"
             neighbor_edges = list(neighbors)
         else:
             continue
 
-        # The two adjacent plane regions are the other endpoints of the
-        # fillet/chamfer edges.
+        # Resolve an edge line for the blend — either the exact plane-
+        # plane intersection (when we have two non-parallel plane
+        # neighbors) or a fallback using the cylinder axis (when
+        # adjacency is ambiguous: rolled-over edges, rim fillets).
+        p_rid_a = p_rid_b = None  # used later in record
         plane_rids: list[int] = []
         for e in neighbor_edges:
             other = e.surface_b_id if e.surface_a_id == rid else e.surface_a_id
             of = fitted_lookup.get(other)
             if of is not None and of.surface_type == SurfaceType.PLANE:
                 plane_rids.append(other)
-        # Need exactly two distinct plane neighbors to define a sharp line.
-        unique_plane_rids = list(dict.fromkeys(plane_rids))[:2]
-        if len(unique_plane_rids) < 2:
-            continue
+        unique_plane_rids = list(dict.fromkeys(plane_rids))
 
-        p_rid_a, p_rid_b = unique_plane_rids[0], unique_plane_rids[1]
-        pA = fitted_lookup[p_rid_a]
-        pB = fitted_lookup[p_rid_b]
-        n_A = np.asarray(pA.params.get("normal"), dtype=float)
-        n_B = np.asarray(pB.params.get("normal"), dtype=float)
-        # Some plane-fit outputs store d directly; compute a point on the
-        # plane from the region's centroid projected onto the plane normal.
-        rA = region_lookup.get(p_rid_a)
-        rB = region_lookup.get(p_rid_b)
-        if rA is None or rB is None:
-            continue
-        p_A = rA.vertices.mean(axis=0)
-        p_B = rB.vertices.mean(axis=0)
-        nA_norm = float(np.linalg.norm(n_A))
-        nB_norm = float(np.linalg.norm(n_B))
-        if nA_norm < 1e-8 or nB_norm < 1e-8:
-            continue
-        n_A = n_A / nA_norm
-        n_B = n_B / nB_norm
+        # Try the two-non-parallel-planes path.
+        line_dir = line_point = None
+        for i in range(len(unique_plane_rids)):
+            for j in range(i + 1, len(unique_plane_rids)):
+                pA = fitted_lookup[unique_plane_rids[i]]
+                pB = fitted_lookup[unique_plane_rids[j]]
+                n_A = np.asarray(pA.params.get("normal"), dtype=float)
+                n_B = np.asarray(pB.params.get("normal"), dtype=float)
+                nA_norm = float(np.linalg.norm(n_A))
+                nB_norm = float(np.linalg.norm(n_B))
+                if nA_norm < 1e-8 or nB_norm < 1e-8:
+                    continue
+                n_A = n_A / nA_norm
+                n_B = n_B / nB_norm
+                if abs(float(np.dot(n_A, n_B))) > 0.95:
+                    continue
+                ld = np.cross(n_A, n_B)
+                ld_norm = float(np.linalg.norm(ld))
+                if ld_norm < 1e-8:
+                    continue
+                ld = ld / ld_norm
+                rA = region_lookup.get(unique_plane_rids[i])
+                rB = region_lookup.get(unique_plane_rids[j])
+                if rA is None or rB is None:
+                    continue
+                p_A = rA.vertices.mean(axis=0)
+                p_B = rB.vertices.mean(axis=0)
+                M_sys = np.array([n_A, n_B, ld])
+                rhs = np.array([float(n_A @ p_A), float(n_B @ p_B), 0.0])
+                try:
+                    lp = np.linalg.solve(M_sys, rhs)
+                except np.linalg.LinAlgError:
+                    continue
+                line_dir = ld
+                line_point = lp
+                p_rid_a = unique_plane_rids[i]
+                p_rid_b = unique_plane_rids[j]
+                break
+            if line_dir is not None:
+                break
 
-        # Reject near-parallel planes (no well-defined intersection).
-        if abs(float(np.dot(n_A, n_B))) > 0.95:
-            continue
-
-        # Plane-plane intersection line.
-        line_dir = np.cross(n_A, n_B)
-        ld_norm = float(np.linalg.norm(line_dir))
-        if ld_norm < 1e-8:
-            continue
-        line_dir = line_dir / ld_norm
-
-        # Line must be principal-axis aligned for prismatic parts.
-        if float(np.max(np.abs(line_dir))) < 0.9:
-            continue
-
-        M_sys = np.array([n_A, n_B, line_dir])
-        rhs = np.array([float(n_A @ p_A), float(n_B @ p_B), 0.0])
-        try:
-            line_point = np.linalg.solve(M_sys, rhs)
-        except np.linalg.LinAlgError:
-            continue
+        # Fallback: rolled-over plate edge or rim fillet — use the
+        # cylinder axis as the edge line (the "sharp line" a fillet
+        # would collapse to lies along the cylinder axis for this
+        # kind of blend). Only applies to cylinder-ish fits.
+        if line_dir is None:
+            if f.surface_type not in (SurfaceType.CYLINDER, SurfaceType.CONE):
+                continue
+            axis = np.asarray(
+                f.params.get("axis_dir") or f.params.get("axis")
+                or [0, 0, 1], dtype=float,
+            )
+            an = np.linalg.norm(axis)
+            if an < 1e-12:
+                continue
+            line_dir = axis / an
+            ap = f.params.get("axis_point")
+            if ap is None:
+                # Derive an axis point from the region centroid.
+                line_point = region.vertices.mean(axis=0)
+            else:
+                line_point = np.asarray(ap, dtype=float)
 
         # Line point inside mesh bbox + margin.
         margin = bbox_diag * 0.1
@@ -201,7 +295,16 @@ def identify_blends_from_topology(
         t_along = rel @ line_dir
         perp = rel - np.outer(t_along, line_dir)
         perp_dist = np.linalg.norm(perp, axis=1)
-        radius = float(np.median(perp_dist))
+        # Prefer the fitter's radius (known-stable from least-squares
+        # fit of the blend region itself) over the distance-from-line
+        # estimate. The latter gets badly inflated when line_point
+        # lands far from the true axis, which happens for fillets
+        # with fragmented plane neighbors or diagonal axes.
+        fit_radius = float(f.params.get("radius", 0) or 0)
+        if fit_radius > 0.2:
+            radius = fit_radius
+        else:
+            radius = float(np.median(perp_dist))
         if kind == "fillet":
             max_radius = bbox_diag * 0.08
             if radius < 0.2 or radius > max_radius:
@@ -224,7 +327,9 @@ def identify_blends_from_topology(
             "num_faces": int(len(blend_face_ids)),
             "face_indices": np.asarray(blend_face_ids, dtype=np.int64).copy(),
             "region_id": rid,
-            "plane_region_ids": [p_rid_a, p_rid_b],
+            "plane_region_ids": [
+                rid_ for rid_ in (p_rid_a, p_rid_b) if rid_ is not None
+            ],
         })
         peeled_region_ids.add(rid)
 

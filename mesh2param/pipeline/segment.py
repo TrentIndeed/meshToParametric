@@ -100,15 +100,21 @@ def segment_mesh(
             labels, cleaned.normals, adjacency,
         )
         # Peel rim fillets out of plate-spanning frame regions.
-        # Small through-holes' rim fillets end up mesh-connected
-        # to the rolled-edge perimeter of the plate, so region
-        # growing assigns them to the big frame-half region that
-        # spans the whole plate. Visually the rim fillet then
-        # paints with the same color as the outer rolled edge
-        # ("connected to the outside flat plane"). This pass
-        # extracts hole-local rim fillet faces into their own
-        # per-hole regions.
         labels = _peel_hole_rim_fillets(labels, cleaned, adjacency)
+        # Pull borderline-tilted faces out of curved regions
+        # back into adjacent flat regions when their neighborhood
+        # is dominantly flat. Captures the general principle
+        # "lots of flat-adjacent triangles = one flat plane",
+        # fixing fan-triangulation patterns where slightly-tilted
+        # slices got incorrectly pulled into the curved fillet
+        # region instead of joining the flat surface.
+        labels = _pull_axial_into_flat_regions(
+            labels, cleaned.normals, adjacency,
+        )
+        # Final cleanup: small-region merge.
+        labels = _merge_small_regions(
+            labels, adjacency, cleaned.normals, 15,
+        )
     except Exception:
         logger.exception(
             "Stage 2 failed during segmentation passes: faces=%d, labels_shape=%s",
@@ -312,6 +318,119 @@ def _merge_small_regions(
     remap = {old: new for new, old in enumerate(unique)}
     labels = np.array([remap[l] for l in labels], dtype=np.int64)
 
+    return labels
+
+
+def _pull_axial_into_flat_regions(
+    labels: np.ndarray,
+    normals: np.ndarray,
+    adjacency: dict[int, set[int]],
+    iterations: int = 5,
+) -> np.ndarray:
+    """Reassign borderline-tilted faces from curved regions back
+    into adjacent flat regions when their neighborhood is
+    dominantly flat.
+
+    General principle: a flat plane is a connected set of faces
+    whose normals all point in (approximately) the same direction.
+    Region growing with normal-similarity flood-fill correctly
+    identifies most flat-plane faces, but at the boundary between
+    a flat plate and an adjacent curved fillet, fan-triangulated
+    "near-flat" faces (e.g. ~20° tilt) ambiguously satisfy BOTH
+    the flat region's drift criterion AND the curved region's
+    normal-similarity to its growing edge. They tend to land in
+    the curved region, leaving the flat plate visually fragmented.
+
+    This pass walks each face once per iteration. If the face is
+    in a curved region (mean-normal magnitude < 0.95) AND has a
+    mesh neighbor in a tightly-flat region (mean-normal magnitude
+    ≥ 0.95) AND the face's normal is within 30° of that flat
+    region's mean normal, the face joins the flat region.
+
+    Iterates because the boundary moves inward by one face each
+    pass — a fan slice next to a flat plate joins the plate, then
+    its neighbor (one slice deeper into the fillet) is now next to
+    the (extended) flat plate, and so on, until the slices are
+    actually too tilted to merge.
+    """
+    labels = labels.copy()
+    flat_threshold = 0.95
+    cos_30 = np.cos(np.radians(30.0))
+
+    for _ in range(iterations):
+        # Cache per-region mean normal and magnitude.
+        region_faces: dict[int, np.ndarray] = {}
+        for lbl in np.unique(labels):
+            region_faces[int(lbl)] = np.where(labels == lbl)[0]
+        region_mean: dict[int, np.ndarray] = {}
+        region_mag: dict[int, float] = {}
+        for lbl, faces in region_faces.items():
+            mn = normals[faces].mean(axis=0)
+            mag = float(np.linalg.norm(mn))
+            region_mag[lbl] = mag
+            if mag > 1e-12:
+                region_mean[lbl] = mn / mag
+            else:
+                region_mean[lbl] = mn
+
+        changed = False
+        new_labels = labels.copy()
+        for fi in range(len(normals)):
+            my_lbl = int(labels[fi])
+            # Already in a flat region — skip
+            if region_mag.get(my_lbl, 0.0) >= flat_threshold:
+                continue
+            face_n = normals[fi]
+            hop1 = adjacency.get(fi, set())
+            if not hop1:
+                continue
+            # 2-hop neighborhood normal magnitude — if it's near 1,
+            # the LOCAL CONTEXT is flat (whole neighborhood points
+            # one direction), even if this individual face is
+            # slightly tilted from the fan layout. A rim-fillet face
+            # has 2-hop neighborhood with rotating normals, mag ~0.6.
+            hop2: set[int] = set()
+            for h in hop1:
+                hop2.update(adjacency.get(h, set()))
+            nbrhd = list((hop1 | hop2) - {fi})
+            if len(nbrhd) < 4:
+                continue
+            ctx_mean = normals[nbrhd].mean(axis=0)
+            ctx_mag = float(np.linalg.norm(ctx_mean))
+            if ctx_mag < 0.92:
+                continue  # local context isn't flat
+            ctx_dir = ctx_mean / ctx_mag
+
+            # Find a mesh-adjacent flat region whose mean normal
+            # matches the local context direction.
+            best_lbl = None
+            best_dot = -1.0
+            for nb in hop1:
+                nb_lbl = int(labels[nb])
+                if nb_lbl == my_lbl:
+                    continue
+                if region_mag.get(nb_lbl, 0.0) < flat_threshold:
+                    continue
+                dot = float(np.dot(region_mean[nb_lbl], ctx_dir))
+                if dot > 0.95 and dot > best_dot:
+                    best_dot = dot
+                    best_lbl = nb_lbl
+            if best_lbl is None:
+                continue
+            # Final check: face's own normal isn't crazy-far from
+            # the flat region (within 45°)
+            if float(np.dot(face_n, region_mean[best_lbl])) < 0.7:
+                continue
+            new_labels[fi] = best_lbl
+            changed = True
+        labels = new_labels
+        if not changed:
+            break
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=np.int64)
     return labels
 
 
@@ -974,26 +1093,56 @@ def _unify_cylinder_features(
         if len(cluster_faces) < 4:
             continue
 
-        # Find cluster rotation axis. Prefer world axes (X/Y/Z) —
-        # prismatic parts have bore/roll axes aligned to the part
-        # frame. Choose the world axis with the MOST cluster-face
-        # normals perpendicular to it (|n·axis| < 0.25). If no
-        # world axis beats the SVD's 3rd direction by a clear
-        # margin, fall back to SVD (for non-axis-aligned bores).
+        # Find cluster rotation axis. A real cylinder axis A has
+        # face normals that ROTATE in the plane perpendicular to A,
+        # spanning a wide range of angles (a quarter-cylinder spans
+        # ~90°, a full cylinder ~360°). Wrong axes have normals
+        # CLUMPED in the perpendicular plane.
+        #
+        # For each candidate world axis (X/Y/Z), project the cluster
+        # normals onto the perpendicular plane and measure circular
+        # spread (1 - |mean(e^{iθ})|). Pick the axis with highest
+        # spread, falling back to SVD's 3rd direction for off-axis
+        # bores.
+        #
+        # The previous "count |n·axis|<0.25" voting failed when a
+        # spatial cluster mixed bore-wall faces (rotating around Z)
+        # with adjacent flat tab-top (+Z) and base-plate (-Z) faces:
+        # those flat faces also satisfy |n·X|<0.25 and |n·Y|<0.25,
+        # tying the vote and arbitrarily picking X — which then
+        # absorbed the tab top into the cylinder region.
         cn = normals[cluster_faces]
+
+        def _axis_spread(ax: np.ndarray) -> float:
+            proj = cn - (cn @ ax)[:, None] * ax
+            mag = np.linalg.norm(proj, axis=1)
+            signif = mag > 0.5
+            if int(signif.sum()) < 4:
+                return -1.0
+            p = proj[signif] / mag[signif][:, None]
+            if abs(ax[0]) < 0.5:
+                u = np.cross(ax, np.array([1.0, 0.0, 0.0]))
+            else:
+                u = np.cross(ax, np.array([0.0, 1.0, 0.0]))
+            u = u / np.linalg.norm(u)
+            v = np.cross(ax, u)
+            theta = np.arctan2(p @ v, p @ u)
+            z = np.exp(1j * theta)
+            return float(1.0 - abs(z.mean()))
+
         best_axis = None
-        best_count = 0
+        best_spread = -1.0
         for candidate in np.eye(3):
-            count = int((np.abs(cn @ candidate) < 0.25).sum())
-            if count > best_count:
-                best_count = count
+            spread = _axis_spread(candidate)
+            if spread > best_spread:
+                best_spread = spread
                 best_axis = candidate
-        # SVD fallback
+        # SVD fallback for non-axis-aligned bores
         centered_cn = cn - cn.mean(axis=0)
         _, _, vh = np.linalg.svd(centered_cn, full_matrices=False)
         svd_axis = vh[2]
-        svd_count = int((np.abs(cn @ svd_axis) < 0.25).sum())
-        if svd_count > best_count * 1.1:
+        svd_spread = _axis_spread(svd_axis)
+        if svd_spread > best_spread + 0.1:
             axis = svd_axis
         else:
             axis = best_axis

@@ -30,6 +30,107 @@ logger = logging.getLogger(__name__)
 MAX_JOBS = 50  # max completed jobs to keep in memory
 
 
+def _project_vertex_to_primitive(vert: np.ndarray, fitted) -> np.ndarray:
+    """Snap a vertex onto its region's fitted analytic surface.
+
+    Used for the "render only the primitives" view: each region's
+    triangulation is preserved, but every vertex is moved to lie
+    exactly on the fitted plane / cylinder / cone / sphere. Shared
+    vertices duplicated per region — boundaries become small visible
+    gaps that highlight where one primitive ends and another begins.
+    """
+    from mesh2param.models.region import SurfaceType
+    params = fitted.params
+    stype = fitted.surface_type
+    if stype == SurfaceType.PLANE:
+        normal = np.asarray(params["normal"], dtype=float)
+        normal = normal / (np.linalg.norm(normal) + 1e-15)
+        point = np.asarray(params["point"], dtype=float)
+        signed_dist = float(np.dot(vert - point, normal))
+        return vert - signed_dist * normal
+    if stype == SurfaceType.SPHERE:
+        center = np.asarray(params["center"], dtype=float)
+        radius = float(params["radius"])
+        d = vert - center
+        n = np.linalg.norm(d)
+        if n < 1e-15:
+            return vert
+        return center + d * (radius / n)
+    if stype == SurfaceType.CYLINDER:
+        axis_point = np.asarray(params["axis_point"], dtype=float)
+        axis_dir = np.asarray(params["axis_dir"], dtype=float)
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+        radius = float(params["radius"])
+        rel = vert - axis_point
+        axial = float(np.dot(rel, axis_dir)) * axis_dir
+        radial = rel - axial
+        rn = np.linalg.norm(radial)
+        if rn < 1e-15:
+            return vert
+        return axis_point + axial + radial * (radius / rn)
+    if stype == SurfaceType.CONE:
+        apex = np.asarray(params["apex"], dtype=float)
+        axis_dir = np.asarray(params["axis_dir"], dtype=float)
+        axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+        half_angle = float(np.radians(params["half_angle"]))
+        rel = vert - apex
+        t = float(np.dot(rel, axis_dir))
+        radial = rel - t * axis_dir
+        rn = np.linalg.norm(radial)
+        expected_r = abs(t) * np.tan(half_angle)
+        if rn < 1e-15 or expected_r < 1e-15:
+            return vert
+        return apex + t * axis_dir + radial * (expected_r / rn)
+    return vert
+
+
+def _build_primitive_mesh(regions, sub_cleaned, fitted_list, color_for_region):
+    """Build a (vertices, faces, per-face-colors) mesh by projecting
+    each region's vertices onto its fitted primitive.
+
+    Vertices are duplicated per region so each region renders on its
+    own exact primitive surface. Returns three numpy arrays ready to
+    flatten into the viz wire format.
+    """
+    fitted_lookup = {f.region_id: f for f in fitted_list}
+    new_vertices: list = []
+    new_faces: list = []
+    new_colors: list = []
+    for region in regions:
+        f = fitted_lookup.get(region.region_id)
+        if f is None or len(region.face_indices) == 0:
+            continue
+        color = color_for_region.get(region.region_id, [0.6, 0.6, 0.6])
+        # Per-region vertex projection cache: map original vertex
+        # index -> new index in this region's projected vertex set.
+        local_remap: dict[int, int] = {}
+        local_verts: list[np.ndarray] = []
+        for fi in region.face_indices:
+            tri = sub_cleaned.faces[fi]
+            new_tri = []
+            for vi in tri:
+                vi_int = int(vi)
+                if vi_int not in local_remap:
+                    projected = _project_vertex_to_primitive(
+                        sub_cleaned.vertices[vi_int], f,
+                    )
+                    local_remap[vi_int] = len(local_verts)
+                    local_verts.append(projected)
+                new_tri.append(local_remap[vi_int])
+            base_idx = len(new_vertices)
+            new_faces.append([base_idx + new_tri[0],
+                              base_idx + new_tri[1],
+                              base_idx + new_tri[2]])
+            new_colors.append(color)
+        new_vertices.extend(local_verts)
+    if not new_vertices:
+        return None
+    verts_arr = np.asarray(new_vertices, dtype=np.float32)
+    faces_arr = np.asarray(new_faces, dtype=np.int32)
+    colors_arr = np.asarray(new_colors, dtype=np.float32)
+    return verts_arr, faces_arr, colors_arr
+
+
 def _color_regions_no_adjacent_match(regions, sub_cleaned, palette):
     """Assign each region a color from the palette such that no two
     mesh-adjacent regions share the same color.
@@ -606,58 +707,47 @@ class JobQueue:
         _pause_for_review()
 
         # Stage 3: Fitting
-        # Color per-region (like Stage 2) rather than per-surface-type
-        # — type coloring made all cylinders one green and all planes
-        # one blue, which visually re-merged regions segmentation had
-        # carefully separated. Additionally, DESATURATE faces whose
-        # residual against the fitted primitive exceeds the fit's
-        # tolerance: these "outlier" faces are at region boundaries
-        # or are noise that didn't really belong to the region's
-        # primitive. Showing them dim makes the clean primitive
-        # surfaces stand out, answering the "shouldn't fitting be
-        # cleaner than segmentation?" question — yes, by visually
-        # ignoring the faces that DON'T fit.
-        from mesh2param.pipeline.fit import compute_residuals
+        # Render PRIMITIVE GEOMETRY: each region's vertices are
+        # projected onto its fitted plane / cylinder / cone / sphere.
+        # The triangulation is preserved but the surface itself is
+        # mathematically exact. Region boundaries become small
+        # visible gaps because vertices duplicated per region project
+        # to different points — that gap visually highlights where
+        # one primitive ends and the next begins, which is exactly
+        # the "show me only the primitives" view.
         job.progress = 20
         job.progress_stage = "Fitting primitives..."
-        fit_colors = []
+        fit_pieces = []
         for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
-            fc = np.full((len(sub_cleaned.faces), 3), 0.55)
             color_for_region = _color_regions_no_adjacent_match(
                 regions, sub_cleaned, palette,
             )
-            fitted_lookup = {f.region_id: f for f in fitted}
-            face_centroids = sub_cleaned.vertices[sub_cleaned.faces].mean(axis=1)
-            bbox_diag = float(np.linalg.norm(
-                sub_cleaned.bbox[1] - sub_cleaned.bbox[0]
-            ))
-            # Outlier threshold: 0.5% of bbox diagonal — a face whose
-            # centroid is more than this far from the fitted surface
-            # is treated as not-really-part-of-this-primitive.
-            outlier_thresh = bbox_diag * 0.005
-            outlier_color = np.array([0.85, 0.85, 0.85])  # dim grey
-            for region in regions:
-                color = np.array(
-                    color_for_region.get(region.region_id, [0.6, 0.6, 0.6])
-                )
-                f = fitted_lookup.get(region.region_id)
-                if f is None or len(region.face_indices) == 0:
-                    for fi in region.face_indices:
-                        if fi < len(fc):
-                            fc[fi] = color
-                    continue
-                pts = face_centroids[region.face_indices]
-                try:
-                    residuals = np.abs(compute_residuals(pts, f))
-                    inliers = residuals < outlier_thresh
-                except Exception:
-                    inliers = np.ones(len(region.face_indices), dtype=bool)
-                for k, fi in enumerate(region.face_indices):
-                    if fi >= len(fc):
-                        continue
-                    fc[fi] = color if inliers[k] else outlier_color
-            fit_colors.append((body, sub_cleaned, fc))
-        _set_body_viz(fit_colors)
+            built = _build_primitive_mesh(
+                regions, sub_cleaned, fitted, color_for_region,
+            )
+            if built is None:
+                # Fallback: render raw mesh with grey
+                fit_pieces.append({
+                    "vertices": sub_cleaned.vertices.flatten().tolist(),
+                    "faces": sub_cleaned.faces.flatten().tolist(),
+                    "colors": None,
+                    "color": body_colors[len(fit_pieces) % len(body_colors)],
+                })
+                continue
+            verts_arr, faces_arr, colors_arr = built
+            fit_pieces.append({
+                "vertices": verts_arr.flatten().tolist(),
+                "faces": faces_arr.flatten().tolist(),
+                "colors": colors_arr.flatten().tolist(),
+                "color": body_colors[len(fit_pieces) % len(body_colors)],
+            })
+        # Always use the pieces path (works for 1 or multiple bodies),
+        # since projecting per-region requires per-region vertex sets
+        # that don't fit a single CleanedMesh.
+        job.progress_colors = None
+        job.progress_colors_per_face = False
+        job._decomp_pieces = fit_pieces
+        job.progress_version += 1
         _pause_for_review()
 
         # Stage 4: Topology — same face colors as fitting + edge lines

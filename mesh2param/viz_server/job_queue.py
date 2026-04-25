@@ -777,7 +777,12 @@ class JobQueue:
         edge_cols = np.array(edge_col_list) if edge_col_list else None
         job.progress_edges = edge_pts.flatten().tolist() if edge_pts is not None else None
         job.progress_edge_colors = edge_cols.flatten().tolist() if edge_cols is not None else None
-        _set_body_viz(fit_colors)
+        # Reuse Stage 3's projected-primitive pieces as the base
+        # face geometry; edges classified above are overlaid on top.
+        job.progress_colors = None
+        job.progress_colors_per_face = False
+        job._decomp_pieces = fit_pieces
+        job.progress_version += 1
         _pause_for_review()
 
         # Stage 4.5: Blend graph — highlight each plane-to-plane

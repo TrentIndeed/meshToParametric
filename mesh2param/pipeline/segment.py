@@ -101,6 +101,20 @@ def segment_mesh(
         )
         # Peel rim fillets out of plate-spanning frame regions.
         labels = _peel_hole_rim_fillets(labels, cleaned, adjacency)
+        # Peel small through-holes whose bore wall got fused with
+        # an adjacent rolled perimeter edge (e.g. a hole drilled
+        # through a plate corner). The general "is this round and
+        # 360°?" heuristic in _peel_hole_rim_fillets fails when the
+        # hole's bore wall normals only span a partial arc because
+        # they share triangles with a curved edge feature. This pass
+        # uses a DIFFERENT signal: a small flat island of plate-face
+        # material that's spatially DISCONNECTED from the main plate
+        # face implies a hole punched through the plate at that
+        # island's location. Use the island's centroid as the hole
+        # center and peel the bore wall + rim fillets around it.
+        labels = _peel_isolated_flat_island_holes(
+            labels, cleaned, adjacency,
+        )
         # Pull borderline-tilted faces out of curved regions
         # back into adjacent flat regions when their neighborhood
         # is dominantly flat. Captures the general principle
@@ -562,6 +576,216 @@ def _peel_hole_rim_fillets(
     unique = np.unique(labels)
     remap = {old: new for new, old in enumerate(unique)}
     labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    return labels
+
+
+def _peel_isolated_flat_island_holes(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Peel small through-holes detected via isolated flat-face islands.
+
+    For each candidate axis (X/Y/Z), find all faces whose normal is
+    closely aligned with that axis. Spatially DBSCAN-cluster them in
+    the perpendicular plane. A SMALL cluster (a few mm to ~25mm)
+    that's spatially separated from larger plate-face clusters is a
+    flat island — typically the donut-shaped flange around a small
+    through-hole punched through a plate corner.
+
+    For each such island, take its centroid as the hole center and:
+      1. Peel BORE WALL faces: faces with |n·axis| < 0.25 within
+         a small radius of the center → new region.
+      2. Peel RIM FILLET faces (front + back side, by sign of
+         n·axis): faces with 0.3 < |n·axis| < 0.95 within the same
+         radius → two new regions.
+
+    Skips islands when:
+      • The bore wall already sits in a small (< 100 face) local
+        region (already peeled by an earlier pass).
+      • There aren't enough bore-wall candidate faces near the
+        center (< 8) — false positive.
+
+    This is the GENERAL fix for "tab embedded in rolled edge": the
+    rolled edge gets the bore + rim if we don't intervene because
+    they're geometrically continuous in the mesh.
+    """
+    from sklearn.cluster import DBSCAN
+
+    labels = labels.copy()
+    normals = cleaned.normals
+    verts = cleaned.vertices
+    n_faces = len(normals)
+    centroids = np.array([
+        verts[cleaned.faces[fi]].mean(axis=0) for fi in range(n_faces)
+    ])
+    next_label = int(labels.max()) + 1
+
+    # Restrict to the body's THIN axis: a "hole punched through the
+    # plate" goes along the plate's thinnest direction. A side plate
+    # is thin in X (~6mm); its tab through-holes pierce in X. The
+    # bottom plate is thin in Z (~10mm); its tabs pierce in Z. This
+    # avoids the failure mode where the function processed a side
+    # tab's perpendicular cluster (axis=X on the bottom plate) and
+    # fragmented the tab's flat top + bottom into rim regions.
+    bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+    thin_axis = int(np.argmin(bbox_size))
+
+    for axis_idx in [thin_axis]:
+        axis_vec = np.eye(3)[axis_idx]
+        flat = np.where(np.abs(normals @ axis_vec) > 0.85)[0]
+        if len(flat) < 5:
+            continue
+        perp_idx = [i for i in range(3) if i != axis_idx]
+        proj = centroids[flat][:, perp_idx]
+        db = DBSCAN(eps=3.0, min_samples=4).fit(proj)
+        clusters = [c for c in set(db.labels_) if c >= 0]
+        if not clusters:
+            continue
+
+        # Compute each cluster's perp-plane bbox extent so we can
+        # discriminate "main plate face" (huge) from "tab island"
+        # (small, < 25mm).
+        cluster_info: list[tuple[int, np.ndarray, np.ndarray, float]] = []
+        for cl in clusters:
+            m = db.labels_ == cl
+            ff = flat[m]
+            cc = centroids[ff]
+            bb = cc.max(axis=0) - cc.min(axis=0)
+            extent = max(bb[p] for p in perp_idx)
+            cluster_info.append((cl, ff, cc, extent))
+
+        for cl, island_faces, island_centroids, extent in cluster_info:
+            # Tab island: small in perp plane, but not tiny.
+            if extent > 25.0 or extent < 4.0:
+                continue
+            # The cluster's perp-plane extent should be UNIFORM
+            # (round-ish), not elongated: a tab annulus is round,
+            # but a perimeter strip is long+thin.
+            sub_bb = island_centroids.max(axis=0) - island_centroids.min(axis=0)
+            perp_dims = sorted([sub_bb[p] for p in perp_idx])
+            if perp_dims[0] / max(perp_dims[1], 0.01) < 0.6:
+                continue
+            # The cluster must bridge BOTH sides of the plate
+            # (+axis-facing faces AND -axis-facing faces in the same
+            # spatial cluster). This is the signature of a hole
+            # punched through a thin region: DBSCAN bridges the
+            # opposing flat faces because they share the same perp-
+            # plane footprint.
+            #
+            # A standalone tab top (e.g. the bottom-plate's
+            # cantilevered side tabs) has +Z-facing faces only and
+            # does NOT bridge — its cluster is single-sided. We
+            # skip those because they're already cleanly segmented
+            # by earlier passes; intervening fragments them.
+            side_signs = np.sign(normals[island_faces] @ axis_vec)
+            n_pos = int((side_signs > 0).sum())
+            n_neg = int((side_signs < 0).sum())
+            if min(n_pos, n_neg) < 4:
+                continue  # single-sided — leave alone
+
+            # Don't peel an island that's ALREADY sitting in clean
+            # local regions. We only need to act if the island's
+            # faces are absorbed into giant plate-spanning regions
+            # (the rolled-edge frame). When < 50% of island faces
+            # are in large (>=200) regions, the existing
+            # segmentation already gave the tab its own region(s)
+            # and intervening would just fragment them.
+            island_label_sizes = Counter(labels.tolist())
+            in_big = int(sum(
+                1 for fi in island_faces
+                if island_label_sizes[int(labels[fi])] >= 200
+            ))
+            if in_big / len(island_faces) < 0.5:
+                continue
+
+            island_center = island_centroids.mean(axis=0)
+
+            # Bore-wall candidates: faces perpendicular to axis,
+            # within a small radius (extent * 0.7) of island center
+            # in perp plane, AND currently sitting in a large
+            # plate-spanning region (>= 200 faces). Faces already
+            # in clean local regions (existing well-formed bore /
+            # rim / chamfer regions, typically 30-100 faces) are
+            # left alone — this pass is only meant to RESCUE faces
+            # absorbed into a giant rolled-edge or frame region.
+            label_sizes = Counter(labels.tolist())
+            radial = np.where(np.abs(normals @ axis_vec) < 0.25)[0]
+            if len(radial) == 0:
+                continue
+            d_perp = np.linalg.norm(
+                centroids[radial][:, perp_idx]
+                - island_center[perp_idx],
+                axis=1,
+            )
+            bore_radius_max = extent * 0.7
+            bore_mask = d_perp < bore_radius_max
+            bore_candidates = radial[bore_mask]
+            if len(bore_candidates) == 0:
+                continue
+            big_src = np.array(
+                [label_sizes[int(labels[fi])] >= 200 for fi in bore_candidates],
+                dtype=bool,
+            )
+            bore_candidates = bore_candidates[big_src]
+            if len(bore_candidates) < 8:
+                continue
+
+            # Skip if bore is already local (dominant label is small
+            # and centered here).
+            src_labels = Counter(int(labels[fi]) for fi in bore_candidates)
+            dom_lbl, dom_n = src_labels.most_common(1)[0]
+            if dom_n / len(bore_candidates) < 0.5:
+                # Already split across labels — leave alone
+                pass
+            else:
+                lbl_face_count = int((labels == dom_lbl).sum())
+                if lbl_face_count < 100:
+                    continue  # already a local feature
+
+            # Reassign bore-wall faces to a new label.
+            for fi in bore_candidates:
+                labels[fi] = next_label
+            next_label += 1
+
+            # Rim fillet candidates: tilted normal, near hole center.
+            # Split front/back by sign of (n · axis) and reassign each
+            # side independently so each rim becomes its own region.
+            tilted = np.where(
+                (np.abs(normals @ axis_vec) > 0.3)
+                & (np.abs(normals @ axis_vec) < 0.95)
+            )[0]
+            if len(tilted) == 0:
+                continue
+            d_perp_tilted = np.linalg.norm(
+                centroids[tilted][:, perp_idx]
+                - island_center[perp_idx],
+                axis=1,
+            )
+            rim_mask = d_perp_tilted < bore_radius_max
+            tilted_in_range = tilted[rim_mask]
+            if len(tilted_in_range) == 0:
+                continue
+            # Same big-source restriction as for bore peeling.
+            big_src_tilted = np.array(
+                [label_sizes[int(labels[fi])] >= 200 for fi in tilted_in_range],
+                dtype=bool,
+            )
+            tilted_in_range = tilted_in_range[big_src_tilted]
+            for side in (1.0, -1.0):
+                side_faces = tilted_in_range[
+                    np.sign(normals[tilted_in_range] @ axis_vec) == side
+                ]
+                if len(side_faces) < 5:
+                    continue
+                for fi in side_faces:
+                    labels[fi] = next_label
+                next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[lbl] for lbl in labels], dtype=np.int64)
     return labels
 
 

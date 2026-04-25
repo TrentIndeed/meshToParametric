@@ -701,16 +701,19 @@ def _peel_isolated_flat_island_holes(
 
             island_center = island_centroids.mean(axis=0)
 
-            # Bore-wall candidates: faces perpendicular to axis,
-            # within a small radius (extent * 0.7) of island center
-            # in perp plane, AND currently sitting in a large
-            # plate-spanning region (>= 200 faces). Faces already
-            # in clean local regions (existing well-formed bore /
-            # rim / chamfer regions, typically 30-100 faces) are
-            # left alone — this pass is only meant to RESCUE faces
-            # absorbed into a giant rolled-edge or frame region.
+            # Bore-wall candidates: faces (nearly) perpendicular to
+            # axis (|n·axis|<0.15, tight to capture only the actual
+            # cylinder wall and not the inner-edge fillet faces
+            # which can have |n·axis| up to ~0.25), within a small
+            # radius (extent * 0.7) of island center in perp plane,
+            # AND currently sitting in a large plate-spanning
+            # region (>= 200 faces). Faces already in clean local
+            # regions (existing well-formed bore / rim / chamfer
+            # regions, typically 30-100 faces) are left alone —
+            # this pass is only meant to RESCUE faces absorbed
+            # into a giant rolled-edge or frame region.
             label_sizes = Counter(labels.tolist())
-            radial = np.where(np.abs(normals @ axis_vec) < 0.25)[0]
+            radial = np.where(np.abs(normals @ axis_vec) < 0.15)[0]
             if len(radial) == 0:
                 continue
             d_perp = np.linalg.norm(
@@ -748,11 +751,18 @@ def _peel_isolated_flat_island_holes(
                 labels[fi] = next_label
             next_label += 1
 
-            # Rim fillet candidates: tilted normal, near hole center.
-            # Split front/back by sign of (n · axis) and reassign each
-            # side independently so each rim becomes its own region.
+            # Rim fillet candidates: tilted normal (anything between
+            # the bore-wall threshold and the flat-plate threshold),
+            # near hole center. Split front/back by sign of
+            # (n · axis) and reassign each side independently so
+            # each rim becomes its own region.
+            #
+            # Range 0.15-0.95 deliberately overlaps the bore-wall
+            # 0.15 cutoff so the inner-edge fillet faces (|n·axis|
+            # 0.15-0.3) become rim, not bore. Outer-edge fillet
+            # faces (|n·axis| 0.85-0.95) become rim, not flat plate.
             tilted = np.where(
-                (np.abs(normals @ axis_vec) > 0.3)
+                (np.abs(normals @ axis_vec) > 0.15)
                 & (np.abs(normals @ axis_vec) < 0.95)
             )[0]
             if len(tilted) == 0:

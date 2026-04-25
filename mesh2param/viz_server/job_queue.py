@@ -606,19 +606,27 @@ class JobQueue:
         _pause_for_review()
 
         # Stage 3: Fitting
+        # Color per-region (like Stage 2) rather than per-surface-type.
+        # Type coloring made all cylinders one shade of green and all
+        # planes one shade of blue, which visually re-merged distinct
+        # regions that segmentation had carefully separated (e.g. bore
+        # wall and rim fillet, both fitted as CYLINDER, both rendering
+        # green). Per-region coloring preserves the segmentation's
+        # spatial story while still letting the user see each fit's
+        # type via the feature tree / hover info.
         job.progress = 20
         job.progress_stage = "Fitting primitives..."
         fit_colors = []
         for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
-            fitted_lookup = {f.region_id: f for f in fitted}
+            color_for_region = _color_regions_no_adjacent_match(
+                regions, sub_cleaned, palette,
+            )
             for region in regions:
-                f = fitted_lookup.get(region.region_id)
-                if f:
-                    color = type_colors.get(f.surface_type.name, [0.6, 0.6, 0.6])
-                    for fi in region.face_indices:
-                        if fi < len(fc):
-                            fc[fi] = color
+                color = color_for_region.get(region.region_id, [0.6, 0.6, 0.6])
+                for fi in region.face_indices:
+                    if fi < len(fc):
+                        fc[fi] = color
             fit_colors.append((body, sub_cleaned, fc))
         _set_body_viz(fit_colors)
         _pause_for_review()

@@ -115,6 +115,18 @@ def segment_mesh(
         labels = _peel_isolated_flat_island_holes(
             labels, cleaned, adjacency,
         )
+        # Split rolled-edge regions that connect two opposing flat
+        # regions (e.g. the perimeter wrap of a cantilevered tab,
+        # going from the tab's bottom face up to the parent body's
+        # top face) into separate fillet-near-A + side-wall +
+        # fillet-near-B sub-regions. This is what makes 4 mounting
+        # tabs on the same body segment SYMMETRICALLY: without it,
+        # some tabs' wraps split into chamfer/wall/transition by
+        # coincidence of DBSCAN axis-detection thresholds, while
+        # others stay as one giant region.
+        labels = _split_rolled_edge_into_fillet_wall(
+            labels, cleaned, adjacency,
+        )
         # Pull borderline-tilted faces out of curved regions
         # back into adjacent flat regions when their neighborhood
         # is dominantly flat. Captures the general principle
@@ -791,6 +803,180 @@ def _peel_isolated_flat_island_holes(
                 for fi in side_faces:
                     labels[fi] = next_label
                 next_label += 1
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[lbl] for lbl in labels], dtype=np.int64)
+    return labels
+
+
+def _split_rolled_edge_into_fillet_wall(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Split a curved region that connects two OPPOSING flat regions
+    into fillet-near-A + side-wall + fillet-near-B sub-regions.
+
+    A cantilevered protrusion (boss, tab, rib) has its outer
+    perimeter rolled-edge connect from one flat face (e.g. the
+    tab's bottom) around to the opposite flat face (the parent
+    body's top). Region growing produces ONE region for the whole
+    roll because the transition is smooth, but geometrically the
+    roll has 3 distinct sub-regions:
+
+        • fillet near flat A — face normals partly aligned with
+          A's mean normal (the curve "pulling toward" A)
+        • side wall — normals perpendicular to A's and B's normals,
+          consistent direction throughout (low local rotation)
+        • fillet near flat B — normals partly aligned with B's mean
+
+    This pass enforces SYMMETRIC segmentation across multiple
+    similar features on the same body. Without it, four identical
+    mounting tabs on a base plate end up with different region
+    counts because DBSCAN's axis voting and adjacent-cylinder
+    fragmentation produce different cluster groupings depending on
+    the tab's orientation relative to world axes.
+
+    Conditions to split:
+        1. Region has > 80 faces (substantial — likely a large roll)
+        2. Region has mean-normal magnitude < 0.95 (truly curved)
+        3. Region has TWO mesh-adjacent flat regions (mag > 0.95)
+           with normals pointing in opposing directions
+           (dot product < -0.7, i.e. > 135° apart)
+        4. After splitting, all 3 sub-regions have >= 15 faces
+           (otherwise this region was a simple fillet, not a roll)
+    """
+    labels = labels.copy()
+    normals = cleaned.normals
+
+    region_faces: dict[int, np.ndarray] = {}
+    for lbl in np.unique(labels):
+        region_faces[int(lbl)] = np.where(labels == lbl)[0]
+
+    region_adj: dict[int, set[int]] = defaultdict(set)
+    for fi, neighbors in adjacency.items():
+        li = int(labels[fi])
+        for nb in neighbors:
+            ln = int(labels[nb])
+            if li != ln:
+                region_adj[li].add(ln)
+                region_adj[ln].add(li)
+
+    region_mean: dict[int, np.ndarray] = {}
+    region_mag: dict[int, float] = {}
+    for lbl, faces in region_faces.items():
+        mn = normals[faces].mean(axis=0)
+        mag = float(np.linalg.norm(mn))
+        region_mag[lbl] = mag
+        if mag > 1e-12:
+            region_mean[lbl] = mn / mag
+        else:
+            region_mean[lbl] = mn
+
+    next_label = int(labels.max()) + 1
+
+    # Process largest curved regions first (most worth splitting);
+    # iterate over a snapshot of the keys so adding new labels
+    # mid-loop doesn't perturb iteration.
+    curved_lbls = [
+        l for l in region_faces
+        if len(region_faces[l]) >= 80 and region_mag[l] < 0.95
+    ]
+    curved_lbls.sort(key=lambda l: -len(region_faces[l]))
+
+    for lbl in curved_lbls:
+        faces = region_faces[lbl]
+        face_norms = normals[faces]
+
+        flat_neighbors = [
+            nb for nb in region_adj.get(lbl, set())
+            if region_mag.get(nb, 0.0) >= 0.95
+            and len(region_faces.get(nb, [])) >= 20
+        ]
+        if not flat_neighbors:
+            continue
+
+        # Try opposing pair first (3-piece roll: fillet-A +
+        # side-wall + fillet-B). Otherwise try single flat neighbor
+        # (2-piece roll: fillet + side-wall). The single-flat case
+        # handles rolled edges that only cover one half of the
+        # geometric wrap (the other half landed in a separate
+        # region during region growing).
+        opposing = None
+        for i in range(len(flat_neighbors)):
+            for j in range(i + 1, len(flat_neighbors)):
+                a, b = flat_neighbors[i], flat_neighbors[j]
+                if float(np.dot(region_mean[a], region_mean[b])) < -0.7:
+                    opposing = (a, b)
+                    break
+            if opposing is not None:
+                break
+
+        if opposing is not None:
+            a_lbl, b_lbl = opposing
+            a_norm = region_mean[a_lbl]
+            b_norm = region_mean[b_lbl]
+            a_dots = face_norms @ a_norm
+            b_dots = face_norms @ b_norm
+            fillet_a_mask = a_dots > 0.5
+            fillet_b_mask = b_dots > 0.5
+            both = fillet_a_mask & fillet_b_mask
+            if int(both.sum()) > 0:
+                prefer_a = a_dots[both] >= b_dots[both]
+                both_idx = np.where(both)[0]
+                fillet_a_mask[both_idx] = prefer_a
+                fillet_b_mask[both_idx] = ~prefer_a
+            wall_mask = ~fillet_a_mask & ~fillet_b_mask
+
+            if (
+                int(fillet_a_mask.sum()) >= 20
+                and int(fillet_b_mask.sum()) >= 20
+                and int(wall_mask.sum()) >= 20
+            ):
+                wall_mean = face_norms[wall_mask].mean(axis=0)
+                wall_mag = float(np.linalg.norm(wall_mean))
+                if wall_mag >= 0.5:
+                    wall_dir = wall_mean / wall_mag
+                    if (
+                        abs(float(np.dot(wall_dir, a_norm))) <= 0.5
+                        and abs(float(np.dot(wall_dir, b_norm))) <= 0.5
+                    ):
+                        labels[faces[fillet_a_mask]] = next_label
+                        next_label += 1
+                        labels[faces[wall_mask]] = next_label
+                        next_label += 1
+                        continue  # done with this region
+
+        # Single-flat-neighbor split: fillet (toward the flat) +
+        # side-wall (perpendicular to it). Pick the flat neighbor
+        # whose normal best matches the curved region's tilt
+        # direction (i.e. dot(region_mean, flat_normal) is most
+        # positive — the flat we're rolling INTO).
+        best_flat = max(
+            flat_neighbors,
+            key=lambda nb: float(np.dot(region_mean[lbl], region_mean[nb])),
+        )
+        a_norm = region_mean[best_flat]
+        if float(np.dot(region_mean[lbl], a_norm)) < 0.3:
+            continue  # region isn't actually tilting toward this flat
+        a_dots = face_norms @ a_norm
+        fillet_mask = a_dots > 0.5
+        wall_mask = ~fillet_mask
+        if int(fillet_mask.sum()) < 20 or int(wall_mask.sum()) < 20:
+            continue
+        wall_mean = face_norms[wall_mask].mean(axis=0)
+        wall_mag = float(np.linalg.norm(wall_mean))
+        if wall_mag < 0.5:
+            continue
+        wall_dir = wall_mean / wall_mag
+        if abs(float(np.dot(wall_dir, a_norm))) > 0.5:
+            continue  # wall not perpendicular to flat → not a real roll
+
+        labels[faces[fillet_mask]] = next_label
+        next_label += 1
+        # wall_mask faces keep `lbl`.
 
     # Renumber contiguously
     unique = np.unique(labels)

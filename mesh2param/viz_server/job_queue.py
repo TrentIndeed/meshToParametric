@@ -72,25 +72,112 @@ def _color_regions_no_adjacent_match(regions, sub_cleaned, palette):
                 region_neighbors[ri].add(rj)
                 region_neighbors[rj].add(ri)
 
-    # Greedy color assignment, largest regions first (so big visual
-    # blobs get the most-distinct colors).
+    # 2-hop neighbors: regions that share a common direct neighbor.
+    # This catches the "bore + rolled-edge separated by a thin rim
+    # fillet" case — the bore and the rolled edge aren't mesh-
+    # adjacent, but visually they read as continuous through the
+    # narrow rim ring. Forcing them to different colors makes the
+    # rim's separation visible at a glance.
+    region_two_hop: dict[int, set[int]] = defaultdict(set)
+    for ri, neighbors in region_neighbors.items():
+        for n in neighbors:
+            for nn in region_neighbors.get(n, set()):
+                if nn != ri:
+                    region_two_hop[ri].add(nn)
+
+    # Compute HSL features for each palette entry. The previous
+    # RGB-distance metric let visually-similar pastels (e.g. cyan
+    # next to green: both light, both green-dominant, only the
+    # B channel differs) end up adjacent — they read as the same
+    # color under 3D shading. HSL splits the perceptual axes that
+    # matter: hue (where on the color wheel) and lightness (how
+    # bright). We score against neighbors using both, weighted
+    # so that two LIGHT colors next to each other or two
+    # SAME-HUE colors next to each other are both penalised.
+    import colorsys
+    palette_hsl: list[tuple[float, float, float]] = []
+    for r, g, b in palette:
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
+        palette_hsl.append((h, l, s))
+
+    def _hue_dist(a: int, b: int) -> float:
+        # Circular hue distance in [0, 0.5]
+        ha, hb = palette_hsl[a][0], palette_hsl[b][0]
+        d = abs(ha - hb)
+        return min(d, 1.0 - d)
+
+    def _light_dist(a: int, b: int) -> float:
+        return abs(palette_hsl[a][1] - palette_hsl[b][1])
+
+    # Minimum hue separation that reads as "different hue family"
+    # at a glance. 0.20 = 72° on the color wheel — well past the
+    # 60° boundary where adjacent hues (e.g. red and pink-magenta,
+    # red and orange) start blending visually. The palette is
+    # designed with 4 hue families at 90° apart so any two
+    # distinct hues exceed this threshold.
+    HUE_SEPARATION = 0.20
+
+    def _hue_far_enough(a: int, b: int) -> bool:
+        return _hue_dist(a, b) >= HUE_SEPARATION
+
+    def _perceptual_dist(a: int, b: int) -> float:
+        # Hue × 4, lightness × 1 — hue dominates because human
+        # vision distinguishes hues much faster than lightness.
+        return 4.0 * _hue_dist(a, b) + 1.0 * _light_dist(a, b)
+
+    # Greedy color assignment, largest regions first. For each
+    # region, pick the palette color that MAXIMIZES the minimum
+    # perceptual distance to its 1-hop and 2-hop neighbors. The
+    # tiered score prefers (a) not-already-used-by-1-hop, then
+    # (b) not-used-by-2-hop, then (c) max perceptual distance
+    # against 1-hop, (d) against 2-hop. This guarantees adjacent
+    # regions get colors with different hues AND different
+    # lightness — preventing both same-color and same-shade
+    # collisions.
     sorted_regions = sorted(regions, key=lambda r: -r.num_faces)
     color_idx_for: dict[int, int] = {}
     for r in sorted_regions:
-        used = {
+        rid = r.region_id
+        one_hop_used = [
             color_idx_for[n]
-            for n in region_neighbors.get(r.region_id, set())
+            for n in region_neighbors.get(rid, set())
             if n in color_idx_for
-        }
-        chosen = None
+        ]
+        two_hop_used = [
+            color_idx_for[n]
+            for n in region_two_hop.get(rid, set())
+            if n in color_idx_for
+        ]
+        # Score tiers (highest priority first):
+        #   1. hue-distinct from every 1-hop neighbor
+        #   2. hue-distinct from every 2-hop neighbor
+        #   3. max of MIN perceptual distance over 1-hop ∪ 2-hop
+        #      (the "weakest link" — guarantees no neighbor at any
+        #      hop is too close)
+        #   4. max sum of distances (tiebreaker)
+        # The weakest-link metric prevents the failure mode where
+        # min_dist_1hop dominated and let a candidate with
+        # min_dist_2hop = 0 win — which produced bore + tab-top
+        # both getting THE SAME palette index.
+        all_used = one_hop_used + two_hop_used
+        best_ci, best_score = 0, (-1, -1, -1.0, -1.0)
         for ci in range(len(palette)):
-            if ci not in used:
-                chosen = ci
-                break
-        if chosen is None:
-            # Palette exhausted by neighbors — fallback to round-robin
-            chosen = r.region_id % len(palette)
-        color_idx_for[r.region_id] = chosen
+            hue_ok_1hop = (
+                1 if all(_hue_far_enough(ci, c) for c in one_hop_used) else 0
+            )
+            hue_ok_2hop = (
+                1 if all(_hue_far_enough(ci, c) for c in two_hop_used) else 0
+            )
+            if all_used:
+                weakest = min(_perceptual_dist(ci, c) for c in all_used)
+                total = sum(_perceptual_dist(ci, c) for c in all_used)
+            else:
+                weakest, total = 4.0, 4.0
+            score = (hue_ok_1hop, hue_ok_2hop, weakest, total)
+            if score > best_score:
+                best_score = score
+                best_ci = ci
+        color_idx_for[rid] = best_ci
     return {rid: palette[ci] for rid, ci in color_idx_for.items()}
 
 
@@ -383,11 +470,25 @@ class JobQueue:
 
         # ── Stages 2-5: run per body (or full mesh for single-body) ──
 
+        # 4 distinct hue families × 3 lightness tiers = 12 colors.
+        # Hues at 90° intervals (red, lime, cyan, purple) so any
+        # two distinct hues land in clearly different families —
+        # never "red-orange" next to "pink-magenta" the way 60°
+        # gaps allowed. Lightness alternates across indices so
+        # consecutive picks differ in BOTH hue and brightness.
         palette = [
-            [0.0, 0.55, 1.0],  [1.0, 0.35, 0.0],  [0.0, 1.0, 0.25],
-            [1.0, 0.0, 0.55],  [0.0, 0.15, 0.9],   [0.0, 0.9, 0.8],
-            [0.7, 0.0, 1.0],   [1.0, 0.2, 0.0],    [0.2, 0.8, 0.2],
-            [0.9, 0.0, 0.9],   [0.0, 0.7, 0.5],    [1.0, 0.6, 0.0],
+            [1.00, 0.55, 0.55],  # 0  light red    (hue   0°, L 0.78)
+            [0.45, 0.05, 0.05],  # 1  dark red     (hue   0°, L 0.25)
+            [0.65, 1.00, 0.40],  # 2  light lime   (hue  90°, L 0.70)
+            [0.20, 0.50, 0.00],  # 3  dark olive   (hue  90°, L 0.25)
+            [0.45, 0.95, 1.00],  # 4  light cyan   (hue 188°, L 0.73)
+            [0.00, 0.40, 0.55],  # 5  dark teal    (hue 196°, L 0.27)
+            [0.85, 0.55, 1.00],  # 6  light purple (hue 273°, L 0.78)
+            [0.30, 0.00, 0.55],  # 7  dark purple  (hue 273°, L 0.27)
+            [1.00, 0.85, 0.55],  # 8  cream        (hue  40°, L 0.78)
+            [0.55, 0.30, 0.00],  # 9  dark amber   (hue  33°, L 0.27)
+            [0.40, 1.00, 0.85],  # 10 mint         (hue 158°, L 0.70)
+            [0.10, 0.30, 0.65],  # 11 navy         (hue 218°, L 0.38)
         ]
         type_colors = {
             'PLANE': [0.0, 0.55, 1.0], 'CYLINDER': [0.0, 1.0, 0.25],

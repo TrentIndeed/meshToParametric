@@ -606,14 +606,18 @@ class JobQueue:
         _pause_for_review()
 
         # Stage 3: Fitting
-        # Color per-region (like Stage 2) rather than per-surface-type.
-        # Type coloring made all cylinders one shade of green and all
-        # planes one shade of blue, which visually re-merged distinct
-        # regions that segmentation had carefully separated (e.g. bore
-        # wall and rim fillet, both fitted as CYLINDER, both rendering
-        # green). Per-region coloring preserves the segmentation's
-        # spatial story while still letting the user see each fit's
-        # type via the feature tree / hover info.
+        # Color per-region (like Stage 2) rather than per-surface-type
+        # — type coloring made all cylinders one green and all planes
+        # one blue, which visually re-merged regions segmentation had
+        # carefully separated. Additionally, DESATURATE faces whose
+        # residual against the fitted primitive exceeds the fit's
+        # tolerance: these "outlier" faces are at region boundaries
+        # or are noise that didn't really belong to the region's
+        # primitive. Showing them dim makes the clean primitive
+        # surfaces stand out, answering the "shouldn't fitting be
+        # cleaner than segmentation?" question — yes, by visually
+        # ignoring the faces that DON'T fit.
+        from mesh2param.pipeline.fit import compute_residuals
         job.progress = 20
         job.progress_stage = "Fitting primitives..."
         fit_colors = []
@@ -622,11 +626,36 @@ class JobQueue:
             color_for_region = _color_regions_no_adjacent_match(
                 regions, sub_cleaned, palette,
             )
+            fitted_lookup = {f.region_id: f for f in fitted}
+            face_centroids = sub_cleaned.vertices[sub_cleaned.faces].mean(axis=1)
+            bbox_diag = float(np.linalg.norm(
+                sub_cleaned.bbox[1] - sub_cleaned.bbox[0]
+            ))
+            # Outlier threshold: 0.5% of bbox diagonal — a face whose
+            # centroid is more than this far from the fitted surface
+            # is treated as not-really-part-of-this-primitive.
+            outlier_thresh = bbox_diag * 0.005
+            outlier_color = np.array([0.85, 0.85, 0.85])  # dim grey
             for region in regions:
-                color = color_for_region.get(region.region_id, [0.6, 0.6, 0.6])
-                for fi in region.face_indices:
-                    if fi < len(fc):
-                        fc[fi] = color
+                color = np.array(
+                    color_for_region.get(region.region_id, [0.6, 0.6, 0.6])
+                )
+                f = fitted_lookup.get(region.region_id)
+                if f is None or len(region.face_indices) == 0:
+                    for fi in region.face_indices:
+                        if fi < len(fc):
+                            fc[fi] = color
+                    continue
+                pts = face_centroids[region.face_indices]
+                try:
+                    residuals = np.abs(compute_residuals(pts, f))
+                    inliers = residuals < outlier_thresh
+                except Exception:
+                    inliers = np.ones(len(region.face_indices), dtype=bool)
+                for k, fi in enumerate(region.face_indices):
+                    if fi >= len(fc):
+                        continue
+                    fc[fi] = color if inliers[k] else outlier_color
             fit_colors.append((body, sub_cleaned, fc))
         _set_body_viz(fit_colors)
         _pause_for_review()

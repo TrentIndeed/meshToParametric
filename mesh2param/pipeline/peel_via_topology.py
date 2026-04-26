@@ -217,7 +217,33 @@ def identify_blends_from_topology(
             # uniform, fail spread test), countersink cones
             # (normals at uniform half-angle, fail alignment).
             face_norms = cleaned.normals[region.face_indices]
-            if len(plane_nbr_fits) == 0:
+            # Big rounded structural fillet: a large curved region
+            # (>=200 faces) with many plane neighbors (>=4) and
+            # very curved (mean-normal magnitude < 0.3). These are
+            # rolled side edges of plates — the cylinder/cone wrap
+            # from one flat face through the curve to another, but
+            # often the segmentation only catches the "vertical"
+            # portion where normals don't reach either flat
+            # direction. The bridge test would reject them, but
+            # they ARE legitimate fillets in CAD terms.
+            mean_n_mag = float(
+                np.linalg.norm(face_norms.mean(axis=0))
+            )
+            if (
+                region.num_faces >= 200
+                and len(plane_nbr_fits) >= 4
+                and mean_n_mag < 0.3
+            ):
+                bridge_ok = True
+                kind = "fillet"
+                neighbor_edges = list(neighbors)
+                bis_ni = bis_nj = None
+                # Skip the bridge test path below
+                # (using a flag instead of structural restructure).
+                _big_fillet = True
+            else:
+                _big_fillet = False
+            if len(plane_nbr_fits) == 0 and not _big_fillet:
                 # No flat surface to bridge to — skip.
                 continue
             # Plane-count restriction targets cantilever side
@@ -232,36 +258,37 @@ def identify_blends_from_topology(
             #     side plate runs the full plate length but is
             #     only a fraction of a mm thick). Cantilever
             #     walls are blocky (aspect ratio ≈ 3-4).
-            if (
-                f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
-                and len(plane_nbr_fits) > 2
-                and region.num_faces < 150
-            ):
-                region_verts = cleaned.vertices[
-                    np.unique(cleaned.faces[region.face_indices].ravel())
-                ]
-                bb_size = region_verts.max(axis=0) - region_verts.min(axis=0)
-                bb_sorted = sorted(bb_size, reverse=True)
-                aspect_ratio = bb_sorted[0] / max(bb_sorted[2], 0.01)
-                if aspect_ratio < 50:
+            if not _big_fillet:
+                if (
+                    f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
+                    and len(plane_nbr_fits) > 2
+                    and region.num_faces < 150
+                ):
+                    region_verts = cleaned.vertices[
+                        np.unique(cleaned.faces[region.face_indices].ravel())
+                    ]
+                    bb_size = region_verts.max(axis=0) - region_verts.min(axis=0)
+                    bb_sorted = sorted(bb_size, reverse=True)
+                    aspect_ratio = bb_sorted[0] / max(bb_sorted[2], 0.01)
+                    if aspect_ratio < 50:
+                        continue
+                bridge_ok = False
+                for pn in plane_nbr_fits:
+                    n_p = _pn(pn)
+                    dots = face_norms @ n_p
+                    if dots.size == 0:
+                        continue
+                    spread = float(dots.max() - dots.min())
+                    if spread > 1.0:
+                        continue
+                    if (dots > 0.866).any():
+                        bridge_ok = True
+                        break
+                if not bridge_ok:
                     continue
-            bridge_ok = False
-            for pn in plane_nbr_fits:
-                n_p = _pn(pn)
-                dots = face_norms @ n_p
-                if dots.size == 0:
-                    continue
-                spread = float(dots.max() - dots.min())
-                if spread > 1.0:
-                    continue
-                if (dots > 0.866).any():
-                    bridge_ok = True
-                    break
-            if not bridge_ok:
-                continue
-            kind = "fillet"
-            neighbor_edges = list(neighbors)
-            bis_ni = bis_nj = None  # chamfer-only, unused for fillets
+                kind = "fillet"
+                neighbor_edges = list(neighbors)
+                bis_ni = bis_nj = None  # chamfer-only, unused for fillets
         elif f.surface_type == SurfaceType.PLANE:
             # Narrow plane strip — possible chamfer between two planes.
             chamfer_edges = [e for e in neighbors

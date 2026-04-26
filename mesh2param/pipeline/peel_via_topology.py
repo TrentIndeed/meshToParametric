@@ -202,35 +202,19 @@ def identify_blends_from_topology(
                         if (dots > 0.866).any() and (dots < 0.3).any():
                             bridge_ok = True
                             break
-                # Case C — conical CHAMFER misfit as cylinder/cone:
-                # A countersink chamfer has UNIFORM tilt — all faces
-                # at the same angle to the adjacent plate. The fitter
-                # often classifies it as CYLINDER with a tilted axis
-                # rather than as a true CONE, so the chamfer branch
-                # below (which only matches PLANE surfaces) misses
-                # it. Detect by uniformity: dot products against an
-                # adjacent plane's normal are clustered tightly
-                # (max-min < 0.3) AND the mean tilt sits in the
-                # chamfer band (0.3 ≤ mean ≤ 0.866 = 30°-72° tilt).
-                # This catches countersinks while excluding bore
-                # walls (mean ≈ 0, all-perpendicular) and uniform
-                # flat strips (mean ≈ 1, all-parallel).
-                if not bridge_ok and region.num_faces < 80:
-                    for pn in plane_nbr_fits:
-                        n_p = _pn(pn)
-                        dots = face_norms @ n_p
-                        if dots.size == 0:
-                            continue
-                        spread = float(dots.max() - dots.min())
-                        mean_dot = float(dots.mean())
-                        if spread < 0.3 and 0.3 <= mean_dot <= 0.866:
-                            bridge_ok = True
-                            kind = "chamfer"  # tag as chamfer, not fillet
-                            break
+                # NOTE: don't tag uniform-tilt curved regions as
+                # chamfers. On real meshes such regions are usually
+                # FILLETS with very small radius that tessellate to
+                # only one or two face-rows of nearly-uniform tilt;
+                # if the source CAD intended a chamfer it would have
+                # been modelled as a flat-strip cone and the PLANE
+                # branch below picks it up. Tagging uniform-tilt
+                # regions as chamfers caused false-positive orange
+                # rings around hole rims that the user knows are
+                # fillets, not chamfers.
                 if not bridge_ok:
                     continue
-            if kind is None:
-                kind = "fillet"
+            kind = "fillet"
             neighbor_edges = list(neighbors)
             bis_ni = bis_nj = None  # chamfer-only, unused for fillets
         elif f.surface_type == SurfaceType.PLANE:

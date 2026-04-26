@@ -217,33 +217,8 @@ def identify_blends_from_topology(
             # uniform, fail spread test), countersink cones
             # (normals at uniform half-angle, fail alignment).
             face_norms = cleaned.normals[region.face_indices]
-            # Big rounded structural fillet: a large curved region
-            # (>=200 faces) with many plane neighbors (>=4) and
-            # very curved (mean-normal magnitude < 0.3). These are
-            # rolled side edges of plates — the cylinder/cone wrap
-            # from one flat face through the curve to another, but
-            # often the segmentation only catches the "vertical"
-            # portion where normals don't reach either flat
-            # direction. The bridge test would reject them, but
-            # they ARE legitimate fillets in CAD terms.
-            mean_n_mag = float(
-                np.linalg.norm(face_norms.mean(axis=0))
-            )
-            if (
-                region.num_faces >= 200
-                and len(plane_nbr_fits) >= 4
-                and mean_n_mag < 0.3
-            ):
-                bridge_ok = True
-                kind = "fillet"
-                neighbor_edges = list(neighbors)
-                bis_ni = bis_nj = None
-                # Skip the bridge test path below
-                # (using a flag instead of structural restructure).
-                _big_fillet = True
-            else:
-                _big_fillet = False
-            if len(plane_nbr_fits) == 0 and not _big_fillet:
+            _big_fillet = False
+            if len(plane_nbr_fits) == 0:
                 # No flat surface to bridge to — skip.
                 continue
             # Plane-count restriction targets cantilever side

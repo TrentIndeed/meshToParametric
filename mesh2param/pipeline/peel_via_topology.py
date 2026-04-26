@@ -218,40 +218,7 @@ def identify_blends_from_topology(
             # (normals at uniform half-angle, fail alignment).
             face_norms = cleaned.normals[region.face_indices]
             _big_fillet = False
-            # PERIMETER FILLET: a cylinder/cone whose axis runs
-            # PARALLEL to a plate (perpendicular to the body's
-            # thin axis) is a rolled-edge fillet running along
-            # the plate's perimeter. Bore walls have axes ALONG
-            # the body's thin axis (perpendicular to the plate
-            # face) so they're excluded by this check.
-            # Conditions:
-            #   • CYLINDER or CONE
-            #   • axis perpendicular to body's thin axis (i.e.
-            #     axis lies in the plate's plane)
-            #   • mean-normal magnitude < 0.4 (highly curved
-            #     cross-section, sweeping across an edge)
-            #   • ≥ 2 plane neighbors (the two surfaces being
-            #     filleted, or the plate face + adjacent feature)
-            if (
-                f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
-                and 2 <= len(plane_nbr_fits) <= 3
-                and region.num_faces < 150
-                and axis is not None
-            ):
-                bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
-                thin_axis_idx = int(np.argmin(bbox_size))
-                axis_along_thin = abs(float(axis[thin_axis_idx]))
-                mean_n_mag = float(np.linalg.norm(face_norms.mean(axis=0)))
-                # Big rounded structural walls (central opening
-                # cylinders) have many plane neighbors AND many
-                # faces — both gates exclude them.
-                if axis_along_thin < 0.5 and mean_n_mag < 0.4:
-                    bridge_ok = True
-                    kind = "fillet"
-                    neighbor_edges = list(neighbors)
-                    bis_ni = bis_nj = None
-                    _big_fillet = True
-            if len(plane_nbr_fits) == 0 and not _big_fillet:
+            if len(plane_nbr_fits) == 0:
                 continue
             # Plane-count restriction targets cantilever side
             # walls: small (<150 face) curved regions wrapping a

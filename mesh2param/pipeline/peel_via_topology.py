@@ -99,14 +99,45 @@ def identify_blends_from_topology(
         # neighboring edges as CHAMFER or SHARP instead of FILLET.
         # So we use shape + size + plane-adjacency as the filter, and
         # skip the edge-tag check entirely.
-        # Collect plane neighbors (weak signal — we don't require any
-        # specific count, just used later for chamfer bisector check).
+        # Collect plane neighbors. We treat both true PLANE fits AND
+        # flat-but-misfit CYLINDER/CONE/SPHERE fits as "plane
+        # equivalents" — these are regions whose face normals are
+        # near-uniform (mean-normal magnitude > 0.95), i.e. flat
+        # plates that the fitter occasionally classifies as a
+        # cylinder with absurd radius. Counting them lets fillets
+        # that border such misfit plates still pass the
+        # "must-bridge-to-a-flat" gate.
         plane_nbr_fits: list = []
         for e in neighbors:
             other = e.surface_b_id if e.surface_a_id == rid else e.surface_a_id
             of = fitted_lookup.get(other)
-            if of is not None and of.surface_type == SurfaceType.PLANE:
-                plane_nbr_fits.append(of)
+            if of is None:
+                continue
+            other_region = region_lookup.get(other)
+            if other_region is None or len(other_region.face_indices) == 0:
+                continue
+            other_mean_n = cleaned.normals[other_region.face_indices].mean(axis=0)
+            other_mag = float(np.linalg.norm(other_mean_n))
+            is_flat = (
+                of.surface_type == SurfaceType.PLANE
+                or other_mag > 0.95
+            )
+            if is_flat:
+                # Build a synthetic plane-like fit using the mean
+                # normal as `normal` so downstream _pn() works.
+                if of.surface_type == SurfaceType.PLANE:
+                    plane_nbr_fits.append(of)
+                else:
+                    syn = type(of)(
+                        region_id=of.region_id,
+                        surface_type=SurfaceType.PLANE,
+                        params={
+                            "normal": (other_mean_n / other_mag).tolist(),
+                            "point": other_region.vertices.mean(axis=0).tolist(),
+                        },
+                        rms_error=0.0,
+                    )
+                    plane_nbr_fits.append(syn)
 
         def _pn(fit):
             n = np.asarray(fit.params.get("normal", [0, 0, 1]), dtype=float)
@@ -189,18 +220,17 @@ def identify_blends_from_topology(
             if len(plane_nbr_fits) == 0:
                 # No flat surface to bridge to — skip.
                 continue
-            # CYLINDER/CONE fits get the structural-wall guard:
-            # 3+ plane neighbors signals a cantilever side wall
-            # (touches top, end, and side plates) which the
-            # bridge-test alone can't reject. SPHERE fits skip
-            # this guard — the fitter only picks SPHERE when it
-            # can't approximate the surface as a cylinder/cone,
-            # which is the signature of a torus rim fillet on a
-            # large hole. Sphere-fitted rims are always fillets
-            # in practice.
+            # Plane-count restriction applies only to SMALL curved
+            # regions (<150 faces). Small + 3+ planes is the
+            # signature of a cantilever side wall wrapping a 3D
+            # corner of a tab. Large curved regions with many
+            # plane neighbors are typically perimeter rolled
+            # edges of a plate (legitimate fillets that wrap
+            # around top, bottom, and end faces).
             if (
                 f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
                 and len(plane_nbr_fits) > 2
+                and region.num_faces < 150
             ):
                 continue
             bridge_ok = False

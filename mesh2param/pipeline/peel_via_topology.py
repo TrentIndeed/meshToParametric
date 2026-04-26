@@ -142,23 +142,95 @@ def identify_blends_from_topology(
                 if an < 1e-12:
                     continue
                 axis = axis / an
-                # Require ≥1 plane neighbor whose normal is
-                # perpendicular to the axis (axis·n < 0.5). That's the
-                # positive signature of an edge fillet: the fillet
-                # runs ALONG the edge of at least one flat face.
-                # A hole bore has all neighbors piercing (axis parallel
-                # to plate normal, axis·n ≈ 1) — no perpendicular
-                # neighbors — so this rejects it. A corner fillet can
-                # have mixed neighbors (some pierce top/bottom plates,
-                # some are perpendicular vertical walls) and still
-                # passes as long as any one is perpendicular.
-                has_perp = any(
-                    abs(float(np.dot(axis, _pn(pn)))) < 0.5
-                    for pn in plane_nbr_fits
-                )
-                if not has_perp:
+                # POSITIVE FILLET SIGNATURE: the curved region must
+                # BRIDGE two adjacent flat surfaces. That means:
+                #   1. There exist two plane neighbors whose normals
+                #      are ≥ 60° apart (n_A · n_B < 0.5) — these are
+                #      the two faces being filleted.
+                #   2. The region's own face normals span from
+                #      ≈ n_A's direction to ≈ n_B's direction —
+                #      i.e. some faces are within ~30° of n_A AND
+                #      some are within ~30° of n_B.
+                # This rejects the false positives of the previous
+                # "axis perpendicular to ≥1 plane" rule:
+                #   - Bore walls: radial normals don't align with any
+                #     plate normal at all (n_f · n_plate ≈ 0 always).
+                #   - Side walls: normals all point one direction,
+                #     they may align with ONE neighbor but not span
+                #     between two.
+                #   - Countersink cones: normals at half-angle to
+                #     axis (typically 45°), don't reach 30° of any
+                #     plate normal.
+                # Only true fillets sweep their normals from one
+                # adjacent flat's direction to the other's.
+                bridge_ok = False
+                face_norms = cleaned.normals[region.face_indices]
+                # Case A — between two planes: pair of plane
+                # neighbors ≥60° apart, region's normals include
+                # some aligned with each (within ~30°).
+                for i_pn in range(len(plane_nbr_fits)):
+                    n_a = _pn(plane_nbr_fits[i_pn])
+                    for j_pn in range(i_pn + 1, len(plane_nbr_fits)):
+                        n_b = _pn(plane_nbr_fits[j_pn])
+                        if abs(float(np.dot(n_a, n_b))) > 0.5:
+                            continue
+                        a_dots = face_norms @ n_a
+                        b_dots = face_norms @ n_b
+                        if (a_dots > 0.866).any() and (b_dots > 0.866).any():
+                            bridge_ok = True
+                            break
+                    if bridge_ok:
+                        break
+                # Case B — rim fillet: between a plane and a
+                # cylinder (e.g. a hole's rim where the plate meets
+                # the bore wall). Only ONE plane neighbor exists,
+                # but the region's normals SWEEP from plate-aligned
+                # to nearly plate-perpendicular (toward the bore
+                # wall direction). Restricted to SMALL regions
+                # (< 80 faces) since structural cylinders like tab
+                # side walls can also span this range; only the
+                # tight rim/edge fillets should pass.
+                # Bore walls themselves fail both ends — their
+                # normals are uniformly radial, never aligned with
+                # the plate. Countersink cones fail because their
+                # normals are uniformly at the cone half-angle,
+                # not spread across a range.
+                if not bridge_ok and region.num_faces < 80:
+                    for pn in plane_nbr_fits:
+                        n_p = _pn(pn)
+                        dots = face_norms @ n_p
+                        if (dots > 0.866).any() and (dots < 0.3).any():
+                            bridge_ok = True
+                            break
+                # Case C — conical CHAMFER misfit as cylinder/cone:
+                # A countersink chamfer has UNIFORM tilt — all faces
+                # at the same angle to the adjacent plate. The fitter
+                # often classifies it as CYLINDER with a tilted axis
+                # rather than as a true CONE, so the chamfer branch
+                # below (which only matches PLANE surfaces) misses
+                # it. Detect by uniformity: dot products against an
+                # adjacent plane's normal are clustered tightly
+                # (max-min < 0.3) AND the mean tilt sits in the
+                # chamfer band (0.3 ≤ mean ≤ 0.866 = 30°-72° tilt).
+                # This catches countersinks while excluding bore
+                # walls (mean ≈ 0, all-perpendicular) and uniform
+                # flat strips (mean ≈ 1, all-parallel).
+                if not bridge_ok and region.num_faces < 80:
+                    for pn in plane_nbr_fits:
+                        n_p = _pn(pn)
+                        dots = face_norms @ n_p
+                        if dots.size == 0:
+                            continue
+                        spread = float(dots.max() - dots.min())
+                        mean_dot = float(dots.mean())
+                        if spread < 0.3 and 0.3 <= mean_dot <= 0.866:
+                            bridge_ok = True
+                            kind = "chamfer"  # tag as chamfer, not fillet
+                            break
+                if not bridge_ok:
                     continue
-            kind = "fillet"
+            if kind is None:
+                kind = "fillet"
             neighbor_edges = list(neighbors)
             bis_ni = bis_nj = None  # chamfer-only, unused for fillets
         elif f.surface_type == SurfaceType.PLANE:

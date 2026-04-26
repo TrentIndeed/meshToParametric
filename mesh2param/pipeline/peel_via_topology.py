@@ -218,8 +218,40 @@ def identify_blends_from_topology(
             # (normals at uniform half-angle, fail alignment).
             face_norms = cleaned.normals[region.face_indices]
             _big_fillet = False
-            if len(plane_nbr_fits) == 0:
-                # No flat surface to bridge to — skip.
+            # PERIMETER FILLET: a cylinder/cone whose axis runs
+            # PARALLEL to a plate (perpendicular to the body's
+            # thin axis) is a rolled-edge fillet running along
+            # the plate's perimeter. Bore walls have axes ALONG
+            # the body's thin axis (perpendicular to the plate
+            # face) so they're excluded by this check.
+            # Conditions:
+            #   • CYLINDER or CONE
+            #   • axis perpendicular to body's thin axis (i.e.
+            #     axis lies in the plate's plane)
+            #   • mean-normal magnitude < 0.4 (highly curved
+            #     cross-section, sweeping across an edge)
+            #   • ≥ 2 plane neighbors (the two surfaces being
+            #     filleted, or the plate face + adjacent feature)
+            if (
+                f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
+                and 2 <= len(plane_nbr_fits) <= 3
+                and region.num_faces < 150
+                and axis is not None
+            ):
+                bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
+                thin_axis_idx = int(np.argmin(bbox_size))
+                axis_along_thin = abs(float(axis[thin_axis_idx]))
+                mean_n_mag = float(np.linalg.norm(face_norms.mean(axis=0)))
+                # Big rounded structural walls (central opening
+                # cylinders) have many plane neighbors AND many
+                # faces — both gates exclude them.
+                if axis_along_thin < 0.5 and mean_n_mag < 0.4:
+                    bridge_ok = True
+                    kind = "fillet"
+                    neighbor_edges = list(neighbors)
+                    bis_ni = bis_nj = None
+                    _big_fillet = True
+            if len(plane_nbr_fits) == 0 and not _big_fillet:
                 continue
             # Plane-count restriction targets cantilever side
             # walls: small (<150 face) curved regions wrapping a
@@ -245,7 +277,16 @@ def identify_blends_from_topology(
                     bb_size = region_verts.max(axis=0) - region_verts.min(axis=0)
                     bb_sorted = sorted(bb_size, reverse=True)
                     aspect_ratio = bb_sorted[0] / max(bb_sorted[2], 0.01)
-                    if aspect_ratio < 50:
+                    # Two exemptions: long thin strips (aspect ≥ 50)
+                    # AND highly-curved cylinders (mag < 0.4) that
+                    # wrap most of the way around an axis. The
+                    # latter catches base-plate side fillets where
+                    # the rolled edge continues from the side plate
+                    # onto the base plate (a curved strip with many
+                    # plane neighbors). Cantilever side walls have
+                    # mag in 0.5-0.8 and don't pass this exemption.
+                    mean_mag = float(np.linalg.norm(face_norms.mean(axis=0)))
+                    if aspect_ratio < 50 and mean_mag >= 0.4:
                         continue
                 bridge_ok = False
                 for pn in plane_nbr_fits:

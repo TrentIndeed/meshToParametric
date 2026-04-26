@@ -1580,6 +1580,14 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             _renderProgressGeometry(d.progress_geometry);
           }
 
+          // Update debug summary panel (visible only when Debug toggle is on).
+          // Lines accumulate as the pipeline advances; we replace the whole
+          // panel contents each poll so finalised stages stay visible.
+          if (Array.isArray(d.debug_summary)) {
+            const lines = document.getElementById('debug-lines');
+            if (lines) lines.textContent = d.debug_summary.join('\n');
+          }
+
           // Show Continue button when pipeline is paused
           const cancelBtn = document.getElementById('btn-cancel');
           if (d.paused && cancelBtn) {
@@ -2406,6 +2414,23 @@ document.getElementById('step-through-cb')?.addEventListener('change', (e) => {
   if (currentJobId) {
     fetch(`/api/job/${currentJobId}/step-through/${e.target.checked ? '1' : '0'}`, { method: 'POST' });
   }
+});
+
+// Debug toggle — show/hide the per-stage pipeline summary panel.
+// Persists across reloads via localStorage. The panel itself is
+// populated from job.debug_summary inside the status poll loop.
+(function restoreDebug() {
+  const cb = document.getElementById('debug-cb');
+  if (!cb) return;
+  const saved = localStorage.getItem('paramesh_debug') === '1';
+  cb.checked = saved;
+  const panel = document.getElementById('debug-panel');
+  if (panel) panel.style.display = saved ? '' : 'none';
+})();
+document.getElementById('debug-cb')?.addEventListener('change', (e) => {
+  localStorage.setItem('paramesh_debug', e.target.checked ? '1' : '0');
+  const panel = document.getElementById('debug-panel');
+  if (panel) panel.style.display = e.target.checked ? '' : 'none';
 });
 
 autoLoad();

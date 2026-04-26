@@ -314,6 +314,11 @@ class Job:
     bbox_max: list = field(default_factory=lambda: [0, 0, 0])
     token_cost: int = 0
     created_at: float = field(default_factory=time.time)
+    # Per-stage debug summary lines, e.g.
+    #   "[Body 0] Stage 2: 17 regions (5 plates, 10 curves, 2 cyl) median=42f"
+    # Populated as the pipeline runs and exposed via /api/job/{id}/status
+    # so the frontend Debug toggle can show them.
+    debug_summary: list = field(default_factory=list)
 
 
 class JobQueue:
@@ -692,7 +697,7 @@ class JobQueue:
         job.progress = 15
         job.progress_stage = "Segmenting surfaces..."
         seg_colors = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
+        for bi, (body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends) in enumerate(body_stage_data):
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
             color_for_region = _color_regions_no_adjacent_match(
                 regions, sub_cleaned, palette,
@@ -703,6 +708,24 @@ class JobQueue:
                     if fi < len(fc):
                         fc[fi] = color
             seg_colors.append((body, sub_cleaned, fc))
+            # Debug summary: kind breakdown by mean-normal magnitude.
+            n_plate = n_curve = n_cyl = 0
+            face_counts = []
+            for r in regions:
+                face_counts.append(r.num_faces)
+                mn = sub_cleaned.normals[r.face_indices].mean(axis=0)
+                mag = float(np.linalg.norm(mn))
+                if mag > 0.95:
+                    n_plate += 1
+                elif mag < 0.3:
+                    n_cyl += 1
+                else:
+                    n_curve += 1
+            median_f = int(sorted(face_counts)[len(face_counts) // 2]) if face_counts else 0
+            job.debug_summary.append(
+                f"[Body {bi}] Stage 2: {len(regions)} regions "
+                f"({n_plate} plate, {n_curve} curve, {n_cyl} cyl) median={median_f}f"
+            )
         _set_body_viz(seg_colors)
         _pause_for_review()
 
@@ -718,7 +741,9 @@ class JobQueue:
         job.progress = 20
         job.progress_stage = "Fitting primitives..."
         fit_pieces = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
+        from mesh2param.config import FitConfig as _FitCfg
+        fit_rms_tol_ratio = _FitCfg().rms_tolerance_ratio
+        for bi, (body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends) in enumerate(body_stage_data):
             color_for_region = _color_regions_no_adjacent_match(
                 regions, sub_cleaned, palette,
             )
@@ -726,21 +751,42 @@ class JobQueue:
                 regions, sub_cleaned, fitted, color_for_region,
             )
             if built is None:
-                # Fallback: render raw mesh with grey
                 fit_pieces.append({
                     "vertices": sub_cleaned.vertices.flatten().tolist(),
                     "faces": sub_cleaned.faces.flatten().tolist(),
                     "colors": None,
                     "color": body_colors[len(fit_pieces) % len(body_colors)],
                 })
-                continue
-            verts_arr, faces_arr, colors_arr = built
-            fit_pieces.append({
-                "vertices": verts_arr.flatten().tolist(),
-                "faces": faces_arr.flatten().tolist(),
-                "colors": colors_arr.flatten().tolist(),
-                "color": body_colors[len(fit_pieces) % len(body_colors)],
-            })
+            else:
+                verts_arr, faces_arr, colors_arr = built
+                fit_pieces.append({
+                    "vertices": verts_arr.flatten().tolist(),
+                    "faces": faces_arr.flatten().tolist(),
+                    "colors": colors_arr.flatten().tolist(),
+                    "color": body_colors[len(fit_pieces) % len(body_colors)],
+                })
+            # Debug summary: fit-type counts and misfits.
+            type_counts = {}
+            misfits = []
+            bbox_diag = float(np.linalg.norm(
+                sub_cleaned.bbox[1] - sub_cleaned.bbox[0]
+            ))
+            tol = fit_rms_tol_ratio * bbox_diag
+            for f in fitted:
+                t = f.surface_type.name
+                type_counts[t] = type_counts.get(t, 0) + 1
+                if f.rms_error > tol:
+                    misfits.append(f"rid {f.region_id} {t} RMS={f.rms_error:.2f}")
+            type_str = " ".join(
+                f"{n}{k[:3].lower()}" for k, n in sorted(type_counts.items())
+            )
+            misfit_str = (
+                f", {len(misfits)} misfit (worst: {misfits[0]})"
+                if misfits else ""
+            )
+            job.debug_summary.append(
+                f"[Body {bi}] Stage 3: {len(fitted)} fits ({type_str}){misfit_str}"
+            )
         # Always use the pieces path (works for 1 or multiple bodies),
         # since projecting per-region requires per-region vertex sets
         # that don't fit a single CleanedMesh.
@@ -755,9 +801,13 @@ class JobQueue:
         job.progress_stage = "Building topology..."
         edge_pts_list = []
         edge_col_list = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
+        for bi, (body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends) in enumerate(body_stage_data):
             region_lookup = {r.region_id: r for r in regions}
+            edge_type_counts = {}
             for edge in edges_list:
+                edge_type_counts[edge.transition_type.name] = edge_type_counts.get(
+                    edge.transition_type.name, 0
+                ) + 1
                 ra = region_lookup.get(edge.surface_a_id)
                 rb = region_lookup.get(edge.surface_b_id)
                 if ra is None or rb is None:
@@ -773,6 +823,14 @@ class JobQueue:
                 for v0, v1 in shared_edges:
                     edge_pts_list.extend([sub_cleaned.vertices[v0], sub_cleaned.vertices[v1]])
                     edge_col_list.extend([color, color])
+            type_str = ", ".join(
+                f"{n} {k.lower()}" for k, n in sorted(
+                    edge_type_counts.items(), key=lambda kv: -kv[1]
+                )
+            ) or "0"
+            job.debug_summary.append(
+                f"[Body {bi}] Stage 4: {len(edges_list)} edges ({type_str})"
+            )
         edge_pts = np.array(edge_pts_list) if edge_pts_list else None
         edge_cols = np.array(edge_col_list) if edge_col_list else None
         job.progress_edges = edge_pts.flatten().tolist() if edge_pts is not None else None
@@ -827,9 +885,12 @@ class JobQueue:
         job.progress_edges = None
         job.progress_edge_colors = None
         feat_colors = []
-        for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends in body_stage_data:
+        for bi, (body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, _topo_blends) in enumerate(body_stage_data):
             fc = np.full((len(sub_cleaned.faces), 3), 0.55)
+            feat_type_counts = {}
             for feat in body_tree.features:
+                tname = getattr(feat.type, 'name', str(feat.type))
+                feat_type_counts[tname] = feat_type_counts.get(tname, 0) + 1
                 color = feature_type_colors.get(feat.type, [0.55, 0.55, 0.55])
                 try:
                     fi_arr = feat.face_indices
@@ -840,6 +901,13 @@ class JobQueue:
                 except Exception:
                     pass
             feat_colors.append((body, sub_cleaned, fc))
+            type_str = ", ".join(
+                f"{n} {k.lower().replace('_', ' ')}"
+                for k, n in sorted(feat_type_counts.items(), key=lambda kv: -kv[1])
+            ) or "0"
+            job.debug_summary.append(
+                f"[Body {bi}] Stage 5: {len(body_tree.features)} features ({type_str})"
+            )
         _set_body_viz(feat_colors)
         _pause_for_review()
 

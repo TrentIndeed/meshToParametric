@@ -560,6 +560,7 @@ async def job_status(job_id: str):
         "paused": job.paused,
         "variants": variants_info,
         "active_variant": getattr(job, 'active_variant', 0),
+        "debug_summary": list(getattr(job, 'debug_summary', [])),
     }
 
     # Include progress geometry if pipeline is still running

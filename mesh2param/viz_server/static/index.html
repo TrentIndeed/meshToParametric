@@ -733,6 +733,16 @@ body {
       <div id="dim-rows"></div>
     </div>
   </div>
+  <!-- Debug summary (shown when Debug toggle is on; rendered live as
+       the pipeline emits per-stage debug_summary lines). Lives under
+       the dimensions panel so it sits at the bottom-right of the
+       viewer area, where the user expects to skim diagnostics. -->
+  <div id="debug-panel" style="display:none; padding:10px 14px; border-bottom:1px solid var(--border); font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-secondary); max-height:240px; overflow-y:auto;">
+    <div style="font-family:'OpenAI Sans',sans-serif; font-weight:600; font-size:11px; color:var(--text-primary); margin-bottom:6px; display:flex; align-items:center; gap:6px;">
+      <i class="ri-bug-line"></i> Pipeline debug
+    </div>
+    <div id="debug-lines" style="white-space:pre-wrap; line-height:1.5;"></div>
+  </div>
   <!-- Model stats (shown after pipeline completes) -->
   <div id="model-stats" style="display:none; padding:12px 16px; border-bottom:1px solid var(--border); font-size:12px; color:var(--text-secondary);">
     <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
@@ -863,6 +873,25 @@ body {
     </span>
     Step
   </label>
+  <label id="debug-toggle" title="Show per-stage pipeline summary in the bottom-right panel" style="
+    display:flex; align-items:center; gap:6px; cursor:pointer;
+    font-size:11px; color:var(--text-secondary); font-family:'OpenAI Sans',sans-serif;
+    user-select:none; background:var(--bg-tertiary); padding:4px 10px; border-radius:12px;
+    border:1px solid var(--border);
+  ">
+    <span style="position:relative;display:inline-block;width:28px;height:16px;">
+      <input type="checkbox" id="debug-cb" style="opacity:0;width:0;height:0;">
+      <span style="
+        position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px;
+        background:var(--border);transition:background 0.2s;
+      "></span>
+      <span style="
+        position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;
+        background:var(--text-muted);transition:transform 0.2s,background 0.2s;
+      "></span>
+    </span>
+    Debug
+  </label>
 </div>
 
 <!-- Bottom Timeline -->
@@ -872,6 +901,8 @@ body {
 <style>
   #step-through-cb:checked + span { background: var(--accent) !important; }
   #step-through-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
+  #debug-cb:checked + span { background: var(--accent) !important; }
+  #debug-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
 </style>
 <button id="play-btn" title="Play build animation" style="display:none;" onclick="window.playBuildAnimation()">
   <i class="ri-play-fill"></i>

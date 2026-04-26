@@ -220,19 +220,31 @@ def identify_blends_from_topology(
             if len(plane_nbr_fits) == 0:
                 # No flat surface to bridge to — skip.
                 continue
-            # Plane-count restriction applies only to SMALL curved
-            # regions (<150 faces). Small + 3+ planes is the
-            # signature of a cantilever side wall wrapping a 3D
-            # corner of a tab. Large curved regions with many
-            # plane neighbors are typically perimeter rolled
-            # edges of a plate (legitimate fillets that wrap
-            # around top, bottom, and end faces).
+            # Plane-count restriction targets cantilever side
+            # walls: small (<150 face) curved regions wrapping a
+            # 3D corner of a tab, with 3+ plane neighbors (top,
+            # end, side faces). Two exemptions:
+            #   • Large regions (≥150 faces) — perimeter rolled
+            #     edges of plates legitimately touch 4-5 planes.
+            #   • Long thin strips (longest bbox dim ≥ 50× the
+            #     shortest dim) — these are fillets running
+            #     along an edge (e.g. the top-edge fillet on a
+            #     side plate runs the full plate length but is
+            #     only a fraction of a mm thick). Cantilever
+            #     walls are blocky (aspect ratio ≈ 3-4).
             if (
                 f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
                 and len(plane_nbr_fits) > 2
                 and region.num_faces < 150
             ):
-                continue
+                region_verts = cleaned.vertices[
+                    np.unique(cleaned.faces[region.face_indices].ravel())
+                ]
+                bb_size = region_verts.max(axis=0) - region_verts.min(axis=0)
+                bb_sorted = sorted(bb_size, reverse=True)
+                aspect_ratio = bb_sorted[0] / max(bb_sorted[2], 0.01)
+                if aspect_ratio < 50:
+                    continue
             bridge_ok = False
             for pn in plane_nbr_fits:
                 n_p = _pn(pn)

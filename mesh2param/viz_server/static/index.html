@@ -689,6 +689,21 @@ body {
     <p>Drop a mesh file or click Upload</p>
   </div>
 </div>
+<!-- Cursor coordinate readout — bottom-right of the viewer area.
+     Updated on mousemove via raycast against the modelGroup. Lets
+     you check exactly which face/region the mouse is hovering over
+     when diagnosing fillet detection or other per-region issues. -->
+<div id="cursor-coords" style="
+  position:fixed; right:316px; bottom:90px; z-index:60;
+  background:rgba(20, 22, 28, 0.85); color:#E5E7EB;
+  font-family:'JetBrains Mono', monospace; font-size:11px;
+  padding:6px 10px; border-radius:6px;
+  border:1px solid rgba(255,255,255,0.1);
+  pointer-events:none; display:none;
+  letter-spacing:0.02em; line-height:1.5;
+">
+  <span id="cursor-coords-text">—</span>
+</div>
 
 <!-- Settings Modal -->
 <div id="settings-modal">

@@ -93,6 +93,34 @@ const bottom = new THREE.DirectionalLight(0x8899AA, 0.5);
 bottom.position.set(0, -200, 50);
 scene.add(bottom);
 
+// ── Cursor coordinate readout ──
+// Raycasts the mouse against the visible modelGroup and shows the
+// world-space (x, y, z) under the cursor in a fixed div. Useful for
+// confirming which region you're hovering when diagnosing fillet
+// detection or other per-region issues.
+const _coordRaycaster = new THREE.Raycaster();
+const _coordMouse = new THREE.Vector2();
+const _coordEl = document.getElementById('cursor-coords');
+const _coordText = document.getElementById('cursor-coords-text');
+let _coordHideTimer = null;
+renderer.domElement.addEventListener('mousemove', (ev) => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  _coordMouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  _coordMouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  _coordRaycaster.setFromCamera(_coordMouse, camera);
+  const hits = _coordRaycaster.intersectObject(modelGroup, true);
+  if (hits.length > 0 && _coordEl && _coordText) {
+    const p = hits[0].point;
+    _coordText.textContent =
+      `x ${p.x.toFixed(2)}  y ${p.y.toFixed(2)}  z ${p.z.toFixed(2)}`;
+    _coordEl.style.display = '';
+    if (_coordHideTimer) { clearTimeout(_coordHideTimer); _coordHideTimer = null; }
+  } else if (_coordEl) {
+    if (_coordHideTimer) clearTimeout(_coordHideTimer);
+    _coordHideTimer = setTimeout(() => { _coordEl.style.display = 'none'; }, 200);
+  }
+});
+
 // ── Grid + Origin axes ──
 let sceneGrid = null;
 let originAxes = [];

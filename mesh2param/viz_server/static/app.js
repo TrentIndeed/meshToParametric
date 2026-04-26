@@ -1581,11 +1581,36 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           }
 
           // Update debug summary panel (visible only when Debug toggle is on).
-          // Lines accumulate as the pipeline advances; we replace the whole
-          // panel contents each poll so finalised stages stay visible.
+          // Group lines per body so the user can scan one body's stages at a
+          // time. Each line: "[Body N] Stage X: rest" → split into a tag
+          // ("S2"/"S3"/"S4"/"S5") and a body string. "misfit" gets warn
+          // styling so problems pop visually.
           if (Array.isArray(d.debug_summary)) {
-            const lines = document.getElementById('debug-lines');
-            if (lines) lines.textContent = d.debug_summary.join('\n');
+            const container = document.getElementById('debug-lines');
+            if (container) {
+              const byBody = new Map();
+              for (const line of d.debug_summary) {
+                const m = line.match(/^\[Body (\d+)\] Stage (\d+): (.*)$/);
+                if (!m) continue;
+                const [, bodyN, stageN, rest] = m;
+                if (!byBody.has(bodyN)) byBody.set(bodyN, []);
+                byBody.get(bodyN).push({ stage: stageN, body: rest });
+              }
+              const escapeHtml = (s) => s
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+              let html = '';
+              for (const [bodyN, stages] of byBody) {
+                html += `<div class="dbg-body"><div class="dbg-body-title">Body ${bodyN}</div>`;
+                for (const { stage, body } of stages) {
+                  let bodyHtml = escapeHtml(body)
+                    .replace(/\b(\d+)\b/g, '<span class="num">$1</span>')
+                    .replace(/(misfit[^,)]*)/g, '<span class="warn">$1</span>');
+                  html += `<div class="dbg-stage"><span class="dbg-stage-tag">S${stage}</span><span class="dbg-stage-body">${bodyHtml}</span></div>`;
+                }
+                html += '</div>';
+              }
+              container.innerHTML = html || '<div style="color:var(--text-muted);font-style:italic;">Waiting for pipeline…</div>';
+            }
           }
 
           // Show Continue button when pipeline is paused

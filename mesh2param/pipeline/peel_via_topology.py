@@ -116,6 +116,16 @@ def identify_blends_from_topology(
         if f.surface_type in (
             SurfaceType.CYLINDER, SurfaceType.SPHERE, SurfaceType.CONE,
         ):
+            # Reject regions that are actually FLAT but got misfit
+            # as a curved primitive (mean-normal magnitude > 0.95
+            # means all face normals point ~the same direction —
+            # a plate face). The fitter occasionally classifies a
+            # flat plate as a cylinder with absurd radius (10000+
+            # mm), and without this guard it gets tagged as a
+            # giant fillet.
+            mean_n = cleaned.normals[region.face_indices].mean(axis=0)
+            if float(np.linalg.norm(mean_n)) > 0.95:
+                continue
             # A fillet is a LONG THIN CYLINDER STRIP. The positive
             # signature is geometric, not topological:
             #   - small radius (mm-scale, not plate-scale)
@@ -128,11 +138,25 @@ def identify_blends_from_topology(
             # parallel plate faces, and a through-hole rim fillet only
             # has one plane neighbor (the plate face — the other side
             # is the hole cylinder).
+            # Skip the early radius check entirely. Cylinder/sphere
+            # fits to large rim fillets and perimeter rolled edges
+            # often produce huge or wildly-wrong radii (the fitter
+            # is approximating a torus/partial-arc surface with the
+            # closest-available primitive). The downstream radius
+            # check (line ~360) uses median perp-distance from the
+            # actual edge line, which is geometrically correct, so
+            # rejecting here on the raw fit radius drops legitimate
+            # fillets unnecessarily.
+            #
+            # Face-count cap raised from 300 → no fixed limit. Small
+            # mesh tabs have <100-face fillets, but a side plate's
+            # main-hole rim fillet can run 500+ faces. The bridge-
+            # test below + plane-neighbor-count rule handle all the
+            # discrimination work either way.
             radius_raw = f.params.get("radius", 0) or 0
-            if radius_raw > 0 and radius_raw > bbox_diag * 0.1:
-                continue
-            if region.num_faces > 300:
-                continue
+            # Get axis for cylinder/cone (used downstream for
+            # line_dir fallback). Spheres don't have an axis.
+            axis = None
             if f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE):
                 axis = np.asarray(
                     f.params.get("axis_dir") or f.params.get("axis")
@@ -142,61 +166,57 @@ def identify_blends_from_topology(
                 if an < 1e-12:
                     continue
                 axis = axis / an
-                # POSITIVE FILLET SIGNATURE: the curved region must
-                # BRIDGE two adjacent flat surfaces. That means:
-                #   1. There exist two plane neighbors whose normals
-                #      are ≥ 60° apart (n_A · n_B < 0.5) — these are
-                #      the two faces being filleted.
-                #   2. The region's own face normals span from
-                #      ≈ n_A's direction to ≈ n_B's direction —
-                #      i.e. some faces are within ~30° of n_A AND
-                #      some are within ~30° of n_B.
-                # This rejects the false positives of the previous
-                # "axis perpendicular to ≥1 plane" rule:
-                #   - Bore walls: radial normals don't align with any
-                #     plate normal at all (n_f · n_plate ≈ 0 always).
-                #   - Side walls: normals all point one direction,
-                #     they may align with ONE neighbor but not span
-                #     between two.
-                #   - Countersink cones: normals at half-angle to
-                #     axis (typically 45°), don't reach 30° of any
-                #     plate normal.
-                # Only true fillets sweep their normals from one
-                # adjacent flat's direction to the other's.
-                bridge_ok = False
-                face_norms = cleaned.normals[region.face_indices]
-                # A true fillet is bounded topologically: it has
-                # EXACTLY 1 plane neighbor (rim fillet between
-                # plate and bore) OR EXACTLY 2 plane neighbors
-                # (corner fillet between two flats). 3+ plane
-                # neighbors signals a STRUCTURAL CORNER WALL —
-                # the curved surface wraps around a 3D corner of
-                # the part body and is geometrically not a fillet
-                # operation. This matches the bottom-plate's
-                # cantilever side walls (which neighbor top, end,
-                # and side plates at once) vs the actual rim and
-                # tab-top fillets (which only touch one or two
-                # plates each).
-                if len(plane_nbr_fits) not in (1, 2):
+
+            # POSITIVE FILLET SIGNATURE: the curved region must
+            # BRIDGE adjacent flat surfaces. Run this for ALL
+            # curved fits (cylinder, cone, AND sphere) so big
+            # rim fillets fitted as spheres are still detected.
+            #
+            # For each plane neighbor, check whether the region's
+            # face normals form a BOUNDED arc tangent to that
+            # plane:
+            #   • some faces near-aligned with n_p (dot > 0.866)
+            #     — the fillet sits TANGENT to this plate at one
+            #     side
+            #   • angular spread bounded ≤ 1.0 (~90°) — a real
+            #     fillet sweeps at most a quarter-circle; side
+            #     walls wrap 180°+ and fail.
+            # This rejects bore walls (radial normals never
+            # aligned with any plate), side walls (normals
+            # uniform, fail spread test), countersink cones
+            # (normals at uniform half-angle, fail alignment).
+            face_norms = cleaned.normals[region.face_indices]
+            if len(plane_nbr_fits) == 0:
+                # No flat surface to bridge to — skip.
+                continue
+            # CYLINDER/CONE fits get the structural-wall guard:
+            # 3+ plane neighbors signals a cantilever side wall
+            # (touches top, end, and side plates) which the
+            # bridge-test alone can't reject. SPHERE fits skip
+            # this guard — the fitter only picks SPHERE when it
+            # can't approximate the surface as a cylinder/cone,
+            # which is the signature of a torus rim fillet on a
+            # large hole. Sphere-fitted rims are always fillets
+            # in practice.
+            if (
+                f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
+                and len(plane_nbr_fits) > 2
+            ):
+                continue
+            bridge_ok = False
+            for pn in plane_nbr_fits:
+                n_p = _pn(pn)
+                dots = face_norms @ n_p
+                if dots.size == 0:
                     continue
-                # For each plane neighbor, the region's normals
-                # must include some aligned with it (dot > 0.866),
-                # AND the spread of dot values must be ≤ 1.0
-                # (≤ 90° angular spread — bounded arc, not full
-                # wrap-around).
-                for pn in plane_nbr_fits:
-                    n_p = _pn(pn)
-                    dots = face_norms @ n_p
-                    if dots.size == 0:
-                        continue
-                    spread = float(dots.max() - dots.min())
-                    if spread > 1.0:
-                        continue
-                    if (dots > 0.866).any():
-                        bridge_ok = True
-                        break
-                if not bridge_ok:
+                spread = float(dots.max() - dots.min())
+                if spread > 1.0:
                     continue
+                if (dots > 0.866).any():
+                    bridge_ok = True
+                    break
+            if not bridge_ok:
+                continue
             kind = "fillet"
             neighbor_edges = list(neighbors)
             bis_ni = bis_nj = None  # chamfer-only, unused for fillets
@@ -296,50 +316,49 @@ def identify_blends_from_topology(
         # Fallback: rolled-over plate edge or rim fillet — use the
         # cylinder axis as the edge line (the "sharp line" a fillet
         # would collapse to lies along the cylinder axis for this
-        # kind of blend). Only applies to cylinder-ish fits.
+        # kind of blend). Cylinder/cone use their fitted axis;
+        # sphere fits (which appear when the fitter approximates a
+        # torus rim with a sphere) use the dominant plane
+        # neighbor's normal — for a rim fillet around a hole, the
+        # fillet's "edge axis" is perpendicular to the plate.
         if line_dir is None:
-            if f.surface_type not in (SurfaceType.CYLINDER, SurfaceType.CONE):
-                continue
-            axis = np.asarray(
-                f.params.get("axis_dir") or f.params.get("axis")
-                or [0, 0, 1], dtype=float,
-            )
-            an = np.linalg.norm(axis)
-            if an < 1e-12:
-                continue
-            line_dir = axis / an
-            ap = f.params.get("axis_point")
-            if ap is None:
-                # Derive an axis point from the region centroid.
+            if f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE):
+                axis_p = np.asarray(
+                    f.params.get("axis_dir") or f.params.get("axis")
+                    or [0, 0, 1], dtype=float,
+                )
+                an = np.linalg.norm(axis_p)
+                if an < 1e-12:
+                    continue
+                line_dir = axis_p / an
+                ap = f.params.get("axis_point")
+                line_point = (
+                    np.asarray(ap, dtype=float) if ap is not None
+                    else region.vertices.mean(axis=0)
+                )
+            elif f.surface_type == SurfaceType.SPHERE and plane_nbr_fits:
+                # Sphere rim fillet: use the plane neighbor's
+                # normal as the fillet's edge-axis direction.
+                # This is the axis a CAD fillet operation would
+                # use (perpendicular to the plate it sits on).
+                line_dir = _pn(plane_nbr_fits[0])
                 line_point = region.vertices.mean(axis=0)
             else:
-                line_point = np.asarray(ap, dtype=float)
+                continue
 
-        # Re-anchor line_point to the projection of the region's
-        # vertex centroid onto the line. The plane-plane
-        # intersection gives a valid line but its (x, y, z) anchor
-        # can land far outside the part bbox when the planes
-        # intersect at an oblique angle (e.g. a ground-plate
-        # corner whose two perpendicular planes meet at the world
-        # origin). Projecting the centroid onto the line keeps the
-        # anchor near the actual fillet, so downstream length /
-        # perp-distance calculations work in the right coordinate
-        # frame and the bbox sanity check below stays meaningful.
+        # Re-anchor line_point to the closest point on the line
+        # to the region's vertex centroid. This is the FULL
+        # projection (not just along line_dir): drop the
+        # perpendicular component as well so line_point ends up
+        # at the actual nearest point on the line, which
+        # guarantees it sits near the region in 3D rather than
+        # wherever the plane-plane intersection landed.
         if line_dir is not None:
             region_centroid = region.vertices.mean(axis=0)
-            t_anchor = float((region_centroid - line_point) @ line_dir)
+            rel = region_centroid - line_point
+            t_anchor = float(rel @ line_dir)
             line_point = line_point + t_anchor * line_dir
-        # Line point inside mesh bbox + margin (sanity check after
-        # re-anchoring).
-        margin = bbox_diag * 0.1
-        m_min = cleaned.bbox[0]
-        m_max = cleaned.bbox[1]
-        if (
-            line_point[0] < m_min[0] - margin or line_point[0] > m_max[0] + margin
-            or line_point[1] < m_min[1] - margin or line_point[1] > m_max[1] + margin
-            or line_point[2] < m_min[2] - margin or line_point[2] > m_max[2] + margin
-        ):
-            continue
+            # Now line_point is on the line, closest to centroid.
 
         # Collect blend-region vertex IDs and project onto the sharp line.
         blend_face_ids = region.face_indices
@@ -354,22 +373,27 @@ def identify_blends_from_topology(
         # estimate. The latter gets badly inflated when line_point
         # lands far from the true axis, which happens for fillets
         # with fragmented plane neighbors or diagonal axes.
+        # For SPHERE-fitted rim fillets, the fit radius equals the
+        # underlying torus's MAJOR radius (≈ hole radius), not the
+        # fillet's minor radius. Use perp_dist instead so downstream
+        # CAD reconstruction sees the actual fillet radius.
         fit_radius = float(f.params.get("radius", 0) or 0)
-        if fit_radius > 0.2:
+        if f.surface_type == SurfaceType.SPHERE:
+            radius = float(np.median(perp_dist))
+        elif fit_radius > 0.2:
             radius = fit_radius
         else:
             radius = float(np.median(perp_dist))
-        if kind == "fillet":
-            max_radius = bbox_diag * 0.08
-            if radius < 0.2 or radius > max_radius:
-                continue
-        else:  # chamfer
-            max_size = bbox_diag * 0.05
-            if radius < 0.2 or radius > max_size:
-                continue
-
+        # Sanity floor only — drop the upper-radius cap. Big main-
+        # hole rim fillets and perimeter rolled edges have fit radii
+        # 10-25 mm and were getting rejected, hiding the side-plate
+        # fillets entirely. The bridge-test + plane-neighbor count
+        # already discriminate fillets from non-fillets; an absolute
+        # radius cap added no signal beyond that.
+        if radius < 0.2:
+            continue
         length = float(t_along.max() - t_along.min())
-        if length < radius * 1.5:
+        if length < 1.0:
             continue
 
         records.append({

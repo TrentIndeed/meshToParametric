@@ -165,53 +165,36 @@ def identify_blends_from_topology(
                 # adjacent flat's direction to the other's.
                 bridge_ok = False
                 face_norms = cleaned.normals[region.face_indices]
-                # Case A — between two planes: pair of plane
-                # neighbors ≥60° apart, region's normals include
-                # some aligned with each (within ~30°).
-                for i_pn in range(len(plane_nbr_fits)):
-                    n_a = _pn(plane_nbr_fits[i_pn])
-                    for j_pn in range(i_pn + 1, len(plane_nbr_fits)):
-                        n_b = _pn(plane_nbr_fits[j_pn])
-                        if abs(float(np.dot(n_a, n_b))) > 0.5:
-                            continue
-                        a_dots = face_norms @ n_a
-                        b_dots = face_norms @ n_b
-                        if (a_dots > 0.866).any() and (b_dots > 0.866).any():
-                            bridge_ok = True
-                            break
-                    if bridge_ok:
+                # A true fillet is bounded topologically: it has
+                # EXACTLY 1 plane neighbor (rim fillet between
+                # plate and bore) OR EXACTLY 2 plane neighbors
+                # (corner fillet between two flats). 3+ plane
+                # neighbors signals a STRUCTURAL CORNER WALL —
+                # the curved surface wraps around a 3D corner of
+                # the part body and is geometrically not a fillet
+                # operation. This matches the bottom-plate's
+                # cantilever side walls (which neighbor top, end,
+                # and side plates at once) vs the actual rim and
+                # tab-top fillets (which only touch one or two
+                # plates each).
+                if len(plane_nbr_fits) not in (1, 2):
+                    continue
+                # For each plane neighbor, the region's normals
+                # must include some aligned with it (dot > 0.866),
+                # AND the spread of dot values must be ≤ 1.0
+                # (≤ 90° angular spread — bounded arc, not full
+                # wrap-around).
+                for pn in plane_nbr_fits:
+                    n_p = _pn(pn)
+                    dots = face_norms @ n_p
+                    if dots.size == 0:
+                        continue
+                    spread = float(dots.max() - dots.min())
+                    if spread > 1.0:
+                        continue
+                    if (dots > 0.866).any():
+                        bridge_ok = True
                         break
-                # Case B — rim fillet: between a plane and a
-                # cylinder (e.g. a hole's rim where the plate meets
-                # the bore wall). Only ONE plane neighbor exists,
-                # but the region's normals SWEEP from plate-aligned
-                # to nearly plate-perpendicular (toward the bore
-                # wall direction). Restricted to SMALL regions
-                # (< 80 faces) since structural cylinders like tab
-                # side walls can also span this range; only the
-                # tight rim/edge fillets should pass.
-                # Bore walls themselves fail both ends — their
-                # normals are uniformly radial, never aligned with
-                # the plate. Countersink cones fail because their
-                # normals are uniformly at the cone half-angle,
-                # not spread across a range.
-                if not bridge_ok and region.num_faces < 80:
-                    for pn in plane_nbr_fits:
-                        n_p = _pn(pn)
-                        dots = face_norms @ n_p
-                        if (dots > 0.866).any() and (dots < 0.3).any():
-                            bridge_ok = True
-                            break
-                # NOTE: don't tag uniform-tilt curved regions as
-                # chamfers. On real meshes such regions are usually
-                # FILLETS with very small radius that tessellate to
-                # only one or two face-rows of nearly-uniform tilt;
-                # if the source CAD intended a chamfer it would have
-                # been modelled as a flat-strip cone and the PLANE
-                # branch below picks it up. Tagging uniform-tilt
-                # regions as chamfers caused false-positive orange
-                # rings around hole rims that the user knows are
-                # fillets, not chamfers.
                 if not bridge_ok:
                     continue
             kind = "fillet"
@@ -332,7 +315,22 @@ def identify_blends_from_topology(
             else:
                 line_point = np.asarray(ap, dtype=float)
 
-        # Line point inside mesh bbox + margin.
+        # Re-anchor line_point to the projection of the region's
+        # vertex centroid onto the line. The plane-plane
+        # intersection gives a valid line but its (x, y, z) anchor
+        # can land far outside the part bbox when the planes
+        # intersect at an oblique angle (e.g. a ground-plate
+        # corner whose two perpendicular planes meet at the world
+        # origin). Projecting the centroid onto the line keeps the
+        # anchor near the actual fillet, so downstream length /
+        # perp-distance calculations work in the right coordinate
+        # frame and the bbox sanity check below stays meaningful.
+        if line_dir is not None:
+            region_centroid = region.vertices.mean(axis=0)
+            t_anchor = float((region_centroid - line_point) @ line_dir)
+            line_point = line_point + t_anchor * line_dir
+        # Line point inside mesh bbox + margin (sanity check after
+        # re-anchoring).
         margin = bbox_diag * 0.1
         m_min = cleaned.bbox[0]
         m_max = cleaned.bbox[1]

@@ -127,6 +127,15 @@ def segment_mesh(
         labels = _split_rolled_edge_into_fillet_wall(
             labels, cleaned, adjacency,
         )
+        # Split long curved regions (e.g. side-wall fillets running
+        # the full plate length) into corner fillets at each end +
+        # the middle wall. The end-faces' face normals have a
+        # component along the LONG axis (because they curve toward
+        # the perpendicular end-plane), while the middle-wall
+        # faces' normals are perpendicular to the long axis.
+        labels = _split_long_fillet_into_corners(
+            labels, cleaned, adjacency,
+        )
         # Pull borderline-tilted faces out of curved regions
         # back into adjacent flat regions when their neighborhood
         # is dominantly flat. Captures the general principle
@@ -977,6 +986,105 @@ def _split_rolled_edge_into_fillet_wall(
         labels[faces[fillet_mask]] = next_label
         next_label += 1
         # wall_mask faces keep `lbl`.
+
+    # Renumber contiguously
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[lbl] for lbl in labels], dtype=np.int64)
+    return labels
+
+
+def _split_long_fillet_into_corners(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+) -> np.ndarray:
+    """Split long thin curved regions into corner fillets + middle wall.
+
+    A side-wall fillet that runs the full length of a plate has
+    two distinct geometric parts:
+      • The MIDDLE WALL — face normals perpendicular to the
+        long axis (e.g. all pointing -X for a left-side wall),
+        no component along the long axis.
+      • TWO CORNER FILLETS at the ends — face normals tilt
+        toward the +/- end-faces (so they have a noticeable
+        component along the long axis).
+
+    Region growing produces ONE region for the whole roll
+    because the transition from corner to wall is smooth.
+    This pass detects such regions (curved, big, long thin
+    aspect ratio) and peels each end-cluster into its own
+    region so the user-perceived "corner fillets" become
+    visible as separate features. The middle-wall faces
+    keep the original label.
+
+    Conditions to split:
+        1. ≥ 200 faces (large region — small fillets don't
+           need this treatment)
+        2. Mean-normal magnitude < 0.5 (highly curved — the
+           normals span a wide range)
+        3. Long thin shape (longest bbox dim ≥ 4× the second
+           longest)
+        4. After splitting, each corner cluster has ≥ 15 faces
+    """
+    labels = labels.copy()
+    normals = cleaned.normals
+    next_label = int(labels.max()) + 1
+
+    region_faces: dict[int, np.ndarray] = {}
+    for lbl in np.unique(labels):
+        region_faces[int(lbl)] = np.where(labels == lbl)[0]
+
+    # Snapshot the keys so newly created labels don't get re-processed
+    long_lbls = []
+    for lbl, faces in region_faces.items():
+        if len(faces) < 200:
+            continue
+        face_norms = normals[faces]
+        mn = face_norms.mean(axis=0)
+        mag = float(np.linalg.norm(mn))
+        if mag >= 0.5:
+            continue
+        verts_in_region = cleaned.vertices[
+            np.unique(cleaned.faces[faces].ravel())
+        ]
+        bb_size = verts_in_region.max(axis=0) - verts_in_region.min(axis=0)
+        bb_sorted_idx = np.argsort(bb_size)[::-1]
+        if bb_size[bb_sorted_idx[0]] < 4.0 * bb_size[bb_sorted_idx[1]]:
+            continue
+        long_lbls.append((lbl, bb_sorted_idx[0]))
+
+    for lbl, long_axis_idx in long_lbls:
+        faces = region_faces[lbl]
+        face_norms = normals[faces]
+        # Faces with significant normal component along the long
+        # axis are CORNER FILLET faces (the curve transitions
+        # toward an end-face perpendicular to the long axis).
+        # Wall faces have ~zero component along the long axis.
+        n_along = np.abs(face_norms[:, long_axis_idx])
+        corner_mask = n_along > 0.3
+        if int(corner_mask.sum()) < 30:
+            continue
+        # Group corner faces by position along the long axis
+        # (front cluster vs back cluster).
+        face_centroids = np.array([
+            cleaned.vertices[cleaned.faces[fi]].mean(axis=0) for fi in faces
+        ])
+        long_pos = face_centroids[:, long_axis_idx]
+        long_min = long_pos.min()
+        long_max = long_pos.max()
+        long_mid = (long_min + long_max) / 2
+        front_mask = corner_mask & (long_pos < long_mid)
+        back_mask = corner_mask & (long_pos >= long_mid)
+        if int(front_mask.sum()) < 15 or int(back_mask.sum()) < 15:
+            continue
+        # Reassign FRONT corner faces to a new label, BACK to
+        # another new label. Middle-wall faces (~corner_mask
+        # complement) keep the original label.
+        labels[faces[front_mask]] = next_label
+        next_label += 1
+        labels[faces[back_mask]] = next_label
+        next_label += 1
 
     # Renumber contiguously
     unique = np.unique(labels)

@@ -267,6 +267,25 @@ def identify_blends_from_topology(
                     if (dots > 0.866).any():
                         bridge_ok = True
                         break
+                # Corner fillet fallback: small-medium curved
+                # regions (30-100 faces) with directional normals
+                # (mag in 0.6-0.95 — clearly tilted, not flat or
+                # full-cylinder) that have ≥2 plane neighbors are
+                # tab/perimeter corner fillets. The bridge test
+                # rejects them because their face normals don't
+                # reach the +Z/-Z directions of the neighbor
+                # plates — they tilt toward a SMALL end-face plane
+                # (which got filtered out by the size threshold).
+                # Accept them as fillets in this case.
+                if not bridge_ok:
+                    mean_mag2 = float(np.linalg.norm(face_norms.mean(axis=0)))
+                    if (
+                        f.surface_type in (SurfaceType.CYLINDER, SurfaceType.CONE)
+                        and 30 <= region.num_faces <= 100
+                        and 0.6 <= mean_mag2 <= 0.95
+                        and len(plane_nbr_fits) >= 2
+                    ):
+                        bridge_ok = True
                 if not bridge_ok:
                     continue
                 kind = "fillet"

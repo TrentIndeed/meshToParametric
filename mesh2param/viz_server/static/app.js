@@ -474,6 +474,64 @@ function _renderProgressGeometry(pg) {
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geo.computeVertexNormals();
 
+  // Fillet/chamfer intent stage: split the mesh into the gray base
+  // (rendered transparent) and the bright blend-surface patches
+  // (rendered opaque on top, with depthTest off so fillets tucked under
+  // the surface stay visible through the see-through body).
+  const isIntentStage = hasColors && perFace && pg.stage && pg.stage.includes('intent');
+  if (isIntentStage) {
+    const basePos = [];
+    const patchPos = [];
+    const patchCol = [];
+    const isGray = (r, g, b) =>
+      Math.abs(r - 0.62) < 0.04 && Math.abs(g - 0.64) < 0.04 && Math.abs(b - 0.67) < 0.04;
+    for (let i = 0; i < numFaces; i++) {
+      const r = colors[i * 9], g = colors[i * 9 + 1], b = colors[i * 9 + 2];
+      const tgt = isGray(r, g, b) ? basePos : patchPos;
+      for (let k = 0; k < 9; k++) tgt.push(positions[i * 9 + k]);
+      if (!isGray(r, g, b)) for (let k = 0; k < 9; k++) patchCol.push(colors[i * 9 + k]);
+    }
+    // Transparent base body
+    if (basePos.length > 0) {
+      const bGeo = new THREE.BufferGeometry();
+      bGeo.setAttribute('position', new THREE.Float32BufferAttribute(basePos, 3));
+      bGeo.computeVertexNormals();
+      const bMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(0.55, 0.58, 0.62),
+        metalness: 0.1, roughness: 0.7,
+        transparent: true, opacity: 0.22,
+        depthWrite: false, side: THREE.DoubleSide,
+      });
+      const bMesh = new THREE.Mesh(bGeo, bMat);
+      modelGroup.add(bMesh);
+    }
+    // Opaque, glowing fillet surfaces — drawn on top so under-surface
+    // fillets remain visible through the transparent body.
+    if (patchPos.length > 0) {
+      const pGeo = new THREE.BufferGeometry();
+      pGeo.setAttribute('position', new THREE.Float32BufferAttribute(patchPos, 3));
+      pGeo.setAttribute('color', new THREE.Float32BufferAttribute(patchCol, 3));
+      pGeo.computeVertexNormals();
+      const pMat = new THREE.MeshPhongMaterial({
+        vertexColors: true,
+        emissive: new THREE.Color(0.0, 0.4, 0.45),
+        specular: new THREE.Color(0.2, 0.2, 0.2),
+        shininess: 30, side: THREE.DoubleSide,
+        depthTest: false, transparent: true, opacity: 0.95,
+      });
+      const pMesh = new THREE.Mesh(pGeo, pMat);
+      pMesh.renderOrder = 2;
+      modelGroup.add(pMesh);
+    }
+    document.getElementById('empty-state').style.display = 'none';
+    modelGroup.position.set(0, 0, 0);
+    try {
+      const box = new THREE.Box3().setFromObject(modelGroup);
+      modelGroup.position.sub(box.getCenter(new THREE.Vector3()));
+    } catch (e) {}
+    return;
+  }
+
   // Check if this is a colored stage (segmentation, fitting, features)
   const isColoredStage = hasColors && pg.stage &&
     (pg.stage.includes('Segment') || pg.stage.includes('Fitting') ||
@@ -1566,6 +1624,12 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     const stepOn = stepCb ? stepCb.checked : true;
     fetch(`/api/job/${currentJobId}/step-through/${stepOn ? '1' : '0'}`, { method: 'POST' });
 
+    // Send the one-shot breakpoint stage (only relevant when step mode is
+    // off; harmless otherwise since step mode pauses at every stage).
+    const pauseSel = document.getElementById('pause-at-select');
+    const pauseAt = (!stepOn && pauseSel) ? pauseSel.value : 'none';
+    fetch(`/api/job/${currentJobId}/pause-at/${pauseAt}`, { method: 'POST' });
+
     addChatMessage('system', 'Pipeline started — analyzing mesh...');
     let lastStage = '';
 
@@ -1823,8 +1887,15 @@ window._cancelPipeline = function() {
 
 // Rerun pipeline with the same mesh
 window.rerunPipeline = function() {
+  // After a successful run the analyze handler clears pendingTempPath
+  // but stashes the value on window._lastTempPath so the same mesh can
+  // be re-processed without re-uploading.
+  if (!pendingTempPath) {
+    pendingTempPath = window._lastTempPath || null;
+  }
   if (!pendingTempPath) return;
   document.getElementById('btn-rerun').style.display = 'none';
+  document.getElementById('btn-analyze').style.display = '';
   document.getElementById('btn-analyze').click();
 };
 
@@ -1878,7 +1949,8 @@ function finishLoad(statusData) {
   }).catch(() => {});
   document.getElementById('status-dot').className = 'status-dot done';
   document.getElementById('btn-export').disabled = false;
-  document.getElementById('btn-rerun').style.display = pendingTempPath ? '' : 'none';
+  document.getElementById('btn-rerun').style.display =
+    (pendingTempPath || window._lastTempPath) ? '' : 'none';
   document.getElementById('play-btn').style.display = '';
 
   // Enable chat and dimension editing
@@ -2467,6 +2539,7 @@ document.getElementById('step-through-cb')?.addEventListener('change', (e) => {
   if (currentJobId) {
     fetch(`/api/job/${currentJobId}/step-through/${e.target.checked ? '1' : '0'}`, { method: 'POST' });
   }
+  updatePauseAtVisibility();
 });
 
 // Debug toggle — show/hide the per-stage pipeline summary panel.
@@ -2484,7 +2557,44 @@ document.getElementById('debug-cb')?.addEventListener('change', (e) => {
   localStorage.setItem('paramesh_debug', e.target.checked ? '1' : '0');
   const panel = document.getElementById('debug-panel');
   if (panel) panel.style.display = e.target.checked ? '' : 'none';
+  updatePauseAtVisibility();
 });
+
+// "Pause at stage" breakpoint dropdown. Only shown when Debug is on and
+// Step is off — it's a single-stop breakpoint for the otherwise-non-step
+// pipeline. Populated from /api/pause-stages, selection persisted, and
+// sent to the backend on analyze + live when changed mid-run.
+function updatePauseAtVisibility() {
+  const wrap = document.getElementById('pause-at-wrap');
+  const debugOn = document.getElementById('debug-cb')?.checked;
+  const stepOn = document.getElementById('step-through-cb')?.checked;
+  if (wrap) wrap.style.display = (debugOn && !stepOn) ? 'flex' : 'none';
+}
+(async function initPauseAt() {
+  const sel = document.getElementById('pause-at-select');
+  if (!sel) return;
+  try {
+    const r = await fetch('/api/pause-stages');
+    if (r.ok) {
+      const data = await r.json();
+      for (const s of (data.stages || [])) {
+        const opt = document.createElement('option');
+        opt.value = s.key;
+        opt.textContent = s.name;
+        sel.appendChild(opt);
+      }
+    }
+  } catch (e) { /* dropdown stays at "none" only */ }
+  const saved = localStorage.getItem('paramesh_pause_at');
+  if (saved) sel.value = saved;
+  sel.addEventListener('change', (e) => {
+    localStorage.setItem('paramesh_pause_at', e.target.value);
+    if (currentJobId) {
+      fetch(`/api/job/${currentJobId}/pause-at/${e.target.value}`, { method: 'POST' });
+    }
+  });
+  updatePauseAtVisibility();
+})();
 
 autoLoad();
 

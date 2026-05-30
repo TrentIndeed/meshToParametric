@@ -55,6 +55,29 @@ class CadQueryResult:
     solid: object | None = None  # cq.Workplane, lazy-imported
     tess_vertices: np.ndarray | None = None  # (V, 3) tessellated solid verts
     tess_faces: np.ndarray | None = None  # (F, 3) tessellated solid faces
+    # Snapshot of the solid right BEFORE fillets/chamfers were applied —
+    # consumed by the "Fillet & Chamfer Intent" pipeline stage so the
+    # viewer can show the un-blended body with cyan overlay markers
+    # before the apply stage.
+    pre_blend_tess_vertices: np.ndarray | None = None
+    pre_blend_tess_faces: np.ndarray | None = None
+    # Records the intent stage draws as cyan overlays.
+    #   {"fillets": [{radius, axis_dir, axis_point, length}, ...],
+    #    "chamfers": [{corner, along_a, along_b, size}, ...]}
+    intent_records: dict = field(default_factory=dict)
+    # The actual CAD edges (list of [[x,y,z],[x,y,z]] segments) that
+    # received a fillet/chamfer — clean lines lying on the model, used by
+    # the intent overlay instead of synthetic circles.
+    blend_edge_overlay: list = field(default_factory=list)
+    # Combined intent-stage mesh: the un-blended solid (gray) plus
+    # analytic fillet/chamfer surface patches (cyan/orange), as one
+    # per-face-colored mesh so the viewer shows what each blend looks
+    # like. {"vertices": [...], "faces": [...], "colors": [...]} or {}.
+    intent_mesh: dict = field(default_factory=dict)
+    # Per-record match diagnostics from the fillet matcher (matched /
+    # why-not), for debugging the blend-vs-apply gap. See
+    # _apply_recognized_fillets_to_solid(out_diag=...).
+    fillet_match_diag: list = field(default_factory=list)
     construction_steps: list[ConstructionStep] = field(default_factory=list)
     variants: list[BuildVariant] = field(default_factory=list)
     script: str = ""
@@ -193,37 +216,50 @@ def export_cadquery(
 
     variants: list[BuildVariant] = []
 
-    # Variant 1: LLM-optimized (or default heuristic if LLM unavailable)
-    # Skip LLM for simple parts (<10 features) — not worth the 10-15s latency.
-    # Also skip for multi-body parts since LLM only reorders body 0's features,
-    # which would break the multi-body feature tree.
+    # LLM-guided build order is currently disabled — the pipeline runs
+    # heuristic-only construction until the heuristic baseline is solid
+    # enough that an LLM reorder is a measurable improvement, not a
+    # confound when debugging fillet/edge issues.
     llm_order = None
     num_features = len(feature_tree.features)
     is_multi_body = body_results is not None and len(body_results) > 1
-    if is_multi_body:
-        llm_future = None
-    elif use_llm and num_features >= 10:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        # Start LLM call in background while building the default variant
-        llm_future = ThreadPoolExecutor(1).submit(_llm_plan_build_order, feature_tree, cleaned)
-    elif use_llm:
-        llm_future = None
-        # For simple parts, try a quick LLM call with short timeout
-        try:
-            llm_order = _llm_plan_build_order(feature_tree, cleaned)
-        except Exception:
-            pass
-    else:
-        llm_future = None
+    llm_future = None
+    # if is_multi_body:
+    #     llm_future = None
+    # elif use_llm and num_features >= 10:
+    #     from concurrent.futures import ThreadPoolExecutor, as_completed
+    #     # Start LLM call in background while building the default variant
+    #     llm_future = ThreadPoolExecutor(1).submit(_llm_plan_build_order, feature_tree, cleaned)
+    # elif use_llm:
+    #     llm_future = None
+    #     # For simple parts, try a quick LLM call with short timeout
+    #     try:
+    #         llm_order = _llm_plan_build_order(feature_tree, cleaned)
+    #     except Exception:
+    #         pass
+    # else:
+    #     llm_future = None
 
     # Build default variant immediately (no waiting for LLM)
+    result_pre_blend_tess: tuple[np.ndarray, np.ndarray] | None = None
+    intent_records_out: dict = {"fillets": [], "chamfers": []}
+    blend_edge_overlay_out: list = []
+    blend_surface_patches_out: list = []
+    fillet_match_diag_out: list = []
     try:
         # Multi-body: skip per-body fillet application so the union doesn't
         # freeze fillets at body boundaries. Fillets get applied once to the
         # combined solid below, after all bodies are unioned.
-        solid, script, steps = _build_stepwise(
-            **build_args, build_order=llm_order, skip_fillets=is_multi_body,
+        # Always defer chamfers in the default variant so the
+        # subprocess can hand the un-blended solid + intent records to
+        # job_queue's two post-build pipeline stages (intent overlay,
+        # then apply).
+        deferred_chamfers_all: list[dict] = []
+        solid, script, steps, body0_chamfers = _build_stepwise(
+            **build_args, build_order=llm_order,
+            skip_fillets=is_multi_body, skip_chamfers=True,
         )
+        deferred_chamfers_all.extend(body0_chamfers)
 
         # Multi-body: build each additional body and union into the base.
         # Each body step shows the accumulated solid + this step's body geometry
@@ -231,13 +267,14 @@ def export_cadquery(
         if additional_bodies_data and solid is not None:
             for abd in additional_bodies_data:
                 try:
-                    body_solid, body_script, body_steps = _build_stepwise(
+                    body_solid, body_script, body_steps, body_chamfers = _build_stepwise(
                         profiles=abd['profiles'], depth=abd['depth'],
                         extrude_dir=abd['extrude_dir'], extrude_start=abd['extrude_start'],
                         holes=abd['holes'], chamfers=abd['chamfers'],
                         fillets=abd['fillets'], cleaned=abd['cleaned'],
-                        skip_fillets=True,
+                        skip_fillets=True, skip_chamfers=True,
                     )
+                    deferred_chamfers_all.extend(body_chamfers)
                     if body_solid is None:
                         logger.warning("Body %d: _build_stepwise returned None",
                                        abd['body'].body_id)
@@ -336,6 +373,9 @@ def export_cadquery(
         # only if peeled_fillets wasn't supplied (legacy path / testing).
         try:
             if solid is not None:
+                # Build the unified fillet record list first so the intent
+                # overlay can show every fillet that's about to be tried.
+                clusters_from_peel: list[dict] = []
                 if peeled_fillets:
                     clusters_from_peel = [
                         {
@@ -347,10 +387,83 @@ def export_cadquery(
                         }
                         for f in peeled_fillets
                     ]
+
+                # --- Snapshot the un-blended solid for the Stage 7
+                # (Fillet/Chamfer Intent) pipeline-stage viz. The
+                # subprocess returns this alongside the final solid so
+                # job_queue can show the unfilleted body with cyan
+                # overlay before showing the post-apply result.
+                try:
+                    pre_v, pre_f = _tessellate_solid(solid, fast=True)
+                    result_pre_blend_tess = (
+                        np.asarray(pre_v, dtype=np.float64),
+                        np.asarray(pre_f, dtype=np.int64),
+                    )
+                except Exception as pre_exc:
+                    logger.debug("Pre-blend tessellation failed: %s", pre_exc)
+                    result_pre_blend_tess = None
+                intent_records_out = {
+                    "fillets": [
+                        {
+                            "radius": float(c["radius"]),
+                            "axis_dir": np.asarray(c["axis_dir"], dtype=float).tolist(),
+                            "axis_point": np.asarray(
+                                c.get("centroid", c.get("axis_point", [0, 0, 0])),
+                                dtype=float,
+                            ).tolist(),
+                            "length": float(c.get("length", 0.0)),
+                        }
+                        for c in clusters_from_peel
+                    ],
+                    "chamfers": [
+                        {
+                            "corner": np.asarray(c.get("corner"), dtype=float).tolist(),
+                            "along_a": np.asarray(c.get("along_a"), dtype=float).tolist(),
+                            "along_b": np.asarray(c.get("along_b"), dtype=float).tolist(),
+                            "size": float(c.get("size", 0.0)),
+                        }
+                        for c in deferred_chamfers_all
+                        if c.get("corner") is not None
+                    ],
+                }
+
+                # Accumulators for the intent overlay: the actual CAD
+                # edges that receive a blend (clean lines) and analytic
+                # surface patches (quarter-round fillets / bevel chamfers)
+                # so the viz shows what each blend looks like.
+                blend_edge_overlay = blend_edge_overlay_out
+                blend_surface_patches = blend_surface_patches_out
+
+                # --- Apply deferred chamfers ---
+                if deferred_chamfers_all:
+                    try:
+                        solid, cham_steps, cham_script = _apply_deferred_chamfers(
+                            solid, deferred_chamfers_all,
+                            out_edges=blend_edge_overlay,
+                            out_surfaces=blend_surface_patches,
+                        )
+                        steps.extend(cham_steps)
+                        if cham_script:
+                            script += "\n# --- Deferred chamfers ---\n"
+                            script += "\n".join(cham_script) + "\n"
+                        logger.info(
+                            "Deferred chamfer pass: %d/%d applied",
+                            len(cham_steps), len(deferred_chamfers_all),
+                        )
+                    except Exception as cham_exc:
+                        logger.warning(
+                            "Deferred chamfer pass failed: %s", cham_exc,
+                        )
+
+                # --- Apply fillets ---
+                if clusters_from_peel:
                     solid, fillet_steps, fillet_script = (
                         _apply_recognized_fillets_to_solid(
                             solid, body_contexts=None,
                             override_clusters=clusters_from_peel,
+                            out_edges=blend_edge_overlay,
+                            out_surfaces=blend_surface_patches,
+                            out_diag=fillet_match_diag_out,
                         )
                     )
                     source = f"{len(peeled_fillets)} peeled fillet(s)"
@@ -362,7 +475,11 @@ def export_cadquery(
                     else:
                         body_contexts.append((feature_tree, profile_mesh))
                     solid, fillet_steps, fillet_script = (
-                        _apply_recognized_fillets_to_solid(solid, body_contexts)
+                        _apply_recognized_fillets_to_solid(
+                            solid, body_contexts, out_edges=blend_edge_overlay,
+                            out_surfaces=blend_surface_patches,
+                            out_diag=fillet_match_diag_out,
+                        )
                     )
                     source = f"{len(body_contexts)} body context(s) (fallback detection)"
 
@@ -391,13 +508,16 @@ def export_cadquery(
     except Exception:
         logger.exception("Variant 1 (LLM/default) failed")
         solid, script, steps = None, "", []
+        deferred_chamfers_all = []
 
     # If LLM was running in background, collect result and add as a variant
     if llm_future is not None:
         try:
             llm_result = llm_future.result(timeout=30)
             if llm_result:
-                llm_solid, llm_script, llm_steps = _build_stepwise(**build_args, build_order=llm_result)
+                llm_solid, llm_script, llm_steps, _ = _build_stepwise(
+                    **build_args, build_order=llm_result,
+                )
                 try:
                     llm_vol = abs(float(llm_solid.val().Volume()))
                 except Exception:
@@ -422,7 +542,9 @@ def export_cadquery(
     )
     for h_name, h_strategy, h_plan in heuristic_orders[:num_variants - 1]:
         try:
-            h_solid, h_script, h_steps = _build_stepwise(**build_args, build_order=h_plan)
+            h_solid, h_script, h_steps, _ = _build_stepwise(
+                **build_args, build_order=h_plan,
+            )
             try:
                 h_vol = abs(float(h_solid.val().Volume()))
             except Exception:
@@ -463,10 +585,57 @@ def export_cadquery(
         mesh_volume, cad_volume, volume_error, status,
     )
 
+    pre_blend_v = result_pre_blend_tess[0] if result_pre_blend_tess else None
+    pre_blend_f = result_pre_blend_tess[1] if result_pre_blend_tess else None
+
+    # Assemble the intent-stage mesh: the un-blended solid in gray, plus
+    # each analytic fillet (cyan) / chamfer (orange) surface patch, as one
+    # per-face-colored mesh. The patch verts are nudged very slightly
+    # outward along their face normals to avoid z-fighting with the solid.
+    intent_mesh_out: dict = {}
+    if pre_blend_v is not None and pre_blend_f is not None:
+        try:
+            GRAY = [0.62, 0.64, 0.67]
+            CYAN = [0.0, 0.85, 0.95]
+            ORANGE = [1.0, 0.55, 0.0]
+            base_v = np.asarray(pre_blend_v, dtype=float).reshape(-1, 3)
+            base_f = np.asarray(pre_blend_f, dtype=np.int64).reshape(-1, 3)
+            all_v = [base_v]
+            all_f = [base_f]
+            face_colors = [np.tile(GRAY, (len(base_f), 1))]
+            voff = len(base_v)
+            for patch in blend_surface_patches_out:
+                pv = np.asarray(patch["verts"], dtype=float).reshape(-1, 3)
+                pf = np.asarray(patch["faces"], dtype=np.int64).reshape(-1, 3)
+                if len(pv) == 0 or len(pf) == 0:
+                    continue
+                col = CYAN if patch.get("kind") == "fillet" else ORANGE
+                all_v.append(pv)
+                all_f.append(pf + voff)
+                face_colors.append(np.tile(col, (len(pf), 1)))
+                voff += len(pv)
+            merged_v = np.vstack(all_v)
+            merged_f = np.vstack(all_f)
+            merged_c = np.vstack(face_colors)
+            intent_mesh_out = {
+                "vertices": merged_v.flatten().tolist(),
+                "faces": merged_f.flatten().tolist(),
+                "colors": merged_c.flatten().tolist(),
+            }
+        except Exception as _im_exc:
+            logger.debug("Intent mesh assembly failed: %s", _im_exc)
+            intent_mesh_out = {}
+
     result = CadQueryResult(
         solid=solid,
         tess_vertices=tess_verts,
         tess_faces=tess_faces,
+        pre_blend_tess_vertices=pre_blend_v,
+        pre_blend_tess_faces=pre_blend_f,
+        intent_records=intent_records_out,
+        blend_edge_overlay=blend_edge_overlay_out,
+        intent_mesh=intent_mesh_out,
+        fillet_match_diag=fillet_match_diag_out,
         construction_steps=steps,
         variants=variants,
         script=script,
@@ -1455,7 +1624,8 @@ def _build_stepwise(
     build_order: BuildPlan | None = None,
     cleaned: object = None,
     skip_fillets: bool = False,
-) -> tuple[object, str, list[ConstructionStep]]:
+    skip_chamfers: bool = False,
+) -> tuple[object, str, list[ConstructionStep], list[dict]]:
     """Build a clean CAD solid from scratch, step by step.
 
     Steps:
@@ -1468,7 +1638,10 @@ def _build_stepwise(
     Each step is tessellated for the visual slideshow. The resulting
     solid is clean B-rep geometry (no mesh triangles).
 
-    Returns (final_solid, script, construction_steps).
+    Returns (final_solid, script, construction_steps, deferred_chamfers).
+    deferred_chamfers is the list of chamfer records detected but not
+    applied when skip_chamfers=True; empty otherwise. The caller is
+    expected to apply them post-union via _apply_deferred_chamfers.
     """
     import cadquery as cq
 
@@ -1630,6 +1803,17 @@ def _build_stepwise(
     #   - Partial/stepped chamfers: use a side-profile cut (triangle
     #     extruded along the edge) since .chamfer() can't model these.
     mesh_chamfers = _detect_mesh_chamfers(cleaned, extrude_dir)
+    deferred_chamfers: list[dict] = []
+    if skip_chamfers:
+        # Defer to a post-union pass so the "Fillet & Chamfer Intent"
+        # overlay can show all chamfers on the un-chamfered solid.
+        # Carry along the per-body context the application needs.
+        bbox_diag_local = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+        for cham in mesh_chamfers:
+            rec = dict(cham)
+            rec["bbox_diag"] = bbox_diag_local
+            deferred_chamfers.append(rec)
+        mesh_chamfers = []
     for cham in mesh_chamfers:
         label = cham["label"]
         d1 = cham["size"]
@@ -1846,7 +2030,15 @@ def _build_stepwise(
         if sketch.get("type") != "circle":
             continue
 
-        center = np.array(sketch["center"], dtype=float)
+        # Symmetric-hole groups carry a `centers` list — one sketch step
+        # with multiple circles, then one cut. A single-hole feature has
+        # only `center`; treat that as a 1-element group.
+        centers_list = sketch.get("centers")
+        if centers_list:
+            centers_all = [np.array(c, dtype=float) for c in centers_list]
+        else:
+            centers_all = [np.array(sketch["center"], dtype=float)]
+        center = centers_all[0]  # primary center for legacy callers
         radius = float(sketch["radius"])
         h_depth = float(hole.depth)
         h_dir = np.array(hole.direction, dtype=float)
@@ -1881,24 +2073,42 @@ def _build_stepwise(
             cut_start = center - h_dir * (h_depth / 2) - h_dir * 1.0
             cut_length = h_depth + 2.0
 
-        hole_name = f"{'Through' if is_through else 'Blind'} Hole (r={radius:.1f})"
+        n_holes = len(centers_all)
+        if n_holes > 1:
+            hole_name = (
+                f"{'Through' if is_through else 'Blind'} Hole Pattern "
+                f"({n_holes}× r={radius:.1f})"
+            )
+        else:
+            hole_name = f"{'Through' if is_through else 'Blind'} Hole (r={radius:.1f})"
         if note:
             hole_name += f" — {note}"
 
         try:
+            # Compose the hole-cut solid as the union of cylinders at all
+            # group centers. cut_start was computed for the primary center;
+            # for each additional center we shift the start parallel along
+            # the projected XY plane so the cylinder sits where the center
+            # is, while keeping the same axis depth.
             hole_plane = cq.Plane(
                 origin=cq.Vector(*cut_start.tolist()),
                 normal=cq.Vector(*h_dir.tolist()),
             )
             hole_solid = cq.Workplane(hole_plane).circle(radius).extrude(cut_length)
+            for c in centers_all[1:]:
+                shift = c - center
+                shift_plane = cq.Plane(
+                    origin=cq.Vector(*(cut_start + shift).tolist()),
+                    normal=cq.Vector(*h_dir.tolist()),
+                )
+                extra = cq.Workplane(shift_plane).circle(radius).extrude(cut_length)
+                hole_solid = hole_solid.union(extra)
 
-            # Emit a "Sketch Hole" step showing the circle outline on the
-            # pre-cut solid. This mirrors the Sketch Cutout -> Cut Extrude
-            # pair used for non-circular cutouts and gives the viewer an
-            # explicit sketch step for every hole.
+            # Emit a "Sketch Hole" step showing the circle outline(s) on
+            # the pre-cut solid. For a multi-center group, this is one
+            # sketch with N circles (matching how a CAD operator would
+            # actually draw a hole pattern in one sketch).
             try:
-                # Build a pair of 3D perpendiculars to the hole axis so we
-                # can sample N points around the circle's rim.
                 tmp_axis = np.array([0.0, 0.0, 1.0])
                 if abs(np.dot(h_dir, tmp_axis)) > 0.95:
                     tmp_axis = np.array([1.0, 0.0, 0.0])
@@ -1906,23 +2116,22 @@ def _build_stepwise(
                 u_perp = u_perp / (np.linalg.norm(u_perp) + 1e-15)
                 v_perp = np.cross(h_dir, u_perp)
                 v_perp = v_perp / (np.linalg.norm(v_perp) + 1e-15)
-                # Sample the circle rim at the hole's entry surface. For a
-                # through hole the entry is at cut_start + small offset;
-                # for a blind hole it's the same cut_start.
                 N_SAMPLES = 48
-                sketch_plane_origin = np.asarray(cut_start, dtype=float)
                 overlay_pts = []
-                prev_pt = None
-                for k in range(N_SAMPLES + 1):
-                    theta = 2 * np.pi * k / N_SAMPLES
-                    pt = (
-                        sketch_plane_origin
-                        + radius * (np.cos(theta) * u_perp + np.sin(theta) * v_perp)
-                    )
-                    if prev_pt is not None:
-                        overlay_pts.append(prev_pt)
-                        overlay_pts.append(pt)
-                    prev_pt = pt
+                for c_each in centers_all:
+                    shift = c_each - center
+                    sketch_plane_origin = np.asarray(cut_start + shift, dtype=float)
+                    prev_pt = None
+                    for k in range(N_SAMPLES + 1):
+                        theta = 2 * np.pi * k / N_SAMPLES
+                        pt = (
+                            sketch_plane_origin
+                            + radius * (np.cos(theta) * u_perp + np.sin(theta) * v_perp)
+                        )
+                        if prev_pt is not None:
+                            overlay_pts.append(prev_pt)
+                            overlay_pts.append(pt)
+                        prev_pt = pt
                 circle_overlay = np.asarray(overlay_pts, dtype=np.float64)
                 v_pre, f_pre = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
@@ -1943,8 +2152,8 @@ def _build_stepwise(
             wp_test = wp.cut(hole_solid)
             vol_after = abs(float(wp_test.val().Volume()))
 
-            # Expected hole volume: pi * r^2 * cut_length
-            expected_removal = 3.14159 * radius * radius * cut_length
+            # Expected hole volume: pi * r^2 * cut_length × N holes
+            expected_removal = 3.14159 * radius * radius * cut_length * n_holes
             actual_removal = vol_before - vol_after
             # Trigger nudge if less than 10% of expected volume was removed
             barely_cut = actual_removal < expected_removal * 0.10
@@ -2088,7 +2297,7 @@ def _build_stepwise(
     # longer emits fillet steps itself.
 
     script_lines.extend(["", '# cq.exporters.export(result, "output.step")'])
-    return wp, "\n".join(script_lines), steps
+    return wp, "\n".join(script_lines), steps, deferred_chamfers
 
 
 def _build_from_mesh_and_cut_holes(
@@ -2862,6 +3071,45 @@ def _detect_mesh_chamfers(
             queue.extend(adj[node] - visited)
         return len(visited) == len(face_set)
 
+    # --- Diagonal-face adjacency, for the flat-vs-curved test below ---
+    # A chamfer's bevel is a single FLAT face: all its diagonal faces share
+    # one normal. A fillet's rolled surface is CURVED: its diagonal faces
+    # fan across an arc. DBSCAN (eps=0.20) only groups a thin sub-band of
+    # that arc, so a fillet sub-band can masquerade as a small chamfer.
+    # To tell them apart we grow the full connected band of diagonal faces
+    # around each cluster and measure how far the normals fan out.
+    diag_set = set(int(x) for x in diag_indices)
+    diag_adj: dict[int, set[int]] = defaultdict(set)
+    for faces_list in edge_to_faces.values():
+        dl = [f for f in faces_list if f in diag_set]
+        for i in range(len(dl)):
+            for j in range(i + 1, len(dl)):
+                diag_adj[dl[i]].add(dl[j])
+                diag_adj[dl[j]].add(dl[i])
+
+    def _diagonal_band_spread_deg(seed_faces) -> float:
+        """Grow the connected component of diagonal faces around `seed_faces`
+        and return the angular spread (deg) of their normals from the mean.
+        Flat chamfer → ~0°; curved fillet band → tens of degrees."""
+        comp: set[int] = set()
+        stack = [int(f) for f in seed_faces]
+        while stack:
+            fc = stack.pop()
+            if fc in comp:
+                continue
+            comp.add(fc)
+            stack.extend(diag_adj[fc] - comp)
+        if len(comp) < 2:
+            return 0.0
+        comp_n = normals[list(comp)]
+        mean_n = comp_n.mean(axis=0)
+        mn = np.linalg.norm(mean_n)
+        if mn < 1e-9:
+            return 180.0
+        mean_n /= mn
+        dots = np.clip(comp_n @ mean_n, -1.0, 1.0)
+        return float(np.degrees(np.arccos(dots.min())))
+
     # --- Analyze each cluster ---
     results: list[dict] = []
     axis_names = ["X", "Y", "Z"]
@@ -2875,6 +3123,20 @@ def _detect_mesh_chamfers(
 
         avg_normal = normals[cluster_idx].mean(axis=0)
         avg_normal /= (np.linalg.norm(avg_normal) + 1e-15)
+
+        # --- Flat-vs-curved gate: reject fillet bands ---
+        # If the full connected band of diagonal faces around this cluster
+        # fans across a wide arc, it's the curved surface of a fillet, not
+        # a flat chamfer. A genuine chamfer's diagonal faces stay within a
+        # few degrees of one normal.
+        band_spread = _diagonal_band_spread_deg(cluster_idx)
+        if band_spread > 18.0:
+            logger.debug(
+                "Cluster %d: diagonal band fans %.0f° (>18°) — curved "
+                "fillet surface, not a chamfer, skipping",
+                label, band_spread,
+            )
+            continue
 
         # --- Determine which two principal axes this chamfer sits between ---
         abs_avg = np.abs(avg_normal)
@@ -3337,11 +3599,379 @@ def _detect_fillet_strips_from_mesh(cleaned: CleanedMesh) -> list[dict]:
     return results
 
 
+def _apply_deferred_chamfers(
+    wp: object,
+    chamfer_records: list[dict],
+    out_edges: list | None = None,
+    out_surfaces: list | None = None,
+) -> tuple[object, list[ConstructionStep], list[str]]:
+    """Apply chamfers that were detected per-body but deferred to a
+    post-union pass. Mirrors the inline chamfer loop in `_build_stepwise`
+    but operates on a single solid and returns fresh step/script lists.
+
+    Each record must carry its source body's `bbox_diag` so the
+    profile-cut path can compute a "through-all" extrusion length without
+    a CleanedMesh reference.
+
+    If out_edges is provided, each successfully chamfered edge's
+    [start, end] endpoints (world coords) are appended to it — used by
+    the intent-overlay viz.
+    """
+    import cadquery as cq
+
+    applied_steps: list[ConstructionStep] = []
+    script_lines: list[str] = []
+    if not chamfer_records:
+        return wp, applied_steps, script_lines
+
+    for cham in chamfer_records:
+        label = cham["label"]
+        d1 = cham["size"]
+        d2 = cham["size2"]
+        sel = cham["selector"]
+        edge_length_hint = cham.get("edge_length", 0.0)
+        bbox_diag_local = float(cham.get("bbox_diag", 0.0))
+        try:
+            vol_before = abs(float(wp.val().Volume()))
+        except Exception:
+            continue
+
+        applied = False
+        if cham.get("is_full_edge"):
+            attempts = [(d1, d2), (d1 * 0.8, d2 * 0.8), (d1 * 0.6, d2 * 0.6)]
+            for a1, a2 in attempts:
+                try:
+                    min_len = min(a1, a2) * 2.0
+                    sel_edges = wp.edges(sel).filter(lambda e: e.Length() > min_len)
+                    if abs(a1 - a2) / max(a1, a2) < 0.15:
+                        wp_test = sel_edges.chamfer(min(a1, a2))
+                    else:
+                        wp_test = sel_edges.chamfer(a1, a2)
+                    vol_after = abs(float(wp_test.val().Volume()))
+                    if vol_after <= 0:
+                        continue
+                    vol_removed = vol_before - vol_after
+                    try:
+                        total_edge_len = sum(
+                            e.Length() for e in wp.edges(sel).filter(
+                                lambda e: e.Length() > min_len
+                            ).vals()
+                        )
+                    except Exception:
+                        total_edge_len = edge_length_hint
+                    if total_edge_len > 0:
+                        expected_vol = 0.5 * a1 * a2 * total_edge_len
+                        vol_ratio = vol_removed / max(expected_vol, 1e-10)
+                        if vol_ratio < 0.1 or vol_ratio > 10.0:
+                            continue
+                    elif vol_after > vol_before * 1.01:
+                        continue
+                    # Record the chamfered edges (from the pre-chamfer
+                    # solid) for the intent overlay before reassigning wp.
+                    if out_edges is not None:
+                        try:
+                            for _e in wp.edges(sel).filter(
+                                lambda e: e.Length() > min_len
+                            ).vals():
+                                _sp = _e.startPoint(); _ep = _e.endPoint()
+                                out_edges.append(
+                                    [[_sp.x, _sp.y, _sp.z], [_ep.x, _ep.y, _ep.z]]
+                                )
+                        except Exception:
+                            pass
+                    wp = wp_test
+                    v, f = _tessellate_solid(wp, fast=True)
+                    cham_label = (
+                        f"{a1:.1f}x{a2:.1f}" if abs(a1 - a2) > 0.5
+                        else f"{min(a1, a2):.1f}"
+                    )
+                    applied_steps.append(ConstructionStep(
+                        name=f"Chamfer {label} ({cham_label}mm)",
+                        tess_vertices=v, tess_faces=f, volume=vol_after,
+                    ))
+                    script_lines.append(f'# Chamfer {label}')
+                    script_lines.append(
+                        f'result = result.edges("{sel}").chamfer({a1:.4f}, {a2:.4f})'
+                    )
+                    logger.info(
+                        "Deferred chamfer %s: %.2fx%.2f mm, vol %.2f -> %.2f",
+                        label, a1, a2, vol_before, vol_after,
+                    )
+                    if out_surfaces is not None:
+                        patch = _build_chamfer_surface_patch(cham)
+                        if patch is not None:
+                            pv, pf = patch
+                            out_surfaces.append({
+                                "verts": pv.tolist(), "faces": pf.tolist(),
+                                "kind": "chamfer",
+                            })
+                    applied = True
+                    break
+                except Exception as exc:
+                    logger.debug(
+                        "Deferred chamfer %s (%.2fx%.2f) failed: %s",
+                        label, a1, a2, exc,
+                    )
+                    continue
+            if applied:
+                continue
+
+        # --- Side-profile cut fallback (partial chamfers OR .chamfer() failed) ---
+        try:
+            corner = cham["corner"]
+            along_b = cham["along_b"]
+            along_a = cham["along_a"]
+            eidx = cham["edge_axis_idx"]
+            e_min = cham["edge_min"]
+            e_max = cham["edge_max"]
+            ax_u, ax_v = [i for i in range(3) if i != eidx]
+            through_all = bbox_diag_local * 5
+            cut_origin = [0.0, 0.0, 0.0]
+            cut_origin[eidx] = e_min - through_all
+            plane_normal = [0.0, 0.0, 0.0]
+            plane_normal[eidx] = 1.0
+            x_dir = [0.0, 0.0, 0.0]
+            x_dir[ax_u] = 1.0
+            y_dir_check = np.cross(plane_normal, x_dir)
+            if y_dir_check[ax_v] < 0:
+                x_dir = [0.0, 0.0, 0.0]
+                x_dir[ax_v] = 1.0
+                swap_uv = True
+            else:
+                swap_uv = False
+            cut_plane = cq.Plane(
+                origin=cq.Vector(*cut_origin),
+                normal=cq.Vector(*plane_normal),
+                xDir=cq.Vector(*x_dir),
+            )
+
+            def _pt(p):
+                return (p[ax_v], p[ax_u]) if swap_uv else (p[ax_u], p[ax_v])
+
+            tri_pts = [along_b, corner, along_a]
+            cut_wp = cq.Workplane(cut_plane).moveTo(*_pt(tri_pts[0]))
+            for pt in tri_pts[1:]:
+                cut_wp = cut_wp.lineTo(*_pt(pt))
+            cut_wp = cut_wp.close().extrude(2 * through_all + e_max - e_min)
+
+            wp_test = wp.cut(cut_wp)
+            vol_after = abs(float(wp_test.val().Volume()))
+            if vol_after <= 0:
+                continue
+            vol_removed = vol_before - vol_after
+            expected_vol = 0.5 * d1 * d2 * (e_max - e_min)
+            vol_ratio = vol_removed / max(expected_vol, 1e-10)
+            if vol_ratio < 0.05 or vol_ratio > 10.0:
+                continue
+
+            wp = wp_test
+            v, f = _tessellate_solid(wp, fast=True)
+            cham_label = (
+                f"{d1:.1f}x{d2:.1f}" if abs(d1 - d2) > 0.5
+                else f"{min(d1, d2):.1f}"
+            )
+            applied_steps.append(ConstructionStep(
+                name=f"Side Cut {label} ({cham_label}mm)",
+                tess_vertices=v, tess_faces=f, volume=vol_after,
+            ))
+            if out_edges is not None:
+                # The chamfered edge runs along the edge axis at the
+                # corner, from e_min to e_max.
+                p_lo = list(map(float, corner)); p_lo[eidx] = float(e_min)
+                p_hi = list(map(float, corner)); p_hi[eidx] = float(e_max)
+                out_edges.append([p_lo, p_hi])
+            if out_surfaces is not None:
+                patch = _build_chamfer_surface_patch(cham)
+                if patch is not None:
+                    pv, pf = patch
+                    out_surfaces.append({
+                        "verts": pv.tolist(), "faces": pf.tolist(),
+                        "kind": "chamfer",
+                    })
+            script_lines.append(f'# Chamfer {label} — profile cut')
+            logger.info(
+                "Deferred chamfer %s (profile cut): %.2fx%.2f mm, vol %.2f -> %.2f",
+                label, d1, d2, vol_before, vol_after,
+            )
+        except Exception as exc:
+            logger.debug("Deferred chamfer %s side-cut failed: %s", label, exc)
+
+    return wp, applied_steps, script_lines
+
+
+def _build_fillet_surface_patch(
+    e0, e1, axis_point, axis_dir, radius, n_along: int = 3, n_arc: int = 10,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build a quarter-round surface patch (the rolling-ball fillet
+    surface) along a matched edge, so the intent viz can show what the
+    fillet actually looks like rather than a bare line.
+
+    The fillet is a portion of a cylinder of `radius` whose axis is the
+    line (axis_point, axis_dir) — the rolling-ball centre line. The patch
+    sweeps a 90° arc centred on the direction from the axis toward the
+    edge (the corner bisector), tangent to the two adjacent faces.
+    Returns (verts (N,3), faces (M,3)) or None.
+    """
+    e0 = np.asarray(e0, dtype=float)
+    e1 = np.asarray(e1, dtype=float)
+    D = np.asarray(axis_dir, dtype=float)
+    nd = np.linalg.norm(D)
+    if nd < 1e-12 or radius <= 0:
+        return None
+    D = D / nd
+    P = np.asarray(axis_point, dtype=float)
+    # Project edge endpoints onto the axis line → cylinder-axis segment.
+    A0 = P + np.dot(e0 - P, D) * D
+    A1 = P + np.dot(e1 - P, D) * D
+    rad_vec = e0 - A0
+    rn = np.linalg.norm(rad_vec)
+    if rn < 1e-9:
+        return None
+    rad = rad_vec / rn               # axis → edge (corner bisector)
+    tang = np.cross(D, rad)
+    tn = np.linalg.norm(tang)
+    if tn < 1e-9:
+        return None
+    tang = tang / tn
+    sweep = np.pi / 2.0              # 90° fillet
+    verts = []
+    for i in range(n_along + 1):
+        t = i / n_along
+        A = A0 * (1.0 - t) + A1 * t
+        for j in range(n_arc + 1):
+            th = -sweep / 2.0 + sweep * (j / n_arc)
+            pt = A + radius * (np.cos(th) * rad + np.sin(th) * tang)
+            verts.append(pt)
+    stride = n_arc + 1
+    faces = []
+    for i in range(n_along):
+        for j in range(n_arc):
+            a = i * stride + j
+            b = a + 1
+            c = a + stride
+            d = c + 1
+            faces.append([a, b, d])
+            faces.append([a, d, c])
+    return np.asarray(verts, dtype=float), np.asarray(faces, dtype=np.int64)
+
+
+def _build_chamfer_surface_patch(cham: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build the flat bevel face of a chamfer as a quad (2 triangles),
+    spanning the edge from edge_min to edge_max between the two contact
+    lines along_a / along_b."""
+    try:
+        along_a = np.asarray(cham["along_a"], dtype=float)
+        along_b = np.asarray(cham["along_b"], dtype=float)
+        eidx = int(cham["edge_axis_idx"])
+        e_min = float(cham["edge_min"])
+        e_max = float(cham["edge_max"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    pa0 = along_a.copy(); pa0[eidx] = e_min
+    pa1 = along_a.copy(); pa1[eidx] = e_max
+    pb0 = along_b.copy(); pb0[eidx] = e_min
+    pb1 = along_b.copy(); pb1[eidx] = e_max
+    verts = np.array([pa0, pb0, pb1, pa1], dtype=float)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    return verts, faces
+
+
+def build_blend_intent_edges(
+    fillet_records: list[dict],
+    chamfer_records: list[dict],
+) -> np.ndarray | None:
+    """Return an (N, 2, 3) array of line-segment endpoints visualizing
+    where each fillet/chamfer record from the blend stage attaches.
+
+    Used by the Stage 7 "Fillet & Chamfer Intent" pipeline-stage viz
+    (called from job_queue.py after the CAD subprocess returns). The
+    output is the same edge-pair format `_set_mesh_viz(edge_pts=...)`
+    consumes, so it lays cyan lines on top of the pre-blend solid.
+
+    Fillet markers: an axis line of length `length` (or >=1mm) centered
+    at `axis_point`, plus two end-circles at the cylinder radius
+    perpendicular to the axis. Chamfer markers: the triangle outline at
+    corner / along_a / along_b world coordinates.
+    """
+    overlay_pairs: list[np.ndarray] = []
+    N_CIRC = 24
+
+    for rec in fillet_records or []:
+        try:
+            r = float(rec.get("radius", 0.0))
+            ad = np.asarray(rec.get("axis_dir"), dtype=float)
+            ap = np.asarray(
+                rec.get("axis_point", rec.get("centroid", [0, 0, 0])), dtype=float,
+            )
+            length = float(rec.get("length", 0.0))
+            n = float(np.linalg.norm(ad))
+            if r <= 0 or n < 1e-12:
+                continue
+            ad = ad / n
+            half = max(length, 1.0) * 0.5
+            p0 = ap - ad * half
+            p1 = ap + ad * half
+            overlay_pairs.append(p0)
+            overlay_pairs.append(p1)
+
+            tmp = np.array([0.0, 0.0, 1.0])
+            if abs(float(np.dot(ad, tmp))) > 0.95:
+                tmp = np.array([1.0, 0.0, 0.0])
+            u_perp = np.cross(ad, tmp)
+            u_perp = u_perp / (np.linalg.norm(u_perp) + 1e-15)
+            v_perp = np.cross(ad, u_perp)
+            v_perp = v_perp / (np.linalg.norm(v_perp) + 1e-15)
+            for end in (p0, p1):
+                prev = None
+                for k in range(N_CIRC + 1):
+                    th = 2 * np.pi * k / N_CIRC
+                    pt = end + r * (np.cos(th) * u_perp + np.sin(th) * v_perp)
+                    if prev is not None:
+                        overlay_pairs.append(prev)
+                        overlay_pairs.append(pt)
+                    prev = pt
+        except Exception as exc:
+            logger.debug("Intent overlay: skipped fillet record (%s)", exc)
+            continue
+
+    for cham in chamfer_records or []:
+        try:
+            corner = np.asarray(cham.get("corner"), dtype=float)
+            along_a = np.asarray(cham.get("along_a"), dtype=float)
+            along_b = np.asarray(cham.get("along_b"), dtype=float)
+            if corner is None or along_a is None or along_b is None:
+                continue
+            tri = [along_b, corner, along_a]
+            for i in range(len(tri)):
+                overlay_pairs.append(tri[i])
+                overlay_pairs.append(tri[(i + 1) % len(tri)])
+        except Exception as exc:
+            logger.debug("Intent overlay: skipped chamfer record (%s)", exc)
+            continue
+
+    if not overlay_pairs:
+        return None
+    return np.asarray(overlay_pairs, dtype=np.float64).reshape(-1, 2, 3)
+
+
 def _apply_recognized_fillets_to_solid(
     wp: object,
     body_contexts: list[tuple[object, CleanedMesh]] | None = None,
     override_clusters: list[dict] | None = None,
+    out_edges: list | None = None,
+    out_surfaces: list | None = None,
+    out_diag: list | None = None,
 ) -> tuple[object, list[object], list[str]]:
+    """If out_edges is provided, each successfully filleted CAD edge's
+    [start, end] endpoints (world coords) are appended to it.
+
+    If out_surfaces is provided, a quarter-round surface patch
+    {"verts","faces","kind":"fillet"} is appended for each filleted
+    edge — used by the intent viz to render the actual fillet surface.
+
+    If out_diag is provided, one dict per recognized record is appended
+    describing its fate (matched / why-not), for debugging the gap
+    between the blend stage and the apply stage."""
     """Apply the FILLET features recognized in Stage 5 to the CAD solid.
 
     body_contexts is a list of (feature_tree, cleaned_mesh) pairs. Each
@@ -3508,7 +4138,14 @@ def _apply_recognized_fillets_to_solid(
 
     matches: list[dict] = []
     used_edge_indices: set[int] = set()
-    for fillet in recognized:
+    # Each record produces ONE bucket. The fan-out within a record bundles
+    # all parallel matched edges into one OCC fillet call (e.g. a perimeter
+    # loop's 4 sides → one call). Distinct records stay distinct buckets,
+    # even when their radii happen to match — different physical fillets
+    # at the same radius become separate operations in the build, not one
+    # merged operation.
+    buckets: list[dict] = []
+    for record_idx, fillet in enumerate(recognized):
         # Prefer the cross-body reconciled radius over the per-body fit
         # so fillets that wrap around a bend come out with one consistent
         # size, not one value on each side. Falls through to raw radius
@@ -3516,67 +4153,93 @@ def _apply_recognized_fillets_to_solid(
         r = float(fillet.get("unified_radius", fillet["radius"]))
         ad = fillet["axis_dir"]
         ap = fillet["axis_point"]
-        best_idx = None
-        best_score = float("inf")
+        # Collect ALL edges that match (parallel within tolerance AND
+        # perp distance close to the fillet radius).
+        candidate_edges: list[tuple[int, float, float]] = []
+        n_parallel = 0          # edges parallel to the axis (dot >= 0.95)
+        best_parallel_pd = None  # closest parallel edge's perp distance
         for i, se in enumerate(solid_edges):
             if i in used_edge_indices:
                 continue
             dot = abs(float(np.dot(se["dir"], ad)))
             if dot < 0.95:
                 continue
-            # Perpendicular distance from the edge midpoint to the
-            # (axis_point, axis_dir) line.
             offset = se["mid"] - ap
             along = float(np.dot(offset, ad))
             perp_vec = offset - along * ad
             perp_dist = float(np.linalg.norm(perp_vec))
-            # The sharp edge we're filleting sits one radius away from
-            # the rolling-ball axis — inside the solid material. So we
-            # want perp_dist ≈ r. Score by how close it is to that,
-            # plus a small along-axis penalty for edges whose midpoint
-            # is far from the recorded axis_point.
+            n_parallel += 1
+            if best_parallel_pd is None or perp_dist < best_parallel_pd:
+                best_parallel_pd = perp_dist
+            if perp_dist > 2.0 * r + 1.0 or perp_dist < 0.2 * r:
+                continue
             score = abs(perp_dist - r) + 0.05 * abs(along)
-            if score < best_score:
-                best_score = score
-                best_idx = i
-        if best_idx is None:
+            candidate_edges.append((i, perp_dist, score))
+        if not candidate_edges:
+            if out_diag is not None:
+                if n_parallel == 0:
+                    reason = "no parallel CAD edge (axis dir matches nothing)"
+                else:
+                    reason = (
+                        f"{n_parallel} parallel edge(s) but nearest perp "
+                        f"dist {best_parallel_pd:.2f} outside accept band "
+                        f"[{0.2 * r:.2f}, {2.0 * r + 1.0:.2f}] for r={r:.2f}"
+                    )
+                out_diag.append({
+                    "record_idx": record_idx, "radius": r,
+                    "axis_dir": [round(float(x), 3) for x in ad],
+                    "axis_point": [round(float(x), 1) for x in ap],
+                    "length": round(float(fillet.get("length", 0.0)), 1),
+                    "matched": False, "n_edges": 0,
+                    "n_parallel": n_parallel,
+                    "best_parallel_pd": (
+                        round(best_parallel_pd, 2)
+                        if best_parallel_pd is not None else None
+                    ),
+                    "reason": reason,
+                })
             continue
-        # Reject if even the best candidate is not near radius distance.
-        best = solid_edges[best_idx]
-        offset = best["mid"] - ap
-        along = float(np.dot(offset, ad))
-        perp_vec = offset - along * ad
-        perp_dist = float(np.linalg.norm(perp_vec))
-        if perp_dist > 2.0 * r + 1.0 or perp_dist < 0.2 * r:
-            continue
-        used_edge_indices.add(best_idx)
-        matches.append({"radius": r, "edge_idx": best_idx})
+        # Fan-out: accept all parallel edges within ±15% of best_pd.
+        # These belong to ONE physical fillet (e.g. a perimeter loop)
+        # and get bundled into a single OCC fillet call at this radius.
+        best_pd = min(pd for _, pd, _ in candidate_edges)
+        record_edges: list = []
+        record_edge_pts: list = []
+        for i, pd, _ in candidate_edges:
+            if abs(pd - best_pd) > best_pd * 0.15:
+                continue
+            used_edge_indices.add(i)
+            record_edges.append(solid_edges[i]["obj"])
+            record_edge_pts.append((solid_edges[i]["start"], solid_edges[i]["end"]))
+            matches.append({"radius": r, "edge_idx": i})
+        if record_edges:
+            buckets.append({
+                "radius_sum": r * len(record_edges),
+                "count": len(record_edges),
+                "edges": record_edges,
+                "edge_pts": record_edge_pts,
+                "record_idx": record_idx,
+            })
+            if out_diag is not None:
+                out_diag.append({
+                    "record_idx": record_idx, "radius": round(r, 2),
+                    "axis_dir": [round(float(x), 3) for x in ad],
+                    "axis_point": [round(float(x), 1) for x in ap],
+                    "length": round(float(fillet.get("length", 0.0)), 1),
+                    "matched": True, "n_edges": len(record_edges),
+                    "n_parallel": n_parallel,
+                    "best_parallel_pd": round(best_pd, 2),
+                    "reason": "matched",
+                })
 
     logger.info(
-        "Fillet matching: %d/%d recognized fillets matched to edges, elapsed=%.1fs",
-        len(matches), len(recognized), _time.time() - pass_start,
+        "Fillet matching: %d/%d recognized fillets matched to edges, "
+        "%d buckets (one per record), elapsed=%.1fs",
+        len(matches), len(recognized), len(buckets),
+        _time.time() - pass_start,
     )
-    if not matches:
+    if not buckets:
         return wp, [], []
-
-    # --- Phase 3: group matches by radius for batched fillet calls ---
-    matches.sort(key=lambda m: m["radius"])
-    buckets: list[dict] = []
-    BUCKET_WIDTH = 0.3  # mm
-    for m in matches:
-        if buckets:
-            curr_r = buckets[-1]["radius_sum"] / buckets[-1]["count"]
-            if abs(m["radius"] - curr_r) < BUCKET_WIDTH:
-                b = buckets[-1]
-                b["radius_sum"] += m["radius"]
-                b["count"] += 1
-                b["edges"].append(solid_edges[m["edge_idx"]]["obj"])
-                continue
-        buckets.append({
-            "radius_sum": m["radius"],
-            "count": 1,
-            "edges": [solid_edges[m["edge_idx"]]["obj"]],
-        })
 
     # --- Phase 4: apply one OCC fillet call per bucket ---
     for bi, bucket in enumerate(buckets):
@@ -3594,6 +4257,21 @@ def _apply_recognized_fillets_to_solid(
                 )
                 continue
             wp = wp_test
+            if out_edges is not None:
+                for sp, ep in bucket.get("edge_pts", []):
+                    out_edges.append([list(map(float, sp)), list(map(float, ep))])
+            if out_surfaces is not None:
+                rec = recognized[bucket["record_idx"]]
+                for sp, ep in bucket.get("edge_pts", []):
+                    patch = _build_fillet_surface_patch(
+                        sp, ep, rec["axis_point"], rec["axis_dir"], mean_r,
+                    )
+                    if patch is not None:
+                        pv, pf = patch
+                        out_surfaces.append({
+                            "verts": pv.tolist(), "faces": pf.tolist(),
+                            "kind": "fillet",
+                        })
             v, f = _tessellate_solid(wp, fast=True)
             step = ConstructionStep(
                 name=f"Fillet (r={mean_r:.2f}mm) x{len(edges)}",

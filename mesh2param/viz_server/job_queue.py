@@ -282,6 +282,26 @@ def _color_regions_no_adjacent_match(regions, sub_cleaned, palette):
     return {rid: palette[ci] for rid, ci in color_idx_for.items()}
 
 
+# Ordered list of pipeline stages that support a pause/breakpoint, as
+# (stage_key, display_name) pairs. The frontend's "pause at stage"
+# dropdown is populated from this list (kept in sync in app.js). The
+# stage_key is what gets stored in Job.pause_at_stage and matched in
+# _pause_for_review.
+PAUSE_STAGES: list[tuple[str, str]] = [
+    ("decompose", "Decompose bodies"),
+    ("segment", "Segmentation"),
+    ("fit", "Primitive fitting"),
+    ("topology", "Topology & edges"),
+    ("blend_graph", "Blend graph"),
+    ("features", "Feature recognition"),
+    ("build", "Build 3D model"),
+    ("intent", "Fillet & chamfer intent"),
+    ("apply", "Apply fillets & chamfers"),
+    ("reconcile", "Blend reconciliation (debug)"),
+]
+PAUSE_STAGE_KEYS = {k for k, _ in PAUSE_STAGES}
+
+
 @dataclass
 class Job:
     id: str
@@ -293,6 +313,10 @@ class Job:
     progress_stage: str = "Queued"
     paused: bool = False  # True when waiting for user to press Continue
     step_through: bool = True  # pause after each visual stage
+    # One-shot breakpoint: when step_through is off, pause at exactly this
+    # stage key (see PAUSE_STAGES). Cleared once the user continues past it,
+    # so the rest of the pipeline runs without further pauses.
+    pause_at_stage: str | None = None
     error: str | None = None
     # Pipeline results
     features: object = None
@@ -396,14 +420,18 @@ class JobQueue:
                 job.status = "error"
                 logger.exception("Job %s failed", job_id)
             finally:
-                # Keep temp file for cancelled jobs so user can re-run.
-                # Also keep if it looks like a cancel (pipeline raised mid-way).
+                # Keep temp file for cancelled jobs so user can re-run,
+                # and for successfully done jobs so the UI's Reanalyze
+                # button can re-trigger the pipeline on the same mesh.
+                # Only delete on hard error (file is probably already
+                # broken or unrecognized and re-running won't help).
                 cancelled = (
                     job.error == "Cancelled by user"
                     or job.error == "Job cancelled"
                     or "cancel" in (job.error or "").lower()
                 )
-                if not cancelled:
+                keep = cancelled or job.status == "done"
+                if not keep:
                     Path(job.file_path).unlink(missing_ok=True)
 
     def _run_pipeline(self, job: Job):
@@ -425,9 +453,20 @@ class JobQueue:
             if job.status == "error":
                 raise RuntimeError("Job cancelled")
 
-        def _pause_for_review():
-            """Pause pipeline so the user can review the current visualization."""
-            if not job.step_through:
+        def _pause_for_review(stage_key: str | None = None):
+            """Pause pipeline so the user can review the current visualization.
+
+            Pauses when either step-through mode is on (pause at every
+            stage) OR a one-shot breakpoint targets this stage_key. After
+            the user continues past a breakpoint, it's cleared so the rest
+            of the run proceeds without pausing.
+            """
+            breakpoint_hit = (
+                stage_key is not None
+                and job.pause_at_stage is not None
+                and stage_key == job.pause_at_stage
+            )
+            if not job.step_through and not breakpoint_hit:
                 return
             job.paused = True
             while job.paused:
@@ -435,6 +474,27 @@ class JobQueue:
                     break
                 time.sleep(0.2)
             job.paused = False
+            if breakpoint_hit:
+                job.pause_at_stage = None  # one-shot — don't pause again
+
+        def _dwell_if_not_step_through(stage_key: str | None = None, seconds: float = 2.5):
+            """Hold the current progress viz long enough for the frontend's
+            poll loop to catch it. Only needed for stages that have no
+            real computation work (pure viz updates) — without this,
+            non-step-through mode races past them before the next poll.
+            In step-through mode (or when this stage is the breakpoint
+            target) the explicit pause handles visibility instead.
+            """
+            if job.step_through:
+                return
+            if stage_key is not None and stage_key == job.pause_at_stage:
+                return  # about to pause here anyway
+            elapsed = 0.0
+            while elapsed < seconds:
+                if job.status == "error":
+                    break
+                time.sleep(0.25)
+                elapsed += 0.25
 
         # Helper: set mesh visualization on the job for live progress
         def _set_mesh_viz(cleaned_mesh, face_colors=None, edge_pts=None, edge_colors=None):
@@ -558,8 +618,8 @@ class JobQueue:
             job._decomp_pieces = pieces  # separate meshes for frontend
             job.progress_version += 1
             logger.info("Multi-body: %d bodies detected", len(decomposition.bodies))
-            if job.step_through:
-                _pause_for_review()
+            if job.step_through or job.pause_at_stage == "decompose":
+                _pause_for_review("decompose")
             else:
                 # Step mode off — still let the explode animation play (3s)
                 for _ in range(15):
@@ -651,7 +711,10 @@ class JobQueue:
                 logger.exception("identify_blends_from_topology failed for body %d", bi)
                 topology_blends = []
             _check_cancelled()
-            body_tree = recognize_features(regions, fitted, graph, edges_list, sub_cleaned, RecognizeConfig())
+            body_tree = recognize_features(
+                regions, fitted, graph, edges_list, sub_cleaned,
+                RecognizeConfig(), topo_blends=topology_blends,
+            )
             return (body, sub_cleaned, regions, fitted, graph, edges_list,
                     body_tree, topology_blends)
 
@@ -727,7 +790,7 @@ class JobQueue:
                 f"({n_plate} plate, {n_curve} curve, {n_cyl} cyl) median={median_f}f"
             )
         _set_body_viz(seg_colors)
-        _pause_for_review()
+        _pause_for_review("segment")
 
         # Stage 3: Fitting
         # Render PRIMITIVE GEOMETRY: each region's vertices are
@@ -794,7 +857,7 @@ class JobQueue:
         job.progress_colors_per_face = False
         job._decomp_pieces = fit_pieces
         job.progress_version += 1
-        _pause_for_review()
+        _pause_for_review("fit")
 
         # Stage 4: Topology — same face colors as fitting + edge lines
         job.progress = 23
@@ -841,7 +904,7 @@ class JobQueue:
         job.progress_colors_per_face = False
         job._decomp_pieces = fit_pieces
         job.progress_version += 1
-        _pause_for_review()
+        _pause_for_review("topology")
 
         # Stage 4.5: Blend graph — highlight each plane-to-plane
         # connection that was classified as a fillet or chamfer. Unlike
@@ -875,7 +938,7 @@ class JobQueue:
             job.progress_edges = None
             job.progress_edge_colors = None
             _set_body_viz(blend_face_colors_by_body)
-            _pause_for_review()
+            _pause_for_review("blend_graph")
         except Exception as _bg_exc:
             logger.debug("Blend graph viz failed: %s", _bg_exc)
 
@@ -909,7 +972,7 @@ class JobQueue:
                 f"[Body {bi}] Stage 5: {len(body_tree.features)} features ({type_str})"
             )
         _set_body_viz(feat_colors)
-        _pause_for_review()
+        _pause_for_review("features")
 
         tree = all_body_results[0][2]
         job.features = tree
@@ -934,14 +997,59 @@ class JobQueue:
         #       uses region adjacency — catches fillets the triangle peeler
         #       missed and gives symmetric detection across mirror features).
         peeled_fillets = list(getattr(job, '_peeled_fillets', []) or [])
-        for _bst in body_stage_data:
+        # Filter cap for the CAD matcher: real fillet radii on a typical
+        # mechanical part are within ~25% of the part's bbox diagonal.
+        # Records whose fitter spat out absurd radii (e.g. 8000mm on a 200mm
+        # part — these come from CYLINDER/SPHERE fits to wrap regions or 3D
+        # corner caps where the fit primitive is a poor approximation) get
+        # pruned so they don't pollute the edge-matching step. The blend
+        # graph viz still shows ALL records; only the CAD export sees the
+        # filtered list.
+        bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+        max_export_radius = bbox_diag * 0.25
+        skipped_for_export = 0
+        topo_for_merge: list[dict] = []
+        # Assign each surviving record a GLOBALLY unique id. region_id only
+        # resets per body, so the cross-body merge would otherwise alias
+        # two different regions that happen to share a region_id. Tag both
+        # the raw record (for the reconciliation overlay) and the merge
+        # copy with this uid via the region_id field the merge tracks.
+        _uid = 0
+        for body_idx, _bst in enumerate(body_stage_data):
             topo_blends = _bst[7] if len(_bst) > 7 else []
             for rec in topo_blends:
+                radius = float(rec.get("radius", 0.0) or 0.0)
+                if radius < 0.2 or radius > max_export_radius:
+                    skipped_for_export += 1
+                    continue
+                rec["reconcile_uid"] = _uid
                 rec_copy = {k: v for k, v in rec.items() if k not in ("face_indices",)}
-                peeled_fillets.append(rec_copy)
+                rec_copy["body_index"] = body_idx
+                rec_copy["region_id"] = _uid  # globally-unique for merge tracking
+                topo_for_merge.append(rec_copy)
+                _uid += 1
+        # Collapse fragments: a single physical fillet often appears as
+        # 2-4 topology records (mesh segmentation splits a long curl into
+        # halves; a fillet that runs across a body boundary gets one
+        # record per body). Merge by collinear axis lines so the CAD
+        # matcher applies one fillet operation per physical edge instead
+        # of N noisy ones.
+        try:
+            from mesh2param.pipeline.reconcile_fillets import (
+                merge_blend_records_for_export,
+            )
+            merged_topo = merge_blend_records_for_export(topo_for_merge)
+        except Exception:
+            logger.exception("merge_blend_records_for_export failed; using raw records")
+            merged_topo = topo_for_merge
+        peeled_fillets.extend(merged_topo)
         logger.info(
-            "peel summary: %d blend record(s) feeding export (triangle + topology)",
-            len(peeled_fillets),
+            "peel summary: %d blend record(s) feeding export "
+            "(triangle peel + %d topology, after merge %d→%d, "
+            "%d skipped for radius out of range [0.2, %.1f]mm)",
+            len(peeled_fillets), len(topo_for_merge),
+            len(topo_for_merge), len(merged_topo),
+            skipped_for_export, max_export_radius,
         )
         try:
             tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
@@ -1020,6 +1128,235 @@ with open(r'{tmp_out.name}', 'wb') as f:
             })
         if job.variants:
             job.steps = job.variants[0]['steps']  # default to first variant
+
+        # --- Build checkpoint: the 3D model is now built (holes cut,
+        # bodies combined) but fillets/chamfers are NOT yet applied.
+        # Show that un-blended solid and offer a breakpoint here so the
+        # user can inspect the base build before the intent/apply stages.
+        try:
+            build_v = getattr(result, 'pre_blend_tess_vertices', None)
+            build_f = getattr(result, 'pre_blend_tess_faces', None)
+            if build_v is None or build_f is None:
+                build_v = result.tess_vertices
+                build_f = result.tess_faces
+            if build_v is not None and build_f is not None:
+                _check_cancelled()
+                job.progress = 94
+                job.progress_stage = "3D model built (before fillets & chamfers)"
+                job.progress_vertices = np.asarray(
+                    build_v, dtype=np.float64,
+                ).flatten().tolist()
+                job.progress_faces = np.asarray(
+                    build_f, dtype=np.int64,
+                ).flatten().tolist()
+                job.progress_colors = None
+                job.progress_colors_per_face = False
+                job.progress_edges = None
+                job.progress_edge_colors = None
+                # Clear the multi-body decomposition pieces from earlier
+                # stages — otherwise the frontend renders those stale
+                # pieces instead of the built CAD solid (pieces take
+                # precedence over progress_vertices in the viewer).
+                job._decomp_pieces = None
+                job.progress_version += 1
+                _dwell_if_not_step_through("build")
+                _pause_for_review("build")
+        except Exception as _build_exc:
+            logger.debug("Build checkpoint viz failed: %s", _build_exc)
+
+        # --- Stage 7: Fillet & Chamfer Intent Overlay ---
+        # Show the un-blended solid (gray) with the actual fillet
+        # (cyan, quarter-round) and chamfer (orange, bevel) SURFACES
+        # painted on, so you can see what each blend looks like — like
+        # the blend-graph stage, but on the rebuilt CAD solid. The
+        # geometry comes from result.intent_mesh; falls back to edge
+        # lines if patch assembly produced nothing.
+        intent_mesh = getattr(result, 'intent_mesh', None) or {}
+        blend_edges = getattr(result, 'blend_edge_overlay', None) or []
+        pre_v = getattr(result, 'pre_blend_tess_vertices', None)
+        pre_f = getattr(result, 'pre_blend_tess_faces', None)
+        try:
+            n_patches = 0
+            if intent_mesh.get("vertices") and intent_mesh.get("faces"):
+                _check_cancelled()
+                # colors are per-face (numFaces*3); count non-gray faces
+                # just for the status label.
+                n_patches = len(blend_edges)
+                job.progress = 96
+                job.progress_stage = (
+                    f"Fillet & chamfer intent: {n_patches} blend surface(s)"
+                )
+                job.progress_vertices = intent_mesh["vertices"]
+                job.progress_faces = intent_mesh["faces"]
+                job.progress_colors = intent_mesh.get("colors")
+                job.progress_colors_per_face = True
+                job.progress_edges = None
+                job.progress_edge_colors = None
+                job._decomp_pieces = None  # render the solid, not stale pieces
+                job.progress_version += 1
+                job.debug_summary.append(
+                    f"Stage 7: {n_patches} fillet/chamfer blend surface(s) shown"
+                )
+                _dwell_if_not_step_through("intent")
+                _pause_for_review("intent")
+            elif pre_v is not None and pre_f is not None:
+                # Fallback: solid + cyan edge lines (no surface patches).
+                _check_cancelled()
+                job.progress = 96
+                job.progress_stage = (
+                    f"Fillet & chamfer intent: {len(blend_edges)} edge(s) to blend"
+                )
+                job.progress_vertices = np.asarray(
+                    pre_v, dtype=np.float64,
+                ).flatten().tolist()
+                job.progress_faces = np.asarray(
+                    pre_f, dtype=np.int64,
+                ).flatten().tolist()
+                job.progress_colors = None
+                job.progress_colors_per_face = False
+                if blend_edges:
+                    flat = []
+                    for seg in blend_edges:
+                        (ax, ay, az), (bx, by, bz) = seg[0], seg[1]
+                        flat.extend([ax, ay, az, bx, by, bz])
+                    job.progress_edges = flat
+                else:
+                    job.progress_edges = None
+                job.progress_edge_colors = None
+                job._decomp_pieces = None
+                job.progress_version += 1
+                _dwell_if_not_step_through("intent")
+                _pause_for_review("intent")
+        except Exception as _intent_exc:
+            logger.debug("Stage 7 (intent overlay) failed: %s", _intent_exc)
+
+        # --- Stage 8: Apply fillets & chamfers ---
+        # Show the final solid (post-apply). The actual application
+        # already ran inside the CAD subprocess; this stage frames it
+        # as its own viz checkpoint so step-through users see the
+        # before/after contrast vs. Stage 7.
+        try:
+            final_v = result.tess_vertices
+            final_f = result.tess_faces
+            if final_v is not None and final_f is not None:
+                _check_cancelled()
+                job.progress = 99
+                job.progress_stage = "Applying fillets & chamfers to model"
+                job.progress_vertices = np.asarray(
+                    final_v, dtype=np.float64,
+                ).flatten().tolist()
+                job.progress_faces = np.asarray(
+                    final_f, dtype=np.int64,
+                ).flatten().tolist()
+                job.progress_colors = None
+                job.progress_colors_per_face = False
+                job.progress_edges = None
+                job.progress_edge_colors = None
+                job._decomp_pieces = None  # render the solid, not stale pieces
+                job.progress_version += 1
+                _dwell_if_not_step_through("apply")
+                _pause_for_review("apply")
+        except Exception as _apply_exc:
+            logger.debug("Stage 8 (apply) viz failed: %s", _apply_exc)
+
+        # --- Debug stage: Blend reconciliation fate overlay ---
+        # Paint every raw fillet blend region by what happened to it on
+        # the way to the CAD apply pass, so the dropoff is visible:
+        #   gray   = filtered out (radius) or dropped in merge (sub-1mm/sphere)
+        #   yellow = merged into a neighbouring record (collinear merge)
+        #   cyan   = matched a CAD edge, clean fit (applied)
+        #   orange = matched but bad fit (huge radius / tilted axis / sliver)
+        #   red    = survived to apply but no CAD edge matched
+        try:
+            diag = getattr(result, 'fillet_match_diag', None) or []
+
+            def _match_for(rec) -> dict | None:
+                """Find the diag entry for a merged record by geometry."""
+                ap = np.asarray(rec.get("axis_point", [0, 0, 0]), float)
+                rr = float(rec.get("radius", 0.0))
+                best, best_d = None, 3.0
+                for d in diag:
+                    dp = np.asarray(d["axis_point"], float)
+                    dist = float(np.linalg.norm(dp - ap))
+                    if dist < best_d and abs(d["radius"] - rr) <= 0.25 * max(rr, 1e-6) + 0.5:
+                        best, best_d = d, dist
+                return best
+
+            def _is_bad_fit(d: dict) -> bool:
+                ad = sorted(abs(float(x)) for x in d["axis_dir"])
+                return (
+                    d["radius"] > 10.0
+                    or d["length"] < 2.0
+                    or (len(ad) >= 2 and ad[1] > 0.1)  # 2nd axis comp → tilted
+                )
+
+            # Map each raw record's globally-unique uid → merged record it
+            # belongs to. (region_id resets per body; reconcile_uid does not.)
+            region_to_merged: dict[int, dict] = {}
+            for m in merged_topo:
+                for rid in m.get("merged_from", [int(m.get("region_id", -1))]):
+                    region_to_merged[int(rid)] = m
+
+            BASE = [0.58, 0.60, 0.63]
+            FATE = {
+                "filtered": [0.34, 0.34, 0.36],
+                "merged":   [0.95, 0.82, 0.15],
+                "matched":  [0.0, 0.85, 0.95],
+                "badfit":   [1.0, 0.50, 0.0],
+                "unmatched": [0.93, 0.18, 0.18],
+            }
+            counts = {k: 0 for k in FATE}
+            fate_colors_by_body = []
+            for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, topo_blends in body_stage_data:
+                fc = np.tile(BASE, (len(sub_cleaned.faces), 1))
+                for rec in topo_blends:
+                    if rec.get("kind") != "fillet":
+                        continue
+                    idx = rec.get("face_indices")
+                    if idx is None or len(idx) == 0:
+                        continue
+                    uid = int(rec.get("reconcile_uid", -1))
+                    r = float(rec.get("radius", 0.0) or 0.0)
+                    if r < 0.2 or r > max_export_radius:
+                        fate = "filtered"
+                    else:
+                        m = region_to_merged.get(uid)
+                        if m is None:
+                            fate = "filtered"  # dropped in merge (sphere/<1mm)
+                        elif uid != int(m.get("seed_region_id", uid)):
+                            fate = "merged"     # absorbed into the seed record
+                        else:
+                            d = _match_for(m)
+                            if d is None or not d.get("matched"):
+                                fate = "unmatched"
+                            elif _is_bad_fit(d):
+                                fate = "badfit"
+                            else:
+                                fate = "matched"
+                    fc[idx] = FATE[fate]
+                    counts[fate] += 1
+                fate_colors_by_body.append((body, sub_cleaned, fc))
+
+            _check_cancelled()
+            job.progress = 99
+            job.progress_stage = (
+                "Blend reconciliation — "
+                f"{counts['matched']} matched, {counts['badfit']} bad-fit, "
+                f"{counts['unmatched']} unmatched, {counts['merged']} merged, "
+                f"{counts['filtered']} filtered"
+            )
+            job.progress_edges = None
+            job.progress_edge_colors = None
+            job._decomp_pieces = None
+            _set_body_viz(fate_colors_by_body)
+            job.debug_summary.append(
+                "Reconcile: " + ", ".join(f"{k}={v}" for k, v in counts.items())
+            )
+            _dwell_if_not_step_through("reconcile")
+            _pause_for_review("reconcile")
+        except Exception as _rec_exc:
+            logger.debug("Blend reconciliation stage failed: %s", _rec_exc)
+
         job.progress = 100
         job.progress_stage = "Done"
 

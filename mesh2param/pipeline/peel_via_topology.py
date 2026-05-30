@@ -244,16 +244,27 @@ def identify_blends_from_topology(
                     bb_size = region_verts.max(axis=0) - region_verts.min(axis=0)
                     bb_sorted = sorted(bb_size, reverse=True)
                     aspect_ratio = bb_sorted[0] / max(bb_sorted[2], 0.01)
-                    # Two exemptions: long thin strips (aspect ≥ 50)
-                    # AND highly-curved cylinders (mag < 0.4) that
-                    # wrap most of the way around an axis. The
-                    # latter catches base-plate side fillets where
-                    # the rolled edge continues from the side plate
-                    # onto the base plate (a curved strip with many
-                    # plane neighbors). Cantilever side walls have
-                    # mag in 0.5-0.8 and don't pass this exemption.
+                    # Four exemptions: long thin strips (aspect ≥ 50),
+                    # highly-curved cylinders (mag < 0.4), tiny corner-
+                    # curl quarter-cylinders, AND thin rolled-edge
+                    # fillets. Cantilever side walls are blocky (full
+                    # plate thickness in every dim, ≥5mm), so any
+                    # region that's THIN in some direction can't be one
+                    # of those false positives:
+                    #   • corner-curl: both smaller dims ≤ 3.5mm
+                    #     (a 2-3mm-radius curl running along an edge)
+                    #   • rolled-edge: shortest dim ≤ 1.5mm (a flat
+                    #     rolled curl, e.g. perimeter rolls on a thin
+                    #     plate face)
                     mean_mag = float(np.linalg.norm(face_norms.mean(axis=0)))
-                    if aspect_ratio < 50 and mean_mag >= 0.4:
+                    is_corner_curl = (
+                        bb_sorted[1] <= 3.5 and bb_sorted[2] <= 3.5
+                    )
+                    is_rolled_edge = bb_sorted[2] <= 1.5
+                    if (
+                        aspect_ratio < 50 and mean_mag >= 0.4
+                        and not is_corner_curl and not is_rolled_edge
+                    ):
                         continue
                 bridge_ok = False
                 for pn in plane_nbr_fits:
@@ -292,12 +303,35 @@ def identify_blends_from_topology(
                 neighbor_edges = list(neighbors)
                 bis_ni = bis_nj = None  # chamfer-only, unused for fillets
         elif f.surface_type == SurfaceType.PLANE:
-            # Narrow plane strip — possible chamfer between two planes.
+            # Two cases for a PLANE region to be a blend:
+            #   1. CHAMFER chamfer: narrow strip between two planes
+            #      with topology-tagged CHAMFER edges, normal at ~45°
+            #      to both neighbors (passes bisector check).
+            #   2. TANGENT BEVEL: a 3D corner fillet whose curvature
+            #      was too gentle for cylinder/sphere fitting, so it
+            #      got rounded to a flat plane. Topology classifies
+            #      its edges to adjacent surfaces as SMOOTH (gentle
+            #      dihedral, tangentially continuous). Recognized by
+            #      its small thin shape (≤ 12mm long, ≤ 2.5mm thick),
+            #      multiple plane neighbors, and absence of CHAMFER
+            #      edges.
             chamfer_edges = [e for e in neighbors
                              if e.transition_type == TransitionType.CHAMFER]
-            if not chamfer_edges:
+            region_verts = cleaned.vertices[
+                np.unique(cleaned.faces[region.face_indices].ravel())
+            ]
+            bb_size = region_verts.max(axis=0) - region_verts.min(axis=0)
+            bb_sorted = sorted(bb_size, reverse=True)
+            is_tangent_bevel = (
+                not chamfer_edges
+                and 30 <= region.num_faces <= 100
+                and bb_sorted[0] <= 12.0
+                and bb_sorted[2] <= 2.5
+                and len(plane_nbr_fits) >= 2
+            )
+            if not chamfer_edges and not is_tangent_bevel:
                 continue
-            if region.num_faces > 40:
+            if chamfer_edges and region.num_faces > 40:
                 continue
             if len(plane_nbr_fits) < 2:
                 continue
@@ -314,18 +348,24 @@ def identify_blends_from_topology(
                     break
             if bis_ni is None:
                 continue
-            # Chamfer face normal should roughly bisect its plane
-            # neighbors — thin flat strips alongside a rounded edge
-            # fail this because their normal matches the plate.
-            cn = _pn(f)
-            bis = bis_ni + bis_nj
-            bis_n = np.linalg.norm(bis)
-            if bis_n < 1e-9:
-                continue
-            bis = bis / bis_n
-            if abs(float(np.dot(cn, bis))) < 0.85:
-                continue
-            kind = "chamfer"
+            # Bisector check for true CHAMFERs: chamfer face normal
+            # should roughly bisect its plane neighbors. Skipped for
+            # tangent bevels because their normal aligns with a
+            # parent surface (the bevel is tangentially continuous,
+            # not at 45°).
+            if not is_tangent_bevel:
+                cn = _pn(f)
+                bis = bis_ni + bis_nj
+                bis_n = np.linalg.norm(bis)
+                if bis_n < 1e-9:
+                    continue
+                bis = bis / bis_n
+                if abs(float(np.dot(cn, bis))) < 0.85:
+                    continue
+            # Tangent bevels are 3D corner FILLETS (rounded transitions
+            # whose curvature was too gentle for cylinder/sphere fitting),
+            # not true 45° CHAMFERs. Tag accordingly.
+            kind = "fillet" if is_tangent_bevel else "chamfer"
             neighbor_edges = list(neighbors)
         else:
             continue
@@ -334,12 +374,16 @@ def identify_blends_from_topology(
         # plane intersection (when we have two non-parallel plane
         # neighbors) or a fallback using the cylinder axis (when
         # adjacency is ambiguous: rolled-over edges, rim fillets).
+        # Use plane_nbr_fits (which already includes synthetic-plane
+        # entries for flat-but-curve-fit neighbors with mag > 0.95)
+        # so line_dir works even when actual flat neighbors got fit
+        # as CYLINDER/CONE/SPHERE.
         p_rid_a = p_rid_b = None  # used later in record
+        plane_fits_by_rid = {pf.region_id: pf for pf in plane_nbr_fits}
         plane_rids: list[int] = []
         for e in neighbor_edges:
             other = e.surface_b_id if e.surface_a_id == rid else e.surface_a_id
-            of = fitted_lookup.get(other)
-            if of is not None and of.surface_type == SurfaceType.PLANE:
+            if other in plane_fits_by_rid:
                 plane_rids.append(other)
         unique_plane_rids = list(dict.fromkeys(plane_rids))
 
@@ -347,8 +391,8 @@ def identify_blends_from_topology(
         line_dir = line_point = None
         for i in range(len(unique_plane_rids)):
             for j in range(i + 1, len(unique_plane_rids)):
-                pA = fitted_lookup[unique_plane_rids[i]]
-                pB = fitted_lookup[unique_plane_rids[j]]
+                pA = plane_fits_by_rid[unique_plane_rids[i]]
+                pB = plane_fits_by_rid[unique_plane_rids[j]]
                 n_A = np.asarray(pA.params.get("normal"), dtype=float)
                 n_B = np.asarray(pB.params.get("normal"), dtype=float)
                 nA_norm = float(np.linalg.norm(n_A))
@@ -448,11 +492,28 @@ def identify_blends_from_topology(
         # underlying torus's MAJOR radius (≈ hole radius), not the
         # fillet's minor radius. Use perp_dist instead so downstream
         # CAD reconstruction sees the actual fillet radius.
+        # Sanity check: the fillet radius cannot exceed the curl
+        # extent (smallest bbox dim of the region's face vertices).
+        # When the cylinder/cone fitter approximates a small partial
+        # arc with a large-radius full cylinder, fit_radius blows up
+        # to 10-100× the actual fillet radius — visible on the
+        # rackmount where 1.4×9.8×9.8 corner curl regions get fit
+        # with 12+mm radii. Cap to ~3× bbox.min so the CAD matcher
+        # doesn't go looking for an edge 12mm away from a 1.4mm-
+        # thick curl. The 3× factor leaves headroom for short-arc
+        # fillets where bbox.min legitimately undershoots radius
+        # but rejects the truly-bogus inflated fits.
+        region_verts = vertices[blend_vert_ids]
+        bbox_size = region_verts.max(axis=0) - region_verts.min(axis=0)
+        bbox_min = float(np.sort(bbox_size)[0])
         fit_radius = float(f.params.get("radius", 0) or 0)
         if f.surface_type == SurfaceType.SPHERE:
             radius = float(np.median(perp_dist))
         elif fit_radius > 0.2:
-            radius = fit_radius
+            if bbox_min > 0 and fit_radius > 3.0 * bbox_min:
+                radius = bbox_min
+            else:
+                radius = fit_radius
         else:
             radius = float(np.median(perp_dist))
         # Sanity floor only — drop the upper-radius cap. Big main-
@@ -479,6 +540,7 @@ def identify_blends_from_topology(
             "plane_region_ids": [
                 rid_ for rid_ in (p_rid_a, p_rid_b) if rid_ is not None
             ],
+            "source_fit_type": f.surface_type.value,
         })
         peeled_region_ids.add(rid)
 

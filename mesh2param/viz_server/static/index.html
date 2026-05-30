@@ -832,7 +832,7 @@ body {
     <i class="ri-sparkling-line"></i> Analyze & Build
   </button>
   <button class="action-btn secondary" id="btn-rerun" style="display:none;" onclick="rerunPipeline()">
-    <i class="ri-refresh-line"></i> Rerun
+    <i class="ri-refresh-line"></i> Reanalyze
   </button>
   <div style="position:relative; display:inline-block;">
     <button class="action-btn secondary" id="btn-export" disabled onclick="document.getElementById('export-menu').classList.toggle('show')">
@@ -944,6 +944,23 @@ body {
       "></span>
     </span>
     Debug
+  </label>
+  <!-- Breakpoint dropdown: only meaningful when Debug is on and Step is off.
+       Pauses the (otherwise non-step) pipeline at exactly the chosen stage. -->
+  <label id="pause-at-wrap" title="Pause the pipeline once at this stage, then continue without further pauses" style="
+    display:none; align-items:center; gap:6px;
+    font-size:11px; color:var(--text-secondary); font-family:'OpenAI Sans',sans-serif;
+    user-select:none; background:var(--bg-tertiary); padding:4px 10px; border-radius:12px;
+    border:1px solid var(--border);
+  ">
+    Pause at
+    <select id="pause-at-select" style="
+      background:var(--bg-secondary); color:var(--text-primary);
+      border:1px solid var(--border); border-radius:8px; font-size:11px;
+      padding:2px 6px; font-family:'OpenAI Sans',sans-serif; cursor:pointer;
+    ">
+      <option value="none">— none —</option>
+    </select>
   </label>
 </div>
 

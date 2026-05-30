@@ -38,6 +38,7 @@ def recognize_features(
     edges: list[SurfaceEdge],
     cleaned: CleanedMesh,
     config: RecognizeConfig | None = None,
+    topo_blends: list[dict] | None = None,
 ) -> FeatureTree:
     """Recognize manufacturing features from surface data and topology.
 
@@ -48,6 +49,13 @@ def recognize_features(
         edges: Classified surface edges from Stage 4.
         cleaned: Output of Stage 1 (for mesh geometry).
         config: Recognition configuration. Uses defaults if None.
+        topo_blends: Optional Stage 4.5 blend records. Any blend whose
+            region isn't already absorbed into a feature here gets a
+            FILLET (or CHAMFER) feature emitted from its record's
+            radius/axis/length parameters. Without this, blend
+            regions that fail Stage 5's stricter strip-cylinder
+            check (Strategy 3) silently get absorbed into the base
+            extrusion, hiding them from the feature tree.
 
     Returns:
         FeatureTree with ordered features and dependency graph.
@@ -90,11 +98,18 @@ def recognize_features(
     except Exception:
         logger.exception("Stage 5 failed finding holes")
         raise
+    # Group symmetric holes (same radius, same axis, same entry plane)
+    # into a single multi-position feature so the construction sequence
+    # emits ONE "Sketch + Cut" step per group instead of one per hole.
+    # Catches the common case of N mounting holes drilled through the
+    # same face — they share a sketch in CAD intent, not N separate
+    # operations.
+    hole_features = _group_symmetric_holes(hole_features)
     for hf, rids in hole_features:
         hf.dependencies = [base_idx]
         features.append(hf)
         assigned.update(rids)
-    logger.debug("Found %d holes", len(hole_features))
+    logger.debug("Found %d holes (after symmetry grouping)", len(hole_features))
 
     # --- 3. Pockets: inward-facing plane groups connected together ---
     try:
@@ -130,7 +145,7 @@ def recognize_features(
     try:
         fillet_chamfer = _find_fillets_and_chamfers(
             regions, fitted, edges, region_lookup, fitted_lookup,
-            config, assigned, graph, cleaned,
+            config, assigned, graph, cleaned, topo_blends,
         )
     except Exception:
         logger.exception("Stage 5 failed finding fillets/chamfers")
@@ -275,6 +290,165 @@ def _find_base_extrusion(
 # ---------------------------------------------------------------------------
 
 
+def _group_symmetric_holes(
+    hole_features: list[tuple[Feature, set[int]]],
+    radius_tol_pct: float = 0.05,
+    plane_dist_tol: float = 1.0,
+    through_hole_radius_tol_pct: float = 0.6,
+) -> list[tuple[Feature, set[int]]]:
+    """Collapse symmetric hole patterns into single multi-center features.
+
+    Two through-holes drilled by the same operation share:
+        • radius (within ~5 %)
+        • axis direction (parallel)
+        • entry-plane position (their centers project to the same point
+          along the shared axis, within ~1 mm)
+
+    Such holes get merged into one Feature whose `sketch_geometry` carries
+    a `centers` list. The CAD export then emits ONE Sketch step (multiple
+    circles) followed by ONE Cut Extrude — matching how a CAD operator
+    would actually model the part. The single-center `center` field is
+    kept too so any consumer that only expects one center (older render
+    paths) still works.
+    """
+    if not hole_features:
+        return hole_features
+
+    # Pairwise union-find by relative radius / axis / entry-plane match.
+    # Bucketed binning misfires near bin boundaries (a 4.00/4.10 pair
+    # gets split if 4.05 is the boundary), but pairwise comparison
+    # is correct by construction.
+    standalone: list[int] = []
+    candidates: list[tuple[int, dict]] = []  # (idx, normalized_meta)
+    for idx, (feat, _rids) in enumerate(hole_features):
+        sg = feat.sketch_geometry or {}
+        if sg.get("type") != "circle":
+            standalone.append(idx)
+            continue
+        center = np.asarray(sg.get("center"), dtype=float)
+        radius = float(sg.get("radius", 0.0))
+        axis = np.asarray(feat.direction, dtype=float)
+        axn = float(np.linalg.norm(axis))
+        if axn < 1e-12 or radius <= 0:
+            standalone.append(idx)
+            continue
+        axis = axis / axn
+        ax_idx = int(np.argmax(np.abs(axis)))
+        candidates.append((idx, {
+            "type": feat.type,
+            "radius": radius,
+            "ax_idx": ax_idx,
+            "axis": axis,
+            "center": center,
+        }))
+
+    n = len(candidates)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def _same_pattern(a: dict, b: dict) -> bool:
+        if a["type"] != b["type"]:
+            return False
+        if a["ax_idx"] != b["ax_idx"]:
+            return False
+        # Radius tolerance: looser for THROUGH holes because the
+        # cylinder fitter is unstable for short stubby cylinders
+        # (a 4-tab through-hole pattern can come back as one tab
+        # at r=4 and another at r=6 just because their bbox shapes
+        # differ slightly). Cap a 2-tab pattern at 60 % radius
+        # spread; tighter for blind holes where the depth is part
+        # of the signature.
+        if a["type"] == FeatureType.THROUGH_HOLE:
+            tol = through_hole_radius_tol_pct
+        else:
+            tol = radius_tol_pct
+        rmax = max(a["radius"], b["radius"])
+        if abs(a["radius"] - b["radius"]) / rmax > tol:
+            return False
+        # For BLIND holes, entry-plane positions must match (signed
+        # along axis). For THROUGH holes, both faces are entry
+        # candidates — skip this check.
+        if a["type"] != FeatureType.THROUGH_HOLE:
+            ax = a["axis"]
+            if abs(np.dot(b["center"] - a["center"], ax)) > plane_dist_tol:
+                return False
+        return True
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _same_pattern(candidates[i][1], candidates[j][1]):
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for k in range(n):
+        groups.setdefault(find(k), []).append(candidates[k][0])
+
+    merged: list[tuple[Feature, set[int]]] = []
+    # Standalone holes (no sketch_geometry) pass through.
+    for idx in standalone:
+        merged.append(hole_features[idx])
+
+    for indices in groups.values():
+        if len(indices) == 1:
+            merged.append(hole_features[indices[0]])
+            continue
+        # Merge group: keep the first member as the seed, attach all
+        # centers, union all face_indices, union all region IDs.
+        seed_feat, seed_rids = hole_features[indices[0]]
+        all_rids: set[int] = set()
+        face_chunks: list[np.ndarray] = []
+        centers: list[list[float]] = []
+        radii: list[float] = []
+        for idx in indices:
+            f, rids = hole_features[idx]
+            all_rids.update(rids)
+            face_chunks.append(np.asarray(f.face_indices, dtype=np.int64))
+            c = f.sketch_geometry.get("center")
+            if c is not None:
+                centers.append([float(x) for x in c])
+            radii.append(float(f.sketch_geometry.get("radius", 0.0)))
+        merged_faces = np.concatenate(face_chunks) if face_chunks else seed_feat.face_indices
+        merged_sketch = dict(seed_feat.sketch_geometry)
+        merged_sketch["centers"] = centers
+        merged_sketch["count"] = len(centers)
+        # Unify radius across the group. The cylinder fitter under-estimates
+        # radius when the visible cylinder patch is short (its arc covers
+        # less than ~270°): the algebraic least-squares fit converges to a
+        # local minimum below the true rolling-cylinder radius. Take the
+        # MAX of the group's fitted radii so a 4-tab pattern where one
+        # tab measured 6mm and another measured 4mm comes out as the
+        # 6mm the user actually drilled.
+        if radii:
+            merged_sketch["radius"] = max(radii)
+        merged_feat = Feature(
+            type=seed_feat.type,
+            face_indices=merged_faces,
+            sketch_geometry=merged_sketch,
+            depth=seed_feat.depth,
+            direction=seed_feat.direction.copy() if hasattr(seed_feat.direction, 'copy') else seed_feat.direction,
+            operation=seed_feat.operation,
+        )
+        merged.append((merged_feat, all_rids))
+        logger.info(
+            "Grouped %d symmetric %s holes into one feature (r=%.2f, "
+            "from %s)",
+            len(indices), seed_feat.type.value,
+            float(merged_sketch.get("radius", 0.0)),
+            sorted(radii),
+        )
+    return merged
+
+
 def _find_holes(
     regions: list[FaceRegion],
     fitted: list[FittedSurface],
@@ -347,6 +521,24 @@ def _find_holes(
             proj = verts @ axis_dir
             height = float(proj.max() - proj.min())
 
+        # Thin-plate override: when the body is much thinner in one
+        # axis than the others (a plate), all through-holes drilled
+        # through the plate face must run in that thin direction. The
+        # cylinder fitter is unstable for short cylinders (bbox like
+        # 8×8×6 — three nearly-equally-good axes), so it can return
+        # axis Y for one hole and axis Z for its mirror. Force the
+        # axis to the thin direction so a plate's mounting holes get
+        # consistent axes regardless of which axis the fitter picked.
+        body_size = cleaned.bbox[1] - cleaned.bbox[0]
+        sorted_dims = np.sort(body_size)
+        is_thin_plate = (
+            sorted_dims[1] >= 3.0 * sorted_dims[0]  # smallest dim ≪ middle dim
+            and sorted_dims[0] > 0
+        )
+        thin_axis_idx = int(np.argmin(body_size))
+        thin_axis = np.zeros(3)
+        thin_axis[thin_axis_idx] = 1.0
+
         # Snap hole axis to nearest principal direction. Reject holes whose
         # axis is more than 15° from any principal direction — these are
         # artifacts from cut-piece cap geometry, not real holes.
@@ -364,6 +556,13 @@ def _find_holes(
         if best_pa is None or best_dot < np.cos(np.radians(15)):
             continue  # axis too far from any principal direction
         axis_dir = best_pa * np.sign(np.dot(axis_dir, best_pa))
+
+        # Override snapped axis with the body's thin direction when the
+        # body is plate-shaped. The cylinder fit picked SOME axis, but
+        # for a hole drilled through a plate face the only physically
+        # plausible axis is the thin one.
+        if is_thin_plate:
+            axis_dir = thin_axis * np.sign(np.dot(axis_dir, thin_axis) or 1.0)
 
         # Determine through vs blind. A cylindrical region that wraps
         # more than 270° of arc (already checked above) and has a
@@ -615,6 +814,7 @@ def _find_fillets_and_chamfers(
     assigned: set[int],
     graph: nx.Graph | None = None,
     cleaned: CleanedMesh | None = None,
+    topo_blends: list[dict] | None = None,
 ) -> list[tuple[Feature, set[int]]]:
     """Find fillet and chamfer features.
 
@@ -1032,6 +1232,66 @@ def _find_fillets_and_chamfers(
             ),
             {rid},
         ))
+
+    # Strategy 4: Stage 4.5 blend-record fallback. Any blend region that
+    # passed the topology blend graph but failed Strategy 3's stricter
+    # strip-cylinder fit (e.g. large 3D corner caps fit as SPHERE,
+    # perimeter rolled-edge "frame" regions that wrap the whole plate)
+    # would otherwise be silently absorbed into BASE_EXTRUSION at the
+    # catch-all in recognize_features. Emit a FILLET / CHAMFER feature
+    # using the blend record's own fitted radius/axis so the feature
+    # tree matches what the user saw cyan in the blend graph.
+    if topo_blends:
+        for rec in topo_blends:
+            rid = rec.get("region_id")
+            if rid is None:
+                continue
+            if rid in assigned or rid in fillet_rids or rid in chamfer_rids:
+                continue
+            region = region_lookup.get(rid)
+            if region is None:
+                continue
+            kind = rec.get("kind", "fillet")
+            radius = float(rec.get("radius", 0.0) or 0.0)
+            axis_dir = rec.get("axis_dir")
+            axis_point = rec.get("axis_point")
+            length = float(rec.get("length", 0.0) or 0.0)
+            if kind == "fillet":
+                sketch = {"type": "arc", "radius": round(radius, 3)}
+                if axis_dir is not None:
+                    sketch["axis_dir"] = [round(float(x), 4) for x in axis_dir]
+                if axis_point is not None:
+                    sketch["axis_point"] = [round(float(x), 4) for x in axis_point]
+                if length > 0:
+                    sketch["length"] = round(length, 3)
+                results.append((
+                    Feature(
+                        type=FeatureType.FILLET,
+                        face_indices=region.face_indices.copy(),
+                        sketch_geometry=sketch,
+                        depth=0.0,
+                        operation="REMOVE",
+                    ),
+                    {rid},
+                ))
+            else:
+                bbox_size = region.vertices.max(axis=0) - region.vertices.min(axis=0)
+                width = float(sorted(bbox_size)[0])
+                if width < 0.1:
+                    width = float(sorted(bbox_size)[1])
+                results.append((
+                    Feature(
+                        type=FeatureType.CHAMFER,
+                        face_indices=region.face_indices.copy(),
+                        sketch_geometry={
+                            "type": "bevel",
+                            "width": round(width, 2),
+                        },
+                        depth=round(width, 2),
+                        operation="REMOVE",
+                    ),
+                    {rid},
+                ))
 
     return results
 

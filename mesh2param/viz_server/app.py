@@ -620,6 +620,33 @@ async def set_step_through(job_id: str, enabled: str):
     return {"step_through": job.step_through}
 
 
+@app.get("/api/pause-stages")
+async def get_pause_stages():
+    """List the pipeline stages that support a one-shot breakpoint, as
+    [{key, name}, ...] in pipeline order. Frontend uses this to populate
+    the 'pause at stage' dropdown."""
+    from mesh2param.viz_server.job_queue import PAUSE_STAGES
+    return {"stages": [{"key": k, "name": n} for k, n in PAUSE_STAGES]}
+
+
+@app.post("/api/job/{job_id}/pause-at/{stage}")
+async def set_pause_at_stage(job_id: str, stage: str):
+    """Set a one-shot breakpoint: in non-step mode, pause at exactly this
+    stage. Pass 'none' to clear. The pipeline resumes (and runs to
+    completion without further pauses) when the user presses Continue."""
+    from mesh2param.viz_server.job_queue import PAUSE_STAGE_KEYS
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    if stage in ("none", "", "off"):
+        job.pause_at_stage = None
+    elif stage in PAUSE_STAGE_KEYS:
+        job.pause_at_stage = stage
+    else:
+        return JSONResponse({"error": f"Unknown stage: {stage}"}, status_code=400)
+    return {"pause_at_stage": job.pause_at_stage}
+
+
 @app.post("/api/job/{job_id}/variant/{variant_index}")
 async def switch_variant(job_id: str, variant_index: int):
     """Switch the active build variant. Updates steps for all subsequent requests."""

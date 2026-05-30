@@ -999,33 +999,29 @@ def _split_long_fillet_into_corners(
     cleaned: CleanedMesh,
     adjacency: dict[int, set[int]],
 ) -> np.ndarray:
-    """Split long thin curved regions into corner fillets + middle wall.
+    """Carve corner-fillet regions out of long curved wall regions.
 
-    A side-wall fillet that runs the full length of a plate has
-    two distinct geometric parts:
-      • The MIDDLE WALL — face normals perpendicular to the
-        long axis (e.g. all pointing -X for a left-side wall),
-        no component along the long axis.
-      • TWO CORNER FILLETS at the ends — face normals tilt
-        toward the +/- end-faces (so they have a noticeable
-        component along the long axis).
+    Region growing often merges a side wall with the perpendicular
+    end-face strips it connects to via small (2-3mm radius) rounded
+    corners. The merged region's bbox spans the full footprint of
+    the wall + strips: long along the wall, modest along the strips,
+    full plate-thickness in Z.
 
-    Region growing produces ONE region for the whole roll
-    because the transition from corner to wall is smooth.
-    This pass detects such regions (curved, big, long thin
-    aspect ratio) and peels each end-cluster into its own
-    region so the user-perceived "corner fillets" become
-    visible as separate features. The middle-wall faces
-    keep the original label.
+    The actual CORNER FILLET is a quarter-cylinder at each end of
+    the wall, on the OUTER side (the side the wall normals point
+    toward). It spans the full plate thickness in Z and has only
+    ~2-3mm extent in the long-axis and mid-axis directions.
 
-    Conditions to split:
-        1. ≥ 200 faces (large region — small fillets don't
-           need this treatment)
-        2. Mean-normal magnitude < 0.5 (highly curved — the
-           normals span a wide range)
-        3. Long thin shape (longest bbox dim ≥ 4× the second
-           longest)
-        4. After splitting, each corner cluster has ≥ 15 faces
+    This pass:
+      1. Finds large curved regions (≥100 faces, mag<0.5) with a
+         long-thin rectangular footprint (long axis ≥ 4× mid axis)
+         and full plate-thickness in the short axis (≥5mm).
+      2. Determines the OUTER mid-axis side from the dominant
+         direction of face normals along that axis (e.g. for the
+         left side wall, normals point -X, so outer is at mid_min).
+      3. Carves out faces within ~2.5mm of each (long_end, outer)
+         corner point in 2D — keeping the full Z range — into a
+         new region per corner.
     """
     labels = labels.copy()
     normals = cleaned.normals
@@ -1035,56 +1031,98 @@ def _split_long_fillet_into_corners(
     for lbl in np.unique(labels):
         region_faces[int(lbl)] = np.where(labels == lbl)[0]
 
-    # Snapshot the keys so newly created labels don't get re-processed
-    long_lbls = []
-    for lbl, faces in region_faces.items():
-        if len(faces) < 200:
+    CORNER_RADIUS = 2.5  # mm — captures ~2-3mm fillet curl + a sliver of each adjacent flat
+    MIN_CORNER_FACES = 12
+
+    for lbl, faces in list(region_faces.items()):
+        if len(faces) < 100:
             continue
         face_norms = normals[faces]
         mn = face_norms.mean(axis=0)
         mag = float(np.linalg.norm(mn))
         if mag >= 0.5:
             continue
-        verts_in_region = cleaned.vertices[
-            np.unique(cleaned.faces[faces].ravel())
-        ]
-        bb_size = verts_in_region.max(axis=0) - verts_in_region.min(axis=0)
-        bb_sorted_idx = np.argsort(bb_size)[::-1]
-        if bb_size[bb_sorted_idx[0]] < 4.0 * bb_size[bb_sorted_idx[1]]:
-            continue
-        long_lbls.append((lbl, bb_sorted_idx[0]))
 
-    for lbl, long_axis_idx in long_lbls:
-        faces = region_faces[lbl]
-        face_norms = normals[faces]
-        # Faces with significant normal component along the long
-        # axis are CORNER FILLET faces (the curve transitions
-        # toward an end-face perpendicular to the long axis).
-        # Wall faces have ~zero component along the long axis.
-        n_along = np.abs(face_norms[:, long_axis_idx])
-        corner_mask = n_along > 0.3
-        if int(corner_mask.sum()) < 30:
-            continue
-        # Group corner faces by position along the long axis
-        # (front cluster vs back cluster).
         face_centroids = np.array([
             cleaned.vertices[cleaned.faces[fi]].mean(axis=0) for fi in faces
         ])
-        long_pos = face_centroids[:, long_axis_idx]
-        long_min = long_pos.min()
-        long_max = long_pos.max()
-        long_mid = (long_min + long_max) / 2
-        front_mask = corner_mask & (long_pos < long_mid)
-        back_mask = corner_mask & (long_pos >= long_mid)
-        if int(front_mask.sum()) < 15 or int(back_mask.sum()) < 15:
+        bb_size = face_centroids.max(axis=0) - face_centroids.min(axis=0)
+        bb_idx = np.argsort(bb_size)[::-1]
+        long_axis = int(bb_idx[0])
+        mid_axis = int(bb_idx[1])
+        short_axis = int(bb_idx[2])
+
+        if bb_size[long_axis] < 4.0 * bb_size[mid_axis]:
             continue
-        # Reassign FRONT corner faces to a new label, BACK to
-        # another new label. Middle-wall faces (~corner_mask
-        # complement) keep the original label.
-        labels[faces[front_mask]] = next_label
-        next_label += 1
-        labels[faces[back_mask]] = next_label
-        next_label += 1
+        if bb_size[short_axis] < 5.0:
+            continue
+
+        # Outer side along mid_axis: try first by face-normal direction
+        # (works for a single-wall region like the left-side wall); fall
+        # back to "whichever extreme is closest to the body's bbox edge"
+        # for wrap regions where inner+outer walls cancel each other.
+        body_min = float(cleaned.vertices[:, mid_axis].min())
+        body_max = float(cleaned.vertices[:, mid_axis].max())
+        reg_min = float(face_centroids[:, mid_axis].min())
+        reg_max = float(face_centroids[:, mid_axis].max())
+        n_mid_sum = float(face_norms[:, mid_axis].sum())
+        if abs(n_mid_sum) >= 0.1 * len(faces):
+            outer_mid = reg_max if n_mid_sum > 0 else reg_min
+        else:
+            d_min = abs(reg_min - body_min)
+            d_max = abs(reg_max - body_max)
+            outer_mid = reg_max if d_max < d_min else reg_min
+
+        long_min = float(face_centroids[:, long_axis].min())
+        long_max = float(face_centroids[:, long_axis].max())
+
+        # Two corners: one at each long-axis end on the outer mid side.
+        carved_any = False
+        carved_mask_global = np.zeros(len(faces), dtype=bool)
+        for long_target in (long_min, long_max):
+            corner_mask = (
+                (np.abs(face_centroids[:, long_axis] - long_target) < CORNER_RADIUS)
+                & (np.abs(face_centroids[:, mid_axis] - outer_mid) < CORNER_RADIUS)
+            )
+            if int(corner_mask.sum()) < MIN_CORNER_FACES:
+                continue
+            labels[faces[corner_mask]] = next_label
+            next_label += 1
+            carved_any = True
+            carved_mask_global |= corner_mask
+
+        # If we carved corners, also split the leftover wrapper into
+        # flat sub-regions by dominant face-normal direction. Without
+        # this the corner fillet is adjacent to a single low-magnitude
+        # "wrapper" region that doesn't pass the flat-plane test in
+        # Stage 4.5's bridge-detection, so the corner never gets
+        # tagged as a blend. Splitting the wrapper into +X/-X/+Y/-Y
+        # buckets gives each corner a pair of true flat plane
+        # neighbors to bridge between.
+        if carved_any:
+            leftover = ~carved_mask_global
+            if int(leftover.sum()) >= 30:
+                leftover_idx = np.where(leftover)[0]
+                left_norms = face_norms[leftover_idx]
+                # Bucket each face by signed dominant normal axis.
+                # bucket = axis * 2 + (1 if positive else 0)
+                abs_n = np.abs(left_norms)
+                dom_axis = np.argmax(abs_n, axis=1)
+                signs = (left_norms[np.arange(len(leftover_idx)), dom_axis] > 0).astype(np.int64)
+                bucket = dom_axis * 2 + signs
+                unique_buckets, counts = np.unique(bucket, return_counts=True)
+                # Order buckets by count (largest stays as original label)
+                order = np.argsort(counts)[::-1]
+                for rank, ub_idx in enumerate(order):
+                    ub = unique_buckets[ub_idx]
+                    mask = bucket == ub
+                    if int(mask.sum()) < 20:
+                        continue
+                    if rank == 0:
+                        continue  # largest bucket keeps original lbl
+                    target_faces = faces[leftover_idx[mask]]
+                    labels[target_faces] = next_label
+                    next_label += 1
 
     # Renumber contiguously
     unique = np.unique(labels)
@@ -1953,7 +1991,21 @@ def _classify_surface_type(
 
     if mean_curv < 0.1:
         if normal_spread < 0.1:
-            return SurfaceType.PLANE
+            # Slight scatter in normals: could be a true plane with mesh
+            # noise OR a gentle 3D corner fillet (e.g. a 5-10mm radius
+            # rounded transition tessellated coarsely). Use SVD on the
+            # centered normals to disambiguate. A true plane has all
+            # singular values near zero; a curved surface has at least
+            # one large singular value, and a sphere-like 3D corner
+            # fillet has TWO large ones (normals span a 2D patch).
+            if len(normals) >= 3:
+                centered = normals - normals.mean(axis=0)
+                _, sv, _ = np.linalg.svd(centered, full_matrices=False)
+                sv_n = sv / (sv[0] + 1e-15)
+                if sv_n[1] < 0.5:
+                    return SurfaceType.PLANE
+            else:
+                return SurfaceType.PLANE
 
     # Use SVD on normals to distinguish cylinder vs sphere.
     # Cylinder normals lie in a plane (perpendicular to the axis),

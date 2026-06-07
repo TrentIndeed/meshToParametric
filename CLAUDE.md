@@ -6,7 +6,7 @@ Python pipeline that converts triangulated mesh files (STL/OBJ/PLY/3MF) of prism
 Target parts: brackets, mounts, plates — prismatic components with planar faces, cylindrical holes, pockets, bosses, fillets, chamfers. Not freeform/organic geometry.
 
 ## Active handoffs (read before changing the corresponding stage)
-- **`docs/FILLET_AND_HOLE_HANDOFF.md`** — current state of fillet detection (Stages 4.5–6) and through-hole grouping on the rackmount mesh. Covers what's been changed in this round, what still doesn't work, and the next 3 things to attack in order. Read this before editing `peel_via_topology.py`, `reconcile_fillets.py`, `recognize.py`'s hole/fillet sections, or `export_cadquery.py`'s fillet matcher.
+- **`docs/FILLET_AND_HOLE_HANDOFF.md`** — historical notes on Stages 4.5–6. The collinear-merge / reconciliation path it documents has been replaced by the stitched-fillets stage and the per-edge measured-radius matcher in `export_cadquery.py`. Read for background; current code is in `viz_server/job_queue.py` (stitched stage block) and `pipeline/export_cadquery.py` (`_apply_recognized_fillets_to_solid`).
 - **`docs/SEGMENTATION_HANDOFF.md`** — open issue with corner-triangle classification at fillet-fillet junctions in Stage 2.
 
 ## Setup

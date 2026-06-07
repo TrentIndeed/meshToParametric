@@ -1,6 +1,15 @@
 # Fillet Detection & Hole Recognition Handoff
 
-**Status:** in-progress. The blend-graph (Stage 4.5) and feature tree (Stage 5) now show the fillets the user expects, but the CAD build (Stage 6) applies wrong fillet count/sizes and the through-hole detection produces inconsistent radii because Stage 2 segmentation is over-merging bore + adjacent surfaces. This doc gives a new Claude session the context to attack it without re-running dead ends.
+> ## ⚠️ SUPERSEDED — read this banner before the body
+>
+> The pipeline below this banner describes the **collinear-merge / reconciliation** flow that was used before the **stitched-fillets stage** replaced it. The notes are kept for historical context but the code they reference has been removed or rewritten. Current state, as of the rewrite:
+>
+> - `reconcile_fillets.py`, `merge_blend_records_for_export`, `_detect_mesh_fillets`, `_detect_mesh_fillet_clusters`, `_detect_fillet_strips_from_mesh`, `_filter_edges_by_mesh_fillets`, `_estimate_fillet_radius_from_mesh`, `_apply_top_fillet_to_solid`, `_find_body_top_face`, the swept-tube and edgewalk debug stages, `swept_tube.py`, `fit_fillets_along_edges.py`, `extract_cad_edges.py`, `_diag_fillet_match.py`, `tests/test_export_fillet_consistency.py`, and `tests/test_fillet_detection.py` are all **deleted**.
+> - The stitched-fillets stage in [`mesh2param/viz_server/job_queue.py`](../mesh2param/viz_server/job_queue.py) groups every per-body fillet record into cross-body clusters via vertex KDTree proximity + axis-aligned continuation, then packages each cluster as `{group_id, vertices: (N,3) ndarray, n_records}` onto `job._stitched_clusters`.
+> - The CAD subprocess pickle now carries `stitched_clusters` instead of `peeled_fillets`. `export_cadquery(..., stitched_clusters=...)` calls a rewritten `_apply_recognized_fillets_to_solid` that matches sharp solid edges to clusters by vertex proximity and **measures the radius per edge** from the cluster's vertices (90th percentile perpendicular distance from edge line). No upstream record radius is ever read.
+> - **Known broken (next session):** the apply pass is still placing fillets at short corner-meeting edges instead of along the long edges that should actually be filleted. Suspected root cause is the matcher's "best mean proximity" metric favouring short edges that sit fully inside a cluster's vertex bbox over long edges that only have their middle inside it. The intent overlay also doesn't render any surface patches because no edges are matching the way we'd expect. Investigate the edge-selection metric (mean → median or coverage-fraction?) and the edge enumeration on the rebuilt LLM-built solid before anything else.
+
+**Original status (collinear-merge era):** in-progress. The blend-graph (Stage 4.5) and feature tree (Stage 5) now show the fillets the user expects, but the CAD build (Stage 6) applies wrong fillet count/sizes and the through-hole detection produces inconsistent radii because Stage 2 segmentation is over-merging bore + adjacent surfaces. This doc gives a new Claude session the context to attack it without re-running dead ends.
 
 **Scope:** Stages 3 (`fit.py`), 4.5 (`peel_via_topology.py`), 5 (`recognize.py`), and 6 (`export_cadquery.py`) of the meshToParametric pipeline, focused on the rackmount mesh (`models/Mesh5/RackMount.3mf`).
 

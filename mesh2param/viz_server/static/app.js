@@ -1637,6 +1637,12 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     // Capture this invocation's job ID so zombie polls from previous analyze
     // calls don't interfere when this job gets cancelled/replaced
     const myJobId = currentJobId;
+    // Stuck-detection state: when the progress percentage stops moving
+    // for too long, surface a "Force reset queue" button so the user
+    // isn't trapped staring at a frozen spinner.
+    const _analyzeStartedAt = Date.now();
+    let _lastProgress = -1;
+    let _lastProgressAt = Date.now();
     const statusData = await new Promise((resolve, reject) => {
       const poll = setInterval(async () => {
         try {
@@ -1703,6 +1709,48 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
               }
               container.innerHTML = html || '<div style="color:var(--text-muted);font-style:italic;">Waiting for pipeline…</div>';
             }
+          }
+
+          // Detect stuck-at-queued / no-progress and surface a
+          // "Force reset queue" escape hatch. The backend has its own
+          // 3-minute watchdog, but the frontend hint shows up after
+          // 30 s of zero progress so the user isn't left staring at a
+          // spinner.
+          const stuckBtnHost = document.getElementById('btn-cancel');
+          const isStuck = (
+            (d.status === 'queued' && (Date.now() - _analyzeStartedAt) > 30000)
+            || (d.status === 'processing' && !d.paused
+                && d.progress === _lastProgress
+                && (Date.now() - _lastProgressAt) > 60000)
+          );
+          if (d.progress !== _lastProgress) {
+            _lastProgress = d.progress;
+            _lastProgressAt = Date.now();
+          }
+          if (isStuck && stuckBtnHost) {
+            if (!document.getElementById('btn-force-reset')) {
+              const rBtn = document.createElement('button');
+              rBtn.id = 'btn-force-reset';
+              rBtn.textContent = 'Force reset queue';
+              rBtn.title = 'Kill the stuck worker thread and start a fresh one';
+              rBtn.style.cssText = 'margin-left:8px;padding:4px 14px;border-radius:6px;border:1px solid #f55;background:#3a0e0e;color:#ff9090;font-size:12px;font-weight:600;cursor:pointer;font-family:OpenAI Sans,sans-serif;';
+              rBtn.onclick = async () => {
+                rBtn.disabled = true;
+                rBtn.textContent = 'Resetting...';
+                try {
+                  await fetch('/api/queue/reset', { method: 'POST' });
+                  setTimeout(() => location.reload(), 700);
+                } catch (e) {
+                  console.error('[reset] failed:', e);
+                  rBtn.disabled = false;
+                  rBtn.textContent = 'Force reset queue';
+                }
+              };
+              stuckBtnHost.parentElement.appendChild(rBtn);
+            }
+          } else {
+            const rBtn = document.getElementById('btn-force-reset');
+            if (rBtn) rBtn.remove();
           }
 
           // Show Continue button when pipeline is paused

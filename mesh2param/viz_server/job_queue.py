@@ -293,6 +293,7 @@ PAUSE_STAGES: list[tuple[str, str]] = [
     ("fit", "Primitive fitting"),
     ("topology", "Topology & edges"),
     ("blend_graph", "Blend graph"),
+    ("stitched", "Stitched fillets (debug)"),
     ("features", "Feature recognition"),
     ("build", "Build 3D model"),
     ("intent", "Fillet & chamfer intent"),
@@ -318,6 +319,12 @@ class Job:
     # so the rest of the pipeline runs without further pauses.
     pause_at_stage: str | None = None
     error: str | None = None
+    # Worker-watchdog timestamp. Refreshed every time the worker calls
+    # `_check_cancelled()` (which happens at most stage transitions and
+    # inside the long polls). When this falls too far behind real time
+    # while status is "processing", the worker is hung and the queue
+    # auto-force-resets it.
+    last_activity_at: float = field(default_factory=time.time)
     # Pipeline results
     features: object = None
     cleaned: object = None
@@ -356,6 +363,12 @@ class JobQueue:
         self._tokens_spent = 0
         self._on_complete = None  # callback: fn(job) called when job finishes
         self._db_loaded = False  # True after initial DB load
+        # Background watchdog: catches the "worker thread is alive but
+        # not making progress" case even when nobody submits a new job.
+        self._watchdog = threading.Thread(
+            target=self._watchdog_loop, daemon=True, name="job-queue-watchdog",
+        )
+        self._watchdog.start()
 
     def set_on_complete(self, fn):
         """Set a callback for when a job completes. fn(job) is called."""
@@ -390,11 +403,96 @@ class JobQueue:
         self._ensure_worker()
         return job_id
 
+    # Hard ceiling on how long a job can run without a worker heartbeat
+    # before the queue declares the worker thread hung and spawns a
+    # fresh one. The old thread becomes an orphan daemon — Python can't
+    # kill threads cleanly, but it won't hold up the queue.
+    STUCK_THRESHOLD_S = 180.0
+
     def _ensure_worker(self):
-        """Start the worker thread if not already running."""
-        if self._worker is None or not self._worker.is_alive():
-            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
-            self._worker.start()
+        """Start the worker thread if not already running, AND force-
+        restart it if the current processing job has gone silent past
+        the stuck threshold.
+
+        Called by `submit()` and by the background watchdog. Cheap and
+        safe to call often — if nothing's wrong it's a no-op."""
+        if self._worker is not None and self._worker.is_alive():
+            stuck_job = self._find_stuck_job()
+            if stuck_job is not None:
+                self._force_new_worker(stuck_job)
+                return
+            return  # worker fine
+        # No live worker — spawn one (also covers the initial-startup case).
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def _find_stuck_job(self):
+        """Return the processing job that's gone past STUCK_THRESHOLD_S
+        with no `_check_cancelled` heartbeat, else None. Paused jobs
+        (`job.paused == True`) are excluded — those are waiting on the
+        user, not stuck."""
+        now = time.time()
+        with self._lock:
+            for j in self._jobs.values():
+                if j.status != "processing" or j.paused:
+                    continue
+                if now - j.last_activity_at > self.STUCK_THRESHOLD_S:
+                    return j
+        return None
+
+    def _force_new_worker(self, stuck_job=None) -> None:
+        """Mark any stuck job as errored, terminate every tracked
+        subprocess (across all jobs, just to be safe), and spawn a
+        fresh worker thread. The previous thread becomes orphan —
+        Python can't reliably kill threads, but daemonised it'll exit
+        with the process and meanwhile won't block the queue."""
+        with self._lock:
+            jobs_snapshot = list(self._jobs.values())
+        for j in jobs_snapshot:
+            proc = getattr(j, "_cad_subprocess", None)
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                j._cad_subprocess = None
+            if j is stuck_job:
+                j.status = "error"
+                j.paused = False
+                if not j.error:
+                    j.error = "Worker stuck — auto-reset"
+        logger.warning(
+            "Force-resetting worker thread (stuck job: %s)",
+            stuck_job.id if stuck_job else "(none)",
+        )
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def force_reset(self) -> dict:
+        """Manual reset entry point exposed via the API. Kills any
+        in-flight subprocess, marks the active job as errored, and
+        replaces the worker thread."""
+        with self._lock:
+            active = next(
+                (j for j in self._jobs.values() if j.status == "processing"),
+                None,
+            )
+        self._force_new_worker(active)
+        return {"reset": True, "killed_job_id": active.id if active else None}
+
+    def _watchdog_loop(self):
+        """Background thread: every 15 s, check for a hung worker and
+        force-restart if so. Catches the case where the user is just
+        waiting (no new submissions) and so `_ensure_worker` never
+        runs to trigger the auto-reset."""
+        while True:
+            time.sleep(15.0)
+            try:
+                stuck = self._find_stuck_job()
+                if stuck is not None:
+                    self._force_new_worker(stuck)
+            except Exception:
+                logger.exception("Watchdog crashed; continuing")
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -450,6 +548,11 @@ class JobQueue:
         logger.info("Pipeline started for job %s (file=%r)", job.id, job.filename)
 
         def _check_cancelled():
+            # Worker-watchdog heartbeat: any call into _check_cancelled
+            # means the worker is making forward progress in user code.
+            # If this stops getting called, the watchdog will eventually
+            # force-restart the worker thread.
+            job.last_activity_at = time.time()
             if job.status == "error":
                 raise RuntimeError("Job cancelled")
 
@@ -570,14 +673,19 @@ class JobQueue:
         # in-place before decomposition, so per-body segmentation saw
         # an already-peeled mesh with no fillets left to find. Blend
         # records now come from the per-body pass and get cross-body
-        # reconciliation (see reconcile_fillets.py).
+        # grouping by the stitched-fillets stage.
         from mesh2param.pipeline.segment import segment_mesh
         from mesh2param.pipeline.fit import fit_surfaces
         from mesh2param.pipeline.topology import build_topology
         from mesh2param.config import SegmentConfig, FitConfig, TopologyConfig
 
-        # Per-body blends populate job._peeled_fillets after decomposition.
-        job._peeled_fillets = []
+        # The stitched-fillets stage populates this with the cluster
+        # payload (group_id + face-vertex array) consumed by the CAD
+        # apply pass. Stays empty if the stitched stage didn't run.
+        job._stitched_clusters = []
+        # uid → group_id, used by the reconcile-stage viz at the end
+        # of the run to recolor each fillet face by apply-stage fate.
+        job._uid_to_group = {}
 
         # Stage 1.5: Body Decomposition
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh
@@ -737,17 +845,10 @@ class JobQueue:
             _check_cancelled()
             body_stage_data.append(_process_single_body(bi, b))
 
-        # Cross-body fillet reconciliation: per-body fits give each fillet
-        # its own slightly-different radius. Any two fillets that are
-        # actually the same underlying edge (parallel axes, coincident
-        # axis lines, comparable radii) get a unified_radius so the
-        # downstream CAD export produces a seamless joined edge.
-        try:
-            from mesh2param.pipeline.reconcile_fillets import reconcile_blend_radii
-            per_body_blends = [bsd[7] for bsd in body_stage_data]
-            reconcile_blend_radii(per_body_blends)
-        except Exception:
-            logger.exception("reconcile_blend_radii failed — continuing")
+        # No upstream radius reconciliation — the stitched stage
+        # collapses cross-body fragments into one cluster, and the
+        # apply stage measures the radius per CAD edge from the same
+        # vertex set. The per-body record radii are never read.
 
         all_body_results = [(body, sub_cleaned, body_tree)
                             for body, sub_cleaned, _, _, _, _, body_tree, _ in body_stage_data]
@@ -942,6 +1043,265 @@ class JobQueue:
         except Exception as _bg_exc:
             logger.debug("Blend graph viz failed: %s", _bg_exc)
 
+        # --- Debug stage: Stitched fillets ---
+        # Endpoint-graph stitcher. Every fillet from the blend graph is
+        # kept as-is (no reclassification, no dropping). Two records
+        # are stitched into the same group if either rule fires:
+        #
+        #   1. **Direct contact** — any face vertex of A is within
+        #      `DIRECT_EPS` (2 mm) of any face vertex of B. Catches
+        #      duplicate vertices at body-decomposition seams and
+        #      curved-segment junctions where mesh edges touch.
+        #
+        #   2. **Collinear continuation** — A and B have aligned axes
+        #      (|cos| ≥ 0.5) AND some endpoint pair (EA, EB) lies on
+        #      the same axial line: the perpendicular offset of
+        #      (EB − EA) from A's axis is below `eps_perp`, and the
+        #      axial gap is below `eps_axial`. Thresholds scale with
+        #      radius so small fillets aren't merged across big plates
+        #      and big rim fillets aren't broken up. The perpendicular
+        #      check rejects parallel fillets on opposite plate edges
+        #      (their connection vector is perpendicular to the axis,
+        #      not along it).
+        #
+        # Chamfers paint in their blend-graph orange so nothing visible
+        # there disappears here. The CAD apply pipeline is untouched —
+        # this stitching is viz-only.
+        try:
+            from scipy.spatial import cKDTree
+
+            # Body decomposition shares vertex positions across
+            # bodies, so the true cross-body seams sit at 0 mm
+            # (vertices identical) or ≤ 1 mm (one mesh-edge apart).
+            # Anything beyond ~2 mm is cross-plate-thickness, which
+            # the user explicitly does NOT want merged. So a single
+            # tight threshold serves both same-body touching pieces
+            # and true cross-body seams.
+            DIRECT_EPS = 2.0
+            AXIS_DOT_MIN = 0.5
+
+            # Pass 1: gather per-record info: face vertices + axis +
+            # endpoints + radius. Records without a usable axis fall
+            # back to the direct-contact rule only.
+            records_info: list[dict] = []
+            n_chamfers = 0
+            for body_idx, _bst in enumerate(body_stage_data):
+                _body, _sub, _regs, _fits, _g, _e, _bt, topo_blends = _bst
+                for rec in topo_blends:
+                    kind = rec.get("kind")
+                    if kind == "chamfer":
+                        n_chamfers += 1
+                        continue
+                    if kind != "fillet":
+                        continue
+                    fi = rec.get("face_indices")
+                    if fi is None or len(fi) == 0:
+                        continue
+                    fi_arr = np.asarray(fi, dtype=np.int64)
+                    verts = _sub.vertices[_sub.faces[fi_arr]].reshape(-1, 3)
+                    ad_raw = rec.get("axis_dir")
+                    ap_raw = rec.get("axis_point")
+                    if ad_raw is not None:
+                        axis_dir = np.asarray(ad_raw, dtype=float)
+                        an = float(np.linalg.norm(axis_dir))
+                    else:
+                        axis_dir = None
+                        an = 0.0
+                    if axis_dir is not None and an >= 1e-9:
+                        axis_dir = axis_dir / an
+                        axis_point = (
+                            np.asarray(ap_raw, dtype=float)
+                            if ap_raw is not None
+                            else verts.mean(axis=0)
+                        )
+                        t = (verts - axis_point) @ axis_dir
+                        t_min, t_max = float(t.min()), float(t.max())
+                        endpoints = np.array([
+                            axis_point + t_min * axis_dir,
+                            axis_point + t_max * axis_dir,
+                        ])
+                    else:
+                        axis_dir = None
+                        endpoints = None
+                    records_info.append({
+                        "body_idx": body_idx,
+                        "rec": rec,
+                        "verts": verts,
+                        "axis_dir": axis_dir,
+                        "endpoints": endpoints,
+                        "radius": float(rec.get("radius", 0.0) or 0.0),
+                    })
+
+            for uid, ri in enumerate(records_info):
+                ri["uid"] = uid
+                ri["rec"]["stitch_uid"] = uid
+
+            n_records = len(records_info)
+
+            parent: dict[int, int] = {ri["uid"]: ri["uid"] for ri in records_info}
+
+            def _find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def _union(a: int, b: int) -> None:
+                ra, rb = _find(a), _find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            # Pass 2a: direct-contact via a single global KDTree over
+            # every fillet vertex tagged with its record uid.
+            n_direct_unions = 0
+            if records_info:
+                all_verts_arr = np.vstack([ri["verts"] for ri in records_info])
+                all_uids_arr = np.concatenate([
+                    np.full(len(ri["verts"]), ri["uid"], dtype=np.int64)
+                    for ri in records_info
+                ])
+                tree = cKDTree(all_verts_arr)
+                for i, j in tree.query_pairs(r=DIRECT_EPS):
+                    ua = int(all_uids_arr[i])
+                    ub = int(all_uids_arr[j])
+                    if ua != ub and _find(ua) != _find(ub):
+                        _union(ua, ub)
+                        n_direct_unions += 1
+
+            # Pass 2b: collinear-continuation. O(N²) but N is small.
+            n_axial_unions = 0
+            for i_idx in range(len(records_info)):
+                A = records_info[i_idx]
+                if A["axis_dir"] is None or A["endpoints"] is None:
+                    continue
+                for j_idx in range(i_idx + 1, len(records_info)):
+                    B = records_info[j_idx]
+                    if B["axis_dir"] is None or B["endpoints"] is None:
+                        continue
+                    if _find(A["uid"]) == _find(B["uid"]):
+                        continue
+                    align = abs(float(A["axis_dir"] @ B["axis_dir"]))
+                    if align < AXIS_DOT_MIN:
+                        continue
+                    r_min = min(A["radius"], B["radius"])
+                    # Keep eps_perp tight — opposite-face parallel
+                    # fillets on a thin plate sit ~plate-thickness
+                    # apart and must NOT merge here. We tolerate
+                    # only small axis-fit slop (~r).
+                    eps_perp = max(1.5, 1.5 * r_min)
+                    eps_axial = max(4.0, 3.0 * r_min)
+                    stitched = False
+                    for EA in A["endpoints"]:
+                        for EB in B["endpoints"]:
+                            d = EB - EA
+                            axial = float(d @ A["axis_dir"])
+                            perp_vec = d - axial * A["axis_dir"]
+                            perp_d = float(np.linalg.norm(perp_vec))
+                            if perp_d < eps_perp and abs(axial) < eps_axial:
+                                _union(A["uid"], B["uid"])
+                                n_axial_unions += 1
+                                stitched = True
+                                break
+                        if stitched:
+                            break
+
+            # Pass 3: connected-component labelling.
+            root_to_group: dict[int, int] = {}
+            uid_to_group: dict[int, int] = {}
+            for ri in records_info:
+                root = _find(ri["uid"])
+                if root not in root_to_group:
+                    root_to_group[root] = len(root_to_group)
+                uid_to_group[ri["uid"]] = root_to_group[root]
+            uid_to_body_rec = {ri["uid"]: (ri["body_idx"], ri["rec"]) for ri in records_info}
+
+            n_groups = len(root_to_group)
+            group_counts: dict[int, int] = {}
+            for gi in uid_to_group.values():
+                group_counts[gi] = group_counts.get(gi, 0) + 1
+            n_multi = sum(1 for c in group_counts.values() if c > 1)
+            n_singletons = n_groups - n_multi
+
+            # Pass 4: paint faces per group.
+            stitch_palette = np.array([
+                [1.00, 0.20, 0.20], [0.20, 1.00, 0.40], [0.30, 0.55, 1.00],
+                [1.00, 0.70, 0.20], [0.90, 0.20, 0.95], [0.20, 0.95, 0.95],
+                [1.00, 0.45, 0.80], [0.60, 0.95, 0.20], [0.50, 0.30, 1.00],
+                [1.00, 0.85, 0.30], [0.30, 0.85, 0.65], [0.95, 0.50, 0.30],
+                [0.65, 0.20, 0.55], [0.25, 0.65, 0.40], [0.95, 0.30, 0.55],
+                [0.40, 0.40, 0.95], [0.85, 0.60, 0.95], [0.20, 0.75, 0.95],
+            ])
+            BASE_GRAY = np.array([0.55, 0.55, 0.55])
+            CHAMFER_COLOR = np.array([1.00, 0.55, 0.00])
+
+            stitched_face_colors: list[tuple] = []
+            for body_idx, _bst in enumerate(body_stage_data):
+                body, sub_cleaned, _regs, _fits, _g, _e, _bt, topo_blends = _bst
+                fc = np.tile(BASE_GRAY, (len(sub_cleaned.faces), 1))
+                for rec in topo_blends:
+                    kind = rec.get("kind")
+                    idx = rec.get("face_indices")
+                    if idx is None or len(idx) == 0:
+                        continue
+                    if kind == "chamfer":
+                        fc[idx] = CHAMFER_COLOR
+                        continue
+                    if kind != "fillet":
+                        continue
+                    uid = int(rec.get("stitch_uid", -1))
+                    gi = uid_to_group.get(uid)
+                    if gi is not None:
+                        fc[idx] = stitch_palette[gi % len(stitch_palette)]
+                stitched_face_colors.append((body, sub_cleaned, fc))
+
+            # Build the cluster payload for the CAD apply pass. Each
+            # group becomes ONE fillet feature on the rebuilt solid:
+            # CadQuery only needs to know which edges to fillet, and
+            # the radius is measured per-edge from the mesh geometry
+            # at apply time (so the unreliable rec["radius"] from the
+            # cylinder fitter never gets passed through). We hand
+            # over the full face-vertex set per group; the matcher
+            # in export_cadquery does the KDTree + per-edge radius.
+            stitched_clusters_payload: list[dict] = []
+            for gi, members in sorted(
+                {gi_: [u for u, g in uid_to_group.items() if g == gi_]
+                 for gi_ in set(uid_to_group.values())}.items()
+            ):
+                verts_for_group = np.vstack([
+                    next(ri for ri in records_info if ri["uid"] == u)["verts"]
+                    for u in members
+                ])
+                stitched_clusters_payload.append({
+                    "group_id": gi,
+                    "vertices": verts_for_group.astype(np.float64),
+                    "n_records": len(members),
+                })
+            job._stitched_clusters = stitched_clusters_payload
+            # Stash uid → group_id so the reconcile-stage viz at the
+            # end of the run can map each fillet face to the apply
+            # diag entry for its group.
+            job._uid_to_group = dict(uid_to_group)
+
+            _check_cancelled()
+            job.progress = 25
+            job.progress_stage = (
+                f"Stitched fillets: {n_records} records → {n_groups} groups "
+                f"({n_multi} multi-record, {n_singletons} singletons); "
+                f"contact={n_direct_unions} axial={n_axial_unions}; "
+                f"chamfers={n_chamfers} orange"
+            )
+            job.progress_edges = None
+            job.progress_edge_colors = None
+            _set_body_viz(stitched_face_colors)
+            job.debug_summary.append(
+                f"Stitched fillets: {n_records} → {n_groups} groups "
+                f"({n_multi} multi-record, {n_singletons} singletons)"
+            )
+            _dwell_if_not_step_through("stitched")
+            _pause_for_review("stitched")
+        except Exception as _st_exc:
+            logger.debug("Stitched fillets stage failed: %s", _st_exc)
+
         # Stage 5: Feature recognition
         job.progress = 26
         job.progress_stage = "Recognizing features..."
@@ -990,75 +1350,21 @@ class JobQueue:
         logger.debug("Job %s: stage=cadquery features=%d bodies=%d",
                       job.id, tree.num_features, len(all_body_results))
 
-        # CadQuery in subprocess. Combine blends from both peel passes:
-        #   (a) Pre-decompose triangle-based peel_blends (fillets + chamfers
-        #       on the raw mesh).
-        #   (b) Per-body topology-based identify_blends_from_topology (cleaner,
-        #       uses region adjacency — catches fillets the triangle peeler
-        #       missed and gives symmetric detection across mirror features).
-        peeled_fillets = list(getattr(job, '_peeled_fillets', []) or [])
-        # Filter cap for the CAD matcher: real fillet radii on a typical
-        # mechanical part are within ~25% of the part's bbox diagonal.
-        # Records whose fitter spat out absurd radii (e.g. 8000mm on a 200mm
-        # part — these come from CYLINDER/SPHERE fits to wrap regions or 3D
-        # corner caps where the fit primitive is a poor approximation) get
-        # pruned so they don't pollute the edge-matching step. The blend
-        # graph viz still shows ALL records; only the CAD export sees the
-        # filtered list.
-        bbox_diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
-        max_export_radius = bbox_diag * 0.25
-        skipped_for_export = 0
-        topo_for_merge: list[dict] = []
-        # Assign each surviving record a GLOBALLY unique id. region_id only
-        # resets per body, so the cross-body merge would otherwise alias
-        # two different regions that happen to share a region_id. Tag both
-        # the raw record (for the reconciliation overlay) and the merge
-        # copy with this uid via the region_id field the merge tracks.
-        _uid = 0
-        for body_idx, _bst in enumerate(body_stage_data):
-            topo_blends = _bst[7] if len(_bst) > 7 else []
-            for rec in topo_blends:
-                radius = float(rec.get("radius", 0.0) or 0.0)
-                if radius < 0.2 or radius > max_export_radius:
-                    skipped_for_export += 1
-                    continue
-                rec["reconcile_uid"] = _uid
-                rec_copy = {k: v for k, v in rec.items() if k not in ("face_indices",)}
-                rec_copy["body_index"] = body_idx
-                rec_copy["region_id"] = _uid  # globally-unique for merge tracking
-                topo_for_merge.append(rec_copy)
-                _uid += 1
-        # Collapse fragments: a single physical fillet often appears as
-        # 2-4 topology records (mesh segmentation splits a long curl into
-        # halves; a fillet that runs across a body boundary gets one
-        # record per body). Merge by collinear axis lines so the CAD
-        # matcher applies one fillet operation per physical edge instead
-        # of N noisy ones.
-        try:
-            from mesh2param.pipeline.reconcile_fillets import (
-                merge_blend_records_for_export,
-            )
-            merged_topo = merge_blend_records_for_export(topo_for_merge)
-        except Exception:
-            logger.exception("merge_blend_records_for_export failed; using raw records")
-            merged_topo = topo_for_merge
-        peeled_fillets.extend(merged_topo)
+        # CadQuery runs in a subprocess. The fillet feature list comes
+        # straight from the stitched stage — one cluster per physical
+        # fillet, each carrying the face-vertex set so the apply pass
+        # can do vertex-proximity edge matching with per-edge measured
+        # radii. No upstream radius value gets passed through.
+        stitched_clusters = list(getattr(job, '_stitched_clusters', []) or [])
         logger.info(
-            "peel summary: %d blend record(s) feeding export "
-            "(triangle peel + %d topology, after merge %d→%d, "
-            "%d skipped for radius out of range [0.2, %.1f]mm)",
-            len(peeled_fillets), len(topo_for_merge),
-            len(topo_for_merge), len(merged_topo),
-            skipped_for_export, max_export_radius,
+            "stitched-clusters → export: %d group(s) feeding fillet apply",
+            len(stitched_clusters),
         )
         try:
             tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            # Pass body results for multi-body construction.
-            # peeled_fillets: list of {radius, axis_dir, axis_point, length,
-            # num_faces} from stage 1.75. export_cadquery re-applies them
-            # as grouped-by-radius fillet features on the combined solid.
             pickle.dump(
-                (tree, cleaned, all_body_results, decomposition, peeled_fillets),
+                (tree, cleaned, all_body_results, decomposition,
+                 stitched_clusters),
                 tmp_in,
             )
             tmp_in.close()
@@ -1074,27 +1380,62 @@ class JobQueue:
 import pickle, sys
 sys.path.insert(0, '.')
 with open(r'{tmp_in.name}', 'rb') as f:
-    tree, cleaned, all_body_results, decomposition, peeled_fillets = pickle.load(f)
+    tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
 from mesh2param.pipeline.export_cadquery import export_cadquery
 result = export_cadquery(tree, cleaned, use_llm=True, num_variants={num_variants},
                          body_results=all_body_results if decomposition.is_multi_body else None,
-                         peeled_fillets=peeled_fillets)
+                         stitched_clusters=stitched_clusters)
 result.solid = None
 with open(r'{tmp_out.name}', 'wb') as f:
     pickle.dump(result, f)
 """
         try:
-            proc = subprocess.run(
+            # Use Popen + poll loop instead of subprocess.run so a UI
+            # cancel can terminate the subprocess immediately. Without
+            # this the worker stays blocked inside run() for up to the
+            # full timeout, and any newly-submitted job sits in the
+            # queue with status="queued" until the worker frees up.
+            proc_handle = subprocess.Popen(
                 [sys.executable, "-c", script],
-                capture_output=True, text=True, timeout=600,  # 10 min for 4 variants
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-        except subprocess.TimeoutExpired:
-            logger.error("Job %s: CadQuery subprocess timed out after 180s", job.id)
-            Path(tmp_in.name).unlink(missing_ok=True)
-            Path(tmp_out.name).unlink(missing_ok=True)
-            raise RuntimeError("CadQuery subprocess timed out after 180s")
+            job._cad_subprocess = proc_handle
+            deadline = time.time() + 600.0
+            try:
+                while True:
+                    if job.status == "error":
+                        # Cancel hit while subprocess running — kill it
+                        # so the worker can move on to the next job.
+                        try:
+                            proc_handle.terminate()
+                            proc_handle.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc_handle.kill()
+                        Path(tmp_in.name).unlink(missing_ok=True)
+                        Path(tmp_out.name).unlink(missing_ok=True)
+                        raise RuntimeError("Cancelled by user")
+                    try:
+                        proc_handle.wait(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if time.time() > deadline:
+                        proc_handle.kill()
+                        Path(tmp_in.name).unlink(missing_ok=True)
+                        Path(tmp_out.name).unlink(missing_ok=True)
+                        raise RuntimeError("CadQuery subprocess timed out after 600s")
+            finally:
+                job._cad_subprocess = None
+            stdout, stderr = proc_handle.communicate()
+
+            class _ProcResult:
+                pass
+            proc = _ProcResult()
+            proc.returncode = proc_handle.returncode
+            proc.stdout = stdout
+            proc.stderr = stderr
         except Exception:
-            logger.exception("Job %s: CadQuery subprocess failed to launch", job.id)
+            logger.exception("Job %s: CadQuery subprocess failed", job.id)
             Path(tmp_in.name).unlink(missing_ok=True)
             Path(tmp_out.name).unlink(missing_ok=True)
             raise
@@ -1260,52 +1601,22 @@ with open(r'{tmp_out.name}', 'wb') as f:
             logger.debug("Stage 8 (apply) viz failed: %s", _apply_exc)
 
         # --- Debug stage: Blend reconciliation fate overlay ---
-        # Paint every raw fillet blend region by what happened to it on
-        # the way to the CAD apply pass, so the dropoff is visible:
-        #   gray   = filtered out (radius) or dropped in merge (sub-1mm/sphere)
-        #   yellow = merged into a neighbouring record (collinear merge)
-        #   cyan   = matched a CAD edge, clean fit (applied)
-        #   orange = matched but bad fit (huge radius / tilted axis / sliver)
-        #   red    = survived to apply but no CAD edge matched
+        # Paint every fillet face by what the apply stage did with its
+        # stitched group:
+        #   cyan = group's CAD edges matched and were filleted
+        #   red  = group exists but no CAD edge matched (apply skipped it)
+        # No "merged" / "badfit" / "filtered" categories — the new
+        # pipeline doesn't drop records or fit radii, so those buckets
+        # are gone.
         try:
             diag = getattr(result, 'fillet_match_diag', None) or []
-
-            def _match_for(rec) -> dict | None:
-                """Find the diag entry for a merged record by geometry."""
-                ap = np.asarray(rec.get("axis_point", [0, 0, 0]), float)
-                rr = float(rec.get("radius", 0.0))
-                best, best_d = None, 3.0
-                for d in diag:
-                    dp = np.asarray(d["axis_point"], float)
-                    dist = float(np.linalg.norm(dp - ap))
-                    if dist < best_d and abs(d["radius"] - rr) <= 0.25 * max(rr, 1e-6) + 0.5:
-                        best, best_d = d, dist
-                return best
-
-            def _is_bad_fit(d: dict) -> bool:
-                ad = sorted(abs(float(x)) for x in d["axis_dir"])
-                return (
-                    d["radius"] > 10.0
-                    or d["length"] < 2.0
-                    or (len(ad) >= 2 and ad[1] > 0.1)  # 2nd axis comp → tilted
-                )
-
-            # Map each raw record's globally-unique uid → merged record it
-            # belongs to. (region_id resets per body; reconcile_uid does not.)
-            region_to_merged: dict[int, dict] = {}
-            for m in merged_topo:
-                for rid in m.get("merged_from", [int(m.get("region_id", -1))]):
-                    region_to_merged[int(rid)] = m
+            diag_by_group = {int(d.get("group_id", -1)): d for d in diag}
+            uid_to_group_map = dict(getattr(job, "_uid_to_group", {}) or {})
 
             BASE = [0.58, 0.60, 0.63]
-            FATE = {
-                "filtered": [0.34, 0.34, 0.36],
-                "merged":   [0.95, 0.82, 0.15],
-                "matched":  [0.0, 0.85, 0.95],
-                "badfit":   [1.0, 0.50, 0.0],
-                "unmatched": [0.93, 0.18, 0.18],
-            }
-            counts = {k: 0 for k in FATE}
+            CYAN = [0.0, 0.85, 0.95]
+            RED = [0.93, 0.18, 0.18]
+            counts = {"matched": 0, "unmatched": 0}
             fate_colors_by_body = []
             for body, sub_cleaned, regions, fitted, graph, edges_list, body_tree, topo_blends in body_stage_data:
                 fc = np.tile(BASE, (len(sub_cleaned.faces), 1))
@@ -1315,35 +1626,22 @@ with open(r'{tmp_out.name}', 'wb') as f:
                     idx = rec.get("face_indices")
                     if idx is None or len(idx) == 0:
                         continue
-                    uid = int(rec.get("reconcile_uid", -1))
-                    r = float(rec.get("radius", 0.0) or 0.0)
-                    if r < 0.2 or r > max_export_radius:
-                        fate = "filtered"
+                    uid = int(rec.get("stitch_uid", -1))
+                    gi = uid_to_group_map.get(uid)
+                    d = diag_by_group.get(int(gi)) if gi is not None else None
+                    if d is not None and d.get("matched"):
+                        fc[idx] = CYAN
+                        counts["matched"] += 1
                     else:
-                        m = region_to_merged.get(uid)
-                        if m is None:
-                            fate = "filtered"  # dropped in merge (sphere/<1mm)
-                        elif uid != int(m.get("seed_region_id", uid)):
-                            fate = "merged"     # absorbed into the seed record
-                        else:
-                            d = _match_for(m)
-                            if d is None or not d.get("matched"):
-                                fate = "unmatched"
-                            elif _is_bad_fit(d):
-                                fate = "badfit"
-                            else:
-                                fate = "matched"
-                    fc[idx] = FATE[fate]
-                    counts[fate] += 1
+                        fc[idx] = RED
+                        counts["unmatched"] += 1
                 fate_colors_by_body.append((body, sub_cleaned, fc))
 
             _check_cancelled()
             job.progress = 99
             job.progress_stage = (
                 "Blend reconciliation — "
-                f"{counts['matched']} matched, {counts['badfit']} bad-fit, "
-                f"{counts['unmatched']} unmatched, {counts['merged']} merged, "
-                f"{counts['filtered']} filtered"
+                f"{counts['matched']} matched, {counts['unmatched']} unmatched"
             )
             job.progress_edges = None
             job.progress_edge_colors = None

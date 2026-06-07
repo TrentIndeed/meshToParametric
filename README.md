@@ -172,11 +172,11 @@ trimesh, cadquery, pyvista, matplotlib, numpy, scipy, scikit-learn, networkx, fa
 
 This section tracks major changes to the core pipeline, problems hit, and how they were addressed. The pipeline works end-to-end on simple prismatic parts; the main ongoing work is **reliable segmentation on coarse, radial-fan triangulations** (common in 3MF exports from slicers).
 
-### Pipeline restructure — per-body segmentation + cross-body reconciliation
+### Pipeline restructure — per-body segmentation + stitched fillets
 
 The original flow segmented the whole mesh, peeled its fillets, then decomposed into bodies. That made the per-body segmenter see an already-peeled mesh with no fillets to find, so fillet records for CAD export came only from the whole-mesh peel and had no symmetry between mirror features.
 
-Restructured to: **ingest → decompose → per-body segment/fit/topology/identify_blends in parallel → cross-body fillet reconciliation → export**. New module `pipeline/reconcile_fillets.py` uses union-find to cluster per-body fillet records that describe the same underlying edge (parallel axes, coincident axis lines, similar radii) and writes a single **arc-length-weighted `unified_radius`** back onto every member. Export reads `unified_radius`, so a fillet that wraps a bend comes out with one seamless size instead of jagged per-body radii.
+Restructured to: **ingest → decompose → per-body segment/fit/topology/identify_blends → stitched-fillets stage (groups per-body records into cross-body clusters via vertex KDTree proximity + axis-aligned continuation) → CAD apply (vertex-proximity edge matching with per-edge measured radius)**. The stitched stage replaced the earlier collinear-merge reconciliation step. The apply pass no longer trusts upstream record radii — it measures each CAD edge's radius from the same mesh vertex set the stitched group carries.
 
 ### Segmentation: axis-class + smoothing
 
@@ -214,7 +214,7 @@ Chamfer detection requires a narrow plane region whose normal roughly bisects it
 | Pink triangular wedges poking into flat plate | Smoothing flipped flat triangles to curved whenever >50% of neighbors were curved | Tightened: only flip aligned→curved on **zero** same-class neighbors; added reverse smoothing for slightly-tilted plate triangles |
 | Tab cylinders pie-sliced into 8 wedges | Radial-fan triangulation: each slice's normal in a different cardinal class | Iterative aligned→curved smoothing dissolves isolated slices; fragment-merger re-unifies |
 | 139 segfaults after pipeline runs | Native-code crash (likely OCP/CadQuery on some mesh); no Python trace | Added `faulthandler.enable()` to server startup — next segfault will print a C-level stack trace |
-| Fillet radii mismatched across body seams | Per-body RANSAC fits each edge independently | `reconcile_fillets.py` clusters same-edge fillets across bodies, assigns one arc-length-weighted `unified_radius` |
+| Fillet radii mismatched across body seams | Per-body RANSAC fits each edge independently | Apply stage measures radius per CAD edge from the stitched group's mesh vertex set; the upstream fit radius is no longer read |
 
 ### Side-plate through-hole rim fillets — six-pass segmentation refinement
 
@@ -241,12 +241,7 @@ End result for `models/Mesh5/RackMount.3mf`:
 
 ### Test suite
 
-Regression guards in `tests/test_fillet_detection.py`:
-
-- `test_regions_are_not_spiky` — asserts every side-plate region has compactness (4πA / P²) ≥ 0.08. Catches segmentation regressions that introduce pointy fragment regions.
-- `test_bottom_plate_has_tab_fillets` — at least one plausible-radius fillet found on the tab bodies.
-- `test_fillets_constant_width` — per cross-body cluster, radii agree within 15% (validates reconciliation).
-- `test_side_plates_have_expected_fillets` — **currently failing**; expects 6 fillets per side plate but this mesh's radial-fan triangulation absorbs them. Keep as a target.
+Fillet-specific regression tests (`tests/test_fillet_detection.py`, `tests/test_export_fillet_consistency.py`) were removed when the upstream collinear-merge reconciliation pass was replaced by the stitched-fillets stage; the invariants they encoded (radius agreement across body seams, sphere-fit filtering at export time) no longer apply because the apply pass measures radii per edge from raw mesh vertices rather than reading any upstream fit. Future regression coverage for the new vertex-proximity matcher is open work.
 
 Per-feature invariants in `tests/test_rackmount_segmentation.py` (20 tests, all passing) covering each body of `models/Mesh5/RackMount.3mf`:
 

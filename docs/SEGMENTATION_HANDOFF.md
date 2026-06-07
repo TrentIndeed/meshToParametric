@@ -44,12 +44,7 @@ After this:
 - `_merge_small_regions` with two-pass fallback (similar normal → longest-shared-boundary)
 - `_merge_adjacent_cylinder_fragments` stitches cylinder quadrants back together
 
-Tests in [tests/test_fillet_detection.py](../tests/test_fillet_detection.py):
-- **3 of 4 pass.**
-- `test_regions_are_not_spiky` — passes at compactness ≥ 0.08. Acts as a regression guard.
-- `test_bottom_plate_has_tab_fillets` — passes (≥1 tab fillet detected).
-- `test_fillets_constant_width` — passes (trivially on this mesh).
-- `test_side_plates_have_expected_fillets` — **fails**. Expects 6 fillets per side plate (4 long edges + 2 hole rim); currently 0-2 plausible fillets detected. This has been failing the whole session; fixing it is a separate problem, not the one this doc is about.
+The fillet-specific regression tests this doc originally referenced (`tests/test_fillet_detection.py`) have been **deleted** — the reconciliation/collinear-merge pass they exercised was replaced by the stitched-fillets stage + per-edge measured-radius matcher, so the invariants no longer apply. Future segmentation regression coverage will need new tests against the stitched-stage output and/or apply-stage edge match counts.
 
 ## What's been tried (don't repeat these)
 
@@ -129,7 +124,7 @@ Key files:
   - `_merge_small_regions` — line ~410, two-pass fallback merger
   - `_merge_adjacent_cylinder_fragments` — line ~740, cylinder quadrant stitcher
   - `_smooth_region_boundaries` — line ~155, post-pass label smoothing
-- [tests/test_fillet_detection.py](../tests/test_fillet_detection.py) — the regression suite
+- (the dedicated fillet regression suite has been removed — see banner above)
 
 Running the diag loop this session used:
 
@@ -156,8 +151,7 @@ Render corner zoom-ins with `mesh.clip_box([xmin, xmax, ymin, ymax, zmin, zmax],
 
 1. Body 0 top-left corner — no color wedges in the plate face
 2. Body 0 through-hole — one continuous ring, no 90° breaks
-3. `pytest tests/test_fillet_detection.py` — at least 3/4 still pass (the spiky guard is the key regression signal)
-4. `fit_surfaces` returns a cylinder at radius ≈ 2mm on Body 0 (the bore)
+3. `fit_surfaces` returns a cylinder at radius ≈ 2mm on Body 0 (the bore)
 
 If any of those four regresses, revert the change before continuing.
 

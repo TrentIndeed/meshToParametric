@@ -585,15 +585,34 @@ async def job_status(job_id: str):
     return result
 
 
+@app.post("/api/queue/reset")
+async def queue_reset():
+    """Last-resort recovery: kill the in-flight CadQuery subprocess,
+    mark the currently processing job as errored, and replace the
+    worker thread with a fresh one. Useful when a job is hung and the
+    automatic watchdog hasn't caught it yet."""
+    result = queue.force_reset()
+    return result
+
+
 @app.post("/api/job/{job_id}/cancel")
 async def cancel_job(job_id: str):
-    """Cancel a running job. Unpauses and marks as error so the worker moves on."""
+    """Cancel a running job. Unpauses and marks as error so the worker
+    moves on, AND kills the CadQuery subprocess if one is mid-flight
+    (otherwise the worker stays blocked inside subprocess.wait for up
+    to 10 min and the next queued job can't start)."""
     job = queue.get(job_id)
     if job is None:
         return JSONResponse({"error": "Job not found"}, status_code=404)
     job.paused = False
     job.status = "error"
     job.error = "Cancelled by user"
+    proc = getattr(job, "_cad_subprocess", None)
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     return {"status": "cancelled"}
 
 

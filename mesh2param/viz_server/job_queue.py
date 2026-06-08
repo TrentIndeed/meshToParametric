@@ -1459,7 +1459,8 @@ with open(r'{tmp_out.name}', 'wb') as f:
         try:
             interesting = (
                 "Edge enumeration", "Fillet matching", "Fillet pass",
-                "Bucket ", "Stitched fillets",
+                "Bucket ", "Stitched fillets", "nearest-edge dump",
+                "cluster ",
             )
             for line in (proc.stdout or "").splitlines():
                 if any(tag in line for tag in interesting):

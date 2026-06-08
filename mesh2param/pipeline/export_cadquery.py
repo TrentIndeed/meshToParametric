@@ -3773,13 +3773,26 @@ def _apply_recognized_fillets_to_solid(
         samples = se["samples"]
         best_cluster_idx = -1
         best_mean_d = float("inf")
+        best_max_d = float("inf")
         for ci, c in enumerate(clusters):
             d, _ = c["_tree"].query(samples, k=1)
             md = float(np.mean(d))
             if md < best_mean_d:
                 best_mean_d = md
+                best_max_d = float(np.max(d))
                 best_cluster_idx = ci
-        if best_cluster_idx < 0 or best_mean_d > MAX_EDGE_PROX_MM:
+        if best_cluster_idx < 0:
+            continue
+        if best_mean_d > MAX_EDGE_PROX_MM:
+            continue
+        # COVERAGE gate: the cluster must run along the WHOLE edge,
+        # not just sit near one end. Without this, a long unrelated
+        # concave edge with one end happening to fall near a fillet
+        # cluster passes the mean-distance check and gets a spurious
+        # fillet applied to it (the "two short fillets that don't
+        # exist" symptom). MAX_EDGE_PROX_MM applies to the WORST
+        # sample, not the average — every sample must be close.
+        if best_max_d > MAX_EDGE_PROX_MM:
             continue
 
         # Measure radius: perpendicular distances from edge LINE

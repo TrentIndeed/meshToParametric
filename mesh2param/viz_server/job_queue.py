@@ -1377,7 +1377,11 @@ class JobQueue:
 
         num_variants = getattr(job, '_num_variants', 1)
         script = f"""
-import pickle, sys
+import pickle, sys, logging
+logging.basicConfig(
+    level=logging.INFO, stream=sys.stdout,
+    format='%(levelname)s %(name)s: %(message)s',
+)
 sys.path.insert(0, '.')
 with open(r'{tmp_in.name}', 'rb') as f:
     tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
@@ -1446,6 +1450,22 @@ with open(r'{tmp_out.name}', 'wb') as f:
                          job.id, proc.returncode, proc.stderr[-300:])
             Path(tmp_out.name).unlink(missing_ok=True)
             raise RuntimeError(f"CadQuery failed: {proc.stderr[-300:]}")
+
+        # Forward fillet-matching lines from the subprocess into the
+        # main server log so the matcher's per-edge decisions are
+        # visible without running the pipeline standalone. Filter to
+        # the lines we actually want to see — the subprocess can be
+        # very chatty otherwise.
+        try:
+            interesting = (
+                "Edge enumeration", "Fillet matching", "Fillet pass",
+                "Bucket ", "Stitched fillets",
+            )
+            for line in (proc.stdout or "").splitlines():
+                if any(tag in line for tag in interesting):
+                    logger.info("[cad] %s", line)
+        except Exception:
+            pass
 
         try:
             with open(tmp_out.name, "rb") as f:

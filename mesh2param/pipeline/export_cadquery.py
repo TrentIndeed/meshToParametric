@@ -3587,31 +3587,41 @@ def _apply_recognized_fillets_to_solid(
     The face-vertex set comes from the segmented mesh; the rebuilt
     solid has SHARP edges wherever those vertices used to sit.
 
-    Matching rule, per CAD edge:
-      1. Reject edges that aren't straight lines (sharp corner edges
-         between flat faces are straight; existing rounds/holes are
-         circles or ellipses and shouldn't be filleted).
-      2. Sample N points along the edge. For each cluster, query a
-         KDTree built from the cluster's vertices and average the
-         min-distance across samples. The cluster whose vertices
-         track closest to the edge along its whole length wins
-         (cap at 8 mm — beyond that the edge isn't anywhere near
-         this fillet).
-      3. Measure the radius locally: at each sample, collect cluster
-         vertices within 12 mm and take the perpendicular distance
-         from the edge's LINE (not segment) to each. The 90th
-         percentile across all samples = the local fillet radius.
-         That number comes straight from the mesh geometry — no
-         upstream fit is trusted.
+    Matching follows the standard CAD-kernel composition (Onshape /
+    SolidWorks / Inventor / OCC all do this):
 
-    Edges that belong to the same cluster with similar measured radii
-    (within ±15%) get bundled into one OCC ``fillet`` call. CadQuery
-    tangent-chains co-incident edges automatically, so a perimeter
-    loop or a straight+corner-curl pair becomes a single feature.
+      1. **Topology gate**: edge must be two-sided (manifold) — i.e.
+         shared by exactly two adjacent faces. Drops boundary edges
+         and the short non-manifold seams that boolean unions leave.
+      2. **Convexity gate**: edge dihedral angle must be CONCAVE.
+         Fillets add material on inside corners; convex edges should
+         get chamfers / outside-rounds, not the inside fillet we're
+         applying. (Inventor's "All Fillets" mode literally says it
+         selects all remaining concave edges.)
+      3. **Straight-line gate**: only LINE-type edges. Circular edges
+         on existing rounds / holes aren't fillet candidates.
+      4. **Proximity** to a stitched cluster: edge must run near the
+         cluster's mesh vertex set (mean sample distance ≤ 8 mm).
+      5. **Score = length / (proximity + 1 mm)**: rank edges by how
+         long they are weighted by how cleanly they sit in the
+         cluster. Long edges win over short corner-meeting edges
+         even when both are close. Reject anything shorter than
+         2·radius (a fillet of radius r cannot live on a shorter
+         edge).
 
-    out_edges / out_surfaces / out_diag are populated for the intent
-    overlay, the per-edge surface preview, and the reconciliation
-    debug viz respectively.
+    Radius is measured per-edge from the cluster's vertices: 90th
+    percentile of perpendicular distance from the edge LINE. No
+    upstream record radius is trusted.
+
+    Edges in the same cluster with similar measured radii (±15%) get
+    bundled into one OCC ``fillet`` call. CadQuery / OCC will
+    tangent-chain co-incident edges of the same surface continuity
+    automatically, so a perimeter loop becomes one feature even when
+    we hand it one edge from each side.
+
+    out_edges / out_surfaces / out_diag populate the intent overlay,
+    the per-edge surface preview, and the reconciliation debug viz
+    respectively.
     """
     import time as _time
     from scipy.spatial import cKDTree
@@ -3643,20 +3653,80 @@ def _apply_recognized_fillets_to_solid(
         logger.info("Fillet pass: all stitched clusters were empty")
         return wp, [], []
 
-    # Enumerate STRAIGHT edges only.
+    # --- Edge enumeration with topology + convexity attributes ---
+    # Use CadQuery's high-level `edge.ancestors(solid, "Face")` to
+    # find each edge's adjacent faces in one call. Convexity is
+    # determined by **sampling 16 points on a small circle around the
+    # edge midpoint, perpendicular to the edge tangent**, and asking
+    # the OCC solid classifier how many sit inside the solid:
+    #   < 50 % inside → convex (less than a hemisphere of solid)
+    #   > 50 % inside → concave (more than a hemisphere)
+    # This is robust without needing to reason about OCC face
+    # orientation flags. We keep only concave manifold straight edges,
+    # the standard fillet candidate set.
     solid_edges: list[dict] = []
+    n_skip_geom = 0
+    n_skip_nonmanifold = 0
+    n_skip_convex = 0
+    n_skip_flat = 0
     try:
+        from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+        from OCP.gp import gp_Pnt
+
+        solid_val = wp.val()
+        solid_clf = BRepClass3d_SolidClassifier(solid_val.wrapped)
+        IN_STATE = 0  # TopAbs_IN
+
+        CIRCLE_SAMPLES = 16
+        CIRCLE_EPS = 0.05  # mm — tight to stay close to the edge
+
+        def _classify_convexity(midpoint, tangent) -> tuple[str, float]:
+            """Sample a small circle around `midpoint` perpendicular to
+            `tangent`. Return (convexity, in_fraction). Convexity is
+            "concave" / "convex" / "flat"."""
+            arb = (
+                np.array([1.0, 0.0, 0.0])
+                if abs(tangent[0]) < 0.9
+                else np.array([0.0, 1.0, 0.0])
+            )
+            u = arb - tangent * float(np.dot(arb, tangent))
+            u = u / (np.linalg.norm(u) + 1e-12)
+            v = np.cross(tangent, u)
+            in_count = 0
+            for k in range(CIRCLE_SAMPLES):
+                a = 2.0 * np.pi * k / CIRCLE_SAMPLES
+                offset = CIRCLE_EPS * (np.cos(a) * u + np.sin(a) * v)
+                pt = gp_Pnt(
+                    midpoint[0] + offset[0],
+                    midpoint[1] + offset[1],
+                    midpoint[2] + offset[2],
+                )
+                solid_clf.Perform(pt, 1e-6)
+                if int(solid_clf.State()) == IN_STATE:
+                    in_count += 1
+            frac = in_count / CIRCLE_SAMPLES
+            if abs(frac - 0.5) < 0.06:
+                return "flat", frac
+            return ("concave" if frac > 0.5 else "convex"), frac
+
         for edge in wp.edges().vals():
-            geom_type = None
             try:
                 geom_type = edge.geomType()
             except Exception:
-                geom_type = None
-            if geom_type is not None and geom_type != "LINE":
+                continue
+            if geom_type != "LINE":
+                n_skip_geom += 1
+                continue
+            # Topology gate: must be a two-sided (manifold) edge.
+            try:
+                adj_faces = edge.ancestors(solid_val, "Face").Faces()
+            except Exception:
+                adj_faces = []
+            if len(adj_faces) != 2:
+                n_skip_nonmanifold += 1
                 continue
             try:
-                sp = edge.startPoint()
-                ep = edge.endPoint()
+                sp = edge.startPoint(); ep = edge.endPoint()
             except Exception:
                 continue
             start = np.array([sp.x, sp.y, sp.z], dtype=float)
@@ -3666,22 +3736,38 @@ def _apply_recognized_fillets_to_solid(
             if length < 1e-6:
                 continue
             direction = direction / length
+            midpoint = 0.5 * (start + end)
+            convexity, _frac = _classify_convexity(midpoint, direction)
+            if convexity == "flat":
+                n_skip_flat += 1
+                continue
+            if convexity != "concave":
+                n_skip_convex += 1
+                continue
             ts = np.linspace(0.0, 1.0, SAMPLES_PER_EDGE)
             samples = start[None, :] + ts[:, None] * (end - start)[None, :]
             solid_edges.append({
                 "obj": edge,
                 "start": start, "end": end, "dir": direction,
                 "len": length, "samples": samples,
+                "midpoint": midpoint, "convexity": convexity,
             })
     except Exception as exc:
-        logger.debug("Edge enumeration failed: %s", exc)
+        logger.debug("Edge enumeration with topology failed: %s", exc)
         return wp, [], []
+
+    logger.info(
+        "Edge enumeration: %d concave manifold straight edges "
+        "(skipped %d non-line, %d non-manifold, %d convex, %d flat)",
+        len(solid_edges), n_skip_geom, n_skip_nonmanifold,
+        n_skip_convex, n_skip_flat,
+    )
 
     if not solid_edges:
-        logger.info("Fillet pass: no straight edges on solid")
+        logger.info("Fillet pass: no concave manifold straight edges on solid")
         return wp, [], []
 
-    # Per-edge match + per-edge radius.
+    # --- Per-edge match: cluster assignment + per-edge measured radius ---
     matched: list[dict] = []
     for ei, se in enumerate(solid_edges):
         samples = se["samples"]
@@ -3715,11 +3801,23 @@ def _apply_recognized_fillets_to_solid(
         radius = float(np.percentile(perp_d, 90))
         if not (0.2 <= radius <= 25.0):
             continue
+        # Length gate: an edge shorter than 2·r physically cannot
+        # carry a fillet of radius r. This is the single biggest fix
+        # for the "fillets at corners" symptom: short corner-meeting
+        # edges fail this test and never reach the apply pass.
+        if se["len"] < 2.0 * radius:
+            continue
+        # Score: length per unit proximity. Long well-aligned edges
+        # outrank short edges sitting fully inside a cluster's vertex
+        # cloud — even when the short edge's mean distance is lower.
+        score = se["len"] / (best_mean_d + 1.0)
         matched.append({
             "edge_idx": ei,
             "cluster_idx": best_cluster_idx,
             "radius": radius,
             "mean_d": best_mean_d,
+            "length": se["len"],
+            "score": score,
         })
 
     logger.info(
@@ -3792,7 +3890,11 @@ def _apply_recognized_fillets_to_solid(
             vol_before = abs(float(wp.val().Volume()))
             wp_test = wp.newObject(edges_obj).fillet(r)
             vol_after = abs(float(wp_test.val().Volume()))
-            if vol_after <= 0 or vol_after > vol_before * 1.01:
+            # Concave fillets ADD material (fill the inside corner),
+            # so a small volume gain is expected and correct. Reject
+            # only when the result is zero/negative or shows a wildly
+            # implausible change (> 5 %).
+            if vol_after <= 0 or vol_after > vol_before * 1.05:
                 logger.debug(
                     "Bucket %d r=%.2f on %d edges rejected: vol %.0f -> %.0f",
                     bi, r, len(edges_obj), vol_before, vol_after,

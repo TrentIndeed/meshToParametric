@@ -1377,21 +1377,28 @@ class JobQueue:
 
         num_variants = getattr(job, '_num_variants', 1)
         script = f"""
-import pickle, sys, logging
+import pickle, sys, logging, traceback, faulthandler
+faulthandler.enable()
 logging.basicConfig(
     level=logging.INFO, stream=sys.stdout,
     format='%(levelname)s %(name)s: %(message)s',
 )
 sys.path.insert(0, '.')
-with open(r'{tmp_in.name}', 'rb') as f:
-    tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
-from mesh2param.pipeline.export_cadquery import export_cadquery
-result = export_cadquery(tree, cleaned, use_llm=True, num_variants={num_variants},
-                         body_results=all_body_results if decomposition.is_multi_body else None,
-                         stitched_clusters=stitched_clusters)
-result.solid = None
-with open(r'{tmp_out.name}', 'wb') as f:
-    pickle.dump(result, f)
+try:
+    with open(r'{tmp_in.name}', 'rb') as f:
+        tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
+    from mesh2param.pipeline.export_cadquery import export_cadquery
+    result = export_cadquery(tree, cleaned, use_llm=False, num_variants={num_variants},
+                             body_results=all_body_results if decomposition.is_multi_body else None,
+                             stitched_clusters=stitched_clusters)
+    result.solid = None
+    with open(r'{tmp_out.name}', 'wb') as f:
+        pickle.dump(result, f)
+except BaseException as _exc:
+    print('=== SUBPROCESS EXCEPTION ===', flush=True)
+    traceback.print_exc(file=sys.stdout)
+    sys.stdout.flush()
+    sys.exit(2)
 """
         try:
             # Use Popen + poll loop instead of subprocess.run so a UI
@@ -1399,9 +1406,18 @@ with open(r'{tmp_out.name}', 'wb') as f:
             # this the worker stays blocked inside run() for up to the
             # full timeout, and any newly-submitted job sits in the
             # queue with status="queued" until the worker frees up.
+            # IMPORTANT: redirect to FILES, not PIPE. With PIPE the
+            # parent only drains stdout after proc.wait() returns —
+            # once the OS pipe buffer (~64 KB on Windows) fills up
+            # mid-run, the subprocess deadlocks on its next print.
+            cad_log_path = Path("data") / f"cad_subproc_{job.id}.log"
+            cad_log_path.parent.mkdir(parents=True, exist_ok=True)
+            cad_err_path = Path("data") / f"cad_subproc_{job.id}.err.log"
+            cad_log_fh = open(cad_log_path, "w", encoding="utf-8")
+            cad_err_fh = open(cad_err_path, "w", encoding="utf-8")
             proc_handle = subprocess.Popen(
                 [sys.executable, "-c", script],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=cad_log_fh, stderr=cad_err_fh, text=True,
             )
             job._cad_subprocess = proc_handle
             deadline = time.time() + 600.0
@@ -1418,6 +1434,12 @@ with open(r'{tmp_out.name}', 'wb') as f:
                         Path(tmp_in.name).unlink(missing_ok=True)
                         Path(tmp_out.name).unlink(missing_ok=True)
                         raise RuntimeError("Cancelled by user")
+                    # Heartbeat so the watchdog doesn't classify the
+                    # running subprocess as a stuck worker and kill it.
+                    # The subprocess can legitimately take longer than
+                    # STUCK_THRESHOLD_S; only its internal `deadline`
+                    # below should bound it.
+                    job.last_activity_at = time.time()
                     try:
                         proc_handle.wait(timeout=0.5)
                         break
@@ -1425,19 +1447,40 @@ with open(r'{tmp_out.name}', 'wb') as f:
                         pass
                     if time.time() > deadline:
                         proc_handle.kill()
-                        Path(tmp_in.name).unlink(missing_ok=True)
+                        try:
+                            proc_handle.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        # Don't unlink tmp_in here — let the failure
+                        # handler preserve it for offline replay.
                         Path(tmp_out.name).unlink(missing_ok=True)
-                        raise RuntimeError("CadQuery subprocess timed out after 600s")
+                        raise RuntimeError(
+                            f"CadQuery subprocess timed out after 600s; "
+                            f"see {cad_log_path}"
+                        )
             finally:
                 job._cad_subprocess = None
-            stdout, stderr = proc_handle.communicate()
+                try:
+                    cad_log_fh.close()
+                except Exception:
+                    pass
+                try:
+                    cad_err_fh.close()
+                except Exception:
+                    pass
 
             class _ProcResult:
                 pass
             proc = _ProcResult()
             proc.returncode = proc_handle.returncode
-            proc.stdout = stdout
-            proc.stderr = stderr
+            try:
+                proc.stdout = cad_log_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                proc.stdout = ""
+            try:
+                proc.stderr = cad_err_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                proc.stderr = ""
         except Exception:
             logger.exception("Job %s: CadQuery subprocess failed", job.id)
             Path(tmp_in.name).unlink(missing_ok=True)
@@ -1446,10 +1489,26 @@ with open(r'{tmp_out.name}', 'wb') as f:
         Path(tmp_in.name).unlink(missing_ok=True)
 
         if proc.returncode != 0:
-            logger.error("Job %s: CadQuery subprocess failed (exit %d): %s",
-                         job.id, proc.returncode, proc.stderr[-300:])
+            # Preserve the input pickle for offline replay.
+            preserved = None
+            try:
+                preserved = Path("data") / f"cad_subproc_{job.id}_input.pkl"
+                preserved.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy(tmp_in.name, str(preserved))
+            except Exception as _cpy_exc:
+                logger.warning("Failed to preserve subproc input pkl: %s", _cpy_exc)
+            logger.error(
+                "Job %s: CadQuery subprocess failed (exit %d); stdout at %s; stderr at %s; input pkl: %s\n"
+                "stderr tail: %s\nstdout tail: %s",
+                job.id, proc.returncode, cad_log_path, cad_err_path, preserved,
+                (proc.stderr or "")[-600:],
+                (proc.stdout or "")[-600:],
+            )
             Path(tmp_out.name).unlink(missing_ok=True)
-            raise RuntimeError(f"CadQuery failed: {proc.stderr[-300:]}")
+            raise RuntimeError(
+                f"CadQuery failed (exit {proc.returncode}); see {cad_log_path}"
+            )
 
         # Forward fillet-matching lines from the subprocess into the
         # main server log so the matcher's per-edge decisions are
@@ -1460,7 +1519,7 @@ with open(r'{tmp_out.name}', 'wb') as f:
             interesting = (
                 "Edge enumeration", "Fillet matching", "Fillet pass",
                 "Bucket ", "Stitched fillets", "nearest-edge dump",
-                "cluster ",
+                "cluster ", "CHECKPOINT", "SUBPROCESS EXCEPTION",
             )
             for line in (proc.stdout or "").splitlines():
                 if any(tag in line for tag in interesting):

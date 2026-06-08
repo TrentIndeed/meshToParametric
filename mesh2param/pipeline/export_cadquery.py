@@ -467,6 +467,7 @@ def export_cadquery(
                     )
         except Exception as fil_exc:
             logger.warning("Stitched fillet apply pass failed: %s", fil_exc)
+        logger.info("CHECKPOINT: post-fillet-apply, continuing to variants/tess")
 
         v1_name = "AI Optimized" if llm_order else "Default"
         v1_strategy = llm_order.strategy if llm_order else "Default heuristic ordering"
@@ -3843,31 +3844,43 @@ def _apply_recognized_fillets_to_solid(
     # WHY: the cluster's bbox, the nearest concave edge, and the
     # mean/max sample distance for that edge. This is the data we
     # need to tell whether the rebuilt solid's edges are in the
-    # right place at all.
+    # right place at all. Each cluster dump is wrapped so a crash
+    # on one cluster (numerical issue with KDTree, etc.) doesn't
+    # take down the rest of the subprocess.
     if not matched and solid_edges:
-        logger.warning("Fillet matching: ZERO matches; nearest-edge dump:")
-        for ci, c in enumerate(clusters):
-            verts = c["_verts"]
-            bmin = verts.min(axis=0); bmax = verts.max(axis=0)
-            best = None  # (mean_d, max_d, ei, edge_info)
-            for ei, se in enumerate(solid_edges):
-                d, _ = c["_tree"].query(se["samples"], k=1)
-                md = float(np.mean(d))
-                mx = float(np.max(d))
-                if best is None or md < best[0]:
-                    best = (md, mx, ei, se)
-            md, mx, ei, se = best
-            logger.warning(
-                "  cluster %d (gid=%s, %d verts) bbox "
-                "(%.1f..%.1f, %.1f..%.1f, %.1f..%.1f): "
-                "nearest edge #%d len=%.1f mean=%.2f max=%.2f "
-                "start=(%.1f,%.1f,%.1f) end=(%.1f,%.1f,%.1f)",
-                ci, c.get("group_id", ci), len(verts),
-                bmin[0], bmax[0], bmin[1], bmax[1], bmin[2], bmax[2],
-                ei, se["len"], md, mx,
-                se["start"][0], se["start"][1], se["start"][2],
-                se["end"][0], se["end"][1], se["end"][2],
-            )
+        try:
+            logger.warning("Fillet matching: ZERO matches; nearest-edge dump:")
+            for ci, c in enumerate(clusters):
+                try:
+                    verts = c["_verts"]
+                    bmin = verts.min(axis=0); bmax = verts.max(axis=0)
+                    best = None
+                    for ei, se in enumerate(solid_edges):
+                        d, _ = c["_tree"].query(se["samples"], k=1)
+                        md = float(np.mean(d))
+                        mx = float(np.max(d))
+                        if best is None or md < best[0]:
+                            best = (md, mx, ei, se)
+                    if best is None:
+                        continue
+                    md, mx, ei, se = best
+                    logger.warning(
+                        "  cluster %d (gid=%s, %d verts) bbox "
+                        "(%.1f..%.1f, %.1f..%.1f, %.1f..%.1f): "
+                        "nearest edge #%d len=%.1f mean=%.2f max=%.2f "
+                        "start=(%.1f,%.1f,%.1f) end=(%.1f,%.1f,%.1f)",
+                        ci, c.get("group_id", ci), len(verts),
+                        bmin[0], bmax[0], bmin[1], bmax[1], bmin[2], bmax[2],
+                        ei, se["len"], md, mx,
+                        se["start"][0], se["start"][1], se["start"][2],
+                        se["end"][0], se["end"][1], se["end"][2],
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "  cluster %d dump crashed: %r", ci, _e,
+                    )
+        except Exception as _e:
+            logger.warning("nearest-edge dump aborted: %r", _e)
 
     # Diagnostics: one entry per cluster with what happened.
     cluster_edge_count: dict[int, int] = {}

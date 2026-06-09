@@ -3836,6 +3836,19 @@ def _apply_recognized_fillets_to_solid(
         n_clusters_with_normals, len(clusters),
     )
 
+    LENGTH_MATCH_MIN_FRAC = 0.1  # candidate edge length must be at
+                                  # least this fraction of the cluster's
+                                  # principal-axis extent. Set
+                                  # permissively — the LLM rebuild's
+                                  # polygon-profile path splits long
+                                  # edges into many short segments, so
+                                  # even real rolled-edge fillet
+                                  # locations don't have a single
+                                  # 145 mm edge; they have 5-10
+                                  # collinear segments. We only want
+                                  # to filter the truly tiny union-
+                                  # seam creases (~thickness scale).
+
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}
     n_total_clusters = 0
@@ -3857,6 +3870,20 @@ def _apply_recognized_fillets_to_solid(
         cluster_normals = [
             np.asarray(pn, dtype=float) for pn in cluster_normals_raw
         ]
+        # PCA to find the cluster's principal axis + extent. The
+        # length-match filter rejects junction-crease edges whose
+        # length is much shorter than the fillet's actual span. A
+        # 6.8 mm tab-side seam shouldn't match a 145 mm perimeter-
+        # wrap cluster.
+        centered = verts - verts.mean(axis=0)
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            principal = vh[0]
+            t_proj = centered @ principal
+            principal_extent = float(t_proj.max() - t_proj.min())
+        except Exception:
+            principal_extent = 0.0
+        length_min = LENGTH_MATCH_MIN_FRAC * principal_extent
         matched_edges: list[int] = []
         for ei, se in enumerate(solid_edges):
             mid = se["midpoint"]
@@ -3864,6 +3891,12 @@ def _apply_recognized_fillets_to_solid(
             if not (bmin[0] <= mid[0] <= bmax[0]
                     and bmin[1] <= mid[1] <= bmax[1]
                     and bmin[2] <= mid[2] <= bmax[2]):
+                continue
+            # Length-match filter: skip candidate edges that are
+            # much shorter than the cluster's fillet span. These
+            # are typically union-seam creases — concave by BREP
+            # convention but not real CAD-selectable fillet edges.
+            if length_min > 0.0 and se["len"] < length_min:
                 continue
             # Fine vertex-proximity check: the edge midpoint must
             # be within (radius + base) of an actual cluster vertex.

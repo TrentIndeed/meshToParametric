@@ -3698,13 +3698,15 @@ def _apply_recognized_fillets_to_solid(
             end = np.array([ep.x, ep.y, ep.z], dtype=float)
             direction = end - start
             length = float(np.linalg.norm(direction))
-            # Skip tiny degenerate edges: OCC's BRepFilletAPI refuses
-            # to fillet edges below its float tolerance, and the
-            # corner-tolerance match would otherwise pick them as
-            # near-coincident vertex pairs at body decomposition
-            # seams. 0.5 mm filters seam artifacts while preserving
-            # any real CAD edge on the parts we target.
-            if length < 0.5:
+            # Skip short polygon-simplification seam artifacts.
+            # OCC's BRepFilletAPI refuses any fillet whose radius
+            # approaches half the edge length, and below ~2 mm the
+            # edges are almost never real CAD-selectable fillet
+            # candidates — they're internal junctions from the
+            # face-projection sketch's collinear segments. Any real
+            # rolled-edge fillet on the rackmount has its underlying
+            # edge measured in tens of mm.
+            if length < 2.0:
                 continue
             direction = direction / length
             midpoint = 0.5 * (start + end)
@@ -3784,13 +3786,40 @@ def _apply_recognized_fillets_to_solid(
         except Exception:
             se["adj_normals"] = []
 
-    # Plane match is intentionally permissive — the LLM-built
-    # extruded-polygon faces have non-trivial normal noise from the
-    # face-projection sketch step, so even a generous 45° gate
-    # (cos(45°) = 0.707) is still effective at killing the obvious
-    # "edge between unrelated planes" false positives (the user's
-    # tab-to-base-side-vs-tab-top-curved case) without throwing
-    # out the slightly-misaligned real matches.
+    # Non-coplanarity gate: the perpendicular-circle solid-inside
+    # test reports "concave" for edges where the two adjacent faces
+    # are barely off-coplanar (e.g. 175° dihedral, only 5° dip).
+    # OCC's BRepFilletAPI refuses to fillet those — they aren't
+    # selectable as edges in any CAD app either; they're internal
+    # polygon-simplification seams. Require the two adjacent face
+    # normals to differ by ≥30° so the edge is a REAL corner with
+    # a real dihedral, not a polygon-noise pseudo-corner.
+    COPLANAR_MAX_DOT = 0.866  # cos(30°)
+    pruned_edges: list[dict] = []
+    n_skip_coplanar = 0
+    for se in solid_edges:
+        adj = se.get("adj_normals", [])
+        if len(adj) != 2:
+            pruned_edges.append(se)
+            continue
+        cos_a = abs(float(np.dot(adj[0], adj[1])))
+        if cos_a > COPLANAR_MAX_DOT:
+            n_skip_coplanar += 1
+            continue
+        pruned_edges.append(se)
+    logger.info(
+        "Edge prune: %d edges (%d additional skipped as near-coplanar; "
+        "their adjacent faces are within 30° of parallel and OCC will "
+        "not fillet them)",
+        len(pruned_edges), n_skip_coplanar,
+    )
+    solid_edges = pruned_edges
+    if not solid_edges:
+        logger.info(
+            "Fillet pass: no real concave corner edges after coplanarity prune"
+        )
+        return wp, [], []
+
     PLANE_MATCH_DOT_MIN = 0.7
 
     # Diagnostic: how many edges actually got 2 adjacent face normals?

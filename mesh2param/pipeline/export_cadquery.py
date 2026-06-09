@@ -3597,47 +3597,38 @@ def _apply_recognized_fillets_to_solid(
     out_surfaces: list | None = None,
     out_diag: list | None = None,
 ) -> tuple[object, list[object], list[str]]:
-    """Apply stitched fillets to the rebuilt solid via corner-to-corner
-    edge matching.
+    """Apply stitched fillets to the rebuilt solid via bbox overlap.
 
-    Each entry in ``stitched_clusters`` is one physical fillet group;
-    inside the group, ``segments`` is a list of per-record
-    ``{corner_a, corner_b, axis_dir, radius, length}`` entries. Each
-    segment names the two corner points the original fillet ran
-    between, regardless of how the rebuilt solid's geometry falls
-    between them. We do not match where the fillet vertices were —
-    we match the rebuilt solid's CONCAVE edge whose endpoints sit
-    closest to the segment's corner_a / corner_b. This is the way a
-    human applies a fillet: pick the edge between two corners, set
-    the radius.
+    Each entry in ``stitched_clusters`` is one physical fillet group:
+    ``{group_id, vertices: (N,3) ndarray, radius, n_records}``. The
+    matcher ignores everything except those four fields. For each
+    group:
 
-    Pipeline:
-      1. Enumerate every two-sided LINE edge on the rebuilt solid
-         and classify each as concave / convex / flat via a small
-         perpendicular-circle solid-inside test.
-      2. For each segment in each cluster, find the edge whose
-         endpoint pair best matches (corner_a, corner_b) (tested
-         in both directions).
-      3. Score = sum of corner-to-endpoint distances. Reject when
-         the best score exceeds the corner-tolerance gate.
-      4. Bucket matched edges by cluster + radius band and apply
-         one OCC fillet per bucket, with per-edge fallback and a
-         length-aware radius cap.
+      1. Compute the **bounding box of the vertex cloud** plus a
+         small margin (radius + 3 mm).
+      2. Find every two-sided, concave, LINE-type edge on the
+         rebuilt solid whose midpoint sits inside that bbox.
+      3. Apply ``.fillet(edges, radius)`` to all the in-bbox edges
+         with the group's radius (capped at edge_len/3 for
+         OCC stability).
 
-    The vertex-proximity matcher this function replaced could not
-    work when the rebuilt solid's in-between geometry differed from
-    the original mesh — even a slightly different polygon profile
-    moved every cluster vertex out of range. Corners survive that.
+    If two groups claim the same edge, the group with the smaller
+    bbox volume wins ("more specific" feature wins). OCC's
+    ``BRepFilletAPI`` tangent-chains co-incident edges automatically,
+    so a perimeter loop or a 3D corner blend that touches three
+    perpendicular concave edges all in the same bbox gets handled
+    in one operation.
+
+    This is the "general area" rule: the group says "the fillet
+    lived in this volume of space", the matcher applies to every
+    suitable edge in that volume — no axis assumptions, no
+    record-type distinctions, no exact corner snapping.
     """
     import time as _time
 
     pass_start = _time.time()
     applied_steps: list = []
     applied_script: list = []
-
-    CORNER_BASE_TOL_MM = 8.0
-    CORNER_RADIUS_TOL = 2.0
-    RADIUS_BAND_REL = 0.15
 
     clusters = list(stitched_clusters or [])
     if not clusters:
@@ -3745,134 +3736,96 @@ def _apply_recognized_fillets_to_solid(
         logger.info("Fillet pass: no concave manifold straight edges on solid")
         return wp, [], []
 
-    # --- Corner-to-corner segment matching ---
-    # "In a general area" — for each segment, find the concave edge
-    # whose endpoints land closest to the segment's two corners,
-    # with a DIRECTION-ALIGNMENT BONUS that nudges ties toward
-    # edges whose direction matches the segment's axis_dir. We do
-    # NOT require a snap to a specific solid vertex; the corner
-    # point and the CAD edge endpoint can be up to ``2·tol`` apart
-    # in summed distance, where tol = 8 mm + 2·r per corner. This
-    # is the "general area" the user described.
-    DIR_BONUS_MM = 4.0  # subtract this from score when axis-aligned
-    DIR_DOT_MIN = 0.7
+    # --- Bbox-overlap matching ---
+    # For each stitched group: every concave straight edge whose
+    # MIDPOINT sits inside the group's vertex bounding box (with a
+    # small margin) gets filleted at the group's radius. No corner
+    # arithmetic, no axis assumptions, no record-type distinction.
+    # This is what "apply a fillet in the general area" means in
+    # CAD-app terms — the group identifies a 3D region; the matcher
+    # collects every edge living in that region.
+    BBOX_MARGIN_MM = 3.0
 
-    matched: list[dict] = []
-    n_total_segments = 0
-    n_segments_no_edge = 0
+    matched_by_cluster: dict[int, list[int]] = {}
+    cluster_radius: dict[int, float] = {}
+    n_total_clusters = 0
+    n_clusters_no_edge = 0
     for ci, c in enumerate(clusters):
-        segments = c.get("segments", []) or []
-        for si, seg in enumerate(segments):
-            n_total_segments += 1
-            ca = np.asarray(seg.get("corner_a"), dtype=float)
-            cb = np.asarray(seg.get("corner_b"), dtype=float)
-            seg_radius = float(seg.get("radius", 0.0) or 0.0)
-            if not (0.2 <= seg_radius <= 25.0):
-                continue
-            tol = CORNER_BASE_TOL_MM + CORNER_RADIUS_TOL * seg_radius
+        n_total_clusters += 1
+        verts = np.asarray(c.get("vertices"), dtype=float)
+        if verts.ndim != 2 or len(verts) == 0:
+            continue
+        radius = float(c.get("radius", 0.0) or 0.0)
+        if not (0.2 <= radius <= 25.0):
+            continue
+        margin = BBOX_MARGIN_MM + radius
+        bmin = verts.min(axis=0) - margin
+        bmax = verts.max(axis=0) + margin
+        edges_in_bbox: list[int] = []
+        for ei, se in enumerate(solid_edges):
+            mid = se["midpoint"]
+            if (bmin[0] <= mid[0] <= bmax[0]
+                    and bmin[1] <= mid[1] <= bmax[1]
+                    and bmin[2] <= mid[2] <= bmax[2]):
+                edges_in_bbox.append(ei)
+        if not edges_in_bbox:
+            n_clusters_no_edge += 1
+            continue
+        matched_by_cluster[ci] = edges_in_bbox
+        cluster_radius[ci] = radius
 
-            ad_raw = seg.get("axis_dir")
-            axis_dir = (
-                np.asarray(ad_raw, dtype=float)
-                if ad_raw is not None else None
-            )
-            if axis_dir is not None:
-                n_axis = float(np.linalg.norm(axis_dir))
-                axis_dir = axis_dir / n_axis if n_axis > 1e-9 else None
-
-            best_score = float("inf")
-            best_edge_idx = -1
-            for ei, se in enumerate(solid_edges):
-                d1 = (
-                    float(np.linalg.norm(se["start"] - ca)) +
-                    float(np.linalg.norm(se["end"] - cb))
-                )
-                d2 = (
-                    float(np.linalg.norm(se["start"] - cb)) +
-                    float(np.linalg.norm(se["end"] - ca))
-                )
-                d = min(d1, d2)
-                # Alignment bonus: shave a few mm off the score when
-                # the edge direction matches the segment axis. This
-                # lets a slightly-farther-but-aligned edge beat a
-                # closer-but-perpendicular one, which is the right
-                # call when two candidate edges land close to the
-                # corner pair (e.g. the box-with-pocket convex rim
-                # vs the concave pocket-floor edge).
-                if axis_dir is not None:
-                    align = abs(float(np.dot(se["dir"], axis_dir)))
-                    if align >= DIR_DOT_MIN:
-                        d = max(0.0, d - DIR_BONUS_MM)
-                if d < best_score:
-                    best_score = d
-                    best_edge_idx = ei
-            if best_edge_idx < 0 or best_score > 2.0 * tol:
-                n_segments_no_edge += 1
-                continue
-            matched.append({
-                "edge_idx": best_edge_idx,
-                "cluster_idx": ci,
-                "segment_idx": si,
-                "radius": seg_radius,
-                "score": best_score,
-            })
-
+    n_total_edges_matched = sum(len(v) for v in matched_by_cluster.values())
     logger.info(
-        "Corner matching: %d/%d segments matched to %d cluster(s) "
-        "across %d concave edges, %.1fs",
-        len(matched), n_total_segments, len(clusters), len(solid_edges),
+        "Bbox matching: %d/%d clusters claimed %d edges "
+        "(of %d concave) in %.1fs",
+        len(matched_by_cluster), n_total_clusters,
+        n_total_edges_matched, len(solid_edges),
         _time.time() - pass_start,
     )
 
-    # If multiple segments matched the same edge, keep the best.
-    by_edge: dict[int, dict] = {}
-    for m in matched:
-        prev = by_edge.get(m["edge_idx"])
-        if prev is None or m["score"] < prev["score"]:
-            by_edge[m["edge_idx"]] = m
-    matched = list(by_edge.values())
+    # If multiple clusters claim the same edge, pick the cluster with
+    # the smallest bbox volume — that's the "most specific" claim.
+    edge_to_cluster: dict[int, int] = {}
+    cluster_bbox_vol: dict[int, float] = {}
+    for ci in matched_by_cluster:
+        verts = np.asarray(clusters[ci]["vertices"], dtype=float)
+        dims = verts.max(axis=0) - verts.min(axis=0)
+        cluster_bbox_vol[ci] = float(np.prod(np.maximum(dims, 1e-3)))
+    for ci, edges in matched_by_cluster.items():
+        for ei in edges:
+            prev = edge_to_cluster.get(ei)
+            if prev is None or cluster_bbox_vol[ci] < cluster_bbox_vol[prev]:
+                edge_to_cluster[ei] = ci
 
-    cluster_edge_count: dict[int, int] = {}
-    for m in matched:
-        cluster_edge_count[m["cluster_idx"]] = (
-            cluster_edge_count.get(m["cluster_idx"], 0) + 1
-        )
+    # Rebuild matched_by_cluster from the resolved edge ownership.
+    matched_by_cluster = {}
+    for ei, ci in edge_to_cluster.items():
+        matched_by_cluster.setdefault(ci, []).append(ei)
+
     if out_diag is not None:
         for ci, c in enumerate(clusters):
-            n_e = cluster_edge_count.get(ci, 0)
+            n_e = len(matched_by_cluster.get(ci, []))
             out_diag.append({
                 "group_id": int(c.get("group_id", ci)),
                 "n_records": int(c.get("n_records", 0)),
-                "n_segments": int(len(c.get("segments", []) or [])),
                 "matched": n_e > 0,
                 "n_edges": n_e,
                 "reason": ("matched" if n_e > 0 else
-                           "no edge within corner tolerance"),
+                           "no concave edge inside bbox"),
             })
 
-    if not matched:
+    if not matched_by_cluster:
         return wp, [], []
 
-    by_cluster: dict[int, list[dict]] = {}
-    for m in matched:
-        by_cluster.setdefault(m["cluster_idx"], []).append(m)
-
     buckets: list[dict] = []
-    for ci, ms in by_cluster.items():
-        ms_sorted = sorted(ms, key=lambda x: x["radius"])
-        current: list[dict] = []
-        for m in ms_sorted:
-            if not current:
-                current = [m]
-                continue
-            r_ref = current[0]["radius"]
-            if abs(m["radius"] - r_ref) <= r_ref * RADIUS_BAND_REL:
-                current.append(m)
-            else:
-                buckets.append({"cluster_idx": ci, "members": current})
-                current = [m]
-        if current:
-            buckets.append({"cluster_idx": ci, "members": current})
+    for ci, edges in matched_by_cluster.items():
+        buckets.append({
+            "cluster_idx": ci,
+            "members": [
+                {"edge_idx": ei, "radius": cluster_radius[ci]}
+                for ei in edges
+            ],
+        })
 
     for bi, bucket in enumerate(buckets):
         members = bucket["members"]
@@ -3994,10 +3947,10 @@ def _apply_recognized_fillets_to_solid(
             continue
 
     logger.info(
-        "Fillet pass done: %d clusters, %d edges matched, %d buckets, "
-        "%d segments missed, %.1fs",
-        len(clusters), len(matched), len(buckets),
-        n_segments_no_edge, _time.time() - pass_start,
+        "Fillet pass done: %d clusters, %d edges in buckets, %d buckets, "
+        "%d clusters with no in-bbox edge, %.1fs",
+        len(clusters), n_total_edges_matched, len(buckets),
+        n_clusters_no_edge, _time.time() - pass_start,
     )
     return wp, applied_steps, applied_script
 

@@ -1255,71 +1255,57 @@ class JobQueue:
                 stitched_face_colors.append((body, sub_cleaned, fc))
 
             # Build the cluster payload for the CAD apply pass. Each
-            # stitched group is one physical fillet feature; within
-            # the group, each source record gets exposed as a
-            # **segment** with corner-to-corner endpoints (computed
-            # from axis_dir + axis_point + face-vertex projection).
-            # The apply pass matches each segment to a CAD edge by
-            # endpoint proximity — corner-to-corner, not vertex-to-
-            # vertex — so the rebuilt solid's edges don't have to
-            # land exactly where the original mesh's fillet vertices
-            # were. The radius is measured from the local fillet
-            # vertex strip and stored per segment; the apply pass
-            # picks the median for the OCC call.
+            # stitched group is one physical fillet feature with a
+            # vertex cloud + a single representative radius. The
+            # apply pass uses the vertex BBOX directly: every
+            # concave edge whose midpoint falls inside the bbox
+            # (with a few mm of margin) gets filleted at the
+            # group's radius. No axes, no per-record corners, no
+            # cylinder/sphere distinction — the matcher just asks
+            # "what edges are in the general area this fillet
+            # lived in", which is what `.fillet()` in any CAD app
+            # actually does.
             stitched_clusters_payload: list[dict] = []
             for gi, members in sorted(
                 {gi_: [u for u, g in uid_to_group.items() if g == gi_]
                  for gi_ in set(uid_to_group.values())}.items()
             ):
-                verts_for_group = np.vstack([
-                    next(ri for ri in records_info if ri["uid"] == u)["verts"]
-                    for u in members
-                ])
-                # Per-record segments: corner-A, corner-B, plus the
-                # raw record-local vertex array for radius
-                # measurement at apply time.
-                segments: list[dict] = []
+                # Per-record radius: median perp distance from the
+                # record's vertices to its fitted axis line. Skip
+                # records without a clean axis (sphere/cone fits
+                # whose "axis" is a plane normal); they still
+                # contribute vertices to the group's bbox, just no
+                # radius vote.
+                per_record_radii: list[float] = []
+                verts_per_record: list[np.ndarray] = []
                 for u in members:
                     ri = next(r for r in records_info if r["uid"] == u)
-                    if ri["endpoints"] is None or ri["axis_dir"] is None:
-                        # Sphere fits / records without a clean axis
-                        # don't get exposed as segments. The face-
-                        # vertex bbox is still in `vertices`; the
-                        # match path can fall back to a bbox-corner
-                        # heuristic when no segments exist.
+                    verts_per_record.append(ri["verts"])
+                    if ri["axis_dir"] is None or ri["endpoints"] is None:
                         continue
-                    ca = ri["endpoints"][0].astype(np.float64)
-                    cb = ri["endpoints"][1].astype(np.float64)
-                    # Measure local radius from this record's verts
-                    # only (not the merged cluster). Perp distance
-                    # from each vertex to the axis line, median for
-                    # robustness.
-                    rel = ri["verts"] - ri["axis_dir"] * (
-                        (ri["verts"] - (ca + cb) * 0.5) @ ri["axis_dir"]
-                    )[:, None]
-                    # Above is wrong — recompute simply: project to
-                    # axis_point, perp = orthogonal component.
                     axis_dir = ri["axis_dir"]
-                    axis_point = (ca + cb) * 0.5
+                    axis_point = 0.5 * (ri["endpoints"][0] + ri["endpoints"][1])
                     rel = ri["verts"] - axis_point
                     along = rel @ axis_dir
                     perp = rel - np.outer(along, axis_dir)
                     perp_d = np.linalg.norm(perp, axis=1)
-                    rec_radius = (
-                        float(np.median(perp_d)) if len(perp_d) >= 3 else 0.0
-                    )
-                    segments.append({
-                        "corner_a": ca.tolist(),
-                        "corner_b": cb.tolist(),
-                        "axis_dir": axis_dir.astype(np.float64).tolist(),
-                        "radius": rec_radius,
-                        "length": float(np.linalg.norm(cb - ca)),
-                    })
+                    if len(perp_d) >= 3:
+                        per_record_radii.append(float(np.median(perp_d)))
+                verts_for_group = np.vstack(verts_per_record)
+                # Group radius: median of per-record radii.  Falls
+                # back to the bbox-min dimension when no record
+                # contributed (all sphere/cone fits) — coarse but
+                # better than zero.
+                if per_record_radii:
+                    group_radius = float(np.median(per_record_radii))
+                else:
+                    bbox_dims = verts_for_group.max(axis=0) - verts_for_group.min(axis=0)
+                    group_radius = float(np.min(bbox_dims)) * 0.5
                 stitched_clusters_payload.append({
                     "group_id": gi,
                     "vertices": verts_for_group.astype(np.float64),
                     "n_records": len(members),
-                    "segments": segments,
+                    "radius": group_radius,
                 })
             job._stitched_clusters = stitched_clusters_payload
             # Stash uid → group_id so the reconcile-stage viz at the

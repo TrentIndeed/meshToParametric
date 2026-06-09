@@ -1083,10 +1083,38 @@ class JobQueue:
             # Pass 1: gather per-record info: face vertices + axis +
             # endpoints + radius. Records without a usable axis fall
             # back to the direct-contact rule only.
+            from mesh2param.models.region import SurfaceType as _ST_pn
             records_info: list[dict] = []
             n_chamfers = 0
             for body_idx, _bst in enumerate(body_stage_data):
                 _body, _sub, _regs, _fits, _g, _e, _bt, topo_blends = _bst
+                # Per-body region/fit lookups so we can resolve a
+                # fillet record's `plane_region_ids` into actual
+                # outward face normals — the apply pass will use
+                # those to reject candidate edges whose adjacent
+                # face normals don't match the original fillet's
+                # adjacent plate normals.
+                regs_lookup = {r.region_id: r for r in _regs}
+                fits_lookup = {f.region_id: f for f in _fits}
+
+                def _plane_normal_for(rid: int) -> np.ndarray | None:
+                    f = fits_lookup.get(rid)
+                    if f is None:
+                        return None
+                    if f.surface_type == _ST_pn.PLANE:
+                        n = np.asarray(
+                            f.params.get("normal", [0, 0, 0]), dtype=float,
+                        )
+                    else:
+                        reg = regs_lookup.get(rid)
+                        if reg is None or len(reg.face_indices) == 0:
+                            return None
+                        n = _sub.normals[reg.face_indices].mean(axis=0)
+                    nrm = float(np.linalg.norm(n))
+                    if nrm < 0.5:
+                        return None
+                    return n / nrm
+
                 for rec in topo_blends:
                     kind = rec.get("kind")
                     if kind == "chamfer":
@@ -1123,6 +1151,15 @@ class JobQueue:
                     else:
                         axis_dir = None
                         endpoints = None
+                    # Collect the adjacent plate normals for this
+                    # record (one per plane_region_id).  Empty list
+                    # is fine — the matcher just won't have a plane
+                    # gate for that record's cluster.
+                    plane_normals_rec: list[list[float]] = []
+                    for prid in (rec.get("plane_region_ids") or []):
+                        n = _plane_normal_for(int(prid))
+                        if n is not None:
+                            plane_normals_rec.append(n.tolist())
                     records_info.append({
                         "body_idx": body_idx,
                         "rec": rec,
@@ -1130,6 +1167,7 @@ class JobQueue:
                         "axis_dir": axis_dir,
                         "endpoints": endpoints,
                         "radius": float(rec.get("radius", 0.0) or 0.0),
+                        "plane_normals": plane_normals_rec,
                     })
 
             for uid, ri in enumerate(records_info):
@@ -1278,9 +1316,12 @@ class JobQueue:
                 # radius vote.
                 per_record_radii: list[float] = []
                 verts_per_record: list[np.ndarray] = []
+                all_plane_normals: list[np.ndarray] = []
                 for u in members:
                     ri = next(r for r in records_info if r["uid"] == u)
                     verts_per_record.append(ri["verts"])
+                    for pn in ri.get("plane_normals", []):
+                        all_plane_normals.append(np.asarray(pn, dtype=float))
                     if ri["axis_dir"] is None or ri["endpoints"] is None:
                         continue
                     axis_dir = ri["axis_dir"]
@@ -1301,11 +1342,23 @@ class JobQueue:
                 else:
                     bbox_dims = verts_for_group.max(axis=0) - verts_for_group.min(axis=0)
                     group_radius = float(np.min(bbox_dims)) * 0.5
+                # Deduplicate plane normals: two normals within ~10°
+                # are considered the same plate orientation.
+                dedup_normals: list[list[float]] = []
+                for n in all_plane_normals:
+                    is_dup = False
+                    for kept in dedup_normals:
+                        if abs(float(np.dot(n, np.asarray(kept)))) > 0.985:
+                            is_dup = True
+                            break
+                    if not is_dup:
+                        dedup_normals.append(n.tolist())
                 stitched_clusters_payload.append({
                     "group_id": gi,
                     "vertices": verts_for_group.astype(np.float64),
                     "n_records": len(members),
                     "radius": group_radius,
+                    "plane_normals": dedup_normals,
                 })
             job._stitched_clusters = stitched_clusters_payload
             # Stash uid → group_id so the reconcile-stage viz at the

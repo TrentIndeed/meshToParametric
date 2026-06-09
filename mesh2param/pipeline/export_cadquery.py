@@ -3757,6 +3757,56 @@ def _apply_recognized_fillets_to_solid(
                         # original mesh's fillet surface to the rebuilt
                         # solid's sharp corner edge
 
+    # Pre-compute each concave edge's adjacent face outward normals
+    # at the edge midpoint. Cached once per edge so the plane-match
+    # check is cheap per cluster query.
+    import cadquery as _cq
+    for se in solid_edges:
+        try:
+            mid_cq = _cq.Vector(
+                float(se["midpoint"][0]),
+                float(se["midpoint"][1]),
+                float(se["midpoint"][2]),
+            )
+            adj = se["obj"].ancestors(solid_val, "Face").Faces()
+            nlist: list[np.ndarray] = []
+            for f in adj:
+                try:
+                    nv = f.normalAt(mid_cq)
+                    nrm = float(np.linalg.norm([nv.x, nv.y, nv.z]))
+                    if nrm > 0.5:
+                        nlist.append(
+                            np.array([nv.x, nv.y, nv.z]) / nrm
+                        )
+                except Exception:
+                    pass
+            se["adj_normals"] = nlist
+        except Exception:
+            se["adj_normals"] = []
+
+    # Plane match is intentionally permissive — the LLM-built
+    # extruded-polygon faces have non-trivial normal noise from the
+    # face-projection sketch step, so even a generous 45° gate
+    # (cos(45°) = 0.707) is still effective at killing the obvious
+    # "edge between unrelated planes" false positives (the user's
+    # tab-to-base-side-vs-tab-top-curved case) without throwing
+    # out the slightly-misaligned real matches.
+    PLANE_MATCH_DOT_MIN = 0.7
+
+    # Diagnostic: how many edges actually got 2 adjacent face normals?
+    n_edges_with_2_normals = sum(
+        1 for se in solid_edges if len(se.get("adj_normals", [])) == 2
+    )
+    n_clusters_with_normals = sum(
+        1 for c in clusters if c.get("plane_normals")
+    )
+    logger.info(
+        "Plane-match data: %d/%d edges have 2 face-normals; "
+        "%d/%d clusters have plane normals",
+        n_edges_with_2_normals, len(solid_edges),
+        n_clusters_with_normals, len(clusters),
+    )
+
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}
     n_total_clusters = 0
@@ -3774,6 +3824,10 @@ def _apply_recognized_fillets_to_solid(
         bmax = verts.max(axis=0) + bbox_margin
         prox_tol = PROX_BASE_MM + radius
         vtree = _cKDTree(verts)
+        cluster_normals_raw = c.get("plane_normals", []) or []
+        cluster_normals = [
+            np.asarray(pn, dtype=float) for pn in cluster_normals_raw
+        ]
         matched_edges: list[int] = []
         for ei, se in enumerate(solid_edges):
             mid = se["midpoint"]
@@ -3782,15 +3836,31 @@ def _apply_recognized_fillets_to_solid(
                     and bmin[1] <= mid[1] <= bmax[1]
                     and bmin[2] <= mid[2] <= bmax[2]):
                 continue
-            # Fine vertex-proximity check: the edge midpoint must be
-            # within (radius + base) of an actual cluster vertex.
-            # Without this an elongated cluster's bbox sweeps in
-            # unrelated concave edges (e.g. tab-to-base junctions
-            # spatially inside a perimeter-wrap's bbox but not
-            # actually part of that fillet).
+            # Fine vertex-proximity check: the edge midpoint must
+            # be within (radius + base) of an actual cluster vertex.
             d, _ = vtree.query(mid, k=1)
             if d > prox_tol:
                 continue
+            # Plane-match check: the edge's TWO adjacent face
+            # normals must EACH align with some plane normal the
+            # original fillet was adjacent to. This is the filter
+            # that rejects bbox-coincident but feature-different
+            # edges (e.g. a tab-to-base-side junction whose
+            # adjacent face normals are nothing like the side
+            # plate's outer/bottom plate normals).
+            if cluster_normals and len(se.get("adj_normals", [])) == 2:
+                ok = True
+                for fn in se["adj_normals"]:
+                    best = 0.0
+                    for cn in cluster_normals:
+                        a = abs(float(np.dot(fn, cn)))
+                        if a > best:
+                            best = a
+                    if best < PLANE_MATCH_DOT_MIN:
+                        ok = False
+                        break
+                if not ok:
+                    continue
             matched_edges.append(ei)
         if not matched_edges:
             n_clusters_no_edge += 1

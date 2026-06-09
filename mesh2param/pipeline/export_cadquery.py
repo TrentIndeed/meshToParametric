@@ -3743,8 +3743,19 @@ def _apply_recognized_fillets_to_solid(
     # arithmetic, no axis assumptions, no record-type distinction.
     # This is what "apply a fillet in the general area" means in
     # CAD-app terms — the group identifies a 3D region; the matcher
-    # collects every edge living in that region.
+    # collects every edge living in that region. Bbox is the COARSE
+    # filter (cheap rejection of obvious mismatches); a per-edge
+    # vertex-proximity check is the FINE filter (the edge midpoint
+    # has to actually be near a fillet face vertex, not just inside
+    # the cluster's axis-aligned bounding box — which is too coarse
+    # for elongated perimeter-wrap clusters that would otherwise
+    # sweep in unrelated concave edges).
+    from scipy.spatial import cKDTree as _cKDTree
+
     BBOX_MARGIN_MM = 3.0
+    PROX_BASE_MM = 4.0  # plus 1*radius — covers the offset from the
+                        # original mesh's fillet surface to the rebuilt
+                        # solid's sharp corner edge
 
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}
@@ -3758,20 +3769,33 @@ def _apply_recognized_fillets_to_solid(
         radius = float(c.get("radius", 0.0) or 0.0)
         if not (0.2 <= radius <= 25.0):
             continue
-        margin = BBOX_MARGIN_MM + radius
-        bmin = verts.min(axis=0) - margin
-        bmax = verts.max(axis=0) + margin
-        edges_in_bbox: list[int] = []
+        bbox_margin = BBOX_MARGIN_MM + radius
+        bmin = verts.min(axis=0) - bbox_margin
+        bmax = verts.max(axis=0) + bbox_margin
+        prox_tol = PROX_BASE_MM + radius
+        vtree = _cKDTree(verts)
+        matched_edges: list[int] = []
         for ei, se in enumerate(solid_edges):
             mid = se["midpoint"]
-            if (bmin[0] <= mid[0] <= bmax[0]
+            # Coarse bbox pre-filter.
+            if not (bmin[0] <= mid[0] <= bmax[0]
                     and bmin[1] <= mid[1] <= bmax[1]
                     and bmin[2] <= mid[2] <= bmax[2]):
-                edges_in_bbox.append(ei)
-        if not edges_in_bbox:
+                continue
+            # Fine vertex-proximity check: the edge midpoint must be
+            # within (radius + base) of an actual cluster vertex.
+            # Without this an elongated cluster's bbox sweeps in
+            # unrelated concave edges (e.g. tab-to-base junctions
+            # spatially inside a perimeter-wrap's bbox but not
+            # actually part of that fillet).
+            d, _ = vtree.query(mid, k=1)
+            if d > prox_tol:
+                continue
+            matched_edges.append(ei)
+        if not matched_edges:
             n_clusters_no_edge += 1
             continue
-        matched_by_cluster[ci] = edges_in_bbox
+        matched_by_cluster[ci] = matched_edges
         cluster_radius[ci] = radius
 
     n_total_edges_matched = sum(len(v) for v in matched_by_cluster.values())

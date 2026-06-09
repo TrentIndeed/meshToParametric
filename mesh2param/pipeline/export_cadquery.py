@@ -3911,6 +3911,58 @@ def _apply_recognized_fillets_to_solid(
     if not matched_by_cluster:
         return wp, [], []
 
+    # Populate the INTENT overlay BEFORE running OCC fillet. The
+    # intent stage is meant to show every edge the matcher
+    # decided was a fillet location — whether or not OCC's
+    # BRepFilletAPI succeeds at applying it. Putting these
+    # outputs here means the user can see what the matcher is
+    # claiming, even on edges where the rebuild's topology
+    # defeats OCC. Applied surfaces are STILL appended again in
+    # the success branch; duplicates are fine because the viz
+    # just paints them once.
+    def _append_intent(ci: int, ei: int, r_use: float) -> None:
+        sp = solid_edges[ei]["start"]
+        ep = solid_edges[ei]["end"]
+        if out_edges is not None:
+            out_edges.append(
+                [list(map(float, sp)), list(map(float, ep))]
+            )
+        if out_surfaces is not None:
+            edge_dir = ep - sp
+            edge_len = float(np.linalg.norm(edge_dir))
+            if edge_len < 1e-6:
+                return
+            edge_dir = edge_dir / edge_len
+            arb = np.array([1.0, 0.0, 0.0])
+            if abs(float(arb @ edge_dir)) > 0.9:
+                arb = np.array([0.0, 1.0, 0.0])
+            perp_dir = arb - float(arb @ edge_dir) * edge_dir
+            perp_dir = perp_dir / (np.linalg.norm(perp_dir) + 1e-12)
+            mid = 0.5 * (sp + ep)
+            patch = _build_fillet_surface_patch(
+                sp, ep, mid + r_use * perp_dir, edge_dir, r_use,
+            )
+            if patch is not None:
+                pv, pf = patch
+                out_surfaces.append({
+                    "verts": pv.tolist(), "faces": pf.tolist(),
+                    "kind": "fillet",
+                })
+
+    for ci, edges in matched_by_cluster.items():
+        r_pre = cluster_radius[ci]
+        for ei in edges:
+            shortest = solid_edges[ei]["len"]
+            r_clamped = max(0.2, min(r_pre, shortest / 3.0))
+            _append_intent(ci, ei, r_clamped)
+    logger.info(
+        "Intent overlay: %d edges queued from %d clusters "
+        "(populated before OCC apply so the viz reflects "
+        "matcher decisions, not just OCC successes)",
+        sum(len(es) for es in matched_by_cluster.values()),
+        len(matched_by_cluster),
+    )
+
     buckets: list[dict] = []
     for ci, edges in matched_by_cluster.items():
         buckets.append({
@@ -3956,12 +4008,11 @@ def _apply_recognized_fillets_to_solid(
                 )
                 continue
             wp = wp_test
-            if out_edges is not None:
-                for sp, ep in edge_pts:
-                    out_edges.append(
-                        [list(map(float, sp)), list(map(float, ep))]
-                    )
-            if out_surfaces is not None:
+            # NOTE: out_edges/out_surfaces already populated for ALL
+            # claimed edges before the apply loop ran. We do NOT add
+            # again on OCC success — duplicates would inflate the
+            # intent viz mesh.
+            if False and out_surfaces is not None:
                 for sp, ep in edge_pts:
                     edge_dir = ep - sp
                     edge_len = float(np.linalg.norm(edge_dir))
@@ -4016,11 +4067,8 @@ def _apply_recognized_fillets_to_solid(
                     if vol_after2 <= 0 or vol_after2 > vol_before2 * 1.05:
                         continue
                     wp = wp_test2
-                    if out_edges is not None:
-                        out_edges.append([
-                            list(map(float, sub_edge["start"])),
-                            list(map(float, sub_edge["end"])),
-                        ])
+                    # out_edges already populated upfront for ALL
+                    # claimed edges; don't append again here.
                     v2, f2 = _tessellate_solid(wp, fast=True)
                     applied_steps.append(ConstructionStep(
                         name=f"Fillet (r={sub_r:.2f}mm) x1",

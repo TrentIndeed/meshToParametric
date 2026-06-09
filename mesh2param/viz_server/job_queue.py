@@ -1255,13 +1255,17 @@ class JobQueue:
                 stitched_face_colors.append((body, sub_cleaned, fc))
 
             # Build the cluster payload for the CAD apply pass. Each
-            # group becomes ONE fillet feature on the rebuilt solid:
-            # CadQuery only needs to know which edges to fillet, and
-            # the radius is measured per-edge from the mesh geometry
-            # at apply time (so the unreliable rec["radius"] from the
-            # cylinder fitter never gets passed through). We hand
-            # over the full face-vertex set per group; the matcher
-            # in export_cadquery does the KDTree + per-edge radius.
+            # stitched group is one physical fillet feature; within
+            # the group, each source record gets exposed as a
+            # **segment** with corner-to-corner endpoints (computed
+            # from axis_dir + axis_point + face-vertex projection).
+            # The apply pass matches each segment to a CAD edge by
+            # endpoint proximity — corner-to-corner, not vertex-to-
+            # vertex — so the rebuilt solid's edges don't have to
+            # land exactly where the original mesh's fillet vertices
+            # were. The radius is measured from the local fillet
+            # vertex strip and stored per segment; the apply pass
+            # picks the median for the OCC call.
             stitched_clusters_payload: list[dict] = []
             for gi, members in sorted(
                 {gi_: [u for u, g in uid_to_group.items() if g == gi_]
@@ -1271,10 +1275,51 @@ class JobQueue:
                     next(ri for ri in records_info if ri["uid"] == u)["verts"]
                     for u in members
                 ])
+                # Per-record segments: corner-A, corner-B, plus the
+                # raw record-local vertex array for radius
+                # measurement at apply time.
+                segments: list[dict] = []
+                for u in members:
+                    ri = next(r for r in records_info if r["uid"] == u)
+                    if ri["endpoints"] is None or ri["axis_dir"] is None:
+                        # Sphere fits / records without a clean axis
+                        # don't get exposed as segments. The face-
+                        # vertex bbox is still in `vertices`; the
+                        # match path can fall back to a bbox-corner
+                        # heuristic when no segments exist.
+                        continue
+                    ca = ri["endpoints"][0].astype(np.float64)
+                    cb = ri["endpoints"][1].astype(np.float64)
+                    # Measure local radius from this record's verts
+                    # only (not the merged cluster). Perp distance
+                    # from each vertex to the axis line, median for
+                    # robustness.
+                    rel = ri["verts"] - ri["axis_dir"] * (
+                        (ri["verts"] - (ca + cb) * 0.5) @ ri["axis_dir"]
+                    )[:, None]
+                    # Above is wrong — recompute simply: project to
+                    # axis_point, perp = orthogonal component.
+                    axis_dir = ri["axis_dir"]
+                    axis_point = (ca + cb) * 0.5
+                    rel = ri["verts"] - axis_point
+                    along = rel @ axis_dir
+                    perp = rel - np.outer(along, axis_dir)
+                    perp_d = np.linalg.norm(perp, axis=1)
+                    rec_radius = (
+                        float(np.median(perp_d)) if len(perp_d) >= 3 else 0.0
+                    )
+                    segments.append({
+                        "corner_a": ca.tolist(),
+                        "corner_b": cb.tolist(),
+                        "axis_dir": axis_dir.astype(np.float64).tolist(),
+                        "radius": rec_radius,
+                        "length": float(np.linalg.norm(cb - ca)),
+                    })
                 stitched_clusters_payload.append({
                     "group_id": gi,
                     "vertices": verts_for_group.astype(np.float64),
                     "n_records": len(members),
+                    "segments": segments,
                 })
             job._stitched_clusters = stitched_clusters_payload
             # Stash uid → group_id so the reconcile-stage viz at the
@@ -1356,45 +1401,15 @@ class JobQueue:
         # can do vertex-proximity edge matching with per-edge measured
         # radii. No upstream radius value gets passed through.
         stitched_clusters = list(getattr(job, '_stitched_clusters', []) or [])
-        # Per-body blend records: each body's topo_blends list. The
-        # export stage uses these to PEEL the fillet faces off each
-        # body's sub_cleaned mesh before profile extraction, so the
-        # rebuilt extruded solid has sharp corners exactly where the
-        # original fillets sat — and the stitched-cluster vertices
-        # then land on the rebuilt solid's edges, letting the matcher
-        # actually apply fillets.
-        body_blend_records: list[list[dict]] = []
-        for _bst in body_stage_data:
-            topo_blends_for_body = _bst[7] if len(_bst) > 7 else []
-            # Strip non-serializable / non-needed fields; keep the
-            # minimum apply_blend_peel needs.
-            slim = []
-            for rec in topo_blends_for_body:
-                if rec.get("kind") not in ("fillet", "chamfer"):
-                    continue
-                if rec.get("axis_dir") is None or rec.get("axis_point") is None:
-                    continue
-                fi = rec.get("face_indices")
-                if fi is None or len(fi) == 0:
-                    continue
-                slim.append({
-                    "kind": rec["kind"],
-                    "axis_dir": np.asarray(rec["axis_dir"], dtype=float),
-                    "axis_point": np.asarray(rec["axis_point"], dtype=float),
-                    "face_indices": np.asarray(fi, dtype=np.int64),
-                })
-            body_blend_records.append(slim)
         logger.info(
-            "stitched-clusters → export: %d group(s) feeding fillet apply; "
-            "per-body blends to peel: %s",
+            "stitched-clusters → export: %d group(s) feeding fillet apply",
             len(stitched_clusters),
-            [len(b) for b in body_blend_records],
         )
         try:
             tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             pickle.dump(
                 (tree, cleaned, all_body_results, decomposition,
-                 stitched_clusters, body_blend_records),
+                 stitched_clusters),
                 tmp_in,
             )
             tmp_in.close()
@@ -1416,11 +1431,10 @@ logging.basicConfig(
 sys.path.insert(0, '.')
 try:
     with open(r'{tmp_in.name}', 'rb') as f:
-        tree, cleaned, all_body_results, decomposition, stitched_clusters, body_blend_records = pickle.load(f)
+        tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
     from mesh2param.pipeline.export_cadquery import export_cadquery
     result = export_cadquery(tree, cleaned, use_llm=False, num_variants={num_variants},
                              body_results=all_body_results if decomposition.is_multi_body else None,
-                             body_blend_records=body_blend_records if decomposition.is_multi_body else None,
                              stitched_clusters=stitched_clusters)
     result.solid = None
     with open(r'{tmp_out.name}', 'wb') as f:

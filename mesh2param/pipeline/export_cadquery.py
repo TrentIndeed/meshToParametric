@@ -106,7 +106,6 @@ def export_cadquery(
     use_llm: bool = True,
     num_variants: int = 1,
     body_results: list | None = None,
-    body_blend_records: list[list[dict]] | None = None,
     stitched_clusters: list[dict] | None = None,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
@@ -136,47 +135,6 @@ def export_cadquery(
     base_feature = feature_tree.features[0]
     extrude_dir = np.array(base_feature.direction)
     depth = base_feature.depth
-
-    # --- Peel fillets from each body's sub_cleaned mesh BEFORE the
-    # profile gets extracted.  apply_blend_peel projects each fillet
-    # face's vertices onto its sharp-corner line and drops the
-    # resulting degenerate triangles, leaving a mesh with hard
-    # corners exactly where the original fillets sat.  Once those
-    # corners get extruded as the rebuilt solid's edges, the
-    # stitched-cluster vertices line up with them and the matcher can
-    # actually apply fillets at apply time.  Without this peel the
-    # rebuilt solid's edges are at body-decomposition seams, nowhere
-    # near where the original fillets ran.
-    peeled_body_results: list = []
-    if body_results and body_blend_records and len(body_results) == len(body_blend_records):
-        try:
-            from mesh2param.pipeline.peel_via_topology import apply_blend_peel
-            for (body, sub_cleaned, body_tree), blend_recs in zip(
-                body_results, body_blend_records,
-            ):
-                fillet_recs = [r for r in (blend_recs or []) if r.get("kind") == "fillet"]
-                if fillet_recs:
-                    try:
-                        peeled_sub = apply_blend_peel(sub_cleaned, fillet_recs)
-                    except Exception as _peel_exc:
-                        logger.warning(
-                            "apply_blend_peel failed on a body (%s); using unpeeled mesh",
-                            _peel_exc,
-                        )
-                        peeled_sub = sub_cleaned
-                else:
-                    peeled_sub = sub_cleaned
-                peeled_body_results.append((body, peeled_sub, body_tree))
-            logger.info(
-                "Peeled %d body sub-meshes for sharp-corner rebuild",
-                len(peeled_body_results),
-            )
-            body_results = peeled_body_results
-        except Exception as _wrap_exc:
-            logger.warning(
-                "Per-body peel wrapper failed (%s); using unpeeled bodies",
-                _wrap_exc,
-            )
 
     if body_results and len(body_results) > 0:
         primary_body, primary_sub, primary_tree = body_results[0]
@@ -3639,90 +3597,53 @@ def _apply_recognized_fillets_to_solid(
     out_surfaces: list | None = None,
     out_diag: list | None = None,
 ) -> tuple[object, list[object], list[str]]:
-    """Apply stitched fillets to the rebuilt solid via vertex proximity.
+    """Apply stitched fillets to the rebuilt solid via corner-to-corner
+    edge matching.
 
-    Each entry in `stitched_clusters` is one physical fillet feature
-    (one stitched group): ``{group_id, vertices: (N,3) ndarray, ...}``.
-    The face-vertex set comes from the segmented mesh; the rebuilt
-    solid has SHARP edges wherever those vertices used to sit.
+    Each entry in ``stitched_clusters`` is one physical fillet group;
+    inside the group, ``segments`` is a list of per-record
+    ``{corner_a, corner_b, axis_dir, radius, length}`` entries. Each
+    segment names the two corner points the original fillet ran
+    between, regardless of how the rebuilt solid's geometry falls
+    between them. We do not match where the fillet vertices were —
+    we match the rebuilt solid's CONCAVE edge whose endpoints sit
+    closest to the segment's corner_a / corner_b. This is the way a
+    human applies a fillet: pick the edge between two corners, set
+    the radius.
 
-    Matching follows the standard CAD-kernel composition (Onshape /
-    SolidWorks / Inventor / OCC all do this):
+    Pipeline:
+      1. Enumerate every two-sided LINE edge on the rebuilt solid
+         and classify each as concave / convex / flat via a small
+         perpendicular-circle solid-inside test.
+      2. For each segment in each cluster, find the edge whose
+         endpoint pair best matches (corner_a, corner_b) (tested
+         in both directions).
+      3. Score = sum of corner-to-endpoint distances. Reject when
+         the best score exceeds the corner-tolerance gate.
+      4. Bucket matched edges by cluster + radius band and apply
+         one OCC fillet per bucket, with per-edge fallback and a
+         length-aware radius cap.
 
-      1. **Topology gate**: edge must be two-sided (manifold) — i.e.
-         shared by exactly two adjacent faces. Drops boundary edges
-         and the short non-manifold seams that boolean unions leave.
-      2. **Convexity gate**: edge dihedral angle must be CONCAVE.
-         Fillets add material on inside corners; convex edges should
-         get chamfers / outside-rounds, not the inside fillet we're
-         applying. (Inventor's "All Fillets" mode literally says it
-         selects all remaining concave edges.)
-      3. **Straight-line gate**: only LINE-type edges. Circular edges
-         on existing rounds / holes aren't fillet candidates.
-      4. **Proximity** to a stitched cluster: edge must run near the
-         cluster's mesh vertex set (mean sample distance ≤ 8 mm).
-      5. **Score = length / (proximity + 1 mm)**: rank edges by how
-         long they are weighted by how cleanly they sit in the
-         cluster. Long edges win over short corner-meeting edges
-         even when both are close. Reject anything shorter than
-         2·radius (a fillet of radius r cannot live on a shorter
-         edge).
-
-    Radius is measured per-edge from the cluster's vertices: 90th
-    percentile of perpendicular distance from the edge LINE. No
-    upstream record radius is trusted.
-
-    Edges in the same cluster with similar measured radii (±15%) get
-    bundled into one OCC ``fillet`` call. CadQuery / OCC will
-    tangent-chain co-incident edges of the same surface continuity
-    automatically, so a perimeter loop becomes one feature even when
-    we hand it one edge from each side.
-
-    out_edges / out_surfaces / out_diag populate the intent overlay,
-    the per-edge surface preview, and the reconciliation debug viz
-    respectively.
+    The vertex-proximity matcher this function replaced could not
+    work when the rebuilt solid's in-between geometry differed from
+    the original mesh — even a slightly different polygon profile
+    moved every cluster vertex out of range. Corners survive that.
     """
     import time as _time
-    from scipy.spatial import cKDTree
 
     pass_start = _time.time()
     applied_steps: list = []
     applied_script: list = []
 
-    MAX_EDGE_PROX_MM = 8.0      # edge must be within this of cluster verts
-    LOCAL_R_SEARCH_MM = 12.0    # search radius around each sample
-    SAMPLES_PER_EDGE = 7
-    RADIUS_BAND_REL = 0.15      # ±15 % bands group edges into one call
+    CORNER_BASE_TOL_MM = 8.0
+    CORNER_RADIUS_TOL = 2.0
+    RADIUS_BAND_REL = 0.15
 
     clusters = list(stitched_clusters or [])
     if not clusters:
         logger.info("Fillet pass: no stitched clusters supplied")
         return wp, [], []
 
-    # Build per-cluster KDTree once.
-    for c in clusters:
-        verts = np.asarray(c.get("vertices"), dtype=float)
-        if verts.ndim != 2 or len(verts) == 0:
-            c["_tree"] = None
-            continue
-        c["_verts"] = verts
-        c["_tree"] = cKDTree(verts)
-    clusters = [c for c in clusters if c.get("_tree") is not None]
-    if not clusters:
-        logger.info("Fillet pass: all stitched clusters were empty")
-        return wp, [], []
-
-    # --- Edge enumeration with topology + convexity attributes ---
-    # Use CadQuery's high-level `edge.ancestors(solid, "Face")` to
-    # find each edge's adjacent faces in one call. Convexity is
-    # determined by **sampling 16 points on a small circle around the
-    # edge midpoint, perpendicular to the edge tangent**, and asking
-    # the OCC solid classifier how many sit inside the solid:
-    #   < 50 % inside → convex (less than a hemisphere of solid)
-    #   > 50 % inside → concave (more than a hemisphere)
-    # This is robust without needing to reason about OCC face
-    # orientation flags. We keep only concave manifold straight edges,
-    # the standard fillet candidate set.
     solid_edges: list[dict] = []
     n_skip_geom = 0
     n_skip_nonmanifold = 0
@@ -3734,18 +3655,13 @@ def _apply_recognized_fillets_to_solid(
 
         solid_val = wp.val()
         solid_clf = BRepClass3d_SolidClassifier(solid_val.wrapped)
-        IN_STATE = 0  # TopAbs_IN
-
+        IN_STATE = 0
         CIRCLE_SAMPLES = 16
-        CIRCLE_EPS = 0.05  # mm — tight to stay close to the edge
+        CIRCLE_EPS = 0.05
 
         def _classify_convexity(midpoint, tangent) -> tuple[str, float]:
-            """Sample a small circle around `midpoint` perpendicular to
-            `tangent`. Return (convexity, in_fraction). Convexity is
-            "concave" / "convex" / "flat"."""
             arb = (
-                np.array([1.0, 0.0, 0.0])
-                if abs(tangent[0]) < 0.9
+                np.array([1.0, 0.0, 0.0]) if abs(tangent[0]) < 0.9
                 else np.array([0.0, 1.0, 0.0])
             )
             u = arb - tangent * float(np.dot(arb, tangent))
@@ -3776,7 +3692,6 @@ def _apply_recognized_fillets_to_solid(
             if geom_type != "LINE":
                 n_skip_geom += 1
                 continue
-            # Topology gate: must be a two-sided (manifold) edge.
             try:
                 adj_faces = edge.ancestors(solid_val, "Face").Faces()
             except Exception:
@@ -3792,7 +3707,13 @@ def _apply_recognized_fillets_to_solid(
             end = np.array([ep.x, ep.y, ep.z], dtype=float)
             direction = end - start
             length = float(np.linalg.norm(direction))
-            if length < 1e-6:
+            # Skip tiny degenerate edges: OCC's BRepFilletAPI refuses
+            # to fillet edges below its float tolerance, and the
+            # corner-tolerance match would otherwise pick them as
+            # near-coincident vertex pairs at body decomposition
+            # seams. 0.5 mm filters seam artifacts while preserving
+            # any real CAD edge on the parts we target.
+            if length < 0.5:
                 continue
             direction = direction / length
             midpoint = 0.5 * (start + end)
@@ -3803,13 +3724,11 @@ def _apply_recognized_fillets_to_solid(
             if convexity != "concave":
                 n_skip_convex += 1
                 continue
-            ts = np.linspace(0.0, 1.0, SAMPLES_PER_EDGE)
-            samples = start[None, :] + ts[:, None] * (end - start)[None, :]
             solid_edges.append({
                 "obj": edge,
                 "start": start, "end": end, "dir": direction,
-                "len": length, "samples": samples,
-                "midpoint": midpoint, "convexity": convexity,
+                "len": length, "midpoint": midpoint,
+                "convexity": convexity,
             })
     except Exception as exc:
         logger.debug("Edge enumeration with topology failed: %s", exc)
@@ -3826,136 +3745,62 @@ def _apply_recognized_fillets_to_solid(
         logger.info("Fillet pass: no concave manifold straight edges on solid")
         return wp, [], []
 
-    # --- Per-edge match: cluster assignment + per-edge measured radius ---
+    # --- Corner-to-corner segment matching ---
     matched: list[dict] = []
-    for ei, se in enumerate(solid_edges):
-        samples = se["samples"]
-        best_cluster_idx = -1
-        best_mean_d = float("inf")
-        best_max_d = float("inf")
-        for ci, c in enumerate(clusters):
-            d, _ = c["_tree"].query(samples, k=1)
-            md = float(np.mean(d))
-            if md < best_mean_d:
-                best_mean_d = md
-                best_max_d = float(np.max(d))
-                best_cluster_idx = ci
-        if best_cluster_idx < 0:
-            continue
-        if best_mean_d > MAX_EDGE_PROX_MM:
-            continue
-        # COVERAGE gate: the cluster must run along the WHOLE edge,
-        # not just sit near one end. Without this, a long unrelated
-        # concave edge with one end happening to fall near a fillet
-        # cluster passes the mean-distance check and gets a spurious
-        # fillet applied to it (the "two short fillets that don't
-        # exist" symptom). MAX_EDGE_PROX_MM applies to the WORST
-        # sample, not the average — every sample must be close.
-        if best_max_d > MAX_EDGE_PROX_MM:
-            continue
+    n_total_segments = 0
+    n_segments_no_edge = 0
+    for ci, c in enumerate(clusters):
+        segments = c.get("segments", []) or []
+        for si, seg in enumerate(segments):
+            n_total_segments += 1
+            ca = np.asarray(seg.get("corner_a"), dtype=float)
+            cb = np.asarray(seg.get("corner_b"), dtype=float)
+            seg_radius = float(seg.get("radius", 0.0) or 0.0)
+            if not (0.2 <= seg_radius <= 25.0):
+                continue
+            tol = CORNER_BASE_TOL_MM + CORNER_RADIUS_TOL * seg_radius
 
-        # Measure radius: perpendicular distances from edge LINE to
-        # nearby cluster vertices, restricted to vertices whose along-
-        # projection falls roughly within the edge span. The along
-        # filter matters because a stitched cluster can wrap an
-        # entire perimeter — without it, a short edge picks up
-        # cluster vertices from OTHER perimeter edges (high perp_d)
-        # and the median measured radius inflates wildly.
-        c = clusters[best_cluster_idx]
-        nearby_idx: set[int] = set()
-        for s in samples:
-            idxs = c["_tree"].query_ball_point(s, r=LOCAL_R_SEARCH_MM)
-            nearby_idx.update(int(k) for k in idxs)
-        if not nearby_idx:
-            continue
-        nearby = c["_verts"][list(nearby_idx)]
-        rel = nearby - se["start"]
-        along = rel @ se["dir"]
-        perp = rel - np.outer(along, se["dir"])
-        perp_d = np.linalg.norm(perp, axis=1)
-        # Drop vertices whose along-projection is outside the edge
-        # extent (with one search-radius of margin on each end).
-        along_margin = LOCAL_R_SEARCH_MM
-        m = (along >= -along_margin) & (along <= se["len"] + along_margin)
-        perp_d = perp_d[m]
-        if len(perp_d) < 3:
-            continue
-        # MEDIAN, not 90th percentile: robust to outlier perp
-        # distances from cluster vertices that ended up in the
-        # neighbourhood but belong to a different edge of the same
-        # perimeter loop.
-        radius = float(np.median(perp_d))
-        if not (0.2 <= radius <= 25.0):
-            continue
-        # Length gate: an edge shorter than r physically cannot
-        # carry a fillet of radius r. (Was 2·r; relaxed to r because
-        # a perimeter loop's short corner-spanning edges legitimately
-        # carry their own piece of the fillet — OCC tangent-chains
-        # the pieces into one continuous fillet at apply time.)
-        if se["len"] < radius:
-            continue
-        # Score: length per unit proximity. Long well-aligned edges
-        # outrank short edges sitting fully inside a cluster's vertex
-        # cloud — even when the short edge's mean distance is lower.
-        score = se["len"] / (best_mean_d + 1.0)
-        matched.append({
-            "edge_idx": ei,
-            "cluster_idx": best_cluster_idx,
-            "radius": radius,
-            "mean_d": best_mean_d,
-            "length": se["len"],
-            "score": score,
-        })
+            best_score = float("inf")
+            best_edge_idx = -1
+            for ei, se in enumerate(solid_edges):
+                d1 = (
+                    float(np.linalg.norm(se["start"] - ca)) +
+                    float(np.linalg.norm(se["end"] - cb))
+                )
+                d2 = (
+                    float(np.linalg.norm(se["start"] - cb)) +
+                    float(np.linalg.norm(se["end"] - ca))
+                )
+                d = min(d1, d2)
+                if d < best_score:
+                    best_score = d
+                    best_edge_idx = ei
+            if best_edge_idx < 0 or best_score > 2.0 * tol:
+                n_segments_no_edge += 1
+                continue
+            matched.append({
+                "edge_idx": best_edge_idx,
+                "cluster_idx": ci,
+                "segment_idx": si,
+                "radius": seg_radius,
+                "score": best_score,
+            })
 
     logger.info(
-        "Fillet matching: %d/%d straight edges matched to %d cluster(s), %.1fs",
-        len(matched), len(solid_edges), len(clusters),
+        "Corner matching: %d/%d segments matched to %d cluster(s) "
+        "across %d concave edges, %.1fs",
+        len(matched), n_total_segments, len(clusters), len(solid_edges),
         _time.time() - pass_start,
     )
 
-    # If nothing matched, dump per-cluster diagnostic so we can see
-    # WHY: the cluster's bbox, the nearest concave edge, and the
-    # mean/max sample distance for that edge. This is the data we
-    # need to tell whether the rebuilt solid's edges are in the
-    # right place at all. Each cluster dump is wrapped so a crash
-    # on one cluster (numerical issue with KDTree, etc.) doesn't
-    # take down the rest of the subprocess.
-    if not matched and solid_edges:
-        try:
-            logger.warning("Fillet matching: ZERO matches; nearest-edge dump:")
-            for ci, c in enumerate(clusters):
-                try:
-                    verts = c["_verts"]
-                    bmin = verts.min(axis=0); bmax = verts.max(axis=0)
-                    best = None
-                    for ei, se in enumerate(solid_edges):
-                        d, _ = c["_tree"].query(se["samples"], k=1)
-                        md = float(np.mean(d))
-                        mx = float(np.max(d))
-                        if best is None or md < best[0]:
-                            best = (md, mx, ei, se)
-                    if best is None:
-                        continue
-                    md, mx, ei, se = best
-                    logger.warning(
-                        "  cluster %d (gid=%s, %d verts) bbox "
-                        "(%.1f..%.1f, %.1f..%.1f, %.1f..%.1f): "
-                        "nearest edge #%d len=%.1f mean=%.2f max=%.2f "
-                        "start=(%.1f,%.1f,%.1f) end=(%.1f,%.1f,%.1f)",
-                        ci, c.get("group_id", ci), len(verts),
-                        bmin[0], bmax[0], bmin[1], bmax[1], bmin[2], bmax[2],
-                        ei, se["len"], md, mx,
-                        se["start"][0], se["start"][1], se["start"][2],
-                        se["end"][0], se["end"][1], se["end"][2],
-                    )
-                except Exception as _e:
-                    logger.warning(
-                        "  cluster %d dump crashed: %r", ci, _e,
-                    )
-        except Exception as _e:
-            logger.warning("nearest-edge dump aborted: %r", _e)
+    # If multiple segments matched the same edge, keep the best.
+    by_edge: dict[int, dict] = {}
+    for m in matched:
+        prev = by_edge.get(m["edge_idx"])
+        if prev is None or m["score"] < prev["score"]:
+            by_edge[m["edge_idx"]] = m
+    matched = list(by_edge.values())
 
-    # Diagnostics: one entry per cluster with what happened.
     cluster_edge_count: dict[int, int] = {}
     for m in matched:
         cluster_edge_count[m["cluster_idx"]] = (
@@ -3967,20 +3812,16 @@ def _apply_recognized_fillets_to_solid(
             out_diag.append({
                 "group_id": int(c.get("group_id", ci)),
                 "n_records": int(c.get("n_records", 0)),
-                "n_vertices": int(len(c["_verts"])),
+                "n_segments": int(len(c.get("segments", []) or [])),
                 "matched": n_e > 0,
                 "n_edges": n_e,
                 "reason": ("matched" if n_e > 0 else
-                           "no straight edge within proximity"),
+                           "no edge within corner tolerance"),
             })
 
     if not matched:
         return wp, [], []
 
-    # Bucket: (cluster_idx, radius band). Sub-cluster within each
-    # cluster's matched edges by radius (±15 %): a stitched group
-    # that mixes a 5 mm corner curl with 1.4 mm strip edges resolves
-    # into two separate fillet calls at the right radii.
     by_cluster: dict[int, list[dict]] = {}
     for m in matched:
         by_cluster.setdefault(m["cluster_idx"], []).append(m)
@@ -4002,22 +3843,10 @@ def _apply_recognized_fillets_to_solid(
         if current:
             buckets.append({"cluster_idx": ci, "members": current})
 
-    # Apply each bucket as one OCC fillet call. Radius = median of
-    # the members' measured radii (robust to one outlier edge).
     for bi, bucket in enumerate(buckets):
         members = bucket["members"]
         radii = [m["radius"] for m in members]
         r = float(np.median(radii))
-        # Cap radius at a fraction of the shortest member edge length.
-        # A fillet of radius r on an edge of length L needs ~r of
-        # clearance on each adjacent face; OCC refuses
-        # ("BRep_API: command not done") when r/L gets close to 1/2.
-        # 1/3 keeps us safely under the failure threshold for
-        # typical right-angle plate edges. The measured radius is
-        # also bounded above by the inflated cluster-spread (when a
-        # cluster covers both faces of a thin plate) — capping
-        # protects against that median getting pulled to ~plate
-        # thickness.
         shortest_len = min(
             solid_edges[m["edge_idx"]]["len"] for m in members
         )
@@ -4026,7 +3855,7 @@ def _apply_recognized_fillets_to_solid(
             r_orig = r
             r = r_cap
             logger.info(
-                "Bucket %d radius capped %.2f → %.2f (shortest edge %.2f mm)",
+                "Bucket %d radius capped %.2f -> %.2f (shortest edge %.2f mm)",
                 bi, r_orig, r, shortest_len,
             )
         edges_obj = [solid_edges[m["edge_idx"]]["obj"] for m in members]
@@ -4040,10 +3869,6 @@ def _apply_recognized_fillets_to_solid(
             vol_before = abs(float(wp.val().Volume()))
             wp_test = wp.newObject(edges_obj).fillet(r)
             vol_after = abs(float(wp_test.val().Volume()))
-            # Concave fillets ADD material (fill the inside corner),
-            # so a small volume gain is expected and correct. Reject
-            # only when the result is zero/negative or shows a wildly
-            # implausible change (> 5 %).
             if vol_after <= 0 or vol_after > vol_before * 1.05:
                 logger.warning(
                     "Bucket %d r=%.2f on %d edges rejected: vol %.0f -> %.0f "
@@ -4060,9 +3885,6 @@ def _apply_recognized_fillets_to_solid(
                     )
             if out_surfaces is not None:
                 for sp, ep in edge_pts:
-                    # Approximate axis: edge direction; axis_point: edge
-                    # midpoint offset by r along arbitrary perpendicular
-                    # (just for preview tessellation; not feature data).
                     edge_dir = ep - sp
                     edge_len = float(np.linalg.norm(edge_dir))
                     if edge_len < 1e-6:
@@ -4093,7 +3915,8 @@ def _apply_recognized_fillets_to_solid(
                 f"# Fillet r={r:.3f} on {len(edges_obj)} stitched edge(s)"
             )
             logger.info(
-                "Bucket %d (cluster %d): r=%.2fmm on %d edges, vol %.0f -> %.0f (dt=%.1fs)",
+                "Bucket %d (cluster %d): r=%.2fmm on %d edges, "
+                "vol %.0f -> %.0f (dt=%.1fs)",
                 bi, bucket["cluster_idx"], r, len(edges_obj),
                 vol_before, vol_after, _time.time() - t_bucket,
             )
@@ -4103,12 +3926,6 @@ def _apply_recognized_fillets_to_solid(
                 "falling back to per-edge",
                 bi, r, len(edges_obj), _time.time() - t_bucket, exc,
             )
-            # Per-edge fallback: maybe OCC refused the multi-edge
-            # tangent-chain but can handle each edge individually
-            # (especially the small-r ones). Try each member edge on
-            # its own. The fanout still produces multiple OCC
-            # operations rather than one tangent-chained call, but
-            # the user sees a fillet where they expected one.
             for sub_m in members:
                 sub_edge = solid_edges[sub_m["edge_idx"]]
                 sub_r = min(sub_m["radius"], sub_edge["len"] / 3.0)
@@ -4146,9 +3963,10 @@ def _apply_recognized_fillets_to_solid(
             continue
 
     logger.info(
-        "Fillet pass done: %d clusters, %d edges matched, %d buckets, %.1fs",
+        "Fillet pass done: %d clusters, %d edges matched, %d buckets, "
+        "%d segments missed, %.1fs",
         len(clusters), len(matched), len(buckets),
-        _time.time() - pass_start,
+        n_segments_no_edge, _time.time() - pass_start,
     )
     return wp, applied_steps, applied_script
 

@@ -78,6 +78,21 @@ def _quarter_cylinder_cluster(
     return np.array(verts, dtype=float)
 
 
+def _segment(axis_start: np.ndarray, axis_end: np.ndarray, radius: float) -> dict:
+    """Build a segment dict matching what job_queue's stitched stage
+    produces: corner-a / corner-b at the fillet axis endpoints, plus
+    radius."""
+    axis_dir = axis_end - axis_start
+    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-12)
+    return {
+        "corner_a": axis_start.tolist(),
+        "corner_b": axis_end.tolist(),
+        "axis_dir": axis_dir.tolist(),
+        "radius": float(radius),
+        "length": float(np.linalg.norm(axis_end - axis_start)),
+    }
+
+
 def test_box_with_pocket_fillets_one_floor_edge():
     """A box with a rectangular pocket has 8 concave edges (4 floor
     + 4 vertical-corner). A cluster on ONE floor edge should fillet
@@ -102,15 +117,20 @@ def test_box_with_pocket_fillets_one_floor_edge():
     r = 3.0
     axis_y = -10.0 + r  # -7
     axis_z = 5.0 + r    # 8
+    axis_start = np.array([-20.0, axis_y, axis_z])
+    axis_end = np.array([20.0, axis_y, axis_z])
     verts = _quarter_cylinder_cluster(
-        axis_start=np.array([-20.0, axis_y, axis_z]),
-        axis_end=np.array([20.0, axis_y, axis_z]),
+        axis_start=axis_start,
+        axis_end=axis_end,
         plane_a_normal=np.array([0.0, 1.0, 0.0]),   # wall faces +Y
         plane_b_normal=np.array([0.0, 0.0, 1.0]),   # floor faces +Z
         radius=r,
     )
 
-    stitched = [{"group_id": 0, "vertices": verts, "n_records": 1}]
+    stitched = [{
+        "group_id": 0, "vertices": verts, "n_records": 1,
+        "segments": [_segment(axis_start, axis_end, r)],
+    }]
     out_edges: list = []
     out_diag: list = []
     wp_after, steps, _ = _apply_recognized_fillets_to_solid(
@@ -160,15 +180,20 @@ def test_l_bracket_inside_corner():
     r = 2.0
     axis_y = 2.5 + r   # 4.5
     axis_z = 5.0 + r   # 7.0
+    axis_start = np.array([-50.0, axis_y, axis_z])
+    axis_end = np.array([50.0, axis_y, axis_z])
     verts = _quarter_cylinder_cluster(
-        axis_start=np.array([-50.0, axis_y, axis_z]),
-        axis_end=np.array([50.0, axis_y, axis_z]),
+        axis_start=axis_start,
+        axis_end=axis_end,
         plane_a_normal=np.array([0.0, 1.0, 0.0]),   # vert face +Y
         plane_b_normal=np.array([0.0, 0.0, 1.0]),    # horiz face +Z
         radius=r,
     )
 
-    stitched = [{"group_id": 0, "vertices": verts, "n_records": 1}]
+    stitched = [{
+        "group_id": 0, "vertices": verts, "n_records": 1,
+        "segments": [_segment(axis_start, axis_end, r)],
+    }]
     out_edges: list = []
     out_diag: list = []
     wp_after, steps, _ = _apply_recognized_fillets_to_solid(
@@ -202,7 +227,14 @@ def test_does_not_fillet_when_cluster_is_far_away():
     )
     # Cluster in the middle of nowhere (200 mm offset).
     verts = np.random.RandomState(0).randn(200, 3) + np.array([500, 500, 500])
-    stitched = [{"group_id": 0, "vertices": verts, "n_records": 1}]
+    stitched = [{
+        "group_id": 0, "vertices": verts, "n_records": 1,
+        "segments": [_segment(
+            np.array([500.0, 500.0, 500.0]),
+            np.array([510.0, 500.0, 500.0]),
+            1.0,
+        )],
+    }]
     _, steps, _ = _apply_recognized_fillets_to_solid(
         wp, stitched_clusters=stitched,
         out_edges=[], out_surfaces=[], out_diag=[],
@@ -249,25 +281,31 @@ def test_rackmount_mimic_three_plate_union():
     # Better: place the cluster along the inside-corner edge itself
     # at (39, y, -96), with vertex set as a quarter cylinder in the
     # +X, -Z direction (air quadrant).
+    right_start = np.array([39.0 - r, 50.0, -96.0 - r])
+    right_end = np.array([39.0 - r, 195.0, -96.0 - r])
+    left_start = np.array([-37.0 + r, 50.0, -96.0 - r])
+    left_end = np.array([-37.0 + r, 195.0, -96.0 - r])
     verts_right = _quarter_cylinder_cluster(
-        axis_start=np.array([39.0 - r, 50.0, -96.0 - r]),
-        axis_end=np.array([39.0 - r, 195.0, -96.0 - r]),
-        plane_a_normal=np.array([-1.0, 0.0, 0.0]),  # outer face -X
-        plane_b_normal=np.array([0.0, 0.0, -1.0]),   # base underside -Z
-        radius=r,
-        n_axial=80,
+        axis_start=right_start, axis_end=right_end,
+        plane_a_normal=np.array([-1.0, 0.0, 0.0]),
+        plane_b_normal=np.array([0.0, 0.0, -1.0]),
+        radius=r, n_axial=80,
     )
     verts_left = _quarter_cylinder_cluster(
-        axis_start=np.array([-37.0 + r, 50.0, -96.0 - r]),
-        axis_end=np.array([-37.0 + r, 195.0, -96.0 - r]),
-        plane_a_normal=np.array([1.0, 0.0, 0.0]),    # outer face +X
+        axis_start=left_start, axis_end=left_end,
+        plane_a_normal=np.array([1.0, 0.0, 0.0]),
         plane_b_normal=np.array([0.0, 0.0, -1.0]),
-        radius=r,
-        n_axial=80,
+        radius=r, n_axial=80,
     )
     stitched = [
-        {"group_id": 0, "vertices": verts_right, "n_records": 1},
-        {"group_id": 1, "vertices": verts_left, "n_records": 1},
+        {
+            "group_id": 0, "vertices": verts_right, "n_records": 1,
+            "segments": [_segment(right_start, right_end, r)],
+        },
+        {
+            "group_id": 1, "vertices": verts_left, "n_records": 1,
+            "segments": [_segment(left_start, left_end, r)],
+        },
     ]
 
     out_edges: list = []
@@ -310,32 +348,33 @@ def test_peel_then_rebuild_matches_long_corner_edge():
     # full 100 mm length — this is what `apply_blend_peel` followed
     # by stitching produces for a perimeter rolled edge.
     r = 2.0
+    long_start = np.array([-50.0, 2.5 + r, 5.0 + r])
+    long_end = np.array([50.0, 2.5 + r, 5.0 + r])
+    far_start = np.array([-50.0, -2.5 - r, 5.0 + r])
+    far_end = np.array([50.0, -2.5 - r, 5.0 + r])
     verts_long = _quarter_cylinder_cluster(
-        axis_start=np.array([-50.0, 2.5 + r, 5.0 + r]),
-        axis_end=np.array([50.0, 2.5 + r, 5.0 + r]),
+        axis_start=long_start, axis_end=long_end,
         plane_a_normal=np.array([0.0, 1.0, 0.0]),
         plane_b_normal=np.array([0.0, 0.0, 1.0]),
-        radius=r,
-        n_axial=100,
-        n_arc=12,
+        radius=r, n_axial=100, n_arc=12,
     )
-    # Add extra vertices simulating the SAME cluster wrapping a
-    # different corner (e.g. the -Y inside corner) — these are
-    # spatially far in y but were stitched into one perimeter group.
-    # The matcher must ignore these when measuring the +Y edge's
-    # local radius.
     verts_far = _quarter_cylinder_cluster(
-        axis_start=np.array([-50.0, -2.5 - r, 5.0 + r]),
-        axis_end=np.array([50.0, -2.5 - r, 5.0 + r]),
+        axis_start=far_start, axis_end=far_end,
         plane_a_normal=np.array([0.0, -1.0, 0.0]),
         plane_b_normal=np.array([0.0, 0.0, 1.0]),
-        radius=r,
-        n_axial=100,
-        n_arc=12,
+        radius=r, n_axial=100, n_arc=12,
     )
     verts_combined = np.vstack([verts_long, verts_far])
 
-    stitched = [{"group_id": 0, "vertices": verts_combined, "n_records": 2}]
+    # Two segments: one along the +Y corner, one along the -Y corner.
+    # The matcher should pick BOTH (one CAD edge per segment).
+    stitched = [{
+        "group_id": 0, "vertices": verts_combined, "n_records": 2,
+        "segments": [
+            _segment(long_start, long_end, r),
+            _segment(far_start, far_end, r),
+        ],
+    }]
     out_edges: list = []
     out_diag: list = []
     _, steps, _ = _apply_recognized_fillets_to_solid(
@@ -367,14 +406,18 @@ def test_does_not_fillet_short_corner_edge():
     # edges are 20 mm long, vertical-corner edges are 5 mm long.
     # The matcher MUST pick the 40 mm edge.
     r = 3.0
+    axis_start = np.array([-20.0, -7.0, 8.0])
+    axis_end = np.array([20.0, -7.0, 8.0])
     verts = _quarter_cylinder_cluster(
-        axis_start=np.array([-20.0, -7.0, 8.0]),
-        axis_end=np.array([20.0, -7.0, 8.0]),
+        axis_start=axis_start, axis_end=axis_end,
         plane_a_normal=np.array([0.0, 1.0, 0.0]),
         plane_b_normal=np.array([0.0, 0.0, 1.0]),
         radius=r,
     )
-    stitched = [{"group_id": 0, "vertices": verts, "n_records": 1}]
+    stitched = [{
+        "group_id": 0, "vertices": verts, "n_records": 1,
+        "segments": [_segment(axis_start, axis_end, r)],
+    }]
     out_edges: list = []
     _, steps, _ = _apply_recognized_fillets_to_solid(
         wp, stitched_clusters=stitched,

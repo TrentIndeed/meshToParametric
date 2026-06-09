@@ -392,6 +392,16 @@ def export_cadquery(
                     # Union into the accumulated solid for the next body
                     vol_before = abs(float(solid.val().Volume()))
                     solid = solid.union(body_solid)
+                    # Fuse near-coplanar adjacent faces left by the
+                    # irregular extruded polygons. Without this the
+                    # solid has many small face fragments that OCC's
+                    # BRepFilletAPI refuses to fillet ("BRep_API:
+                    # command not done"). .clean() invokes
+                    # ShapeUpgrade_UnifySameDomain internally.
+                    try:
+                        solid = solid.clean()
+                    except Exception as _clean_exc:
+                        logger.debug("Workplane.clean failed: %s", _clean_exc)
                     vol_after = abs(float(solid.val().Volume()))
                     v, f = _tessellate_solid(solid, fast=True)
                     steps.append(ConstructionStep(
@@ -2341,12 +2351,20 @@ def _build_from_mesh_and_cut_holes(
 def _simplify_profile(
     points: list[tuple[float, float]],
     tolerance: float = 0.1,
+    angle_thresh_deg: float = 8.0,
 ) -> list[tuple[float, float]]:
     """Simplify a 2D profile to only its corner vertices.
 
     Removes points that are collinear with their neighbors (on straight
-    edges), keeping only vertices where the direction changes significantly.
-    Also snaps coordinates to clean values.
+    edges), keeping only vertices where the direction changes by more
+    than ``angle_thresh_deg``. Also snaps coordinates to a coarse grid.
+
+    The default 8° threshold is intentionally more aggressive than the
+    older 2° (which kept too many near-collinear runs from the peeled
+    mesh's boundary noise — those become individual short edges on the
+    extruded solid that OCC's fillet kernel can't handle). 8° still
+    preserves chamfers (45°), corners (90°), and gentle arcs sampled
+    coarser than 8°.
     """
     if len(points) < 3:
         return points
@@ -2368,8 +2386,6 @@ def _simplify_profile(
     if len(deduped) < 3:
         return deduped
 
-    # Step 2: Keep corners + curve points (direction change > 2°)
-    # Low threshold preserves gentle arcs while removing straight-edge noise.
     pts = deduped
     corners = []
     n = len(pts)
@@ -2382,7 +2398,7 @@ def _simplify_profile(
         cross = v1[0] * v2[1] - v1[1] * v2[0]
         dot = v1[0] * v2[0] + v1[1] * v2[1]
         angle = abs(np.degrees(np.arctan2(cross, dot)))
-        if angle > 2.0:
+        if angle > angle_thresh_deg:
             corners.append(p1)
 
     if len(corners) < 3:

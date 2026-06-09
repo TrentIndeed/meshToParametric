@@ -3746,6 +3746,17 @@ def _apply_recognized_fillets_to_solid(
         return wp, [], []
 
     # --- Corner-to-corner segment matching ---
+    # "In a general area" — for each segment, find the concave edge
+    # whose endpoints land closest to the segment's two corners,
+    # with a DIRECTION-ALIGNMENT BONUS that nudges ties toward
+    # edges whose direction matches the segment's axis_dir. We do
+    # NOT require a snap to a specific solid vertex; the corner
+    # point and the CAD edge endpoint can be up to ``2·tol`` apart
+    # in summed distance, where tol = 8 mm + 2·r per corner. This
+    # is the "general area" the user described.
+    DIR_BONUS_MM = 4.0  # subtract this from score when axis-aligned
+    DIR_DOT_MIN = 0.7
+
     matched: list[dict] = []
     n_total_segments = 0
     n_segments_no_edge = 0
@@ -3760,6 +3771,15 @@ def _apply_recognized_fillets_to_solid(
                 continue
             tol = CORNER_BASE_TOL_MM + CORNER_RADIUS_TOL * seg_radius
 
+            ad_raw = seg.get("axis_dir")
+            axis_dir = (
+                np.asarray(ad_raw, dtype=float)
+                if ad_raw is not None else None
+            )
+            if axis_dir is not None:
+                n_axis = float(np.linalg.norm(axis_dir))
+                axis_dir = axis_dir / n_axis if n_axis > 1e-9 else None
+
             best_score = float("inf")
             best_edge_idx = -1
             for ei, se in enumerate(solid_edges):
@@ -3772,6 +3792,17 @@ def _apply_recognized_fillets_to_solid(
                     float(np.linalg.norm(se["end"] - ca))
                 )
                 d = min(d1, d2)
+                # Alignment bonus: shave a few mm off the score when
+                # the edge direction matches the segment axis. This
+                # lets a slightly-farther-but-aligned edge beat a
+                # closer-but-perpendicular one, which is the right
+                # call when two candidate edges land close to the
+                # corner pair (e.g. the box-with-pocket convex rim
+                # vs the concave pocket-floor edge).
+                if axis_dir is not None:
+                    align = abs(float(np.dot(se["dir"], axis_dir)))
+                    if align >= DIR_DOT_MIN:
+                        d = max(0.0, d - DIR_BONUS_MM)
                 if d < best_score:
                     best_score = d
                     best_edge_idx = ei

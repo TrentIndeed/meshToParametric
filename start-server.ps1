@@ -7,12 +7,17 @@ Set-Location -Path $PSScriptRoot
 $env:PYTHONIOENCODING = "utf-8"
 
 # Free port 8080 if a previous instance is still bound to it.
-$existing = (Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue).OwningProcess
-if ($existing) {
-    Write-Host "Stopping existing process on port 8080 (PID $existing)..."
-    Stop-Process -Id $existing -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
+# Use netstat instead of Get-NetTCPConnection — Get-NetTCPConnection
+# sometimes misses zombie listeners that another snapshot interface
+# (netstat) still sees, and the server then fails to bind with WSAEADDRINUSE
+# even though Get-NetTCPConnection reported nothing.
+$listening = netstat -ano | Select-String ":8080\s+0\.0\.0\.0:0\s+LISTENING\s+(\d+)"
+foreach ($m in $listening) {
+    $pidStr = $m.Matches[0].Groups[1].Value
+    Write-Host "Stopping existing process on port 8080 (PID $pidStr)..."
+    Stop-Process -Id ([int]$pidStr) -Force -ErrorAction SilentlyContinue
 }
+if ($listening) { Start-Sleep -Seconds 1 }
 
 Write-Host "Starting Paramesh AI server at http://127.0.0.1:8080 ..."
 Write-Host "Press Ctrl+C to stop."

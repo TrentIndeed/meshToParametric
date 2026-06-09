@@ -106,6 +106,7 @@ def export_cadquery(
     use_llm: bool = True,
     num_variants: int = 1,
     body_results: list | None = None,
+    body_blend_records: list[list[dict]] | None = None,
     stitched_clusters: list[dict] | None = None,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
@@ -135,6 +136,47 @@ def export_cadquery(
     base_feature = feature_tree.features[0]
     extrude_dir = np.array(base_feature.direction)
     depth = base_feature.depth
+
+    # --- Peel fillets from each body's sub_cleaned mesh BEFORE the
+    # profile gets extracted.  apply_blend_peel projects each fillet
+    # face's vertices onto its sharp-corner line and drops the
+    # resulting degenerate triangles, leaving a mesh with hard
+    # corners exactly where the original fillets sat.  Once those
+    # corners get extruded as the rebuilt solid's edges, the
+    # stitched-cluster vertices line up with them and the matcher can
+    # actually apply fillets at apply time.  Without this peel the
+    # rebuilt solid's edges are at body-decomposition seams, nowhere
+    # near where the original fillets ran.
+    peeled_body_results: list = []
+    if body_results and body_blend_records and len(body_results) == len(body_blend_records):
+        try:
+            from mesh2param.pipeline.peel_via_topology import apply_blend_peel
+            for (body, sub_cleaned, body_tree), blend_recs in zip(
+                body_results, body_blend_records,
+            ):
+                fillet_recs = [r for r in (blend_recs or []) if r.get("kind") == "fillet"]
+                if fillet_recs:
+                    try:
+                        peeled_sub = apply_blend_peel(sub_cleaned, fillet_recs)
+                    except Exception as _peel_exc:
+                        logger.warning(
+                            "apply_blend_peel failed on a body (%s); using unpeeled mesh",
+                            _peel_exc,
+                        )
+                        peeled_sub = sub_cleaned
+                else:
+                    peeled_sub = sub_cleaned
+                peeled_body_results.append((body, peeled_sub, body_tree))
+            logger.info(
+                "Peeled %d body sub-meshes for sharp-corner rebuild",
+                len(peeled_body_results),
+            )
+            body_results = peeled_body_results
+        except Exception as _wrap_exc:
+            logger.warning(
+                "Per-body peel wrapper failed (%s); using unpeeled bodies",
+                _wrap_exc,
+            )
 
     if body_results and len(body_results) > 0:
         primary_body, primary_sub, primary_tree = body_results[0]
@@ -3796,8 +3838,13 @@ def _apply_recognized_fillets_to_solid(
         if best_max_d > MAX_EDGE_PROX_MM:
             continue
 
-        # Measure radius: perpendicular distances from edge LINE
-        # to nearby cluster vertices.
+        # Measure radius: perpendicular distances from edge LINE to
+        # nearby cluster vertices, restricted to vertices whose along-
+        # projection falls roughly within the edge span. The along
+        # filter matters because a stitched cluster can wrap an
+        # entire perimeter — without it, a short edge picks up
+        # cluster vertices from OTHER perimeter edges (high perp_d)
+        # and the median measured radius inflates wildly.
         c = clusters[best_cluster_idx]
         nearby_idx: set[int] = set()
         for s in samples:
@@ -3810,16 +3857,26 @@ def _apply_recognized_fillets_to_solid(
         along = rel @ se["dir"]
         perp = rel - np.outer(along, se["dir"])
         perp_d = np.linalg.norm(perp, axis=1)
+        # Drop vertices whose along-projection is outside the edge
+        # extent (with one search-radius of margin on each end).
+        along_margin = LOCAL_R_SEARCH_MM
+        m = (along >= -along_margin) & (along <= se["len"] + along_margin)
+        perp_d = perp_d[m]
         if len(perp_d) < 3:
             continue
-        radius = float(np.percentile(perp_d, 90))
+        # MEDIAN, not 90th percentile: robust to outlier perp
+        # distances from cluster vertices that ended up in the
+        # neighbourhood but belong to a different edge of the same
+        # perimeter loop.
+        radius = float(np.median(perp_d))
         if not (0.2 <= radius <= 25.0):
             continue
-        # Length gate: an edge shorter than 2·r physically cannot
-        # carry a fillet of radius r. This is the single biggest fix
-        # for the "fillets at corners" symptom: short corner-meeting
-        # edges fail this test and never reach the apply pass.
-        if se["len"] < 2.0 * radius:
+        # Length gate: an edge shorter than r physically cannot
+        # carry a fillet of radius r. (Was 2·r; relaxed to r because
+        # a perimeter loop's short corner-spanning edges legitimately
+        # carry their own piece of the fillet — OCC tangent-chains
+        # the pieces into one continuous fillet at apply time.)
+        if se["len"] < radius:
             continue
         # Score: length per unit proximity. Long well-aligned edges
         # outrank short edges sitting fully inside a cluster's vertex
@@ -3935,6 +3992,27 @@ def _apply_recognized_fillets_to_solid(
         members = bucket["members"]
         radii = [m["radius"] for m in members]
         r = float(np.median(radii))
+        # Cap radius at a fraction of the shortest member edge length.
+        # A fillet of radius r on an edge of length L needs ~r of
+        # clearance on each adjacent face; OCC refuses
+        # ("BRep_API: command not done") when r/L gets close to 1/2.
+        # 1/3 keeps us safely under the failure threshold for
+        # typical right-angle plate edges. The measured radius is
+        # also bounded above by the inflated cluster-spread (when a
+        # cluster covers both faces of a thin plate) — capping
+        # protects against that median getting pulled to ~plate
+        # thickness.
+        shortest_len = min(
+            solid_edges[m["edge_idx"]]["len"] for m in members
+        )
+        r_cap = max(0.2, shortest_len / 3.0)
+        if r > r_cap:
+            r_orig = r
+            r = r_cap
+            logger.info(
+                "Bucket %d radius capped %.2f → %.2f (shortest edge %.2f mm)",
+                bi, r_orig, r, shortest_len,
+            )
         edges_obj = [solid_edges[m["edge_idx"]]["obj"] for m in members]
         edge_pts = [
             (solid_edges[m["edge_idx"]]["start"],
@@ -3951,9 +4029,11 @@ def _apply_recognized_fillets_to_solid(
             # only when the result is zero/negative or shows a wildly
             # implausible change (> 5 %).
             if vol_after <= 0 or vol_after > vol_before * 1.05:
-                logger.debug(
-                    "Bucket %d r=%.2f on %d edges rejected: vol %.0f -> %.0f",
+                logger.warning(
+                    "Bucket %d r=%.2f on %d edges rejected: vol %.0f -> %.0f "
+                    "(gain %.1f%% > 5%%)",
                     bi, r, len(edges_obj), vol_before, vol_after,
+                    (vol_after - vol_before) / max(vol_before, 1) * 100.0,
                 )
                 continue
             wp = wp_test
@@ -4002,10 +4082,51 @@ def _apply_recognized_fillets_to_solid(
                 vol_before, vol_after, _time.time() - t_bucket,
             )
         except Exception as exc:
-            logger.debug(
-                "Bucket %d r=%.2f failed after %.1fs: %s",
-                bi, r, _time.time() - t_bucket, exc,
+            logger.warning(
+                "Bucket %d r=%.2f on %d edges failed after %.1fs: %s; "
+                "falling back to per-edge",
+                bi, r, len(edges_obj), _time.time() - t_bucket, exc,
             )
+            # Per-edge fallback: maybe OCC refused the multi-edge
+            # tangent-chain but can handle each edge individually
+            # (especially the small-r ones). Try each member edge on
+            # its own. The fanout still produces multiple OCC
+            # operations rather than one tangent-chained call, but
+            # the user sees a fillet where they expected one.
+            for sub_m in members:
+                sub_edge = solid_edges[sub_m["edge_idx"]]
+                sub_r = min(sub_m["radius"], sub_edge["len"] / 3.0)
+                if sub_r < 0.2:
+                    continue
+                try:
+                    vol_before2 = abs(float(wp.val().Volume()))
+                    wp_test2 = wp.newObject([sub_edge["obj"]]).fillet(sub_r)
+                    vol_after2 = abs(float(wp_test2.val().Volume()))
+                    if vol_after2 <= 0 or vol_after2 > vol_before2 * 1.05:
+                        continue
+                    wp = wp_test2
+                    if out_edges is not None:
+                        out_edges.append([
+                            list(map(float, sub_edge["start"])),
+                            list(map(float, sub_edge["end"])),
+                        ])
+                    v2, f2 = _tessellate_solid(wp, fast=True)
+                    applied_steps.append(ConstructionStep(
+                        name=f"Fillet (r={sub_r:.2f}mm) x1",
+                        tess_vertices=v2, tess_faces=f2, volume=vol_after2,
+                    ))
+                    applied_script.append(
+                        f"# Fillet r={sub_r:.3f} on 1 edge (per-edge fallback)"
+                    )
+                    logger.info(
+                        "Bucket %d fallback: r=%.2fmm on 1 edge, vol %.0f -> %.0f",
+                        bi, sub_r, vol_before2, vol_after2,
+                    )
+                except Exception as exc2:
+                    logger.warning(
+                        "Bucket %d per-edge fallback r=%.2f failed: %s",
+                        bi, sub_r, exc2,
+                    )
             continue
 
     logger.info(

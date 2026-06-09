@@ -294,6 +294,63 @@ def test_rackmount_mimic_three_plate_union():
     )
 
 
+def test_peel_then_rebuild_matches_long_corner_edge():
+    """When the original mesh's perimeter wrap fillet shows up as a
+    stitched cluster with vertices spanning a wide bbox, and the
+    rebuilt solid has a short cross-thickness edge near the corner,
+    the median-radius + along-extent-filtered measurement must
+    correctly read the local fillet radius (not the cluster's
+    full perpendicular spread) so the length gate doesn't kill the
+    match. This is the regression for the rackmount-mimic failure
+    after peel."""
+    horiz = cq.Workplane("XY").box(100, 30, 5).translate((0, 0, 2.5))
+    vert = cq.Workplane("XY").box(100, 5, 50).translate((0, 0, 30))
+    solid = horiz.union(vert.val())
+    # Synthesise a cluster that wraps the +Y inside-corner along the
+    # full 100 mm length — this is what `apply_blend_peel` followed
+    # by stitching produces for a perimeter rolled edge.
+    r = 2.0
+    verts_long = _quarter_cylinder_cluster(
+        axis_start=np.array([-50.0, 2.5 + r, 5.0 + r]),
+        axis_end=np.array([50.0, 2.5 + r, 5.0 + r]),
+        plane_a_normal=np.array([0.0, 1.0, 0.0]),
+        plane_b_normal=np.array([0.0, 0.0, 1.0]),
+        radius=r,
+        n_axial=100,
+        n_arc=12,
+    )
+    # Add extra vertices simulating the SAME cluster wrapping a
+    # different corner (e.g. the -Y inside corner) — these are
+    # spatially far in y but were stitched into one perimeter group.
+    # The matcher must ignore these when measuring the +Y edge's
+    # local radius.
+    verts_far = _quarter_cylinder_cluster(
+        axis_start=np.array([-50.0, -2.5 - r, 5.0 + r]),
+        axis_end=np.array([50.0, -2.5 - r, 5.0 + r]),
+        plane_a_normal=np.array([0.0, -1.0, 0.0]),
+        plane_b_normal=np.array([0.0, 0.0, 1.0]),
+        radius=r,
+        n_axial=100,
+        n_arc=12,
+    )
+    verts_combined = np.vstack([verts_long, verts_far])
+
+    stitched = [{"group_id": 0, "vertices": verts_combined, "n_records": 2}]
+    out_edges: list = []
+    out_diag: list = []
+    _, steps, _ = _apply_recognized_fillets_to_solid(
+        solid, stitched_clusters=stitched,
+        out_edges=out_edges, out_surfaces=[], out_diag=out_diag,
+    )
+    assert len(steps) >= 1, f"no fillet applied; diag={out_diag}"
+    # The longest matched edge must be the 100 mm corner.
+    longest = max(
+        float(np.linalg.norm(np.asarray(ep) - np.asarray(sp)))
+        for sp, ep in out_edges
+    )
+    assert longest > 90.0, f"longest matched edge only {longest} mm; want >= 100"
+
+
 def test_does_not_fillet_short_corner_edge():
     """A cluster positioned at a long edge must NOT cause the
     matcher to instead pick the short corner-meeting edges. This is

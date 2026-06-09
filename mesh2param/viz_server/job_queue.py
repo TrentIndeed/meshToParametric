@@ -1356,15 +1356,45 @@ class JobQueue:
         # can do vertex-proximity edge matching with per-edge measured
         # radii. No upstream radius value gets passed through.
         stitched_clusters = list(getattr(job, '_stitched_clusters', []) or [])
+        # Per-body blend records: each body's topo_blends list. The
+        # export stage uses these to PEEL the fillet faces off each
+        # body's sub_cleaned mesh before profile extraction, so the
+        # rebuilt extruded solid has sharp corners exactly where the
+        # original fillets sat — and the stitched-cluster vertices
+        # then land on the rebuilt solid's edges, letting the matcher
+        # actually apply fillets.
+        body_blend_records: list[list[dict]] = []
+        for _bst in body_stage_data:
+            topo_blends_for_body = _bst[7] if len(_bst) > 7 else []
+            # Strip non-serializable / non-needed fields; keep the
+            # minimum apply_blend_peel needs.
+            slim = []
+            for rec in topo_blends_for_body:
+                if rec.get("kind") not in ("fillet", "chamfer"):
+                    continue
+                if rec.get("axis_dir") is None or rec.get("axis_point") is None:
+                    continue
+                fi = rec.get("face_indices")
+                if fi is None or len(fi) == 0:
+                    continue
+                slim.append({
+                    "kind": rec["kind"],
+                    "axis_dir": np.asarray(rec["axis_dir"], dtype=float),
+                    "axis_point": np.asarray(rec["axis_point"], dtype=float),
+                    "face_indices": np.asarray(fi, dtype=np.int64),
+                })
+            body_blend_records.append(slim)
         logger.info(
-            "stitched-clusters → export: %d group(s) feeding fillet apply",
+            "stitched-clusters → export: %d group(s) feeding fillet apply; "
+            "per-body blends to peel: %s",
             len(stitched_clusters),
+            [len(b) for b in body_blend_records],
         )
         try:
             tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             pickle.dump(
                 (tree, cleaned, all_body_results, decomposition,
-                 stitched_clusters),
+                 stitched_clusters, body_blend_records),
                 tmp_in,
             )
             tmp_in.close()
@@ -1386,10 +1416,11 @@ logging.basicConfig(
 sys.path.insert(0, '.')
 try:
     with open(r'{tmp_in.name}', 'rb') as f:
-        tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
+        tree, cleaned, all_body_results, decomposition, stitched_clusters, body_blend_records = pickle.load(f)
     from mesh2param.pipeline.export_cadquery import export_cadquery
     result = export_cadquery(tree, cleaned, use_llm=False, num_variants={num_variants},
                              body_results=all_body_results if decomposition.is_multi_body else None,
+                             body_blend_records=body_blend_records if decomposition.is_multi_body else None,
                              stitched_clusters=stitched_clusters)
     result.solid = None
     with open(r'{tmp_out.name}', 'wb') as f:

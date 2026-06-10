@@ -148,10 +148,30 @@ sys.path.insert(0, '.')
 import cadquery as cq
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCP.TopoDS import TopoDS
+from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.GeomAbs import GeomAbs_Cylinder
 
 solid = cq.importers.importStep(r'{step_path}')
 val = solid.val()
 bb = val.BoundingBox()
+
+# Every cylindrical face: bores, counterbores, fillet barrels.
+cylinders = []
+exp_c = TopExp_Explorer(val.wrapped, TopAbs_FACE)
+while exp_c.More():
+    face = TopoDS.Face_s(exp_c.Current())
+    ad = BRepAdaptor_Surface(face)
+    if ad.GetType() == GeomAbs_Cylinder:
+        cyl = ad.Cylinder()
+        loc = cyl.Axis().Location()
+        d = cyl.Axis().Direction()
+        cylinders.append({{
+            'radius': float(cyl.Radius()),
+            'axis_point': [loc.X(), loc.Y(), loc.Z()],
+            'axis_dir': [d.X(), d.Y(), d.Z()],
+        }})
+    exp_c.Next()
 
 exp = TopExp_Explorer(val.wrapped, TopAbs_FACE)
 n_faces = 0
@@ -173,6 +193,7 @@ metrics = {{
     'bbox_max': [bb.xmax, bb.ymax, bb.zmax],
     'n_faces': n_faces,
     'n_edges': n_edges,
+    'cylinders': cylinders,
     'tess_verts': np.array([(v.x, v.y, v.z) for v in tess[0]], dtype=np.float64),
     'tess_faces': np.array(tess[1], dtype=np.int64),
 }}
@@ -267,6 +288,49 @@ class TestStepComparison:
         assert cad_faces >= 18, (
             f"Only {cad_faces} faces — expected more from hole cuts "
             f"(reference has {ref_faces})"
+        )
+
+    def test_hole_accuracy(self, name, mesh_path, step_path):
+        """Recognized holes must land on reference bores with the right
+        radius and axis.
+
+        Aggregate volume error hides these failures: a bore fitted 2mm
+        oversize barely moves volume but makes the part unusable. The
+        0.35mm bound is tight enough to catch the old max-of-group
+        radius rule (0.44mm error on Mesh1) while current accuracy is
+        ~0.17mm.
+        """
+        from mesh2param.pipeline.metrics import (
+            match_holes_to_reference, recognized_holes,
+        )
+
+        tree, cleaned = _run_pipeline(mesh_path)
+        holes = recognized_holes(tree)
+        ref = _load_reference_step(step_path)
+        report = match_holes_to_reference(holes, ref["cylinders"])
+
+        print(f"\n  {name}: {report['n_holes']} holes, "
+              f"{report['n_matched']} matched, "
+              f"{report['n_unmatched']} unmatched, "
+              f"{report['n_axis_wrong']} wrong axis, "
+              f"max radius error {report['max_radius_error']:.3f} mm")
+        for m in report["matched"]:
+            print(f"    {m['type']}: r={m['radius']:.3f} vs ref "
+                  f"{m['ref_radius']:.3f} (err {m['radius_error']:.3f}, "
+                  f"axis_dot {m['axis_dot']:.2f})")
+
+        assert report["n_holes"] > 0, "No holes recognized at all"
+        assert report["n_unmatched"] == 0, (
+            f"{report['n_unmatched']} recognized holes have no colocated "
+            f"reference cylinder: {report['unmatched']}"
+        )
+        assert report["n_axis_wrong"] == 0, (
+            "Holes matched a reference bore but with the wrong axis "
+            "direction (thin-plate override regression?)"
+        )
+        assert report["max_radius_error"] < 0.35, (
+            f"Max hole radius error {report['max_radius_error']:.3f} mm "
+            f">= 0.35 mm"
         )
 
     @pytest.mark.visual

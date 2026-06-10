@@ -408,6 +408,7 @@ def _group_symmetric_holes(
         face_chunks: list[np.ndarray] = []
         centers: list[list[float]] = []
         radii: list[float] = []
+        rms_vals: list[float] = []
         for idx in indices:
             f, rids = hole_features[idx]
             all_rids.update(rids)
@@ -416,19 +417,24 @@ def _group_symmetric_holes(
             if c is not None:
                 centers.append([float(x) for x in c])
             radii.append(float(f.sketch_geometry.get("radius", 0.0)))
+            rms_vals.append(float(f.sketch_geometry.get("fit_rms", float("inf"))))
         merged_faces = np.concatenate(face_chunks) if face_chunks else seed_feat.face_indices
         merged_sketch = dict(seed_feat.sketch_geometry)
         merged_sketch["centers"] = centers
         merged_sketch["count"] = len(centers)
-        # Unify radius across the group. The cylinder fitter under-estimates
-        # radius when the visible cylinder patch is short (its arc covers
-        # less than ~270°): the algebraic least-squares fit converges to a
-        # local minimum below the true rolling-cylinder radius. Take the
-        # MAX of the group's fitted radii so a 4-tab pattern where one
-        # tab measured 6mm and another measured 4mm comes out as the
-        # 6mm the user actually drilled.
+        # Unify radius across the group: take the radius of the member
+        # with the LOWEST fit RMS. Both known failure modes produce a
+        # high-RMS fit — short-arc patches that under-estimate radius,
+        # and over-merged regions (bore fused with a neighboring
+        # cylinder) that inflate it — while a clean 360-degree bore
+        # fits with near-zero RMS. The previous max(radii) rule
+        # rewarded the over-merged fit. Fall back to max() when no
+        # member carries an RMS (older callers).
         if radii:
-            merged_sketch["radius"] = max(radii)
+            if rms_vals and np.isfinite(min(rms_vals)):
+                merged_sketch["radius"] = radii[int(np.argmin(rms_vals))]
+            else:
+                merged_sketch["radius"] = max(radii)
         merged_feat = Feature(
             type=seed_feat.type,
             face_indices=merged_faces,
@@ -555,10 +561,27 @@ def _find_holes(
         axis_dir = best_pa * np.sign(np.dot(axis_dir, best_pa))
 
         # Override snapped axis with the body's thin direction when the
-        # body is plate-shaped. The cylinder fit picked SOME axis, but
-        # for a hole drilled through a plate face the only physically
-        # plausible axis is the thin one.
-        if is_thin_plate:
+        # body is plate-shaped — but only when the geometry doesn't
+        # clearly contradict it. Plates can carry SIDE holes too (e.g.
+        # Body1Mesh's two Z-axis tab holes), and blindly forcing the
+        # thin axis cut them along the wrong direction. The radial
+        # spread of the region's vertices about an axis is near-zero
+        # for the true axis on a >=270-degree wrap, so compare the
+        # fitted axis against the thin-axis hypothesis and only
+        # override when the thin axis explains the geometry comparably.
+        if is_thin_plate and abs(np.dot(axis_dir, thin_axis)) < 0.7:
+            hole_verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
+            res_fitted = _axis_radial_spread(hole_verts, axis_dir)
+            res_thin = _axis_radial_spread(hole_verts, thin_axis)
+            if res_thin <= res_fitted * 1.5:
+                axis_dir = thin_axis * np.sign(np.dot(axis_dir, thin_axis) or 1.0)
+            else:
+                logger.debug(
+                    "Keeping fitted hole axis %s over thin-plate axis %s "
+                    "(radial spread %.3f vs %.3f)",
+                    axis_dir.tolist(), thin_axis.tolist(), res_fitted, res_thin,
+                )
+        elif is_thin_plate:
             axis_dir = thin_axis * np.sign(np.dot(axis_dir, thin_axis) or 1.0)
 
         # Determine through vs blind. A cylindrical region that wraps
@@ -583,6 +606,9 @@ def _find_holes(
                         or region.vertices.mean(axis=0).tolist()
                     ),
                     "radius": radius,
+                    # Carried so symmetric-hole grouping can prefer the
+                    # cleanest fit's radius over the worst one.
+                    "fit_rms": float(f.rms_error),
                 },
                 depth=height,
                 direction=-axis_dir,  # holes cut inward
@@ -592,6 +618,19 @@ def _find_holes(
         ))
 
     return results
+
+
+def _axis_radial_spread(verts: np.ndarray, axis: np.ndarray) -> float:
+    """Std of radial distances about the axis line through the centroid.
+
+    For a full cylindrical wrap the centroid lies on the true axis and
+    every vertex sits at radius r, so the spread is ~tessellation noise;
+    for a wrong axis the distances vary by the cylinder height.
+    """
+    v = verts - verts.mean(axis=0)
+    t = v @ axis
+    perp = v - np.outer(t, axis)
+    return float(np.std(np.linalg.norm(perp, axis=1)))
 
 
 def _cylinder_angular_span(fitted: FittedSurface, region: FaceRegion) -> float:

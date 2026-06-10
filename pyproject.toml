@@ -32,6 +32,7 @@ dependencies = [
 dev = [
     "pytest>=7.4",
     "pytest-cov",
+    "pytest-timeout",
     "ruff>=0.4",
     "httpx>=0.27",
 ]
@@ -44,6 +45,10 @@ include = ["mesh2param*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Kill any single test that runs >10 min — CadQuery/OCC boolean ops can hang
+# on meshes the pipeline doesn't fully support yet.
+timeout = 600
+timeout_method = "thread"
 markers = [
     "visual: tests that generate visualization output",
     "slow: tests that take > 10s (e.g. Onshape API)",

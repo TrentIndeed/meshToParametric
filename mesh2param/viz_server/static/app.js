@@ -1595,6 +1595,9 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
         filename: pendingFile?.name || 'mesh',
         num_variants: parseInt(document.getElementById('variant-slider')?.value || '1'),
         target_dims: window._editedDims || null,
+        // Authoritative at submit time — avoids the post-submit POST
+        // racing the worker (and a stale page never toggling at all).
+        step_through: document.getElementById('step-through-cb')?.checked ?? true,
       }),
     });
     if (!res.ok) { console.error('[analyze] /api/run-pipeline HTTP', res.status); alert('Pipeline request failed: HTTP ' + res.status); loading.classList.remove('show'); return; }

@@ -525,6 +525,11 @@ async def run_pipeline(request: Request, body: dict):
     job = queue.get(job_id)
     if job and target_dims:
         job._target_dims = target_dims
+    # Step-through preference applied AT SUBMIT (the separate
+    # per-job endpoint remains for mid-run toggling).
+    step_through = body.get("step_through")
+    if job is not None and step_through is not None:
+        job.step_through = bool(step_through)
     logger.info("Pipeline queued: job_id=%s filename=%r ip=%s plan=%s variants=%d", job_id, filename, ip, plan, num_variants)
 
     # Set free trial cookie for guest users (marks the 1 free generation as used)

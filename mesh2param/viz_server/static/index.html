@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -51,7 +51,7 @@ body {
   height: 100vh;
 }
 
-/* ── Top Bar ── */
+/* â”€â”€ Top Bar â”€â”€ */
 #topbar {
   position: fixed; top: 0; left: 0; right: 0; height: 48px;
   background: var(--bg-secondary);
@@ -112,7 +112,7 @@ body {
 #topbar .status-dot.processing { background: var(--orange); animation: pulse 1s infinite; }
 @keyframes pulse { 50% { opacity: 0.5; } }
 
-/* ── Feature Tree (left sidebar) — resizable ── */
+/* â”€â”€ Feature Tree (left sidebar) â€” resizable â”€â”€ */
 #sidebar {
   position: fixed; top: 48px; left: 0; bottom: 80px; width: 240px;
   min-width: 48px; max-width: 400px;
@@ -162,7 +162,7 @@ body {
   overflow: hidden; text-overflow: ellipsis;
 }
 
-/* ── Drag handles for resizing ── */
+/* â”€â”€ Drag handles for resizing â”€â”€ */
 .resize-handle {
   position: fixed; top: 48px; bottom: 80px; width: 5px;
   cursor: col-resize; z-index: 55; background: transparent;
@@ -171,12 +171,12 @@ body {
 #resize-left { left: 240px; }
 #resize-right { right: 300px; }
 
-/* ── 3D Viewer ── */
+/* â”€â”€ 3D Viewer â”€â”€ */
 #viewer {
   position: fixed; top: 48px; left: 240px; right: 300px; bottom: 80px;
 }
 
-/* ── AI Chat Panel (right sidebar) — resizable ── */
+/* â”€â”€ AI Chat Panel (right sidebar) â€” resizable â”€â”€ */
 #chat-panel {
   position: fixed; top: 48px; right: 0; bottom: 80px; width: 300px;
   min-width: 0; max-width: 500px;
@@ -238,7 +238,7 @@ body {
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* ── Settings Modal ── */
+/* â”€â”€ Settings Modal â”€â”€ */
 #settings-modal {
   position: fixed; inset: 0; background: rgba(0,0,0,0.4);
   display: none; align-items: center; justify-content: center; z-index: 300;
@@ -288,7 +288,7 @@ body {
 }
 .settings-row .val { color: var(--text-muted); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 
-/* ── Inline Dimension Panel ── */
+/* â”€â”€ Inline Dimension Panel â”€â”€ */
 #dim-panel {
   border-bottom: 1px solid var(--border); flex-shrink: 0;
 }
@@ -324,11 +324,11 @@ body {
 #dim-panel .dim-row input.dim-input:focus { border-color: var(--accent); }
 #dim-panel .dim-row input.dim-input[readonly] { background: transparent; border-color: transparent; cursor: default; }
 
-/* ── Resize Toggle ── */
+/* â”€â”€ Resize Toggle â”€â”€ */
 #resize-toggle:checked + span { background: var(--accent); border-color: var(--accent); }
 #resize-toggle:checked ~ #resize-knob { left: 16px; background: #fff; }
 
-/* ── Dimension Gate Modal ── */
+/* â”€â”€ Dimension Gate Modal â”€â”€ */
 #dim-gate {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6);
   display: none; align-items: center; justify-content: center;
@@ -367,7 +367,7 @@ body {
 #dim-gate .btn-continue:hover { background: #79C0FF; }
 #dim-gate .btn-skip { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); }
 
-/* ── Bottom Timeline ── */
+/* â”€â”€ Bottom Timeline â”€â”€ */
 #timeline {
   position: fixed; bottom: 0; left: 0; right: 0; height: 80px;
   background: var(--bg-secondary); border-top: 1px solid var(--border);
@@ -413,7 +413,7 @@ body {
   font-size: 18px; font-weight: 700; color: var(--text-muted);
 }
 
-/* ── Action buttons ── */
+/* â”€â”€ Action buttons â”€â”€ */
 #actions {
   position: fixed; bottom: 88px; left: 50%; transform: translateX(-50%);
   display: flex; gap: 10px; z-index: 60;
@@ -434,7 +434,7 @@ body {
 }
 .action-btn.secondary:hover { border-color: var(--accent); }
 
-/* ── Empty state ── */
+/* â”€â”€ Empty state â”€â”€ */
 #empty-state {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   text-align: center; color: var(--text-muted);
@@ -442,7 +442,7 @@ body {
 #empty-state i { font-size: 48px; margin-bottom: 12px; display: block; }
 #empty-state p { font-size: 14px; margin-bottom: 16px; }
 
-/* ── Loading bar (bottom, non-blocking, centered) ── */
+/* â”€â”€ Loading bar (bottom, non-blocking, centered) â”€â”€ */
 #loading {
   position: fixed; bottom: 0; left: 0; right: 0; height: 56px;
   background: var(--bg-secondary); border-top: 1px solid var(--border);
@@ -474,7 +474,7 @@ body {
 /* Hidden file input */
 #file-input { display: none; }
 
-/* ── Mobile: hide sidebars, stack controls ── */
+/* â”€â”€ Mobile: hide sidebars, stack controls â”€â”€ */
 @media (max-width: 768px) {
   #sidebar { transform: translateX(-100%); width: 280px; bottom: 0; z-index: 90; }
   #chat-panel { display: none; }
@@ -495,7 +495,7 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-/* ── Tree items (Component, Origin, Settings, Sketches, Body) ── */
+/* â”€â”€ Tree items (Component, Origin, Settings, Sketches, Body) â”€â”€ */
 .component-header { font-weight: 600; }
 .component-header span { font-size: 13px; }
 .tree-section { }
@@ -531,7 +531,7 @@ body {
   height: 1px; background: var(--border); margin: 4px 12px;
 }
 
-/* ── Export dropdown ── */
+/* â”€â”€ Export dropdown â”€â”€ */
 #export-menu {
   display: none; position: absolute; bottom: 100%; left: 0;
   background: var(--bg-secondary); border: 1px solid var(--border);
@@ -549,7 +549,7 @@ body {
 #export-menu > div i { font-size: 15px; color: var(--text-secondary); width: 18px; text-align: center; }
 [data-theme="dark"] #export-menu { box-shadow: 0 -4px 16px rgba(0,0,0,0.4); }
 
-/* ── Light mode feature icon adjustments ── */
+/* â”€â”€ Light mode feature icon adjustments â”€â”€ */
 .feature-item .icon.sketch { background: #dbeafe; color: var(--accent); }
 .feature-item .icon.extrude { background: #dcfce7; color: var(--green); }
 .feature-item .icon.hole { background: #fee2e2; color: var(--red); }
@@ -559,7 +559,7 @@ body {
 .feature-item .icon.boss { background: #dcfce7; color: #4d7c0f; }
 .feature-item .icon.slot { background: #fce7f3; color: #db2777; }
 
-/* ── Dark mode overrides ── */
+/* â”€â”€ Dark mode overrides â”€â”€ */
 [data-theme="dark"] .feature-item .icon.sketch { background: #1a3a5c; color: var(--accent); }
 [data-theme="dark"] .feature-item .icon.extrude { background: #1a3d1a; color: var(--green); }
 [data-theme="dark"] .feature-item .icon.hole { background: #3d1a1a; color: var(--red); }
@@ -689,7 +689,7 @@ body {
     <p>Drop a mesh file or click Upload</p>
   </div>
 </div>
-<!-- Cursor coordinate readout — bottom-right of the viewer area.
+<!-- Cursor coordinate readout â€” bottom-right of the viewer area.
      Updated on mousemove via raycast against the modelGroup. Lets
      you check exactly which face/region the mouse is hovering over
      when diagnosing fillet detection or other per-region issues. -->
@@ -702,7 +702,7 @@ body {
   pointer-events:none; display:none;
   letter-spacing:0.02em; line-height:1.5;
 ">
-  <span id="cursor-coords-text">—</span>
+  <span id="cursor-coords-text">â€”</span>
 </div>
 
 <!-- Settings Modal -->
@@ -800,15 +800,15 @@ body {
   <div id="model-stats" style="display:none; padding:12px 16px; border-bottom:1px solid var(--border); font-size:12px; color:var(--text-secondary);">
     <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
       <span>Features</span>
-      <span id="stat-features" style="font-family:'JetBrains Mono',monospace; color:var(--text-primary);">—</span>
+      <span id="stat-features" style="font-family:'JetBrains Mono',monospace; color:var(--text-primary);">â€”</span>
     </div>
     <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
       <span>Accuracy</span>
-      <span id="stat-accuracy" style="font-family:'JetBrains Mono',monospace; color:var(--text-primary);">—</span>
+      <span id="stat-accuracy" style="font-family:'JetBrains Mono',monospace; color:var(--text-primary);">â€”</span>
     </div>
     <div style="display:flex; justify-content:space-between;">
       <span>Volume</span>
-      <span id="stat-volume" style="font-family:'JetBrains Mono',monospace; color:var(--text-primary);">—</span>
+      <span id="stat-volume" style="font-family:'JetBrains Mono',monospace; color:var(--text-primary);">â€”</span>
     </div>
   </div>
 
@@ -959,7 +959,7 @@ body {
       border:1px solid var(--border); border-radius:8px; font-size:11px;
       padding:2px 6px; font-family:'OpenAI Sans',sans-serif; cursor:pointer;
     ">
-      <option value="none">— none —</option>
+      <option value="none">â€” none â€”</option>
     </select>
   </label>
 </div>
@@ -1029,11 +1029,11 @@ function toggleTheme() {
 (function() {
   const token = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_token='));
   const freeUsed = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('paramesh_free_used='));
-  // Logged in → allow
+  // Logged in â†’ allow
   if (token) return;
-  // Not logged in but free trial not used → allow (guest mode)
+  // Not logged in but free trial not used â†’ allow (guest mode)
   if (!freeUsed) return;
-  // Free trial used, not logged in → redirect to signup
+  // Free trial used, not logged in â†’ redirect to signup
   window.location.href = '/login?next=/app&mode=signup';
 })();
 
@@ -1059,6 +1059,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260419a" type="module"></script>
+<script src="/static/app.js?v=20260610a" type="module"></script>
 </body>
 </html>
+

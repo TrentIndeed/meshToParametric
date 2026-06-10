@@ -34,7 +34,6 @@ from scipy.spatial import cKDTree
 from mesh2param.config import (
     DecomposeConfig, FitConfig, IngestConfig, SegmentConfig, TopologyConfig,
 )
-from mesh2param.models.region import SurfaceType as ST
 from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh
 from mesh2param.pipeline.export_cadquery import export_cadquery
 from mesh2param.pipeline.fit import fit_surfaces

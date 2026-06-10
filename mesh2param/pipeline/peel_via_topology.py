@@ -34,6 +34,83 @@ from mesh2param.models.surface import FittedSurface, SurfaceEdge, TransitionType
 logger = logging.getLogger(__name__)
 
 
+def _face_pair_curvature_radius(
+    face_ids: np.ndarray,
+    faces: np.ndarray,
+    vertices: np.ndarray,
+    normals: np.ndarray,
+    min_angle_deg: float = 4.0,
+    max_angle_deg: float = 75.0,
+) -> float:
+    """Tube radius of a tessellated blend band from adjacent-face curvature.
+
+    Two band faces sharing an edge approximate the arc with normals
+    rotated by the tessellation's angular step dtheta and centroids a
+    chord apart: r = d / (2 sin(dtheta/2)). The median over all
+    cross-band face pairs recovers the fillet radius directly from how
+    the mesh encodes curvature — robust to coarse tessellation (works
+    from a single pair) and to segmentation stripping the tangent rows.
+    Returns 0.0 when no usable pair exists.
+    """
+    face_ids = np.asarray(face_ids, dtype=np.int64)
+    if len(face_ids) < 2:
+        return 0.0
+    # Shared-edge pairs within the band, keeping the edge endpoints so
+    # the centroid step can be projected into the curvature plane.
+    edge_to_face: dict[tuple[int, int], int] = {}
+    pairs: list[tuple[int, int, int, int]] = []  # (face_a, face_b, va, vb)
+    for fi in face_ids:
+        tri = faces[fi]
+        for k in range(3):
+            a, b = int(tri[k]), int(tri[(k + 1) % 3])
+            key = (a, b) if a < b else (b, a)
+            other = edge_to_face.get(key)
+            if other is None:
+                edge_to_face[key] = int(fi)
+            elif other != int(fi):
+                pairs.append((other, int(fi), key[0], key[1]))
+    if not pairs:
+        return 0.0
+    arr = np.asarray(pairs, dtype=np.int64)
+    pa, pb, va, vb = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    n1, n2 = normals[pa], normals[pb]
+    cosang = np.clip(np.einsum("ij,ij->i", n1, n2), -1.0, 1.0)
+    ang = np.arccos(cosang)
+    # Coplanar pairs (two triangles of one flat strip) carry no
+    # curvature signal; near-orthogonal pairs are corner artifacts.
+    keep = (ang > np.radians(min_angle_deg)) & (ang < np.radians(max_angle_deg))
+    if not np.any(keep):
+        return 0.0
+    # The two faces tilt about the shared edge by ang; the surface
+    # bends across the span between their far vertices. Chord per
+    # angular step = mean of the two far-vertex heights above the
+    # shared edge line (perpendicular to it).
+    ev = vertices[vb[keep]] - vertices[va[keep]]
+    ev = ev / (np.linalg.norm(ev, axis=1)[:, None] + 1e-15)
+    e0 = vertices[va[keep]]
+
+    def _far_height(face_rows: np.ndarray) -> np.ndarray:
+        tri = faces[face_rows]                       # (K, 3)
+        heights = np.zeros(len(tri))
+        for col in range(3):
+            vtx = vertices[tri[:, col]]
+            rel = vtx - e0
+            perp = rel - np.einsum("ij,ij->i", rel, ev)[:, None] * ev
+            h = np.linalg.norm(perp, axis=1)
+            heights = np.maximum(heights, h)         # far vertex = max height
+        return heights
+
+    d = 0.5 * (_far_height(pa[keep]) + _far_height(pb[keep]))
+    r = d / (2.0 * np.sin(ang[keep] / 2.0))
+    r = r[(r > 0.05) & (r < 100.0)]
+    if len(r) == 0:
+        return 0.0
+    # Low percentile, not median: on a torus rim the pair population
+    # mixes tube curvature (what we want) with the larger ring
+    # curvature; the tube is always the smaller radius.
+    return float(np.percentile(r, 30))
+
+
 def identify_blends_from_topology(
     regions: list[FaceRegion],
     fitted: list[FittedSurface],
@@ -505,7 +582,18 @@ def identify_blends_from_topology(
         bbox_size = region_verts.max(axis=0) - region_verts.min(axis=0)
         bbox_min = float(np.sort(bbox_size)[0])
         fit_radius = float(f.params.get("radius", 0) or 0)
-        if f.surface_type == SurfaceType.SPHERE:
+        # Primary radius source: adjacent-face curvature of the band's
+        # own tessellation (r = chord / 2 sin(dtheta/2) per face pair).
+        # The previous cascade measured proxies — bbox extent or
+        # distance from the crease line — which systematically
+        # under-reported (a true 2.0mm U-wrap came out 1.41 = the band
+        # thickness extent). Curvature reads the radius directly.
+        curv_radius = _face_pair_curvature_radius(
+            blend_face_ids, faces, vertices, cleaned.normals,
+        )
+        if curv_radius > 0.2:
+            radius = curv_radius
+        elif f.surface_type == SurfaceType.SPHERE:
             radius = float(np.median(perp_dist))
         elif fit_radius > 0.2:
             if bbox_min > 0 and fit_radius > 3.0 * bbox_min:

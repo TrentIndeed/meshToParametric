@@ -1708,13 +1708,13 @@ def _build_stepwise(
     part_max = float(cleaned.bbox[1][primary_axis])
 
     wp_pos = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp_pos = wp_pos.polyline(profiles[0]).close().extrude(depth)
+    wp_pos = _draw_profile_with_arcs(wp_pos, profiles[0]).extrude(depth)
     bb_pos = wp_pos.val().BoundingBox()
     pos_vals = [(bb_pos.xmin, bb_pos.xmax), (bb_pos.ymin, bb_pos.ymax), (bb_pos.zmin, bb_pos.zmax)]
     pos_overlap = min(pos_vals[primary_axis][1], part_max) - max(pos_vals[primary_axis][0], part_min)
 
     wp_neg = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp_neg = wp_neg.polyline(profiles[0]).close().extrude(-depth)
+    wp_neg = _draw_profile_with_arcs(wp_neg, profiles[0]).extrude(-depth)
     bb_neg = wp_neg.val().BoundingBox()
     neg_vals = [(bb_neg.xmin, bb_neg.xmax), (bb_neg.ymin, bb_neg.ymax), (bb_neg.zmin, bb_neg.zmax)]
     neg_overlap = min(neg_vals[primary_axis][1], part_max) - max(neg_vals[primary_axis][0], part_min)
@@ -1778,7 +1778,7 @@ def _build_stepwise(
 
             # Apply the cut or union and emit the step
             extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
-            extra = extra.polyline(profile).close().extrude(extrude_sign)
+            extra = _draw_profile_with_arcs(extra, profile).extrude(extrude_sign)
             vol_before = abs(float(wp.val().Volume()))
             if is_inner:
                 wp = wp.cut(extra)
@@ -2424,13 +2424,13 @@ def _build_solid(
 
     # Extrude the main profile (largest polygon)
     wp = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp = wp.polyline(profiles[0]).close().extrude(depth)
+    wp = _draw_profile_with_arcs(wp, profiles[0]).extrude(depth)
 
     # Union additional profiles (leg extensions, bosses, etc.)
     for i, profile in enumerate(profiles[1:], 1):
         try:
             extra = cq.Workplane(plane_name, origin=tuple(origin_3d))
-            extra = extra.polyline(profile).close().extrude(depth)
+            extra = _draw_profile_with_arcs(extra, profile).extrude(depth)
             wp = wp.union(extra)
             logger.info("Unioned additional profile %d (%d points)", i, len(profile))
         except Exception as e:
@@ -3604,6 +3604,286 @@ def build_blend_intent_edges(
     return np.asarray(overlay_pairs, dtype=np.float64).reshape(-1, 2, 3)
 
 
+def _detect_profile_arc_runs(pts: list) -> list[tuple[int, int]]:
+    """Find runs of polyline vertices that polygonize an outline arc.
+
+    The profile extractor samples the mesh outline, so a designed
+    corner radius arrives as N short segments turning a consistent
+    ~10-20 degrees each. Returns [(start_vertex, end_vertex), ...]
+    runs (inclusive, circular indexing) whose vertices lie on one arc:
+    consistent turn sign, bounded per-vertex turn, short segments, and
+    consistent implied radius.
+    """
+    P = np.asarray(pts, dtype=float)
+    n = len(P)
+    if n < 6:
+        return []
+    seg = np.roll(P, -1, axis=0) - P
+    L = np.linalg.norm(seg, axis=1)
+    if np.any(L < 1e-9):
+        return []
+    D = seg / L[:, None]
+    Dp = np.roll(D, 1, axis=0)
+    cosv = np.clip(np.einsum("ij,ij->i", Dp, D), -1.0, 1.0)
+    crossv = Dp[:, 0] * D[:, 1] - Dp[:, 1] * D[:, 0]
+    turn = np.arctan2(crossv, cosv)
+    Lp = np.roll(L, 1)
+    is_arc = (
+        (np.abs(turn) > np.radians(4.0))
+        & (np.abs(turn) < np.radians(40.0))
+        & (L < 6.0) & (Lp < 6.0)
+    )
+    # implied radius at each arc vertex
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r_v = ((L + Lp) / 2.0) / (2.0 * np.sin(np.abs(turn) / 2.0) + 1e-12)
+
+    runs: list[tuple[int, int]] = []
+    visited = np.zeros(n, dtype=bool)
+    for start in range(n):
+        if visited[start] or not is_arc[start]:
+            continue
+        # grow forward (circular) while same turn sign + similar radius
+        run = [start]
+        visited[start] = True
+        j = (start + 1) % n
+        while (
+            not visited[j] and is_arc[j]
+            and np.sign(turn[j]) == np.sign(turn[start])
+            and 0.5 < r_v[j] / (r_v[start] + 1e-12) < 2.0
+            and len(run) < n
+        ):
+            run.append(j)
+            visited[j] = True
+            j = (j + 1) % n
+        # grow backward
+        j = (start - 1) % n
+        while (
+            not visited[j] and is_arc[j]
+            and np.sign(turn[j]) == np.sign(turn[start])
+            and 0.5 < r_v[j] / (r_v[start] + 1e-12) < 2.0
+            and len(run) < n
+        ):
+            run.insert(0, j)
+            visited[j] = True
+            j = (j - 1) % n
+        if len(run) >= 3:
+            runs.append((run[0], run[-1]))
+    return runs
+
+
+def _draw_profile_with_arcs(wp2d, pts: list):
+    """Draw a closed profile, rebuilding polygonized corner arcs as true
+    arcs (threePointArc) so the solid gets ONE arc edge per outline
+    corner instead of N sliver segments. Sliver chains made OCC's
+    fillet of perimeter-wrap creases fail with "command not done";
+    real arcs roll cleanly and match the original design intent.
+
+    Falls back to a plain polyline on any irregularity.
+    """
+    try:
+        runs = _detect_profile_arc_runs(pts)
+        if not runs:
+            return wp2d.polyline(pts).close()
+        P = [tuple(map(float, p)) for p in pts]
+        n = len(P)
+        in_run = {}
+        for (a, b) in runs:
+            # collect circular vertex list of this run
+            idxs = []
+            j = a
+            while True:
+                idxs.append(j)
+                if j == b:
+                    break
+                j = (j + 1) % n
+            in_run[a] = idxs
+
+        run_member = set()
+        for idxs in in_run.values():
+            run_member.update(idxs[1:])  # all but the entry vertex
+
+        # start at a vertex that is not inside any run
+        start = None
+        for k in range(n):
+            if k not in run_member and k not in in_run:
+                start = k
+                break
+        if start is None:
+            # every vertex is on an arc (circle-like profile) — punt
+            return wp2d.polyline(pts).close()
+
+        wp = wp2d.moveTo(*P[start])
+        i = (start + 1) % n
+        guard = 0
+        while i != start and guard < 2 * n:
+            guard += 1
+            if i in in_run:
+                idxs = in_run[i]
+                a, b = idxs[0], idxs[-1]
+                mid = idxs[len(idxs) // 2]
+                wp = wp.lineTo(*P[a])
+                wp = wp.threePointArc(P[mid], P[b])
+                i = (b + 1) % n
+            else:
+                wp = wp.lineTo(*P[i])
+                i = (i + 1) % n
+        return wp.close()
+    except Exception as exc:
+        logger.debug("Arc-profile draw failed (%s) — plain polyline", exc)
+        return wp2d.polyline(pts).close()
+
+
+def _select_face_wire_edges(
+    planar_faces, edge_key_to_idx, solid_edges, ctree, snap, band_normal, verts,
+):
+    """Face-driven crease selection for perimeter-wrap fillets.
+
+    A wrap belongs to ONE face of the solid: the planar face whose
+    normal is the band normal and whose plane coincides with one side
+    of the band's vertex cloud. That face's outline wire IS the crease
+    chain (spines + corner arcs, corner-to-corner). Selecting from the
+    owning face's wire — instead of proximity-matching every edge on
+    the solid — keeps the two parallel wraps of a plate (inner/outer
+    face) on disjoint edge sets, so conflict resolution can't strip
+    one of them down to fragments.
+
+    Returns [(edge_idx, frac_on, mean_dist, edge), ...] like the
+    proximity candidates, or [] when no owning face is found (caller
+    falls back to proximity selection).
+    """
+    t = verts @ band_normal
+    lo, hi = float(t.min()), float(t.max())
+
+    best_edges: list = []
+    best_score = 0.0
+    for f in planar_faces:
+        if abs(float(f["normal"] @ band_normal)) < 0.95:
+            continue
+        plane_t = float(f["center"] @ band_normal)
+        if min(abs(plane_t - lo), abs(plane_t - hi)) > 1.0:
+            continue
+        edges_here: list = []
+        total_len = 0.0
+        for ek in f["wire_edge_keys"]:
+            ei = edge_key_to_idx.get(ek)
+            if ei is None:
+                continue
+            e = solid_edges[ei]
+            # Sub-millimetre slivers (union-seam artifacts at chain
+            # endpoints) poison BRepFilletAPI for the whole chain —
+            # and rolling them adds nothing visible. Skip them.
+            if e["len"] < 1.0:
+                continue
+            d, _ = ctree.query(e["samples"])
+            frac = float(np.mean(d < snap))
+            if frac < 0.5:
+                continue
+            if e["type"] == "LINE" and e["len"] > 4.0 * snap and \
+                    _edge_angular_coverage(e, verts, snap * 1.5) < 45.0:
+                continue
+            edges_here.append((ei, frac, float(d.mean()), e))
+            total_len += e["len"]
+        if len(edges_here) >= 2 and total_len > best_score:
+            best_score = total_len
+            best_edges = edges_here
+    return best_edges
+
+
+def _edge_angular_coverage(e: dict, cluster_verts: np.ndarray, window: float) -> float:
+    """Angular span (degrees) of nearby band vertices around an edge.
+
+    A fillet band WRAPS the sharp edge it replaces — seen from the edge
+    line, its vertices span ~the blend angle (90 deg for a plain
+    fillet). A parallel bystander edge (e.g. a pocket's rim 2mm above
+    the floor-fillet band) sees the band only from one side: span ~0.
+    """
+    d = e["end"] - e["start"]
+    n = float(np.linalg.norm(d))
+    if n < 1e-9:
+        return 360.0  # closed curve (circle/ellipse): skip the test
+    d = d / n
+    rel = cluster_verts - e["start"]
+    t = rel @ d
+    on_span = (t > -window) & (t < n + window)
+    if not np.any(on_span):
+        return 0.0
+    perp = rel[on_span] - np.outer(t[on_span], d)
+    dist = np.linalg.norm(perp, axis=1)
+    near = (dist > 1e-6) & (dist < window)
+    if near.sum() < 4:
+        return 0.0
+    perp = perp[near]
+    arb = np.array([1.0, 0.0, 0.0]) if abs(d[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = arb - d * float(arb @ d)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(d, u)
+    ang = np.sort(np.arctan2(perp @ v, perp @ u))
+    gap = max(float(np.diff(ang).max()) if len(ang) > 1 else 0.0,
+              2.0 * np.pi - (float(ang[-1]) - float(ang[0])))
+    return float(np.degrees(2.0 * np.pi - gap))
+
+
+def _resolve_edges_on_current_solid(wp, bucket_keys, cluster_verts, snap):
+    """Find this bucket's edges on the CURRENT (possibly refilleted) solid.
+
+    Exact geometric-identity matches first; edges that a neighboring
+    fillet trimmed (midpoint/length changed) are recovered by proximity
+    to the cluster's vertex cloud. Returns live Edge objects.
+    """
+    from scipy.spatial import cKDTree as _cKDTree
+
+    try:
+        current = wp.edges().vals()
+    except Exception:
+        return []
+    key_to_edge = {}
+    for e in current:
+        k = _edge_identity_key(e)
+        if k:
+            key_to_edge[k] = e
+
+    resolved = []
+    missing = []
+    for k in bucket_keys:
+        e = key_to_edge.get(k)
+        if e is not None:
+            resolved.append(e)
+        else:
+            missing.append(k)
+    if not missing or len(cluster_verts) == 0:
+        return resolved
+
+    # Proximity recovery for trimmed edges: a current edge qualifies if
+    # most of its samples hug the cluster cloud and it isn't already in.
+    ctree = _cKDTree(cluster_verts)
+    have = {id(e) for e in resolved}
+    for e in current:
+        if id(e) in have:
+            continue
+        try:
+            samples = np.array([
+                [(_p := e.positionAt(t)).x, _p.y, _p.z]
+                for t in np.linspace(0.0, 1.0, 9)
+            ], dtype=float)
+        except Exception:
+            continue
+        d, _ = ctree.query(samples)
+        if float(np.mean(d < snap)) >= 0.5 and float(d.mean()) < snap:
+            resolved.append(e)
+            have.add(id(e))
+    return resolved
+
+
+def _edge_identity_key(edge) -> tuple:
+    """Geometric identity key for an OCC edge: rounded midpoint + length."""
+    try:
+        mp = edge.positionAt(0.5)
+        ln = float(edge.Length())
+        return (round(mp.x, 2), round(mp.y, 2), round(mp.z, 2), round(ln, 2))
+    except Exception:
+        return ()
+
+
 def _select_crease_edges(cand, snap, band_normal, min_spine_len):
     """Select the connected crease edges for a curve/straight fillet.
 
@@ -3775,27 +4055,67 @@ def _apply_recognized_fillets_to_solid(
         logger.info("Fillet pass: no edges on solid")
         return wp, [], []
 
+    # Identity map from edge geometry to index, plus planar faces with
+    # their outline-wire edges — drives the face-wire (feature-driven)
+    # crease selection.
+    edge_key_to_idx: dict[tuple, int] = {}
+    for ei, e in enumerate(solid_edges):
+        k = _edge_identity_key(e["obj"])
+        if k:
+            edge_key_to_idx[k] = ei
+    planar_faces: list[dict] = []
+    try:
+        for f in wp.faces().vals():
+            try:
+                if f.geomType() != "PLANE":
+                    continue
+                n = f.normalAt()
+                c = f.Center()
+                wire_keys = []
+                for we in f.outerWire().Edges():
+                    k = _edge_identity_key(we)
+                    if k:
+                        wire_keys.append(k)
+                planar_faces.append({
+                    "normal": np.array([n.x, n.y, n.z], dtype=float),
+                    "center": np.array([c.x, c.y, c.z], dtype=float),
+                    "wire_edge_keys": wire_keys,
+                })
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("Face enumeration failed: %s", exc)
+    logger.info("Face enumeration: %d planar faces", len(planar_faces))
+
     # --- Category-aware vertex-proximity matching ---
     SNAP_TOL_BASE = 3.5
     MIN_SPINE_LEN = 3.0
     MIN_EDGE_FRAC = 0.5
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}
+    cluster_band_normal: dict[int, np.ndarray] = {}
     for ci, c in enumerate(clusters):
         verts = np.asarray(c.get("vertices"), dtype=float)
         if verts.ndim != 2 or len(verts) == 0:
             continue
         category = c.get("category", "curve_edge")
         topo_r = float(c.get("radius", 0.0) or 0.0)
-        # Robust radius from geometry (smallest PCA extent).
+        # The cluster radius is now the median of per-record curvature
+        # measurements (adjacent-face normal steps in
+        # peel_via_topology._face_pair_curvature_radius) — trust it
+        # when sane. The old min(topo_r, smallest_PCA_extent) clamp
+        # measured the band's thickness extent, not its radius, and
+        # systematically under-reported (1.4 for a true 2.0mm fillet).
         cv = verts - verts.mean(axis=0)
         try:
             _, _, vh = np.linalg.svd(cv, full_matrices=False)
             smallest_ext = float((cv @ vh[2]).max() - (cv @ vh[2]).min())
         except Exception:
             smallest_ext = topo_r
-        robust_r = min(topo_r, smallest_ext) if topo_r > 0 else smallest_ext
-        robust_r = max(0.3, robust_r)
+        if 0.2 < topo_r < 30.0:
+            robust_r = topo_r
+        else:
+            robust_r = max(0.3, smallest_ext)
         snap = max(SNAP_TOL_BASE, 0.6 * robust_r + 2.0)
 
         ctree = _cKDTree(verts)
@@ -3803,22 +4123,39 @@ def _apply_recognized_fillets_to_solid(
         for ei, e in enumerate(solid_edges):
             d, _ = ctree.query(e["samples"])
             frac = float(np.mean(d < snap))
-            if frac >= MIN_EDGE_FRAC:
-                cand.append((ei, frac, float(d.mean()), e))
+            if frac < MIN_EDGE_FRAC:
+                continue
+            # The band must WRAP this edge, not just run past it — a
+            # pocket's rim edge sits within snap of the floor-fillet
+            # band but sees it from one side only.
+            if e["type"] == "LINE" and _edge_angular_coverage(e, verts, snap * 1.5) < 45.0:
+                continue
+            cand.append((ei, frac, float(d.mean()), e))
 
+        cluster_band_normal[ci] = vh[2].copy()
         if category == "hole_edge":
             circ = [x for x in cand if x[3]["type"] in ("CIRCLE", "ELLIPSE")]
             circ.sort(key=lambda x: x[2])
             chosen = circ[:1]
         else:
-            # Crease = long spine edges + the SHORT corner-arc edges
-            # that bridge two spine edges (so the fillet wraps the U's
-            # 90° corners instead of leaving them sharp). Rim-thickness
-            # spanners (run along the band normal) and junction
-            # connectors (dangle off a single spine end) are excluded.
-            chosen = _select_crease_edges(
-                cand, snap, vh[2], MIN_SPINE_LEN,
+            # Primary: face-wire (feature-driven) selection — the wrap's
+            # owning face contributes its outline chain, corner-to-corner,
+            # disjoint from the parallel wrap on the opposite plate face.
+            chosen = _select_face_wire_edges(
+                planar_faces, edge_key_to_idx, solid_edges,
+                ctree, snap, vh[2], verts,
             )
+            if chosen:
+                logger.info(
+                    "  cluster %d: face-wire selection -> %d edge(s)",
+                    int(c.get("group_id", ci)), len(chosen),
+                )
+            else:
+                # Fallback: proximity crease selection (long spines +
+                # corner-arc bridges).
+                chosen = _select_crease_edges(
+                    cand, snap, vh[2], MIN_SPINE_LEN,
+                )
         if not chosen:
             continue
         matched_by_cluster[ci] = [x[0] for x in chosen]
@@ -3950,8 +4287,54 @@ def _apply_recognized_fillets_to_solid(
             ],
         })
 
-    for bi, bucket in enumerate(buckets):
-        members = bucket["members"]
+    # --- Pair same-plate wraps for a JOINT fillet operation. ---
+    # The inner and outer perimeter wraps of one plate terminate on the
+    # same top face; rolling them sequentially makes OCC fail the
+    # second one's corner constructions ("command not done"). Rolling
+    # both in ONE MakeFillet builds the shared corners jointly — this
+    # is also the actual CAD intent (one fillet feature, N edges).
+    # Pairs are detected by parallel band normals + small normal-axis
+    # gap (plate thickness) + lateral overlap.
+    bucket_pairs: list[list[int]] = []
+    paired: set[int] = set()
+    for i in range(len(buckets)):
+        if i in paired:
+            continue
+        ci = buckets[i]["cluster_idx"]
+        ni = cluster_band_normal.get(ci)
+        partner = None
+        if ni is not None and len(buckets[i]["members"]) >= 3:
+            vi = np.asarray(clusters[ci]["vertices"], dtype=float)
+            for j in range(i + 1, len(buckets)):
+                if j in paired or len(buckets[j]["members"]) < 3:
+                    continue
+                cj = buckets[j]["cluster_idx"]
+                nj = cluster_band_normal.get(cj)
+                if nj is None or abs(float(ni @ nj)) < 0.95:
+                    continue
+                vj = np.asarray(clusters[cj]["vertices"], dtype=float)
+                gap = abs(float((vi.mean(0) - vj.mean(0)) @ ni))
+                if gap < 1.0 or gap > 12.0:
+                    continue
+                # lateral overlap perpendicular to the plate normal
+                lat_i = vi - np.outer(vi @ ni, ni)
+                lat_j = vj - np.outer(vj @ ni, ni)
+                lo = np.maximum(lat_i.min(0), lat_j.min(0))
+                hi = np.minimum(lat_i.max(0), lat_j.max(0))
+                inter = float(np.prod(np.maximum(hi - lo, 0) + 1.0))
+                area_i = float(np.prod(lat_i.max(0) - lat_i.min(0) + 1.0))
+                if inter < 0.5 * area_i:
+                    continue
+                partner = j
+                break
+        if partner is not None:
+            bucket_pairs.append([i, partner])
+            paired.update((i, partner))
+        else:
+            bucket_pairs.append([i])
+            paired.add(i)
+
+    def _bucket_applied_radius(members: list) -> float:
         # --- Applied radius: whole millimetre, floor 2 mm. ---
         # The user's parts are designed with whole-mm fillets, never
         # below 2 mm. The geometry-derived robust radius only sets the
@@ -3973,8 +4356,35 @@ def _apply_recognized_fillets_to_solid(
         r_cap = cap_len / 3.0
         if applied_r > r_cap:
             applied_r = max(2.0, float(int(r_cap)))
+        return applied_r
 
-        edges_obj = [solid_edges[m["edge_idx"]]["obj"] for m in members]
+    def _live_bucket_edges(bucket: dict) -> list:
+        # Re-resolve this bucket's edges against the CURRENT solid.
+        # Earlier buckets rebuild the shape, which silently invalidates
+        # the edge objects captured during enumeration. Match by
+        # geometric identity first; for edges a prior fillet trimmed
+        # (changed midpoint/length), fall back to proximity against
+        # the cluster's vertex cloud.
+        ci = bucket["cluster_idx"]
+        members = bucket["members"]
+        cluster_verts = np.asarray(clusters[ci].get("vertices"), dtype=float)
+        bucket_keys = [
+            _edge_identity_key(solid_edges[m["edge_idx"]]["obj"])
+            for m in members
+        ]
+        edges_obj = _resolve_edges_on_current_solid(
+            wp, bucket_keys, cluster_verts,
+            max(SNAP_TOL_BASE, 0.6 * cluster_radius[ci] + 2.0),
+        )
+        if not edges_obj:
+            edges_obj = [solid_edges[m["edge_idx"]]["obj"] for m in members]
+        return edges_obj
+
+    def _apply_bucket(bi: int, bucket: dict) -> bool:
+        nonlocal wp
+        members = bucket["members"]
+        applied_r = _bucket_applied_radius(members)
+        edges_obj = _live_bucket_edges(bucket)
         n_edges = len(edges_obj)
         t_bucket = _time.time()
         vol_before = abs(float(wp.val().Volume()))
@@ -4019,13 +4429,112 @@ def _apply_recognized_fillets_to_solid(
                     bi, r, n_edges, exc,
                 )
                 continue
+        # Leave-one-out recovery: one degenerate edge (a sliver segment
+        # or a seam OCC can't blend) poisons the whole chain with
+        # "BRep_API: command not done". Find it by dropping one edge at
+        # a time and applying the remaining chain in a single rolling
+        # op — corners stay wrapped everywhere except the dropped
+        # sliver. (RackMount: one of the two mirror-twin U-wraps failed
+        # wholesale this way while its twin succeeded.)
+        if not applied_this_bucket and n_edges >= 3:
+            r_loo = r_candidates[-1]
+            for skip_i in range(n_edges):
+                subset = [e for k, e in enumerate(edges_obj) if k != skip_i]
+                try:
+                    wp_test = wp.newObject(subset).fillet(r_loo)
+                    vol_after = abs(float(wp_test.val().Volume()))
+                    if vol_after <= 0 or vol_after > vol_before * 1.05:
+                        continue
+                except Exception:
+                    continue
+                wp = wp_test
+                v, f = _tessellate_solid(wp, fast=True)
+                applied_steps.append(ConstructionStep(
+                    name=f"Fillet (r={r_loo:.0f}mm) x{len(subset)}",
+                    tess_vertices=v, tess_faces=f, volume=vol_after,
+                ))
+                applied_script.append(
+                    f"# Fillet r={r_loo:.0f} on {len(subset)} crease "
+                    f"edge(s) (1 degenerate edge dropped)"
+                )
+                dropped = edges_obj[skip_i]
+                try:
+                    dmp = dropped.positionAt(0.5)
+                    where = f"({dmp.x:.0f},{dmp.y:.0f},{dmp.z:.0f})"
+                except Exception:
+                    where = "?"
+                logger.info(
+                    "Bucket %d (cluster %d): r=%.0fmm on %d/%d edges after "
+                    "dropping degenerate edge at %s, vol %.0f -> %.0f",
+                    bi, bucket["cluster_idx"], r_loo, len(subset), n_edges,
+                    where, vol_before, vol_after,
+                )
+                applied_this_bucket = True
+                break
         if not applied_this_bucket:
             logger.warning(
                 "Bucket %d (cluster %d): could not roll %d-edge crease at "
-                "any radius >= 2mm; skipped (no partial per-edge apply so "
-                "corners aren't left sharp)",
+                "any radius >= 2mm, even with leave-one-out; skipped "
+                "(no partial per-edge apply so corners aren't left sharp)",
                 bi, bucket["cluster_idx"], n_edges,
             )
+        return applied_this_bucket
+
+    for group in bucket_pairs:
+        if len(group) == 2:
+            bA, bB = buckets[group[0]], buckets[group[1]]
+            rA = _bucket_applied_radius(bA["members"])
+            rB = _bucket_applied_radius(bB["members"])
+            if rA == rB:
+                try:
+                    eA = _live_bucket_edges(bA)
+                    eB = _live_bucket_edges(bB)
+                    seen_ids: set = set()
+                    joint = []
+                    for e in eA + eB:
+                        if id(e) not in seen_ids:
+                            joint.append(e)
+                            seen_ids.add(id(e))
+                    vol_before = abs(float(wp.val().Volume()))
+                    wp_test = wp.newObject(joint).fillet(rA)
+                    vol_after = abs(float(wp_test.val().Volume()))
+                    # Tight gate for joint ops: convex perimeter rolls
+                    # must REMOVE material. OCC occasionally "succeeds"
+                    # with a ballooned blend — reject and go sequential.
+                    if 0.95 * vol_before < vol_after < 1.002 * vol_before:
+                        wp = wp_test
+                        v, f = _tessellate_solid(wp, fast=True)
+                        applied_steps.append(ConstructionStep(
+                            name=f"Fillet (r={rA:.0f}mm) x{len(joint)}",
+                            tess_vertices=v, tess_faces=f, volume=vol_after,
+                        ))
+                        applied_script.append(
+                            f"# Fillet r={rA:.0f} on {len(joint)} crease "
+                            f"edge(s) (joint same-plate pair)"
+                        )
+                        logger.info(
+                            "Joint pair (clusters %d+%d): r=%.0fmm on %d "
+                            "edges, vol %.0f -> %.0f",
+                            bA["cluster_idx"], bB["cluster_idx"], rA,
+                            len(joint), vol_before, vol_after,
+                        )
+                        continue
+                    logger.info(
+                        "Joint pair (clusters %d+%d) rejected by volume "
+                        "gate (%.0f -> %.0f); applying sequentially",
+                        bA["cluster_idx"], bB["cluster_idx"],
+                        vol_before, vol_after,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Joint pair (clusters %d+%d) failed (%s); "
+                        "applying sequentially",
+                        bA["cluster_idx"], bB["cluster_idx"], exc,
+                    )
+            for gi in group:
+                _apply_bucket(gi, buckets[gi])
+        else:
+            _apply_bucket(group[0], buckets[group[0]])
 
     logger.info(
         "Fillet pass done: %d clusters, %d edges in buckets, %d buckets, "

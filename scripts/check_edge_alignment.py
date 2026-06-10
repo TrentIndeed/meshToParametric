@@ -226,7 +226,7 @@ def run() -> int:
           f"({100.0*covered/max(len(sharp_mid),1):.0f}%)")
     uncovered = [(m, c) for m, c in zip(sharp_mid, sharp_cov) if c >= 2.0]
     if uncovered:
-        print(f"  UNCOVERED sharp edges (mesh crease with NO nearby rebuilt edge):")
+        print("  UNCOVERED sharp edges (mesh crease with NO nearby rebuilt edge):")
         for m, c in sorted(uncovered, key=lambda x: -x[1])[:25]:
             print(f"    dist={c:>5.1f}mm  midpoint=({m[0]:>6.1f},{m[1]:>6.1f},{m[2]:>6.1f})")
     print("=" * 78)

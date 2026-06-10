@@ -497,14 +497,14 @@ def run() -> int:
     print(f"RESULT: {n_records} records -> {n_groups} clusters")
     print(f"  direct-contact unions: {n_direct}")
     print(f"  axial-continuation unions: {n_axial}")
-    print(f"  category breakdown:")
+    print("  category breakdown:")
     cat_totals = {}
     for c in cat_per_group.values():
         cat_totals[c] = cat_totals.get(c, 0) + 1
     for c, n in sorted(cat_totals.items(), key=lambda kv: -kv[1]):
         print(f"    {n} {c}")
     print()
-    print(f"  per-cluster (length = fillet path length in mm):")
+    print("  per-cluster (length = fillet path length in mm):")
     rows = []
     for gi in range(n_groups):
         verts = np.vstack([m["verts"] for m in group_records[gi]])
@@ -536,7 +536,7 @@ def run() -> int:
         )
     # Length-grouping summary
     print()
-    print(f"  by-category length groups (looking for the 4+4+4 split):")
+    print("  by-category length groups (looking for the 4+4+4 split):")
     for cat in ["hole_edge", "curve_edge", "straight_edge"]:
         sub = [r_ for r_ in rows if r_["cat"] == cat]
         if not sub:
@@ -580,7 +580,7 @@ def run() -> int:
                 f"bbox={tuple(round(float(x),1) for x in (ri['verts'].max(0)-ri['verts'].min(0)))}"
             )
     print("=" * 70)
-    print(f"EXPECTED: 12 clusters (was 10 before fix)")
+    print("EXPECTED: 12 clusters (was 10 before fix)")
     print(f"OBSERVED: {n_groups} clusters")
     if n_groups == 12:
         print(">>> PASS <<<")

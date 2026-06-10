@@ -504,16 +504,22 @@ def _find_holes(
         if span < 270.0:
             continue  # partial arc, not a hole
 
-        # Reject cylinders that span the entire body along their axis —
-        # these are edge fillets running the full length, not holes
+        # Reject full-length cylinders whose faces point OUTWARD (away
+        # from the axis) — rounded ends / edge fillets / rod surfaces.
+        # The full-length test alone is wrong for through-holes: a hole
+        # drilled through a plate always spans the plate's full extent
+        # along its axis (Body1Mesh's 4 corner holes are h=12 in a
+        # 12mm-thick plate). Hole walls point INWARD toward the axis,
+        # which cleanly separates the two cases.
         height_pre = f.params.get("height", 0)
         if height_pre > 0:
             axis_pre = np.array(f.params.get("axis_dir", [0, 0, 1]))
             part_proj_pre = cleaned.vertices @ axis_pre
             part_extent_pre = float(part_proj_pre.max() - part_proj_pre.min())
             if part_extent_pre > 0 and height_pre > part_extent_pre * 0.9:
-                # Cylinder runs the full length → edge fillet, not a hole
-                continue
+                if not _faces_point_inward(f, region, cleaned):
+                    # Outward-facing full-length cylinder → not a hole
+                    continue
 
         height = f.params.get("height", 0)
         axis_dir = np.array(f.params.get("axis_dir", [0, 0, 1]))
@@ -618,6 +624,26 @@ def _find_holes(
         ))
 
     return results
+
+
+def _faces_point_inward(
+    fitted: FittedSurface, region: FaceRegion, cleaned: CleanedMesh,
+) -> bool:
+    """True if the region's face normals point toward the cylinder axis.
+
+    Hole walls face inward; boss/rod/fillet barrels face outward.
+    """
+    if region is None:
+        return False
+    axis_point = np.array(fitted.params.get("axis_point", fitted.params.get("apex", [0, 0, 0])))
+    axis_dir = np.array(fitted.params.get("axis_dir", [0, 0, 1]))
+    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+    centroids = cleaned.vertices[cleaned.faces[region.face_indices]].mean(axis=1)
+    v = centroids - axis_point
+    radial = v - np.outer(v @ axis_dir, axis_dir)
+    radial /= np.linalg.norm(radial, axis=1)[:, None] + 1e-15
+    dots = np.einsum("ij,ij->i", region.normals, radial)
+    return float(np.mean(dots)) < 0.0
 
 
 def _axis_radial_spread(verts: np.ndarray, axis: np.ndarray) -> float:

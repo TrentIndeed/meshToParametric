@@ -319,7 +319,15 @@ class TestStepComparison:
                   f"{m['ref_radius']:.3f} (err {m['radius_error']:.3f}, "
                   f"axis_dot {m['axis_dot']:.2f})")
 
-        assert report["n_holes"] > 0, "No holes recognized at all"
+        # Recall ratchet: minimum recognized-hole records per model.
+        # Mesh1 has 6 physical bores (4 plate corner + 2 Z-side holes);
+        # the full-length-cylinder rejection used to silently drop the
+        # 4 corner holes.
+        expected_min_holes = {"Mesh1": 6}
+        assert report["n_holes"] >= expected_min_holes.get(name, 1), (
+            f"Only {report['n_holes']} holes recognized "
+            f"(expected >= {expected_min_holes.get(name, 1)})"
+        )
         assert report["n_unmatched"] == 0, (
             f"{report['n_unmatched']} recognized holes have no colocated "
             f"reference cylinder: {report['unmatched']}"

@@ -145,6 +145,45 @@ def match_holes_to_reference(
     }
 
 
+def band_fidelity_report(
+    clusters: list[dict],
+    tess_vertices: np.ndarray,
+    tess_faces: np.ndarray,
+    n_surface_samples: int = 300_000,
+) -> list[dict]:
+    """Distance from each blend cluster's mesh band to the final solid.
+
+    A correctly applied fillet puts the rebuilt surface ON the band
+    (mean ~0.1mm at typical tessellation); a sharp crease or displaced
+    geometry reads ~0.4mm+. On RackMount this exposed a ~0.7mm side-
+    plate placement error that volume metrics couldn't see.
+    """
+    import trimesh
+    from scipy.spatial import cKDTree
+
+    solid = trimesh.Trimesh(
+        vertices=np.asarray(tess_vertices),
+        faces=np.asarray(tess_faces), process=False,
+    )
+    surf_pts, _ = trimesh.sample.sample_surface(solid, n_surface_samples)
+    tree = cKDTree(np.vstack([surf_pts, solid.vertices]))
+    rng = np.random.RandomState(3)
+    out = []
+    for c in clusters:
+        v = np.asarray(c.get("vertices", c.get("verts")), dtype=float)
+        if v.ndim != 2 or len(v) == 0:
+            continue
+        pick = v[rng.choice(len(v), min(200, len(v)), replace=False)]
+        dist, _ = tree.query(pick)
+        out.append({
+            "group_id": int(c.get("group_id", c.get("gid", -1))),
+            "category": c.get("category", "?"),
+            "mean_dist": float(np.mean(dist)),
+            "p90_dist": float(np.percentile(dist, 90)),
+        })
+    return out
+
+
 def blend_apply_report(fillet_match_diag: list[dict]) -> dict:
     """Fillet clusters recognized vs actually matched to a CAD edge.
 

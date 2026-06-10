@@ -819,10 +819,19 @@ def _extract_profile_and_holes(
             if not slice_profiles:
                 continue
 
-            # Prefer the slice with the largest outer boundary.
-            # Using the boundary area (before hole subtraction) ensures
-            # slices through blind holes aren't penalized.
-            candidates.append((-outer_boundary_area, slice_profiles))
+            # Rank slices by the outer boundary's BBOX extent first,
+            # then by enclosed area. A slice cutting through a
+            # perimeter-fillet band has its outline inset by up to
+            # r*(1-cos45) — on RackMount the 90%-depth slice won the
+            # raw-area contest via a near-face bulge while being
+            # 0.5mm SHORT on every filleted side, shrinking the whole
+            # rebuilt plate. The design outline is the slice that
+            # reaches the part's full extent.
+            oc = np.asarray(outer_coords, dtype=float)
+            bbox_extent = float(np.prod(oc.max(axis=0) - oc.min(axis=0)))
+            candidates.append(
+                (-round(bbox_extent, 1), -outer_boundary_area, slice_profiles)
+            )
         except Exception:
             continue
 
@@ -830,8 +839,8 @@ def _extract_profile_and_holes(
         return None, extrude_start, [], [], []
 
     # Pick best candidate
-    candidates.sort(key=lambda x: x[0])
-    best_profiles = candidates[0][1]
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    best_profiles = candidates[0][2]
 
     # If the best slice has multiple large outer polygons (frame split by
     # cutout), find a slice where the frame is one connected piece and

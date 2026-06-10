@@ -7,8 +7,13 @@
 - [x] Reference STEPs for Mesh2 (BottomMount re-export) and Mesh4 (tube) —
   both verified 0.0% volume diff, identical frames. All 5 models now have
   ground truth.
-- [ ] **Mesh2 BottomMount rebuild is -23.2% volume vs reference** — same
-  profile-extraction failure class as Mesh3. Gates xfailed.
+- [x] Mesh2 BottomMount: base extrude axis was a 45-deg chamfer normal
+  ([0.7,0,-0.72]) instead of the plate's thin Z axis, so it sketched the
+  13mm edge and dropped all holes. Fixed in _find_base_extrusion (area-
+  weighted dominant plane + principal-axis snap + thin-plate override).
+  Volume -23.2% -> +9.8%; holes restored; volume/bbox gates now pass.
+- [ ] **Mesh2 remaining +9.8% volume**: the asymmetric chamfer is not cut
+  (0 chamfers detected) and the outline still insets slightly.
 - [ ] **Mesh4 tube: new part class (annular/revolved)**. One seam region
   unfittable (7/8 fitted), the coaxial bore is not recognized as a hole, and
   the base profile should be an annulus (circle + concentric cutout).

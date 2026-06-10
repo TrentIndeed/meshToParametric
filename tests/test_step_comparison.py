@@ -47,8 +47,6 @@ MODEL_PAIRS = discover_model_pairs()
 #   - Mesh5: RackMount is multi-body; this harness runs the single-body
 #     path. Needs decompose + per-body trees to compare fairly.
 KNOWN_FAILURES: dict[tuple[str, str], str] = {
-    ("Mesh2", "volume"): "BottomMount rebuild -23.2% volume (profile extraction)",
-    ("Mesh2", "bbox"): "BottomMount bbox overlap below 90% (profile extraction)",
     ("Mesh2", "holes"): "BottomMount hole set unmatched vs reference",
     ("Mesh3", "volume"): "Front Plate rebuild +36.7% volume (profile extraction)",
     ("Mesh3", "bbox"): "Front Plate bbox overlap 72% (profile extraction)",

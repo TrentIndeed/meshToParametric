@@ -259,13 +259,49 @@ def _find_base_extrusion(
         [r.face_indices for r in plane_regions if r.region_id in best_component]
     )
 
-    # Estimate extrusion direction from the dominant plane normal
+    # Estimate extrusion direction from the dominant plane normal,
+    # weighted by AREA (not triangle count). A finely-tessellated 45°
+    # chamfer can out-count the main plate face; weighting by area
+    # keeps the true dominant face winning. On the re-exported
+    # BottomMount this stopped the base from extruding along a diagonal
+    # chamfer normal ([0.7,0,-0.72]) instead of the plate's thickness.
+    def _plane_area(r: FaceRegion) -> float:
+        tris = cleaned.vertices[cleaned.faces[r.face_indices]]
+        cross = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+        return float(0.5 * np.linalg.norm(cross, axis=1).sum())
+
     largest_plane = max(
         (r for r in plane_regions if r.region_id in best_component),
-        key=lambda r: r.num_faces,
+        key=_plane_area,
     )
     f = fitted_lookup[largest_plane.region_id]
-    direction = np.array(f.params.get("normal", [0, 0, 1]))
+    direction = np.array(f.params.get("normal", [0, 0, 1]), dtype=float)
+    direction = direction / (np.linalg.norm(direction) + 1e-15)
+
+    # Snap to the nearest principal axis — prismatic base faces are
+    # axis-aligned, and a raw fitted normal a few degrees off produces a
+    # skewed extrude and a thin, wrong profile.
+    principal = int(np.argmax(np.abs(direction)))
+    snapped = np.zeros(3)
+    snapped[principal] = float(np.sign(direction[principal]) or 1.0)
+    direction = snapped
+
+    # Thin-plate override: a plate is always extruded through its
+    # thickness. If one bbox dimension is much smaller than the other
+    # two, force the extrude axis to that thin direction regardless of
+    # which face has the most area — this is the canonical prismatic
+    # interpretation and is robust to chamfers/bosses dominating area.
+    size = cleaned.bbox[1] - cleaned.bbox[0]
+    order = np.argsort(size)
+    if size[order[0]] > 0 and size[order[1]] >= 3.0 * size[order[0]]:
+        thin_axis = int(order[0])
+        if thin_axis != principal:
+            logger.info(
+                "Base extrusion: thin-plate override, axis %d -> %d "
+                "(bbox size=%s)", principal, thin_axis, np.round(size, 1).tolist(),
+            )
+        direction = np.zeros(3)
+        direction[thin_axis] = 1.0
 
     # Estimate depth from bbox extent along the extrusion direction
     verts = cleaned.vertices

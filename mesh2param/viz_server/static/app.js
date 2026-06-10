@@ -1627,10 +1627,14 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     const stepOn = stepCb ? stepCb.checked : true;
     fetch(`/api/job/${currentJobId}/step-through/${stepOn ? '1' : '0'}`, { method: 'POST' });
 
-    // Send the one-shot breakpoint stage (only relevant when step mode is
-    // off; harmless otherwise since step mode pauses at every stage).
+    // Send the one-shot breakpoint stage — but ONLY while its control is
+    // actually active (Debug on + step mode off). The dropdown persists in
+    // localStorage, so without the debug gate a breakpoint set during a
+    // debug session kept silently pausing every later run with the
+    // control hidden.
     const pauseSel = document.getElementById('pause-at-select');
-    const pauseAt = (!stepOn && pauseSel) ? pauseSel.value : 'none';
+    const debugOn = document.getElementById('debug-cb')?.checked;
+    const pauseAt = (!stepOn && debugOn && pauseSel) ? pauseSel.value : 'none';
     fetch(`/api/job/${currentJobId}/pause-at/${pauseAt}`, { method: 'POST' });
 
     addChatMessage('system', 'Pipeline started — analyzing mesh...');
@@ -2608,6 +2612,11 @@ document.getElementById('debug-cb')?.addEventListener('change', (e) => {
   localStorage.setItem('paramesh_debug', e.target.checked ? '1' : '0');
   const panel = document.getElementById('debug-panel');
   if (panel) panel.style.display = e.target.checked ? '' : 'none';
+  // Turning Debug off deactivates the breakpoint: clear it on the
+  // active job (server also unpauses if currently stopped at it).
+  if (!e.target.checked && currentJobId) {
+    fetch(`/api/job/${currentJobId}/pause-at/none`, { method: 'POST' });
+  }
   updatePauseAtVisibility();
 });
 

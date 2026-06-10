@@ -727,6 +727,10 @@ async def set_pause_at_stage(job_id: str, stage: str):
         return JSONResponse({"error": "Job not found"}, status_code=404)
     if stage in ("none", "", "off"):
         job.pause_at_stage = None
+        # If the job is currently stopped at the (now-cleared)
+        # breakpoint and step mode is off, resume it.
+        if job.paused and not job.step_through:
+            job.paused = False
     elif stage in PAUSE_STAGE_KEYS:
         job.pause_at_stage = stage
     else:

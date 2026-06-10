@@ -1170,11 +1170,121 @@ class JobQueue:
                         "plane_normals": plane_normals_rec,
                     })
 
+            # Per-record geometry classification. Four categories:
+            #   hole_edge   — closed ring around an axis, tight axial span
+            #                 (~radius). The rolled edge that opens a
+            #                 through-hole. Pair-of-rings on opposite faces
+            #                 of a thin plate share the same axis but
+            #                 represent TWO distinct fillet features and
+            #                 must NOT be axially merged.
+            #   looped      — closed loop around an axis but with large
+            #                 perp extent (perimeter wrap around a body).
+            #   straight_edge — open arc, narrow angular span, long axial
+            #                 extent vs radius (rolled edge along a single
+            #                 straight CAD edge).
+            #   curve_edge  — short axial vs radius, or no usable axis fit
+            #                 (corner curls, sphere-fit residuals, arcs).
+            for ri in records_info:
+                axis_dir = ri["axis_dir"]
+                endpoints = ri["endpoints"]
+                radius = ri["radius"]
+                verts = ri["verts"]
+                if axis_dir is None or endpoints is None or radius <= 0:
+                    ri["category"] = "curve_edge"
+                    ri["is_closed_loop"] = False
+                    ri["axial_extent"] = 0.0
+                    continue
+                axis_point = 0.5 * (endpoints[0] + endpoints[1])
+                rel = verts - axis_point
+                along = rel @ axis_dir
+                axial_extent = float(along.max() - along.min())
+                perp = rel - np.outer(along, axis_dir)
+                perp_d = np.linalg.norm(perp, axis=1)
+                perp_extent = (
+                    float(perp_d.max() - perp_d.min())
+                    if len(perp_d) else 0.0
+                )
+                # Project to plane perp to axis to measure angular wrap.
+                arb = (
+                    np.array([1.0, 0.0, 0.0])
+                    if abs(float(axis_dir[0])) < 0.9
+                    else np.array([0.0, 1.0, 0.0])
+                )
+                u = arb - axis_dir * float(arb @ axis_dir)
+                un = float(np.linalg.norm(u))
+                if un < 1e-9:
+                    ri["category"] = "curve_edge"
+                    ri["is_closed_loop"] = False
+                    ri["axial_extent"] = axial_extent
+                    continue
+                u = u / un
+                v = np.cross(axis_dir, u)
+                pu = perp @ u
+                pv = perp @ v
+                angles = np.arctan2(pv, pu)
+                # Closed-loop test: sort angles, compute the largest gap.
+                # A wrap with no gap > 90° is treated as a full ring.
+                if len(angles) >= 4:
+                    angles_sorted = np.sort(angles)
+                    diffs = np.diff(angles_sorted)
+                    wrap = (2.0 * np.pi) - (
+                        float(angles_sorted[-1]) - float(angles_sorted[0])
+                    )
+                    max_gap = float(max(diffs.max(), wrap))
+                else:
+                    max_gap = 2.0 * np.pi
+                is_closed_loop = max_gap < (np.pi / 2.0)
+                ri["is_closed_loop"] = is_closed_loop
+                ri["axial_extent"] = axial_extent
+                if is_closed_loop:
+                    # Distinguish hole_edge (tight ring around a hole axis)
+                    # from looped (perimeter wrap around the body). A hole
+                    # edge has axial extent ≈ 2r (just the rolled surface);
+                    # a perimeter loop spans the body length, >> r.
+                    if axial_extent < 5.0 * radius:
+                        ri["category"] = "hole_edge"
+                    else:
+                        ri["category"] = "looped"
+                else:
+                    if axial_extent > 3.0 * radius:
+                        ri["category"] = "straight_edge"
+                    else:
+                        ri["category"] = "curve_edge"
+
             for uid, ri in enumerate(records_info):
                 ri["uid"] = uid
                 ri["rec"]["stitch_uid"] = uid
 
             n_records = len(records_info)
+
+            # Per-record diagnostic so we can see exactly what the
+            # union-find sees: does each topology fillet record have
+            # a usable axis? does the classifier see it as a closed
+            # ring or an open arc? This is what determines whether
+            # the two through-hole-face fillets get fused or kept
+            # apart, so logging it makes the union-find behaviour
+            # legible from the subprocess log.
+            for ri in records_info:
+                verts = ri["verts"]
+                bmin = verts.min(axis=0)
+                bmax = verts.max(axis=0)
+                dims = bmax - bmin
+                axis_dir = ri["axis_dir"]
+                ax_str = (
+                    f"({axis_dir[0]:.2f},{axis_dir[1]:.2f},{axis_dir[2]:.2f})"
+                    if axis_dir is not None else "NONE"
+                )
+                logger.info(
+                    "  record uid=%d body=%d nverts=%d r=%.2f "
+                    "axis=%s axial_extent=%.1f closed_loop=%s "
+                    "category=%s bbox dims=(%.1f,%.1f,%.1f)",
+                    ri["uid"], ri["body_idx"], len(verts),
+                    ri["radius"], ax_str,
+                    ri.get("axial_extent", 0.0),
+                    bool(ri.get("is_closed_loop", False)),
+                    ri.get("category", "?"),
+                    dims[0], dims[1], dims[2],
+                )
 
             parent: dict[int, int] = {ri["uid"]: ri["uid"] for ri in records_info}
 
@@ -1190,7 +1300,14 @@ class JobQueue:
                     parent[rb] = ra
 
             # Pass 2a: direct-contact via a single global KDTree over
-            # every fillet vertex tagged with its record uid.
+            # every fillet vertex tagged with its record uid. The
+            # DIRECT_EPS contact threshold itself is the cross-body
+            # stitching gate — two records that share a vertex
+            # within 2 mm fuse, two that don't, stay separate. For
+            # opposite-face through-hole rings (same-body, axially
+            # offset by plate thickness), the proto-cluster bimodal
+            # split below splits them apart geometrically, without
+            # any axial-gap threshold.
             n_direct_unions = 0
             if records_info:
                 all_verts_arr = np.vstack([ri["verts"] for ri in records_info])
@@ -1206,6 +1323,142 @@ class JobQueue:
                         _union(ua, ub)
                         n_direct_unions += 1
 
+            # Proto-cluster closed-loop check. The per-record
+            # classifier above looks at a SINGLE topology record
+            # and asks "do its vertices wrap a full 360° around its
+            # axis?" — but in practice topology often splits a
+            # rolled hole edge into multiple arc records that each
+            # cover < 180°. After the direct-contact pass merges
+            # those arcs into one proto-cluster, the cluster
+            # together wraps the full loop and we can detect it.
+            # Stamping `is_closed_loop` on every member record means
+            # the axial-continuation guard below will fire even when
+            # individual records were classified as open arcs.
+            def _proto_cluster_axis_and_loop(verts: np.ndarray) -> tuple[np.ndarray | None, bool]:
+                if len(verts) < 8:
+                    return None, False
+                centered = verts - verts.mean(axis=0)
+                try:
+                    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+                except Exception:
+                    return None, False
+                # For a ring, the axis is the SHORTEST principal axis
+                # (the tube's central axis — vertices spread broadly
+                # in the perpendicular plane and narrowly along the
+                # axis).
+                axis = vh[2]
+                axis = axis / (np.linalg.norm(axis) + 1e-12)
+                rel = centered
+                along = rel @ axis
+                perp = rel - np.outer(along, axis)
+                arb = (
+                    np.array([1.0, 0.0, 0.0])
+                    if abs(float(axis[0])) < 0.9
+                    else np.array([0.0, 1.0, 0.0])
+                )
+                u = arb - axis * float(arb @ axis)
+                un = float(np.linalg.norm(u))
+                if un < 1e-9:
+                    return axis, False
+                u = u / un
+                v_ = np.cross(axis, u)
+                pu = perp @ u
+                pv = perp @ v_
+                angles = np.arctan2(pv, pu)
+                if len(angles) < 8:
+                    return axis, False
+                angles_sorted = np.sort(angles)
+                diffs = np.diff(angles_sorted)
+                wrap = (2.0 * np.pi) - (
+                    float(angles_sorted[-1]) - float(angles_sorted[0])
+                )
+                max_gap = float(max(diffs.max(), wrap))
+                return axis, (max_gap < (np.pi / 2.0))
+
+            # Group records by current direct-contact root, then
+            # classify each proto-cluster as closed-loop or not.
+            # When a proto-cluster IS a closed loop AND its records
+            # split into two axial layers (the two faces of a thin
+            # plate hosting a through-hole), assign each record a
+            # `bimodal_side` of 0 or 1 so the final group labelling
+            # treats the two halves as separate clusters even
+            # though direct-contact glued their records together.
+            proto_members: dict[int, list[dict]] = {}
+            for ri in records_info:
+                proto_members.setdefault(_find(ri["uid"]), []).append(ri)
+                ri["bimodal_side"] = 0
+            # Map root -> aggregated verts of the WHOLE proto
+            # cluster (pre-split). Each member record carries the
+            # root reference so the cluster builder downstream can
+            # compute fillet length from the full ring even after
+            # a through-hole proto cluster gets split into two
+            # halves — both halves should report the same hole
+            # circumference, not just their partial slice.
+            proto_full_verts_by_root: dict[int, np.ndarray] = {}
+            for root, members_ in proto_members.items():
+                proto_verts = np.vstack([m["verts"] for m in members_])
+                proto_full_verts_by_root[root] = proto_verts
+                proto_axis, proto_is_loop = _proto_cluster_axis_and_loop(
+                    proto_verts
+                )
+                if not proto_is_loop or proto_axis is None:
+                    continue
+                for m in members_:
+                    m["is_closed_loop"] = True
+                    if m.get("category") == "curve_edge":
+                        m["category"] = "hole_edge"
+                # Opposite-plate-face split. The rule the user
+                # asked for: fillets on opposite sides of a plate
+                # must NEVER share a cluster, no matter how close
+                # the plate faces are. Concretely, if this proto
+                # cluster's combined vertex cloud has a small
+                # smallest-dim (≤ 30 mm — anything plate-thickness-
+                # like) AND its records' centroids sit on both
+                # sides of the median plane along that smallest
+                # dim, then the cluster spans two faces and
+                # splits unconditionally.
+                #
+                # No axial-gap threshold, no closed-loop test on
+                # each half, no radii-similarity check. The
+                # geometric fact "smallest bbox dim spans a plate"
+                # combined with "records lie on both sides of the
+                # midplane" is enough — the merge only happened
+                # because direct-contact glued them through a
+                # bridging record (e.g. a hole-tube), and that's
+                # exactly the case the user wants undone.
+                if len(members_) < 2:
+                    continue
+                # A plate is by definition one body. Cross-body
+                # proto clusters live in the same group only
+                # because direct-contact stitched them at a body-
+                # decomp seam — that's a different problem from
+                # opposite-side-of-a-plate and shouldn't get split
+                # by this rule.
+                if len({m["body_idx"] for m in members_}) > 1:
+                    continue
+                proto_min = proto_verts.min(axis=0)
+                proto_max = proto_verts.max(axis=0)
+                proto_dims = proto_max - proto_min
+                thin_axis = int(np.argmin(proto_dims))
+                if float(proto_dims[thin_axis]) > 30.0:
+                    continue
+                rec_thin = np.array([
+                    float(m["verts"].mean(axis=0)[thin_axis])
+                    for m in members_
+                ])
+                midplane = 0.5 * (
+                    float(proto_min[thin_axis])
+                    + float(proto_max[thin_axis])
+                )
+                side_a = {
+                    i for i, v in enumerate(rec_thin) if v < midplane
+                }
+                side_b = set(range(len(members_))) - side_a
+                if not side_a or not side_b:
+                    continue
+                for i, m in enumerate(members_):
+                    m["bimodal_side"] = 0 if i in side_a else 1
+
             # Pass 2b: collinear-continuation. O(N²) but N is small.
             n_axial_unions = 0
             for i_idx in range(len(records_info)):
@@ -1217,6 +1470,20 @@ class JobQueue:
                     if B["axis_dir"] is None or B["endpoints"] is None:
                         continue
                     if _find(A["uid"]) == _find(B["uid"]):
+                        continue
+                    # Closed-loop guard: a ring fillet (one face of a
+                    # through-hole) and another ring on the OPPOSITE
+                    # face of the same plate share the hole's axis but
+                    # are TWO distinct fillet features. The axial gap
+                    # between them equals the plate thickness, which
+                    # the eps_axial heuristic below would happily
+                    # accept. Block ring-to-ring axial merges outright;
+                    # they should stay as separate clusters even though
+                    # they're collinear. The flag is stamped per-record
+                    # AFTER direct-contact stitching (see above), so it
+                    # covers cases where the topology stage gave us
+                    # multiple arcs instead of one ring.
+                    if A.get("is_closed_loop") and B.get("is_closed_loop"):
                         continue
                     align = abs(float(A["axis_dir"] @ B["axis_dir"]))
                     if align < AXIS_DOT_MIN:
@@ -1243,17 +1510,23 @@ class JobQueue:
                         if stitched:
                             break
 
-            # Pass 3: connected-component labelling.
-            root_to_group: dict[int, int] = {}
+            # Pass 3: connected-component labelling. Records share
+            # a group ID iff they share a (root, bimodal_side) key.
+            # bimodal_side splits a closed-loop proto-cluster whose
+            # records sit on opposite plate faces (through-hole on
+            # both sides) into two separate clusters even though
+            # the direct-contact pass merged them into one root.
+            subkey_to_group: dict[tuple, int] = {}
             uid_to_group: dict[int, int] = {}
             for ri in records_info:
                 root = _find(ri["uid"])
-                if root not in root_to_group:
-                    root_to_group[root] = len(root_to_group)
-                uid_to_group[ri["uid"]] = root_to_group[root]
+                sk = (root, int(ri.get("bimodal_side", 0)))
+                if sk not in subkey_to_group:
+                    subkey_to_group[sk] = len(subkey_to_group)
+                uid_to_group[ri["uid"]] = subkey_to_group[sk]
             uid_to_body_rec = {ri["uid"]: (ri["body_idx"], ri["rec"]) for ri in records_info}
 
-            n_groups = len(root_to_group)
+            n_groups = len(subkey_to_group)
             group_counts: dict[int, int] = {}
             for gi in uid_to_group.values():
                 group_counts[gi] = group_counts.get(gi, 0) + 1
@@ -1315,13 +1588,31 @@ class JobQueue:
                 # contribute vertices to the group's bbox, just no
                 # radius vote.
                 per_record_radii: list[float] = []
+                topology_radii: list[float] = []
                 verts_per_record: list[np.ndarray] = []
                 all_plane_normals: list[np.ndarray] = []
+                cat_votes: dict[str, int] = {}
+                any_closed_loop = False
                 for u in members:
                     ri = next(r for r in records_info if r["uid"] == u)
                     verts_per_record.append(ri["verts"])
+                    cat = ri.get("category", "curve_edge")
+                    cat_votes[cat] = cat_votes.get(cat, 0) + 1
+                    if ri.get("is_closed_loop"):
+                        any_closed_loop = True
                     for pn in ri.get("plane_normals", []):
                         all_plane_normals.append(np.asarray(pn, dtype=float))
+                    # Topology-assigned fillet radius — the small
+                    # TUBE radius. The hole-edge classifier uses
+                    # this. Computing perp distance from each
+                    # record's own fitted axis (below) is unsafe
+                    # because topology sometimes fits the wrong
+                    # axis on toroidal surfaces and the resulting
+                    # perp distance becomes the MAJOR radius
+                    # (e.g. 18 mm on a 3 mm fillet), pushing real
+                    # hole-edge clusters out of the filter.
+                    if ri.get("radius", 0) > 0:
+                        topology_radii.append(float(ri["radius"]))
                     if ri["axis_dir"] is None or ri["endpoints"] is None:
                         continue
                     axis_dir = ri["axis_dir"]
@@ -1333,11 +1624,12 @@ class JobQueue:
                     if len(perp_d) >= 3:
                         per_record_radii.append(float(np.median(perp_d)))
                 verts_for_group = np.vstack(verts_per_record)
-                # Group radius: median of per-record radii.  Falls
-                # back to the bbox-min dimension when no record
-                # contributed (all sphere/cone fits) — coarse but
-                # better than zero.
-                if per_record_radii:
+                # Group radius: prefer the topology-assigned tube
+                # radius (median). Falls back to perp-distance
+                # median if topology had no radii, then to bbox.
+                if topology_radii:
+                    group_radius = float(np.median(topology_radii))
+                elif per_record_radii:
                     group_radius = float(np.median(per_record_radii))
                 else:
                     bbox_dims = verts_for_group.max(axis=0) - verts_for_group.min(axis=0)
@@ -1353,12 +1645,162 @@ class JobQueue:
                             break
                     if not is_dup:
                         dedup_normals.append(n.tolist())
+                # Cluster category by ANGULAR COVERAGE of the
+                # cluster's aggregated vertex cloud — measured
+                # around whichever principal axis maximises wrap.
+                # This reflects what the cluster IS after split,
+                # not what its pre-split records were labelled.
+                #
+                #   coverage > 270°       → hole_edge  (closed loop;
+                #                            tight when the loop's
+                #                            in-plane extent is
+                #                            small, otherwise
+                #                            "looped" perimeter wrap)
+                #   135° < coverage ≤ 270° → curve_edge  (rolled
+                #                            edge that bends ≈ 180°
+                #                            from start to end —
+                #                            U-bend / half-loop)
+                #   coverage ≤ 135°       → straight_edge
+                #
+                # Hole-edge vs looped distinction: a hole-edge's
+                # in-plane diameter (max perpendicular extent) is
+                # bounded by typical hole radii on this part class
+                # (≤ ~40 mm); long perimeter wraps run to hundreds
+                # of mm.
+                def _coverage_and_inplane(verts: np.ndarray) -> tuple[float, float]:
+                    if len(verts) < 4:
+                        return 0.0, 0.0
+                    centered = verts - verts.mean(axis=0)
+                    try:
+                        _, _, vh = np.linalg.svd(
+                            centered, full_matrices=False,
+                        )
+                    except Exception:
+                        return 0.0, 0.0
+                    best_cov = 0.0
+                    best_inplane = 0.0
+                    for axis_candidate in (vh[2], vh[0]):
+                        axis = axis_candidate / (
+                            np.linalg.norm(axis_candidate) + 1e-12
+                        )
+                        along = centered @ axis
+                        perp = centered - np.outer(along, axis)
+                        arb = (
+                            np.array([1.0, 0.0, 0.0])
+                            if abs(float(axis[0])) < 0.9
+                            else np.array([0.0, 1.0, 0.0])
+                        )
+                        u = arb - axis * float(arb @ axis)
+                        un = float(np.linalg.norm(u))
+                        if un < 1e-9:
+                            continue
+                        u = u / un
+                        v_ = np.cross(axis, u)
+                        angles = np.arctan2(perp @ v_, perp @ u)
+                        if len(angles) < 4:
+                            continue
+                        s = np.sort(angles)
+                        diffs = np.diff(s)
+                        wrap = (2.0 * np.pi) - (
+                            float(s[-1]) - float(s[0])
+                        )
+                        max_gap = float(max(diffs.max(), wrap))
+                        coverage = (2.0 * np.pi) - max_gap
+                        if coverage > best_cov:
+                            best_cov = coverage
+                            pu = perp @ u
+                            pv = perp @ v_
+                            extent = max(
+                                float(pu.max() - pu.min()),
+                                float(pv.max() - pv.min()),
+                            )
+                            best_inplane = extent
+                    return best_cov, best_inplane
+
+                # For coverage / in-plane / length computation, use
+                # the FULL proto-cluster vertices (pre-split), not
+                # just this half's subset. Both halves of a
+                # through-hole share the same fillet circumference;
+                # using only the split half would report two
+                # different lengths for the same physical fillet.
+                first_uid = members[0]
+                root_for_cluster = _find(first_uid)
+                full_verts = proto_full_verts_by_root.get(
+                    root_for_cluster, verts_for_group,
+                )
+                cov_rad, inplane = _coverage_and_inplane(full_verts)
+                cov_deg = cov_rad * 180.0 / float(np.pi)
+                # Use topology-assigned tube radii (matching the
+                # driver). Falls back to perp-distance medians,
+                # then to group_radius.
+                if topology_radii:
+                    max_r = float(max(topology_radii))
+                elif per_record_radii:
+                    max_r = float(max(per_record_radii))
+                else:
+                    max_r = group_radius
+                # Three categories only:
+                #   hole_edge — tight ring around a real hole.
+                #               Requires closed-loop coverage AND
+                #               small fillet radius AND in-plane
+                #               diameter consistent with hole-edge
+                #               geometry. The max-r-among-records
+                #               check filters out tab-perimeter
+                #               wraps whose topology fit gave one
+                #               record a large "path-cylinder"
+                #               radius alongside small actual
+                #               fillet radii.
+                #   curve_edge — anything that bends but isn't a
+                #               tight hole-edge ring. Covers both
+                #               half-loop / 180° U-bends and long
+                #               perimeter wraps.
+                #   straight_edge — almost no angular wrap.
+                # hole_edge = a NEAR-COMPLETE ring (coverage > 320°)
+                # of hole-scale diameter (in-plane extent ≤ 40 mm).
+                # We do NOT gate on the radius field: for a rolled
+                # hole edge, topology measures the HOLE radius
+                # (~15 mm on the rackmount), not the small fillet
+                # tube radius, so a radius cap wrongly rejects the
+                # real hole rings. Coverage cleanly separates them:
+                # the four through-hole rings wrap ~353°, while
+                # perimeter wraps and tab-corner rounds top out at
+                # ~287°. The in-plane cap keeps full-body perimeter
+                # loops (in-plane ≫ 100 mm) out of the hole bucket.
+                if cov_deg > 320.0 and inplane <= 40.0:
+                    group_category = "hole_edge"
+                elif cov_deg > 135.0:
+                    group_category = "curve_edge"
+                else:
+                    group_category = "straight_edge"
+                # Fillet path length:
+                #   bent path → arc length = coverage_rad * (inplane/2)
+                #   straight  → principal-axis extent
+                if cov_deg > 90.0 and inplane > 0:
+                    group_length = float(cov_rad * inplane * 0.5)
+                else:
+                    centered = full_verts - full_verts.mean(axis=0)
+                    try:
+                        _, sv, _ = np.linalg.svd(centered, full_matrices=False)
+                        group_length = float(2.0 * sv[0] / np.sqrt(len(full_verts)))
+                    except Exception:
+                        group_length = 0.0
+                logger.info(
+                    "  cluster gi=%d: coverage=%.0f°, inplane=%.1fmm, "
+                    "r=%.2f, length=%.1fmm -> %s",
+                    gi, cov_deg, inplane, group_radius,
+                    group_length, group_category,
+                )
                 stitched_clusters_payload.append({
                     "group_id": gi,
                     "vertices": verts_for_group.astype(np.float64),
                     "n_records": len(members),
                     "radius": group_radius,
                     "plane_normals": dedup_normals,
+                    "category": group_category,
+                    "is_closed_loop": any_closed_loop,
+                    "length": group_length,
+                    "coverage_deg": cov_deg,
+                    "inplane_mm": inplane,
                 })
             job._stitched_clusters = stitched_clusters_payload
             # Stash uid → group_id so the reconcile-stage viz at the
@@ -1366,13 +1808,69 @@ class JobQueue:
             # diag entry for its group.
             job._uid_to_group = dict(uid_to_group)
 
+            # --- Ground-truth dump for the stitched stage ---
+            # Write what the ACTUAL server produced to a file so it
+            # can be inspected directly (logger.info from the worker
+            # thread doesn't always reach stdout). One row per
+            # cluster + per-cluster coverage near the two known
+            # rackmount through-hole centers, so we can confirm
+            # what category each hole-edge fillet actually got.
+            try:
+                import json as _json
+                _diag_path = Path("data") / f"stitched_diag_{job.id}.json"
+                _diag_path.parent.mkdir(parents=True, exist_ok=True)
+                _hole_centers = [
+                    [-40.4, 125.5, -133.4],
+                    [42.4, 125.5, -133.4],
+                ]
+                _rows = []
+                for c in stitched_clusters_payload:
+                    cv = np.asarray(c["vertices"], dtype=float)
+                    ctr = cv.mean(axis=0)
+                    # min vertex distance to each hole center
+                    hole_min = [
+                        float(np.min(np.linalg.norm(cv - np.asarray(hc), axis=1)))
+                        for hc in _hole_centers
+                    ]
+                    _rows.append({
+                        "group_id": int(c["group_id"]),
+                        "category": c["category"],
+                        "length_mm": round(float(c.get("length", 0)), 1),
+                        "coverage_deg": round(float(c.get("coverage_deg", 0)), 0),
+                        "inplane_mm": round(float(c.get("inplane_mm", 0)), 1),
+                        "radius": round(float(c["radius"]), 2),
+                        "n_records": int(c["n_records"]),
+                        "centroid": [round(float(x), 1) for x in ctr],
+                        "min_dist_to_holeA": round(hole_min[0], 1),
+                        "min_dist_to_holeB": round(hole_min[1], 1),
+                    })
+                with open(_diag_path, "w", encoding="utf-8") as _fh:
+                    _json.dump({
+                        "n_records": n_records,
+                        "n_groups": n_groups,
+                        "clusters": _rows,
+                    }, _fh, indent=2)
+                logger.info("Stitched diag written to %s", _diag_path)
+            except Exception as _diag_exc:
+                logger.warning("Stitched diag dump failed: %s", _diag_exc)
+
             _check_cancelled()
             job.progress = 25
+            # Per-category cluster breakdown for the viz banner.
+            cat_counts: dict[str, int] = {}
+            for c in stitched_clusters_payload:
+                k = c.get("category", "curve_edge")
+                cat_counts[k] = cat_counts.get(k, 0) + 1
+            cat_summary = ", ".join(
+                f"{n} {k}" for k, n in sorted(
+                    cat_counts.items(), key=lambda kv: -kv[1]
+                )
+            ) or "—"
             job.progress_stage = (
                 f"Stitched fillets: {n_records} records → {n_groups} groups "
                 f"({n_multi} multi-record, {n_singletons} singletons); "
                 f"contact={n_direct_unions} axial={n_axial_unions}; "
-                f"chamfers={n_chamfers} orange"
+                f"categories: {cat_summary}; chamfers={n_chamfers} orange"
             )
             job.progress_edges = None
             job.progress_edge_colors = None
@@ -1384,7 +1882,7 @@ class JobQueue:
             _dwell_if_not_step_through("stitched")
             _pause_for_review("stitched")
         except Exception as _st_exc:
-            logger.debug("Stitched fillets stage failed: %s", _st_exc)
+            logger.exception("Stitched fillets stage failed: %s", _st_exc)
 
         # Stage 5: Feature recognition
         job.progress = 26

@@ -3759,9 +3759,10 @@ def _apply_recognized_fillets_to_solid(
                         # original mesh's fillet surface to the rebuilt
                         # solid's sharp corner edge
 
-    # Pre-compute each concave edge's adjacent face outward normals
-    # at the edge midpoint. Cached once per edge so the plane-match
-    # check is cheap per cluster query.
+    # Pre-compute per-edge geometry: adjacent face normals at the
+    # midpoint, adjacent face areas, and adjacent face bbox dims.
+    # Cached once so the matcher's checks are cheap per cluster
+    # query.
     import cadquery as _cq
     for se in solid_edges:
         try:
@@ -3772,6 +3773,8 @@ def _apply_recognized_fillets_to_solid(
             )
             adj = se["obj"].ancestors(solid_val, "Face").Faces()
             nlist: list[np.ndarray] = []
+            alist: list[float] = []
+            blist: list[tuple[float, float, float]] = []
             for f in adj:
                 try:
                     nv = f.normalAt(mid_cq)
@@ -3782,9 +3785,24 @@ def _apply_recognized_fillets_to_solid(
                         )
                 except Exception:
                     pass
+                try:
+                    alist.append(float(f.Area()))
+                except Exception:
+                    alist.append(0.0)
+                try:
+                    bb = f.BoundingBox()
+                    blist.append(
+                        (float(bb.xlen), float(bb.ylen), float(bb.zlen))
+                    )
+                except Exception:
+                    blist.append((0.0, 0.0, 0.0))
             se["adj_normals"] = nlist
+            se["adj_areas"] = alist
+            se["adj_bbox_dims"] = blist
         except Exception:
             se["adj_normals"] = []
+            se["adj_areas"] = []
+            se["adj_bbox_dims"] = []
 
     # Non-coplanarity gate: the perpendicular-circle solid-inside
     # test reports "concave" for edges where the two adjacent faces
@@ -3820,6 +3838,59 @@ def _apply_recognized_fillets_to_solid(
         )
         return wp, [], []
 
+    # Sliver-face gate: reject edges where either adjacent face is
+    # a tiny polygon-simplification artifact. The diagnostic dump
+    # on the rackmount showed that real fillet edges have BOTH
+    # adjacent face areas large (1000s of mm²) while junction-seam
+    # creases between two extruded bodies have at least one face
+    # that is essentially a 0.1 mm-wide ribbon (area < 10 mm², or
+    # min bbox dim < 0.5 mm). OCC's BRepFilletAPI refuses to
+    # fillet across slivers, and no CAD user would ever pick those
+    # as fillet candidates anyway — they're internal seams from
+    # the face-projection sketch. The numeric thresholds are
+    # calibrated against the rackmount diagnostic: the smallest
+    # real fillet-adjacent face on that part was ~590 mm², the
+    # largest sliver was 451 mm² but it was 0.1 mm wide
+    # geometrically — so we need BOTH an area floor and a
+    # min-bbox-dim floor.
+    MIN_FACE_AREA_MM2 = 25.0
+    MIN_FACE_MIN_DIM_MM = 0.5
+    sliver_pruned: list[dict] = []
+    n_skip_sliver = 0
+    for se in solid_edges:
+        areas = se.get("adj_areas", [])
+        bboxes = se.get("adj_bbox_dims", [])
+        if len(areas) != 2 or len(bboxes) != 2:
+            sliver_pruned.append(se)
+            continue
+        is_sliver = False
+        for a, bb in zip(areas, bboxes):
+            if a < MIN_FACE_AREA_MM2:
+                is_sliver = True
+                break
+            nonzero_dims = [d for d in bb if d > 1e-6]
+            if nonzero_dims and min(nonzero_dims) < MIN_FACE_MIN_DIM_MM:
+                is_sliver = True
+                break
+        if is_sliver:
+            n_skip_sliver += 1
+            continue
+        sliver_pruned.append(se)
+    logger.info(
+        "Edge prune: %d edges (%d additional skipped as sliver-adjacent; "
+        "at least one adjacent face had area < %.0f mm² or a "
+        "bbox dim < %.1f mm — almost certainly a junction-seam crease "
+        "between two extruded bodies, not a real fillet edge)",
+        len(sliver_pruned), n_skip_sliver,
+        MIN_FACE_AREA_MM2, MIN_FACE_MIN_DIM_MM,
+    )
+    solid_edges = sliver_pruned
+    if not solid_edges:
+        logger.info(
+            "Fillet pass: no real concave corner edges after sliver prune"
+        )
+        return wp, [], []
+
     PLANE_MATCH_DOT_MIN = 0.7
 
     # Diagnostic: how many edges actually got 2 adjacent face normals?
@@ -3836,18 +3907,85 @@ def _apply_recognized_fillets_to_solid(
         n_clusters_with_normals, len(clusters),
     )
 
-    LENGTH_MATCH_MIN_FRAC = 0.1  # candidate edge length must be at
-                                  # least this fraction of the cluster's
-                                  # principal-axis extent. Set
-                                  # permissively — the LLM rebuild's
-                                  # polygon-profile path splits long
-                                  # edges into many short segments, so
-                                  # even real rolled-edge fillet
-                                  # locations don't have a single
-                                  # 145 mm edge; they have 5-10
-                                  # collinear segments. We only want
-                                  # to filter the truly tiny union-
-                                  # seam creases (~thickness scale).
+    LENGTH_MATCH_MIN_FRAC = 0.1
+
+    # --- Diagnostic dump: per-cluster + per-edge characterization ---
+    # Print enough numbers to see where the stitched-cluster shape
+    # disconnects from the rebuilt solid's actual edges. We'll
+    # iterate on the matcher's filters based on what these numbers
+    # say, not on guesses about what the rebuild looks like.
+    logger.info("=== STITCHED CLUSTERS (n=%d) ===", len(clusters))
+    for ci, c in enumerate(clusters):
+        verts = np.asarray(c.get("vertices"), dtype=float)
+        radius = float(c.get("radius", 0.0) or 0.0)
+        pnorms = c.get("plane_normals", []) or []
+        if verts.ndim != 2 or len(verts) == 0:
+            logger.info("  cluster %d: EMPTY", ci)
+            continue
+        centroid = verts.mean(axis=0)
+        bmin, bmax = verts.min(axis=0), verts.max(axis=0)
+        dims = bmax - bmin
+        centered = verts - centroid
+        try:
+            _, sv, vh = np.linalg.svd(centered, full_matrices=False)
+            principal = vh[0]
+            secondary = vh[1] if len(vh) > 1 else np.zeros(3)
+            t_princ = centered @ principal
+            t_sec = centered @ secondary
+            extent_princ = float(t_princ.max() - t_princ.min())
+            extent_sec = float(t_sec.max() - t_sec.min())
+            # Curvature proxy: perpendicular spread of vertices relative to a straight line through the centroid in the principal direction. Larger = more bent / wrap.
+            perp_residual = centered - np.outer(t_princ, principal)
+            curvature_rms = float(np.sqrt(np.mean(np.sum(perp_residual ** 2, axis=1))))
+        except Exception:
+            principal = np.zeros(3)
+            extent_princ = 0.0
+            extent_sec = 0.0
+            curvature_rms = 0.0
+        logger.info(
+            "  cluster %d (gid=%s): %d verts, r=%.2f, "
+            "category=%s, closed_loop=%s, "
+            "centroid=(%.1f,%.1f,%.1f), "
+            "bbox dims=(%.1f,%.1f,%.1f), "
+            "principal=(%.2f,%.2f,%.2f), "
+            "extent=%.1f (sec=%.1f), curvature_rms=%.2f, "
+            "%d plane normals",
+            ci, c.get("group_id", ci), len(verts), radius,
+            c.get("category", "?"),
+            bool(c.get("is_closed_loop", False)),
+            centroid[0], centroid[1], centroid[2],
+            dims[0], dims[1], dims[2],
+            principal[0], principal[1], principal[2],
+            extent_princ, extent_sec, curvature_rms, len(pnorms),
+        )
+        for pi, pn in enumerate(pnorms):
+            pn_arr = np.asarray(pn, dtype=float)
+            logger.info(
+                "    plane_normal %d: (%.2f,%.2f,%.2f)",
+                pi, pn_arr[0], pn_arr[1], pn_arr[2],
+            )
+
+    logger.info("=== REBUILD CONCAVE EDGES (n=%d) ===", len(solid_edges))
+    for ei, se in enumerate(solid_edges):
+        mid = se["midpoint"]
+        d = se["dir"]
+        adj_n = se.get("adj_normals", [])
+        adj_a = se.get("adj_areas", [])
+        adj_b = se.get("adj_bbox_dims", [])
+        normals_str = " ; ".join(
+            f"({n[0]:.2f},{n[1]:.2f},{n[2]:.2f})" for n in adj_n
+        )
+        areas_str = ",".join(f"{a:.1f}" for a in adj_a)
+        bbox_str = " ; ".join(
+            f"({b[0]:.1f}x{b[1]:.1f}x{b[2]:.1f})" for b in adj_b
+        )
+        logger.info(
+            "  edge %d: mid=(%.1f,%.1f,%.1f), dir=(%.2f,%.2f,%.2f), len=%.1f, "
+            "adj_normals=[%s], adj_areas=[%s], adj_bbox=[%s]",
+            ei, mid[0], mid[1], mid[2], d[0], d[1], d[2], se["len"],
+            normals_str, areas_str, bbox_str,
+        )
+    logger.info("=== END DIAGNOSTIC ===")
 
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}

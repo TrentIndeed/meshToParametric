@@ -126,7 +126,7 @@ Token cost: ~20 for a simple bracket, ~55 for a complex mount with chamfers.
 - Per-IP token tracking prevents free trial abuse (100 tokens + 10 jobs per IP)
 - Complexity meter rejects meshes >10,000 faces or non-watertight >5,000 faces
 - AI calls: system prefix, prompt sanitization, 8K cap, 20 calls/session, 5s rate limit
-- Auth: SHA-256 + AUTH_SECRET, token cookies, session management
+- Auth: PBKDF2-SHA256 salted password hashes, signed expiring tokens, per-IP login rate limiting
 - Database: SQLite on Docker volume, survives rebuilds
 
 ## Deployment

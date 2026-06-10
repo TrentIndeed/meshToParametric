@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check mesh2param tests
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system libs for headless rendering
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglu1-mesa xvfb
+      - run: pip install -e ".[dev]"
+      # Visual-marked tests need a display + reference renders; skip in CI.
+      - run: pytest -m "not visual and not slow" -q
+        env:
+          AUTH_SECRET: ci-test-secret

@@ -8,7 +8,6 @@ import textwrap
 import matplotlib.pyplot as plt
 import pyvista as pv
 
-from mesh2param.viz.colors import DARK_ACCENT, DARK_BG, DARK_GRID
 
 
 def add_report_banner_pv(

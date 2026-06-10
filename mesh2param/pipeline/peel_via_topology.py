@@ -68,7 +68,6 @@ def identify_blends_from_topology(
 
     vertices = np.asarray(cleaned.vertices, dtype=float)
     faces = np.asarray(cleaned.faces, dtype=np.int64)
-    bbox_diag = cleaned.bbox_diagonal
 
     records: list[dict] = []
     peeled_region_ids: set[int] = set()
@@ -184,7 +183,6 @@ def identify_blends_from_topology(
             # main-hole rim fillet can run 500+ faces. The bridge-
             # test below + plane-neighbor-count rule handle all the
             # discrimination work either way.
-            radius_raw = f.params.get("radius", 0) or 0
             # Get axis for cylinder/cone (used downstream for
             # line_dir fallback). Spheres don't have an axis.
             axis = None

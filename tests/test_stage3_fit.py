@@ -8,10 +8,9 @@ import numpy as np
 import pyvista as pv
 import pytest
 
-from mesh2param.config import FitConfig
 from mesh2param.models.region import SurfaceType
 from mesh2param.models.surface import FittedSurface
-from mesh2param.pipeline.fit import compute_residuals, fit_surfaces
+from mesh2param.pipeline.fit import compute_residuals
 from mesh2param.viz.stage3_fit import Stage3Viz
 
 

@@ -93,7 +93,6 @@ def _get_user_plan(request) -> str:
     except Exception:
         logger.exception("Failed to resolve user plan from auth cookie")
         return "free"
-    _ip_jobs[ip] = _ip_jobs.get(ip, 0) + 1
 
 
 @asynccontextmanager
@@ -114,9 +113,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Paramesh AI", lifespan=lifespan)
+
+# Same-origin by default; extra origins (e.g. staging) via ALLOWED_ORIGINS env var.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://parameshai.com,https://www.parameshai.com,"
+        "http://127.0.0.1:8080,http://localhost:8080",
+    ).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS, allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -132,6 +140,28 @@ class NoCacheStaticMiddleware(BaseHTTPMiddleware):
             response.headers["Expires"] = "0"
         return response
 app.add_middleware(NoCacheStaticMiddleware)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Mesh formats we accept for upload; user-supplied filenames are never trusted
+# beyond this whitelisted suffix.
+ALLOWED_MESH_SUFFIXES = {".stl", ".obj", ".ply", ".3mf"}
+
+
+def _safe_suffix(filename: str | None) -> str | None:
+    """Return the lowercased mesh suffix if whitelisted, else None."""
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in ALLOWED_MESH_SUFFIXES else None
 
 app.include_router(auth_router)
 app.include_router(chat_router)
@@ -288,7 +318,12 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
 
     content = await file.read()
     logger.debug("Preview file received: %r size=%d bytes", file.filename, len(content))
-    suffix = Path(file.filename).suffix
+    suffix = _safe_suffix(file.filename)
+    if suffix is None:
+        return JSONResponse(
+            {"status": "error", "error": "Unsupported file type. Use STL, OBJ, PLY, or 3MF."},
+            status_code=400,
+        )
     # Store in data/uploads/ instead of system temp (survives server restarts)
     upload_dir = Path("data/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -416,10 +451,13 @@ async def preview_mesh(request: Request, file: UploadFile = File(...)):
             "mesh_vertices": cleaned.vertices.flatten().tolist(),
             "mesh_faces": cleaned.faces.flatten().tolist(),
         }
-    except Exception as e:
+    except Exception:
         logger.exception("Preview failed for file %r", file.filename)
         Path(tmp.name).unlink(missing_ok=True)
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+        return JSONResponse(
+            {"status": "error", "error": "Could not process this mesh. Check the file and try again."},
+            status_code=500,
+        )
 
 
 @app.post("/api/check-file")
@@ -501,7 +539,12 @@ async def upload(request: Request, file: UploadFile = File(...)):
             status_code=413,
         )
 
-    suffix = Path(file.filename).suffix
+    suffix = _safe_suffix(file.filename)
+    if suffix is None:
+        return JSONResponse(
+            {"status": "error", "error": "Unsupported file type. Use STL, OBJ, PLY, or 3MF."},
+            status_code=400,
+        )
     upload_dir = Path("data/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=upload_dir)
@@ -859,7 +902,6 @@ async def usage_status(request: Request):
     import time as _time
     plan = _get_user_plan(request)
     limit = PLAN_TOKENS.get(plan, 100)
-    ip = _get_client_ip(request)
     now = _time.time()
 
     # Compute daily/weekly/monthly usage from job history
@@ -901,7 +943,12 @@ async def usage_status(request: Request):
 async def clean_mesh(file: UploadFile = File(...)):
     import trimesh
     logger.debug("Clean request: filename=%r", file.filename)
-    suffix = Path(file.filename).suffix
+    suffix = _safe_suffix(file.filename)
+    if suffix is None:
+        return JSONResponse(
+            {"status": "error", "error": "Unsupported file type. Use STL, OBJ, PLY, or 3MF."},
+            status_code=400,
+        )
     upload_dir = Path("data/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=upload_dir)
@@ -928,9 +975,12 @@ async def clean_mesh(file: UploadFile = File(...)):
             "vertices": cleaned.vertices.flatten().tolist(),
             "faces": cleaned.faces.flatten().tolist(),
         })
-    except Exception as e:
+    except Exception:
         logger.exception("Clean failed for file %r", file.filename)
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+        return JSONResponse(
+            {"status": "error", "error": "Could not clean this mesh. Check the file and try again."},
+            status_code=500,
+        )
     finally:
         Path(tmp.name).unlink(missing_ok=True)
 
@@ -974,9 +1024,9 @@ async def resize_mesh_file(body: dict):
             "dimensions": [round(d, 1) for d in sorted(new_bbox.tolist(), reverse=True)],
             "scale_xyz": [round(s, 4) for s in scale_xyz],
         }
-    except Exception as e:
-        logger.exception("Resize failed: %s", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except Exception:
+        logger.exception("Resize failed")
+        return JSONResponse({"error": "Resize failed. Check the mesh and try again."}, status_code=500)
 
 
 @app.post("/api/clean/resize")
@@ -1005,7 +1055,8 @@ async def resize_mesh(body: dict):
         verts = (verts - c) * scale + c
     mesh = trimesh.Trimesh(vertices=verts, faces=fcs, process=False)
     out_tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
-    mesh.export(out_tmp.name); out_tmp.close()
+    mesh.export(out_tmp.name)
+    out_tmp.close()
     return {"status": "ok", "dimensions": (verts.max(0)-verts.min(0)).tolist(),
             "vertices": verts.flatten().tolist(), "faces": fcs.flatten().tolist(),
             "download_url": f"/api/clean/download/{Path(out_tmp.name).name}"}
@@ -1013,8 +1064,13 @@ async def resize_mesh(body: dict):
 
 @app.get("/api/clean/download/{filename}")
 async def download_cleaned(filename: str):
-    path = Path(tempfile.gettempdir()) / filename
-    if not path.exists() or not filename.endswith(".stl"):
+    # Only serve plain .stl filenames that resolve directly inside the temp dir
+    # (no separators, no "..", no symlink escapes).
+    temp_dir = Path(tempfile.gettempdir()).resolve()
+    if Path(filename).name != filename or not filename.endswith(".stl"):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path = (temp_dir / filename).resolve()
+    if path.parent != temp_dir or not path.is_file():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return FileResponse(str(path), media_type="application/octet-stream", filename="cleaned_mesh.stl")
 
@@ -1098,7 +1154,7 @@ async def contact_form(body: dict):
         smtp_port = int(os.getenv("SMTP_PORT", "587"))
         smtp_user = os.getenv("SMTP_USER", "")
         smtp_pass = os.getenv("SMTP_PASS", "")
-        notify_email = "trentondragon02@gmail.com"
+        notify_email = os.getenv("NOTIFY_EMAIL", "trentondragon02@gmail.com")
 
         if smtp_user and smtp_pass:
             msg = MIMEText(f"From: {name} <{email}>\n\n{message}")
@@ -1178,7 +1234,7 @@ User question: {message}"""
             except Exception:
                 pass
         return {"reply": reply}
-    except Exception as e:
+    except Exception:
         logger.exception("Support chat AI call failed")
         return {"reply": "I'm having trouble connecting right now. Please try /contact to reach us directly."}
 

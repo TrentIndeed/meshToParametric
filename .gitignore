@@ -209,3 +209,21 @@ data/
 
 # Generated mesh-vs-CAD comparison images
 mesh2param/viz_server/static/compare/
+
+# Local handoff / passoff notes (not tracked)
+docs/FILLET_MATCHER_HANDOFF.md
+
+# Node dependencies (playwright for screenshot scripts)
+node_modules/
+
+# Local scratch / diagnostic scripts and dumps
+_diag_*.py
+_check_*.py
+_render.py
+_render_out/
+out.txt
+*.log
+
+# Binary doc exports (keep sources elsewhere; don't version office files)
+*.docx
+*.docx.pdf

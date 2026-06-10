@@ -13,7 +13,6 @@ import numpy as np
 import pyvista as pv
 import pytest
 
-from mesh2param.pipeline.export_onshape import ExportResult
 from mesh2param.viz.stage6_export import Stage6CadQueryViz, Stage6Viz
 
 

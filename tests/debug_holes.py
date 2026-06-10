@@ -1,5 +1,6 @@
 """Debug: check solid bbox and blind hole cuts."""
-import sys, numpy as np
+import sys
+import numpy as np
 sys.path.insert(0, ".")
 import cadquery as cq
 from pathlib import Path
@@ -9,7 +10,7 @@ from mesh2param.pipeline.segment import segment_mesh
 from mesh2param.pipeline.fit import fit_surfaces
 from mesh2param.pipeline.topology import build_topology
 from mesh2param.pipeline.recognize import recognize_features
-from mesh2param.pipeline.export_cadquery import _extract_profile_and_holes, _tessellate_solid
+from mesh2param.pipeline.export_cadquery import _extract_profile_and_holes
 import logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -57,7 +58,7 @@ print()
 # Now test blind hole
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.gp import gp_Pnt
-from OCP.TopAbs import TopAbs_IN, TopAbs_ON, TopAbs_OUT
+from OCP.TopAbs import TopAbs_IN, TopAbs_ON
 
 solid_shape = wp.val().wrapped
 for label, pt in [("blind hole center", (70.8, 24.4, -54.8)),

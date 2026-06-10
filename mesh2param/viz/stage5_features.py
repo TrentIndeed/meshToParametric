@@ -11,10 +11,9 @@ import networkx as nx
 import numpy as np
 import pyvista as pv
 
-from mesh2param.models.feature import Feature, FeatureType
 from mesh2param.models.tree import FeatureTree
 from mesh2param.viz.base import BaseVisualizer, add_report_banner_mpl, add_report_banner_pv
-from mesh2param.viz.colors import DARK_ACCENT, DARK_BG, DARK_GRID, FEATURE_COLORS
+from mesh2param.viz.colors import DARK_BG, FEATURE_COLORS
 
 
 class Stage5Viz(BaseVisualizer):

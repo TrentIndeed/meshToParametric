@@ -17,7 +17,6 @@ import pytest
 from mesh2param.config import (
     FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig,
 )
-from mesh2param.models.surface import TransitionType
 from mesh2param.pipeline.fit import fit_surfaces
 from mesh2param.pipeline.ingest import ingest_mesh
 from mesh2param.pipeline.recognize import recognize_features

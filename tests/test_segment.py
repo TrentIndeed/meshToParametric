@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 import trimesh
 
 from mesh2param.config import IngestConfig, SegmentConfig

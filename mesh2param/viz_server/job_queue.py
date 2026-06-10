@@ -674,10 +674,6 @@ class JobQueue:
         # an already-peeled mesh with no fillets left to find. Blend
         # records now come from the per-body pass and get cross-body
         # grouping by the stitched-fillets stage.
-        from mesh2param.pipeline.segment import segment_mesh
-        from mesh2param.pipeline.fit import fit_surfaces
-        from mesh2param.pipeline.topology import build_topology
-        from mesh2param.config import SegmentConfig, FitConfig, TopologyConfig
 
         # The stitched-fillets stage populates this with the cluster
         # payload (group_id + face-vertex array) consumed by the CAD
@@ -764,10 +760,6 @@ class JobQueue:
             [0.40, 1.00, 0.85],  # 10 mint         (hue 158°, L 0.70)
             [0.10, 0.30, 0.65],  # 11 navy         (hue 218°, L 0.38)
         ]
-        type_colors = {
-            'PLANE': [0.0, 0.55, 1.0], 'CYLINDER': [0.0, 1.0, 0.25],
-            'CONE': [1.0, 0.35, 0.0], 'SPHERE': [1.0, 0.0, 0.55],
-        }
         edge_type_colors = {
             'SHARP': [1.0, 1.0, 1.0], 'FILLET': [0.35, 0.65, 1.0],
             'CHAMFER': [1.0, 0.85, 0.25], 'SMOOTH': [0.5, 0.5, 0.5],
@@ -784,7 +776,6 @@ class JobQueue:
 
         bodies_to_process = decomposition.bodies
         all_body_results = []  # list of (body, sub_cleaned, tree)
-        n_bodies = len(bodies_to_process)
 
         def _face_edges(faces):
             """Get set of edge tuples (v0, v1) from face array."""
@@ -1200,10 +1191,6 @@ class JobQueue:
                 axial_extent = float(along.max() - along.min())
                 perp = rel - np.outer(along, axis_dir)
                 perp_d = np.linalg.norm(perp, axis=1)
-                perp_extent = (
-                    float(perp_d.max() - perp_d.min())
-                    if len(perp_d) else 0.0
-                )
                 # Project to plane perp to axis to measure angular wrap.
                 arb = (
                     np.array([1.0, 0.0, 0.0])
@@ -1524,7 +1511,6 @@ class JobQueue:
                 if sk not in subkey_to_group:
                     subkey_to_group[sk] = len(subkey_to_group)
                 uid_to_group[ri["uid"]] = subkey_to_group[sk]
-            uid_to_body_rec = {ri["uid"]: (ri["body_idx"], ri["rec"]) for ri in records_info}
 
             n_groups = len(subkey_to_group)
             group_counts: dict[int, int] = {}
@@ -1730,15 +1716,6 @@ class JobQueue:
                 )
                 cov_rad, inplane = _coverage_and_inplane(full_verts)
                 cov_deg = cov_rad * 180.0 / float(np.pi)
-                # Use topology-assigned tube radii (matching the
-                # driver). Falls back to perp-distance medians,
-                # then to group_radius.
-                if topology_radii:
-                    max_r = float(max(topology_radii))
-                elif per_record_radii:
-                    max_r = float(max(per_record_radii))
-                else:
-                    max_r = group_radius
                 # Three categories only:
                 #   hole_edge — tight ring around a real hole.
                 #               Requires closed-loop coverage AND

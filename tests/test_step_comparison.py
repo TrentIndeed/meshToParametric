@@ -23,7 +23,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import pyvista as pv
 
 from mesh2param.config import (
     FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig,

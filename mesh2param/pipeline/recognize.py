@@ -68,7 +68,6 @@ def recognize_features(
         len(regions), len(fitted), graph.number_of_nodes(), len(edges),
     )
 
-    bbox_diag = cleaned.bbox_diagonal
 
     region_lookup = {r.region_id: r for r in regions}
     fitted_lookup = {f.region_id: f for f in fitted}
@@ -460,7 +459,6 @@ def _find_holes(
 ) -> list[tuple[Feature, set[int]]]:
     """Find cylindrical holes (through-holes and blind holes)."""
     bbox_diag = cleaned.bbox_diagonal
-    fitted_lookup = {f.region_id: f for f in fitted}
     results = []
 
     for f in fitted:
@@ -480,7 +478,6 @@ def _find_holes(
             if region is None:
                 continue
             verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
-            axis_pt = np.array(f.params.get("axis_dir", [0, 0, 1]))
             # Estimate radius from bbox: smallest two dims averaged / 2
             bbox_size = verts.max(axis=0) - verts.min(axis=0)
             sorted_dims = sorted(bbox_size)
@@ -1105,10 +1102,6 @@ def _find_fillets_and_chamfers(
         # "phantom fillet" ends up applied as a stripe that does not
         # exist in the reference mesh. We reject non-connected regions.
         if cleaned is not None and len(region.face_indices) > 1:
-            face_to_idx = {
-                int(fi): local_i
-                for local_i, fi in enumerate(region.face_indices)
-            }
             edge_to_local: dict[tuple[int, int], list[int]] = defaultdict(list)
             region_faces = cleaned.faces[region.face_indices]
             for local_i, tri in enumerate(region_faces):

@@ -30,7 +30,7 @@ import numpy as np
 
 cq = pytest.importorskip("cadquery")
 
-from mesh2param.pipeline.export_cadquery import (
+from mesh2param.pipeline.export_cadquery import (  # noqa: E402
     _apply_recognized_fillets_to_solid,
 )
 
@@ -257,12 +257,7 @@ def test_rackmount_mimic_three_plate_union():
     # around the bottom edge. We only need the BOTTOM strip at z=-96
     # for the matcher to find the concave inside-corner edge.
     r = 1.4
-    axis_x = 39.0 - r  # outer side, fillet axis is in the air to the
-                        # -X side of the outer face — but the relevant
-                        # edge for THIS rebuilt solid is the inside
-                        # corner where the outer face meets the base
-                        # plate's underside, at x=39, z=-96.
-    # Better: place the cluster along the inside-corner edge itself
+    # Place the cluster along the inside-corner edge itself
     # at (39, y, -96), with vertex set as a quarter cylinder in the
     # +X, -Z direction (air quadrant).
     right_start = np.array([39.0 - r, 50.0, -96.0 - r])

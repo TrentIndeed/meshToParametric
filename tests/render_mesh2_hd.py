@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Render Mesh2 final result at high resolution."""
-import pickle, sys
+import pickle
+import sys
 sys.path.insert(0, ".")
 from pathlib import Path
 from mesh2param.config import *
@@ -11,7 +12,9 @@ from mesh2param.pipeline.topology import build_topology
 from mesh2param.pipeline.recognize import recognize_features
 import pyvista as pv
 import numpy as np
-import tempfile, os, subprocess
+import tempfile
+import os
+import subprocess
 
 cleaned = ingest_mesh(Path('models/Mesh2/BottomMount.3mf'), IngestConfig(remesh=False))
 regions = segment_mesh(cleaned, SegmentConfig())

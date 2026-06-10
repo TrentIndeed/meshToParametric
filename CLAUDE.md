@@ -97,7 +97,7 @@ models/          — mesh + reference STEP pairs (models/Mesh1/ through models/M
 
 ## Auth (from operatorDashboard)
 - `db/database.py` — User, MeshJob, JobStep, WaitlistEntry, SupportTicket models (SQLite)
-- `api/auth.py` — signup, login, verify (SHA-256 + AUTH_SECRET)
+- `api/auth.py` — signup, login, verify (PBKDF2-SHA256 salted hashes; legacy SHA-256 hashes upgraded on login; signed expiring tokens; per-IP rate limit; developer accounts via DEVELOPER_USERNAMES env var)
 - `api/settings.py` — change password, delete account (cascades to jobs)
 - Per-IP token tracking prevents free trial abuse (100 tokens + 10 jobs per IP)
 - Database auto-creates `data/mesh2param.db` on first startup

@@ -432,7 +432,6 @@ def _build_graph(
     Edges carry transition_type and dihedral_angle attributes.
     """
     G = nx.Graph()
-    fitted_lookup = {f.region_id: f for f in fitted}
 
     for region in regions:
         G.add_node(

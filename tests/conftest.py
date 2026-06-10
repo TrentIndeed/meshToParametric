@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import numpy as np
 import pytest
 import trimesh
 
@@ -196,7 +195,10 @@ def body1mesh_cadquery(body1mesh_features, body1mesh_cleaned):
 
     Runs in a subprocess to avoid VTK conflicts between cadquery and pyvista.
     """
-    import subprocess, sys, json, tempfile, pickle
+    import subprocess
+    import sys
+    import tempfile
+    import pickle
 
     # Serialize inputs to a temp file
     tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)

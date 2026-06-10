@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
 
-from mesh2param.viz.base import BaseVisualizer, add_report_banner_mpl, add_report_banner_pv
+from mesh2param.viz.base import BaseVisualizer, add_report_banner_mpl
 from mesh2param.viz.colors import DARK_ACCENT, DARK_BG, DARK_GRID
 
 
@@ -303,8 +303,6 @@ class Stage6CadQueryViz(BaseVisualizer):
         if save_path is not None:
             matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-        from io import BytesIO
 
         steps = getattr(cq_result, "construction_steps", [])
 

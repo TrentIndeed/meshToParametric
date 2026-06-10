@@ -471,10 +471,9 @@ def peel_fillets(
     # A strip-collapsed triangle's three vertices are all on the sharp
     # edge line, so the triangle has (nearly) zero area. Remove it.
     t = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    # Merge vertices that ended up coincident (tolerance scaled to part size).
+    # Merge vertices that ended up coincident.
     try:
-        merge_tol = max(1e-5, bbox_diag * 1e-5)
-        t.merge_vertices(merge_tex_norm=False) if False else t.merge_vertices()
+        t.merge_vertices()
     except Exception:
         pass
     # Drop zero-area triangles.
@@ -602,11 +601,6 @@ def peel_chamfers(
     # chamfers from different tabs share a normal). We need to split
     # each normal cluster into spatially-connected components so each
     # physical chamfer strip is peeled independently.
-    diag_face_to_cluster: dict[int, int] = {
-        int(diag_indices[i]): int(labels[i])
-        for i in range(len(diag_indices))
-        if labels[i] != -1
-    }
 
     def _split_cluster_by_connectivity(cluster_faces: np.ndarray) -> list[np.ndarray]:
         """Split a set of faces into connected components via shared edges."""

@@ -236,14 +236,22 @@ def _merge_coincident_cylinders(
             if r is not None:
                 all_face_idx.update(r.face_indices.tolist())
         merged_face_idx = np.array(sorted(all_face_idx), dtype=np.int64)
-        # Mutate the primary's region in place to contain all faces
+        # Update the primary's region in place so downstream stages (which share
+        # this regions list) see the merged faces. Compute the derived fields
+        # first and only assign all three together — a partial update would
+        # leave face_indices inconsistent with vertices/normals.
+        if len(merged_face_idx) and merged_face_idx[-1] >= len(cleaned.faces):
+            logger.warning(
+                "Skipping cylinder merge for region %d: face index %d out of range (%d faces)",
+                primary.region_id, int(merged_face_idx[-1]), len(cleaned.faces),
+            )
+            merged_cyls.extend(group)
+            continue
+        merged_vertices = cleaned.vertices[cleaned.faces[merged_face_idx].flatten()]
+        merged_normals = cleaned.normals[merged_face_idx]
         primary_region.face_indices = merged_face_idx
-        # Refresh derived fields
-        try:
-            primary_region.vertices = cleaned.vertices[cleaned.faces[merged_face_idx].flatten()]
-            primary_region.normals = cleaned.normals[merged_face_idx]
-        except Exception:
-            pass
+        primary_region.vertices = merged_vertices
+        primary_region.normals = merged_normals
         logger.info(
             "Merged %d cylinder regions into region %d: %d total faces",
             len(group), primary.region_id, len(merged_face_idx),

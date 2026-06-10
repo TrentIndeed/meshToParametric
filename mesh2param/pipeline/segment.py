@@ -11,7 +11,6 @@ import logging
 from collections import Counter, defaultdict
 
 import numpy as np
-from scipy.spatial import cKDTree
 from sklearn.cluster import KMeans
 
 from mesh2param.config import SegmentConfig
@@ -19,6 +18,26 @@ from mesh2param.models.mesh import CleanedMesh
 from mesh2param.models.region import FaceRegion, SurfaceType
 
 logger = logging.getLogger(__name__)
+
+
+def _renumber_labels(labels: np.ndarray) -> np.ndarray:
+    """Remap label values to contiguous 0..N-1, preserving order."""
+    unique = np.unique(labels)
+    remap = {old: new for new, old in enumerate(unique)}
+    return np.array([remap[lbl] for lbl in labels], dtype=np.int64)
+
+
+def _is_rotating_normal_arc(normals: np.ndarray) -> bool:
+    """True if face normals have rank-2 structure (a single rotating-normal arc,
+    e.g. a bore wall): significant in-plane spread but nearly coplanar."""
+    if len(normals) < 3:
+        return False
+    centered = normals - normals.mean(axis=0)
+    _, s_vals, _ = np.linalg.svd(centered, full_matrices=False)
+    if s_vals[0] <= 1e-12:
+        return False
+    s_norm = s_vals / s_vals[0]
+    return s_norm[1] > 0.3 and s_norm[2] < 0.2
 
 
 def segment_mesh(
@@ -348,10 +367,7 @@ def _merge_small_regions(
                 labels[face_mask] = best_neighbor
                 changed = True
 
-    # Renumber labels to be contiguous 0..N-1
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
 
     return labels
 
@@ -390,7 +406,6 @@ def _pull_axial_into_flat_regions(
     """
     labels = labels.copy()
     flat_threshold = 0.95
-    cos_30 = np.cos(np.radians(30.0))
 
     for _ in range(iterations):
         # Cache per-region mean normal and magnitude.
@@ -462,10 +477,7 @@ def _pull_axial_into_flat_regions(
         if not changed:
             break
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -593,10 +605,7 @@ def _peel_hole_rim_fillets(
                     labels[fi] = next_label
                 next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -813,10 +822,7 @@ def _peel_isolated_flat_island_holes(
                     labels[fi] = next_label
                 next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[lbl] for lbl in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -987,10 +993,7 @@ def _split_rolled_edge_into_fillet_wall(
         next_label += 1
         # wall_mask faces keep `lbl`.
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[lbl] for lbl in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -1124,10 +1127,7 @@ def _split_long_fillet_into_corners(
                     labels[target_faces] = next_label
                     next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[lbl] for lbl in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -1215,10 +1215,7 @@ def _peel_axial_tangents_from_curves(
                 labels[fi] = next_label
             next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -1280,10 +1277,7 @@ def _split_disconnected_components(
             # else: keep old_label (same as components[0]) — tiny
             # slivers don't get their own region
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -1329,13 +1323,8 @@ def _split_flat_from_curved(
         # they're geometrically part of the cylinder and must NOT
         # be peeled off as "flat" sub-regions. Without this guard,
         # a 360° bore becomes 1 curved region + 4 cardinal strips.
-        if len(region_normals) >= 3:
-            centered_n = region_normals - avg_n
-            _, s_vals, _ = np.linalg.svd(centered_n, full_matrices=False)
-            if s_vals[0] > 1e-12:
-                s_norm = s_vals / s_vals[0]
-                if s_norm[1] > 0.3 and s_norm[2] < 0.2:
-                    continue  # cylinder-like — preserve whole
+        if _is_rotating_normal_arc(region_normals):
+            continue  # cylinder-like — preserve whole
 
         # Classify each face as flat or curved
         # A face is flat if its normal is within ~15° of a principal axis
@@ -1384,10 +1373,7 @@ def _split_flat_from_curved(
                         labels[fi] = next_label
                     next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
 
     return labels
 
@@ -1451,13 +1437,8 @@ def _curvature_split(
         # small tangent attached has low s[1]/s[0] and correctly
         # proceeds to splitting.
         region_normals = cleaned.normals[mask]
-        if len(region_normals) >= 3:
-            centered_n = region_normals - region_normals.mean(axis=0)
-            _, s_vals, _ = np.linalg.svd(centered_n, full_matrices=False)
-            if s_vals[0] > 1e-12:
-                s_norm = s_vals / s_vals[0]
-                if s_norm[1] > 0.3 and s_norm[2] < 0.2:
-                    continue  # rank-2 rotating-normal arc → protect
+        if _is_rotating_normal_arc(region_normals):
+            continue  # rank-2 rotating-normal arc → protect
 
         # Build feature vectors: (nx, ny, nz, curvature)
         features = np.column_stack([region_normals, region_curvatures])
@@ -1482,10 +1463,7 @@ def _curvature_split(
                 labels[region_indices[sub_mask]] = next_label
                 next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
 
     return labels
 
@@ -1554,10 +1532,7 @@ def _split_cylinders_from_planes(
                 labels[fi] = next_label
             next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
 
     return labels
 
@@ -1761,10 +1736,7 @@ def _unify_cylinder_features(
         for fi in absorbed:
             labels[fi] = target_label
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
     return labels
 
 
@@ -1876,10 +1848,7 @@ def _merge_adjacent_cylinder_fragments(
             labels[region_faces[l]] = next_label
         next_label += 1
 
-    # Renumber contiguously
-    unique = np.unique(labels)
-    remap = {old: new for new, old in enumerate(unique)}
-    labels = np.array([remap[l] for l in labels], dtype=np.int64)
+    labels = _renumber_labels(labels)
 
     return labels
 
@@ -2042,7 +2011,6 @@ def _find_boundary_edges(
     face_indices: np.ndarray, faces: np.ndarray
 ) -> list[tuple[int, int]]:
     """Find edges that border exactly one face in the region (boundary edges)."""
-    face_set = set(face_indices.tolist())
     edge_count: dict[tuple[int, int], int] = defaultdict(int)
 
     for fi in face_indices:

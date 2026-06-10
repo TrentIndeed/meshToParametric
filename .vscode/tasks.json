@@ -1,0 +1,23 @@
+{
+  // Auto-runs when this folder opens (incl. at Windows startup via the Startup
+  // script): resumes the most recent Claude Code chat for this repo (`claude -c`).
+  // Remove this file to stop it. First open may prompt "Allow Automatic Tasks".
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Claude: resume latest chat",
+      "type": "shell",
+      "command": "claude",
+      "args": ["-c"],
+      "runOptions": { "runOn": "folderOpen" },
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": false
+      }
+    }
+  ]
+}

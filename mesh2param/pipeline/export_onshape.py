@@ -13,7 +13,6 @@ In dry-run mode (default), no API calls are made. The module generates:
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 
 import networkx as nx

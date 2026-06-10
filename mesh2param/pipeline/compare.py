@@ -74,15 +74,6 @@ def _section_to_polygons(
     # Build a mapping from 2D path vertices back to 3D vertices
     verts_2d = np.array(path2d.vertices)
 
-    # Instead of using the arbitrary 2D coordinates from to_planar(),
-    # project the original 3D section vertices onto fixed world axes.
-    # This ensures both meshes share the same coordinate frame.
-    fixed_2d = verts_3d[:, [ax_u, ax_v]]
-
-    # Build index mapping: for each 2D path vertex, find the closest 3D vertex
-    from scipy.spatial import cKDTree
-    tree_3d = cKDTree(verts_3d[:, :3])
-
     # Reconstruct the 2D path vertices using to_3d_matrix to get back to 3D,
     # then project onto fixed axes
     ones = np.ones((len(verts_2d), 1))
@@ -155,7 +146,6 @@ def compare_slices(
             "figure_path": str (path to saved PNG),
         }
     """
-    from shapely.geometry import MultiPolygon, Polygon
 
     logger.debug(
         "compare_slices called: orig_verts=%d, orig_faces=%d, cad_verts=%d, cad_faces=%d, n_slices=%d",
@@ -299,10 +289,7 @@ def _render_figure(
     Green = intersection (matching), Red = original only, Blue = CAD only.
     Returns path to saved PNG.
     """
-    from matplotlib.collections import PatchCollection
-    from matplotlib.patches import PathPatch
-    from matplotlib.path import Path as MplPath
-    from shapely.geometry import MultiPolygon, Polygon
+    from shapely.geometry import Polygon
 
     n = len(per_slice)
     cols = min(4, n)

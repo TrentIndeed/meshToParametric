@@ -7,7 +7,6 @@ import os
 import numpy as np
 import pyvista as pv
 import pytest
-import trimesh
 
 from mesh2param.config import IngestConfig
 from mesh2param.pipeline.ingest import ingest_mesh

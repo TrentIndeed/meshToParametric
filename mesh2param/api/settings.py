@@ -1,16 +1,16 @@
 """User settings — change password, delete account.
 
 Adapted from operatorDashboard/backend/api/settings.py.
+Password hashing/verification is shared with mesh2param.api.auth.
 """
 
-import hashlib
 import logging
-import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from mesh2param.db.database import User, MeshJob, JobStep, get_db
+from mesh2param.api.auth import _check_rate_limit, hash_password, verify_password
+from mesh2param.db.database import User, MeshJob, get_db
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,8 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 
 @router.post("/change-password")
-def change_password(body: dict, db: Session = Depends(get_db)):
+def change_password(body: dict, request: Request, db: Session = Depends(get_db)):
+    _check_rate_limit(request)
     username = body.get("username", "")
     current_password = body.get("current_password", "")
     new_password = body.get("new_password", "")
@@ -29,8 +30,6 @@ def change_password(body: dict, db: Session = Depends(get_db)):
     if len(new_password) < 3:
         raise HTTPException(status_code=400, detail="Password must be at least 3 characters")
 
-    auth_secret = os.getenv("AUTH_SECRET", "")
-
     try:
         user = db.query(User).filter(User.username == username).first()
     except Exception:
@@ -40,13 +39,12 @@ def change_password(body: dict, db: Session = Depends(get_db)):
         logger.debug("Password change failed: user %r not found", username)
         raise HTTPException(status_code=404, detail="User not found")
 
-    current_hash = hashlib.sha256(f"{auth_secret}:{current_password}".encode()).hexdigest()
-    if user.password_hash != current_hash:
+    if not verify_password(current_password, user.password_hash):
         logger.debug("Password change failed: incorrect current password for %r", username)
         raise HTTPException(status_code=401, detail="Current password is incorrect")
 
     try:
-        user.password_hash = hashlib.sha256(f"{auth_secret}:{new_password}".encode()).hexdigest()
+        user.password_hash = hash_password(new_password)
         db.commit()
     except Exception:
         logger.exception("Database error saving new password for %r", username)
@@ -56,15 +54,14 @@ def change_password(body: dict, db: Session = Depends(get_db)):
 
 
 @router.post("/delete-account")
-def delete_account(body: dict, db: Session = Depends(get_db)):
+def delete_account(body: dict, request: Request, db: Session = Depends(get_db)):
+    _check_rate_limit(request)
     username = body.get("username", "")
     password = body.get("password", "")
     logger.debug("Account deletion request for username=%r", username)
 
     if not username or not password:
         raise HTTPException(status_code=400, detail="Username and password required")
-
-    auth_secret = os.getenv("AUTH_SECRET", "")
 
     try:
         user = db.query(User).filter(User.username == username).first()
@@ -75,8 +72,7 @@ def delete_account(body: dict, db: Session = Depends(get_db)):
         logger.debug("Account deletion failed: user %r not found", username)
         raise HTTPException(status_code=404, detail="User not found")
 
-    pw_hash = hashlib.sha256(f"{auth_secret}:{password}".encode()).hexdigest()
-    if user.password_hash != pw_hash:
+    if not verify_password(password, user.password_hash):
         logger.debug("Account deletion failed: incorrect password for %r", username)
         raise HTTPException(status_code=401, detail="Incorrect password")
 

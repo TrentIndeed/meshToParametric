@@ -221,7 +221,6 @@ def export_cadquery(
     # enough that an LLM reorder is a measurable improvement, not a
     # confound when debugging fillet/edge issues.
     llm_order = None
-    num_features = len(feature_tree.features)
     is_multi_body = body_results is not None and len(body_results) > 1
     llm_future = None
     # if is_multi_body:
@@ -686,7 +685,6 @@ def _extract_profile_and_holes(
     # Collect profiles from multiple slices across the full depth.
     # Pick the slice with the largest outer profile area — this finds the
     # widest cross-section, avoiding positions where holes/pockets reduce it.
-    mesh_volume = abs(float(mesh.volume)) if mesh.is_watertight else 0
     extent = float(all_proj.max() - all_proj.min())
 
     candidates: list[tuple[float, list]] = []  # (-area, profiles)
@@ -835,7 +833,7 @@ def _extract_profile_and_holes(
         if largest_area < total_area * 0.7 and not is_cutout:
             # Frame is split — find a nearby slice where the frame is one
             # connected piece but total area is similar (not a filled cutout).
-            from shapely.geometry import Polygon as SPoly, MultiPolygon
+            from shapely.geometry import Polygon as SPoly
             from shapely.ops import unary_union
 
             # Search from near-center outward for a connected slice
@@ -995,7 +993,6 @@ def _extract_profile_and_holes(
     # all mesh faces onto the profile plane (works for thin plates where
     # slicing produces open contours instead of closed polygons).
     if best_profiles:
-        from shapely.geometry import Polygon as _ValPoly
         bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
         sorted_dims = sorted(bbox_size.tolist(), reverse=True)
         expected_area = sorted_dims[0] * sorted_dims[1]
@@ -1059,7 +1056,7 @@ def _extract_profile_and_holes(
     # holes that are perpendicular to the plate face (not random Y/Z axes
     # from misidentified cylindrical features).
     try:
-        from shapely.geometry import Polygon as _HolePoly, Point as _PointP
+        from shapely.geometry import Polygon as _HolePoly
         from shapely.ops import unary_union as _HoleUnion
         from mesh2param.models.feature import Feature, FeatureType as _FType
 
@@ -1366,7 +1363,6 @@ def _llm_visual_verify(
     if not is_available():
         return None
 
-    import tempfile
     import os
 
     # Render comparison images using matplotlib (no VTK needed)
@@ -1685,7 +1681,7 @@ def _build_stepwise(
     ))
     script_lines.append(f"# Step 1: Sketch profile on {plane_name} plane")
     script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
-    script_lines.append(f"result = result.polyline(profile).close()")
+    script_lines.append("result = result.polyline(profile).close()")
 
     # --- Step 1: Extrude base profile ---
     # Try both directions, keep the one that overlaps with the actual part bbox.
@@ -1739,8 +1735,12 @@ def _build_stepwise(
                 u2, v2 = profile[(pj + 1) % n_pts]
                 p1 = [0.0, 0.0, 0.0]
                 p2 = [0.0, 0.0, 0.0]
-                p1[ax_u] = u1; p1[ax_v] = v1; p1[primary_axis] = extrude_start
-                p2[ax_u] = u2; p2[ax_v] = v2; p2[primary_axis] = extrude_start
+                p1[ax_u] = u1
+                p1[ax_v] = v1
+                p1[primary_axis] = extrude_start
+                p2[ax_u] = u2
+                p2[ax_v] = v2
+                p2[primary_axis] = extrude_start
                 overlay_pts.append(p1)
                 overlay_pts.append(p2)
             overlay_arr = np.array(overlay_pts, dtype=np.float64)
@@ -2203,7 +2203,8 @@ def _build_from_mesh_and_cut_holes(
     """
     logger.debug("_build_from_mesh_and_cut_holes: %d holes, verts=%d", len(holes), len(cleaned.vertices))
     import cadquery as cq
-    import tempfile, os
+    import tempfile
+    import os
 
     # Export the cleaned mesh to a temp STL for CadQuery import
     mesh_tri = trimesh.Trimesh(
@@ -2479,8 +2480,6 @@ def _build_solid(
         box_half = radius + 0.5
         # Create a box centered on the hole, aligned to the hole axis
         end_a = center - h_dir * (h_depth / 2)
-        end_b = center + h_dir * (h_depth / 2)
-        box_center = (end_a + end_b) / 2
 
         try:
             boss_plane = cq.Plane(
@@ -2591,16 +2590,9 @@ def _tessellate_solid(solid, fast=False) -> tuple[np.ndarray | None, np.ndarray 
         from OCP.BRep import BRep_Tool
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
         from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE, TopAbs_REVERSED
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
         from OCP.TopoDS import TopoDS
-        from OCP.BRepAdaptor import BRepAdaptor_Surface
-        from OCP.GeomAbs import GeomAbs_Plane
         from OCP.TopLoc import TopLoc_Location
-        from OCP.BRepTools import BRepTools_WireExplorer
-        from OCP.GCPnts import GCPnts_UniformDeflection
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from scipy.spatial import Delaunay
-        import shapely.geometry as sg
 
         shape = solid.val().wrapped
 
@@ -2670,7 +2662,6 @@ def _triangulate_planar_face(face) -> tuple[np.ndarray | None, np.ndarray | None
     from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
     from OCP.BRepTools import BRepTools_WireExplorer
     from OCP.GCPnts import GCPnts_UniformDeflection
-    from OCP.BRep import BRep_Tool
     from scipy.spatial import Delaunay
     try:
         import shapely.geometry as sg
@@ -2897,7 +2888,6 @@ def _detect_mesh_chamfers(
     min_cluster_faces = max(5, int(len(cleaned.faces) * 0.0005))
 
     normals = cleaned.normals
-    ext = extrude_dir / (np.linalg.norm(extrude_dir) + 1e-15)
 
     # --- Identify diagonal faces ---
     # A chamfer face between two principal faces has a normal with significant
@@ -3113,7 +3103,6 @@ def _detect_mesh_chamfers(
 
         # Label for display
         side_label_b = "top" if sign_b == ">" else "bottom"
-        side_label_a = "top" if sign_a == ">" else "bottom"
         label_str = f"{side_label_b}-{axis_names[face_ax_b]} {edge_axis}"
 
         # --- Compute chamfer triangle ---
@@ -3168,7 +3157,6 @@ def _detect_mesh_chamfers(
         along_a = list(corner)
         along_a[face_ax_a] = corner_a + d1 * (-1.0 if sign_a == ">" else 1.0)
 
-        poly_pts = [along_b, corner, along_a]
 
         # --- Size filtering ---
         if d1 < size_min or d2 < size_min:
@@ -3309,7 +3297,8 @@ def _apply_deferred_chamfers(
                             for _e in wp.edges(sel).filter(
                                 lambda e: e.Length() > min_len
                             ).vals():
-                                _sp = _e.startPoint(); _ep = _e.endPoint()
+                                _sp = _e.startPoint()
+                                _ep = _e.endPoint()
                                 out_edges.append(
                                     [[_sp.x, _sp.y, _sp.z], [_ep.x, _ep.y, _ep.z]]
                                 )
@@ -3413,8 +3402,10 @@ def _apply_deferred_chamfers(
             if out_edges is not None:
                 # The chamfered edge runs along the edge axis at the
                 # corner, from e_min to e_max.
-                p_lo = list(map(float, corner)); p_lo[eidx] = float(e_min)
-                p_hi = list(map(float, corner)); p_hi[eidx] = float(e_max)
+                p_lo = list(map(float, corner))
+                p_lo[eidx] = float(e_min)
+                p_hi = list(map(float, corner))
+                p_hi[eidx] = float(e_max)
                 out_edges.append([p_lo, p_hi])
             if out_surfaces is not None:
                 patch = _build_chamfer_surface_patch(cham)
@@ -3503,10 +3494,14 @@ def _build_chamfer_surface_patch(cham: dict) -> tuple[np.ndarray, np.ndarray] | 
         e_max = float(cham["edge_max"])
     except (KeyError, TypeError, ValueError):
         return None
-    pa0 = along_a.copy(); pa0[eidx] = e_min
-    pa1 = along_a.copy(); pa1[eidx] = e_max
-    pb0 = along_b.copy(); pb0[eidx] = e_min
-    pb1 = along_b.copy(); pb1[eidx] = e_max
+    pa0 = along_a.copy()
+    pa0[eidx] = e_min
+    pa1 = along_a.copy()
+    pa1[eidx] = e_max
+    pb0 = along_b.copy()
+    pb0[eidx] = e_min
+    pb1 = along_b.copy()
+    pb1[eidx] = e_max
     verts = np.array([pa0, pb0, pb1, pa1], dtype=float)
     faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
     return verts, faces
@@ -3726,11 +3721,11 @@ def _apply_recognized_fillets_to_solid(
     N_SAMP = 15
     solid_edges: list[dict] = []
     try:
-        solid_val = wp.val()
         for edge in wp.edges().vals():
             try:
                 gtype = edge.geomType()
-                sp = edge.startPoint(); ep = edge.endPoint()
+                sp = edge.startPoint()
+                ep = edge.endPoint()
             except Exception:
                 continue
             start = np.array([sp.x, sp.y, sp.z], dtype=float)

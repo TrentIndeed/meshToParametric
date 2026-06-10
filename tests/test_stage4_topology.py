@@ -13,9 +13,7 @@ import numpy as np
 import pyvista as pv
 import pytest
 
-from mesh2param.config import TopologyConfig
 from mesh2param.models.surface import SurfaceEdge, TransitionType
-from mesh2param.pipeline.topology import build_topology
 from mesh2param.viz.stage4_topology import Stage4Viz
 
 

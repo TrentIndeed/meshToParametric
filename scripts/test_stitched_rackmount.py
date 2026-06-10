@@ -46,7 +46,7 @@ AXIS_DOT_MIN = 0.5
 def run() -> int:
     mesh_path = ROOT / "models" / "Mesh5" / "RackMount.3mf"
     logger.info("Loading %s", mesh_path)
-    cleaned = ingest_mesh(str(mesh_path), IngestConfig())
+    cleaned = ingest_mesh(str(mesh_path), IngestConfig(remesh=False))
     decomposition = decompose_bodies(cleaned, DecomposeConfig())
     bodies = decomposition.bodies
     logger.info("Decomposed into %d bodies", len(bodies))

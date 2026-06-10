@@ -3938,118 +3938,80 @@ def _apply_recognized_fillets_to_solid(
 
     for bi, bucket in enumerate(buckets):
         members = bucket["members"]
-        radii = [m["radius"] for m in members]
-        r = float(np.median(radii))
-        shortest_len = min(
+        # --- Applied radius: whole millimetre, floor 2 mm. ---
+        # The user's parts are designed with whole-mm fillets, never
+        # below 2 mm. The geometry-derived robust radius only sets the
+        # ballpark; round it to a whole mm and clamp to >= 2.
+        r_robust = float(np.median([m["radius"] for m in members]))
+        applied_r = max(2.0, float(round(r_robust)))
+        # --- Radius cap from SPINE edges only. ---
+        # A U-crease bundles long spine edges with tiny corner-arc
+        # segments. OCC tangent-chains them, so the effective edge is
+        # the whole chain — the 1.6 mm corner segments must NOT cap the
+        # radius (that produced sub-mm phantom fillets). Cap by the
+        # shortest LONG edge instead.
+        member_lens = sorted(
             solid_edges[m["edge_idx"]]["len"] for m in members
         )
-        r_cap = max(0.2, shortest_len / 3.0)
-        if r > r_cap:
-            r_orig = r
-            r = r_cap
-            logger.info(
-                "Bucket %d radius capped %.2f -> %.2f (shortest edge %.2f mm)",
-                bi, r_orig, r, shortest_len,
-            )
+        max_len = member_lens[-1] if member_lens else 1.0
+        spine_lens = [L for L in member_lens if L >= 0.25 * max_len]
+        cap_len = min(spine_lens) if spine_lens else max_len
+        r_cap = cap_len / 3.0
+        if applied_r > r_cap:
+            applied_r = max(2.0, float(int(r_cap)))
+
         edges_obj = [solid_edges[m["edge_idx"]]["obj"] for m in members]
-        edge_pts = [
-            (solid_edges[m["edge_idx"]]["start"],
-             solid_edges[m["edge_idx"]]["end"])
-            for m in members
-        ]
+        n_edges = len(edges_obj)
         t_bucket = _time.time()
-        try:
-            vol_before = abs(float(wp.val().Volume()))
-            wp_test = wp.newObject(edges_obj).fillet(r)
-            vol_after = abs(float(wp_test.val().Volume()))
-            if vol_after <= 0 or vol_after > vol_before * 1.05:
-                logger.warning(
-                    "Bucket %d r=%.2f on %d edges rejected: vol %.0f -> %.0f "
-                    "(gain %.1f%% > 5%%)",
-                    bi, r, len(edges_obj), vol_before, vol_after,
-                    (vol_after - vol_before) / max(vol_before, 1) * 100.0,
+        vol_before = abs(float(wp.val().Volume()))
+
+        # --- Apply the WHOLE crease in one rolling operation. ---
+        # Never fall back to per-edge: filleting the sides separately
+        # leaves the corners sharp (the exact failure the user saw).
+        # If OCC can't roll the chain at applied_r, retry the whole
+        # chain at successively smaller whole-mm radii down to 2 mm;
+        # if even 2 mm fails, skip the cluster (no broken partial).
+        r_candidates = [applied_r]
+        for rr in range(int(applied_r) - 1, 1, -1):
+            if rr >= 2:
+                r_candidates.append(float(rr))
+        applied_this_bucket = False
+        for r in r_candidates:
+            try:
+                wp_test = wp.newObject(edges_obj).fillet(r)
+                vol_after = abs(float(wp_test.val().Volume()))
+                if vol_after <= 0 or vol_after > vol_before * 1.05:
+                    continue
+                wp = wp_test
+                v, f = _tessellate_solid(wp, fast=True)
+                applied_steps.append(ConstructionStep(
+                    name=f"Fillet (r={r:.0f}mm) x{n_edges}",
+                    tess_vertices=v, tess_faces=f, volume=vol_after,
+                ))
+                applied_script.append(
+                    f"# Fillet r={r:.0f} on {n_edges} crease edge(s)"
+                )
+                logger.info(
+                    "Bucket %d (cluster %d): r=%.0fmm on %d edges, "
+                    "vol %.0f -> %.0f (dt=%.1fs)",
+                    bi, bucket["cluster_idx"], r, n_edges,
+                    vol_before, vol_after, _time.time() - t_bucket,
+                )
+                applied_this_bucket = True
+                break
+            except Exception as exc:
+                logger.debug(
+                    "Bucket %d r=%.0f on %d edges failed: %s",
+                    bi, r, n_edges, exc,
                 )
                 continue
-            wp = wp_test
-            # NOTE: out_edges/out_surfaces already populated for ALL
-            # claimed edges before the apply loop ran. We do NOT add
-            # again on OCC success — duplicates would inflate the
-            # intent viz mesh.
-            if False and out_surfaces is not None:
-                for sp, ep in edge_pts:
-                    edge_dir = ep - sp
-                    edge_len = float(np.linalg.norm(edge_dir))
-                    if edge_len < 1e-6:
-                        continue
-                    edge_dir = edge_dir / edge_len
-                    arb = np.array([1.0, 0.0, 0.0])
-                    if abs(float(arb @ edge_dir)) > 0.9:
-                        arb = np.array([0.0, 1.0, 0.0])
-                    perp_dir = arb - float(arb @ edge_dir) * edge_dir
-                    perp_dir = perp_dir / (np.linalg.norm(perp_dir) + 1e-12)
-                    mid = 0.5 * (sp + ep)
-                    patch = _build_fillet_surface_patch(
-                        sp, ep, mid + r * perp_dir, edge_dir, r,
-                    )
-                    if patch is not None:
-                        pv, pf = patch
-                        out_surfaces.append({
-                            "verts": pv.tolist(), "faces": pf.tolist(),
-                            "kind": "fillet",
-                        })
-            v, f = _tessellate_solid(wp, fast=True)
-            step = ConstructionStep(
-                name=f"Fillet (r={r:.2f}mm) x{len(edges_obj)}",
-                tess_vertices=v, tess_faces=f, volume=vol_after,
-            )
-            applied_steps.append(step)
-            applied_script.append(
-                f"# Fillet r={r:.3f} on {len(edges_obj)} stitched edge(s)"
-            )
-            logger.info(
-                "Bucket %d (cluster %d): r=%.2fmm on %d edges, "
-                "vol %.0f -> %.0f (dt=%.1fs)",
-                bi, bucket["cluster_idx"], r, len(edges_obj),
-                vol_before, vol_after, _time.time() - t_bucket,
-            )
-        except Exception as exc:
+        if not applied_this_bucket:
             logger.warning(
-                "Bucket %d r=%.2f on %d edges failed after %.1fs: %s; "
-                "falling back to per-edge",
-                bi, r, len(edges_obj), _time.time() - t_bucket, exc,
+                "Bucket %d (cluster %d): could not roll %d-edge crease at "
+                "any radius >= 2mm; skipped (no partial per-edge apply so "
+                "corners aren't left sharp)",
+                bi, bucket["cluster_idx"], n_edges,
             )
-            for sub_m in members:
-                sub_edge = solid_edges[sub_m["edge_idx"]]
-                sub_r = min(sub_m["radius"], sub_edge["len"] / 3.0)
-                if sub_r < 0.2:
-                    continue
-                try:
-                    vol_before2 = abs(float(wp.val().Volume()))
-                    wp_test2 = wp.newObject([sub_edge["obj"]]).fillet(sub_r)
-                    vol_after2 = abs(float(wp_test2.val().Volume()))
-                    if vol_after2 <= 0 or vol_after2 > vol_before2 * 1.05:
-                        continue
-                    wp = wp_test2
-                    # out_edges already populated upfront for ALL
-                    # claimed edges; don't append again here.
-                    v2, f2 = _tessellate_solid(wp, fast=True)
-                    applied_steps.append(ConstructionStep(
-                        name=f"Fillet (r={sub_r:.2f}mm) x1",
-                        tess_vertices=v2, tess_faces=f2, volume=vol_after2,
-                    ))
-                    applied_script.append(
-                        f"# Fillet r={sub_r:.3f} on 1 edge (per-edge fallback)"
-                    )
-                    logger.info(
-                        "Bucket %d fallback: r=%.2fmm on 1 edge, vol %.0f -> %.0f",
-                        bi, sub_r, vol_before2, vol_after2,
-                    )
-                except Exception as exc2:
-                    logger.warning(
-                        "Bucket %d per-edge fallback r=%.2f failed: %s",
-                        bi, sub_r, exc2,
-                    )
-            continue
 
     logger.info(
         "Fillet pass done: %d clusters, %d edges in buckets, %d buckets, "

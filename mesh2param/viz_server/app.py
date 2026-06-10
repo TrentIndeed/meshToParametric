@@ -64,6 +64,16 @@ def _get_client_ip(request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
+def _is_local_request(ip: str) -> bool:
+    """Direct localhost access = the developer running the server.
+
+    Production sits behind Caddy, which always supplies X-Forwarded-For
+    (so _get_client_ip returns the real public IP there); a loopback
+    client IP only happens when hitting uvicorn directly in local dev.
+    """
+    return ip in ("127.0.0.1", "::1", "localhost", "testclient")
+
+
 def _check_free_trial(request) -> tuple[bool, str | None]:
     """Check if guest user (no auth cookie) has used their 1 free generation."""
     token = request.cookies.get("paramesh_token", "")
@@ -474,25 +484,34 @@ async def run_pipeline(request: Request, body: dict):
     ip = _get_client_ip(request)
     logger.debug("Run-pipeline request: filename=%r ip=%s plan=%s",
                  body.get("filename"), ip, plan)
-    # Check free trial for guest users (1 free generation)
-    ok, reason = _check_free_trial(request)
-    if not ok:
-        return JSONResponse({"status": "error", "error": reason}, status_code=403)
-
-    # Check plan limits for logged-in users
     token = request.cookies.get("paramesh_token", "")
-    if token:
-        parts_limit = PLAN_PARTS.get(plan, 3)
-        # Count jobs this month
-        import time as _time
-        month_ago = _time.time() - 2592000
-        with queue._lock:
-            monthly_jobs = sum(1 for job in queue._jobs.values() if job.status == "done" and job.created_at >= month_ago)
-        if parts_limit < 9999 and monthly_jobs >= parts_limit:
-            return JSONResponse(
-                {"status": "error", "error": f"Monthly limit reached ({monthly_jobs}/{parts_limit} parts on {plan} plan)."},
-                status_code=403,
-            )
+    if _is_local_request(ip):
+        logger.debug("Local dev request — skipping trial/plan limits")
+    else:
+        # Check free trial for guest users (1 free generation)
+        ok, reason = _check_free_trial(request)
+        if not ok:
+            return JSONResponse({"status": "error", "error": reason}, status_code=403)
+
+        # Check plan limits for logged-in users. Count only THIS
+        # client's completed jobs — the old global count billed every
+        # job in the local DB (any user, any session) against the
+        # requester's monthly limit.
+        if token:
+            parts_limit = PLAN_PARTS.get(plan, 3)
+            import time as _time
+            month_ago = _time.time() - 2592000
+            with queue._lock:
+                monthly_jobs = sum(
+                    1 for job in queue._jobs.values()
+                    if job.status == "done" and job.created_at >= month_ago
+                    and job.client_ip == ip
+                )
+            if parts_limit < 9999 and monthly_jobs >= parts_limit:
+                return JSONResponse(
+                    {"status": "error", "error": f"Monthly limit reached ({monthly_jobs}/{parts_limit} parts on {plan} plan)."},
+                    status_code=403,
+                )
 
     temp_path = body.get("temp_path", "")
     filename = body.get("filename", "mesh.stl")
@@ -521,15 +540,16 @@ async def upload(request: Request, file: UploadFile = File(...)):
     plan = _get_user_plan(request)
     ip = _get_client_ip(request)
     logger.debug("Upload request: filename=%r ip=%s plan=%s", file.filename, ip, plan)
-    ok, reason = _check_free_trial(request)
-    if not ok:
-        return JSONResponse({"status": "error", "error": reason}, status_code=403)
-    parts_limit = PLAN_PARTS.get(plan, 3)
-    if parts_limit < 9999 and queue.tokens_spent >= PLAN_TOKENS.get(plan, 100):
-        return JSONResponse(
-            {"status": "error", "error": f"Monthly limit reached on {plan} plan."},
-            status_code=403,
-        )
+    if not _is_local_request(ip):
+        ok, reason = _check_free_trial(request)
+        if not ok:
+            return JSONResponse({"status": "error", "error": reason}, status_code=403)
+        parts_limit = PLAN_PARTS.get(plan, 3)
+        if parts_limit < 9999 and queue.tokens_spent >= PLAN_TOKENS.get(plan, 100):
+            return JSONResponse(
+                {"status": "error", "error": f"Monthly limit reached on {plan} plan."},
+                status_code=403,
+            )
 
     content = await file.read()
     max_bytes = PLAN_UPLOAD_MB.get(plan, 10) * 1024 * 1024

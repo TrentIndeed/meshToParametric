@@ -691,18 +691,23 @@ class JobQueue:
         job.progress_stage = "Decomposing bodies..."
         decomposition = decompose_bodies(cleaned, DecomposeConfig())
 
+        # Fixed rotation: warm/cool alternating, punchy saturated.
+        # Defined unconditionally — the fit/viz stages below index into
+        # it for single-body parts too (defining it only in the
+        # multi-body branch made every single-body job crash with
+        # UnboundLocalError).
+        body_colors = [
+            [0.0, 0.55, 1.0],  # 1 vivid blue
+            [1.0, 0.35, 0.0],  # 2 orange (no green channel = no yellow)
+            [0.0, 1.0, 0.25],  # 3 neon green
+            [1.0, 0.0, 0.55],  # 4 hot pink
+            [0.0, 0.15, 0.9],  # 5 deep blue
+            [0.0, 0.9, 0.8],   # 6 cyan
+            [0.7, 0.0, 1.0],   # 7 purple
+            [1.0, 0.2, 0.0],   # 8 red-orange
+        ]
+
         if decomposition.is_multi_body:
-            # Fixed rotation: warm/cool alternating, punchy saturated
-            body_colors = [
-                [0.0, 0.55, 1.0],  # 1 vivid blue
-                [1.0, 0.35, 0.0],  # 2 orange (no green channel = no yellow)
-                [0.0, 1.0, 0.25],  # 3 neon green
-                [1.0, 0.0, 0.55],  # 4 hot pink
-                [0.0, 0.15, 0.9],  # 5 deep blue
-                [0.0, 0.9, 0.8],   # 6 cyan
-                [0.7, 0.0, 1.0],   # 7 purple
-                [1.0, 0.2, 0.0],   # 8 red-orange
-            ]
             # Send the cut pieces as separate meshes to the frontend
             pieces = []
             for bi, body in enumerate(decomposition.bodies):

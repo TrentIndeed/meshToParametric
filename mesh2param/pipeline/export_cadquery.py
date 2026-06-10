@@ -3590,6 +3590,78 @@ def build_blend_intent_edges(
     return np.asarray(overlay_pairs, dtype=np.float64).reshape(-1, 2, 3)
 
 
+def _select_crease_edges(cand, snap, band_normal, min_spine_len):
+    """Select the connected crease edges for a curve/straight fillet.
+
+    ``cand`` is a list of ``(edge_idx, frac_on, mean_dist, edge)``
+    candidates already within snap of the cluster's vertex cloud. The
+    crease is the LONG outline edges plus the SHORT corner arcs that
+    bridge them (corner to corner). Excluded:
+      - rim-thickness spanners — run along the band normal (across the
+        plate), not in the outline plane;
+      - junction connectors at an OPEN end of the U — short edges that
+        dangle off a single spine edge instead of bridging two.
+    """
+    import collections
+
+    inplane = []
+    for x in cand:
+        e = x[3]
+        d = e["end"] - e["start"]
+        n = float(np.linalg.norm(d))
+        if n < 1e-9 or e["len"] < 1.0 or x[2] > snap:
+            continue
+        if abs(float((d / n) @ band_normal)) < 0.6:
+            inplane.append(x)
+    if not inplane:
+        return [x for x in cand if x[3]["len"] >= min_spine_len]
+    max_len = max(x[3]["len"] for x in inplane)
+    spine = [x for x in inplane if x[3]["len"] >= 0.25 * max_len]
+    shorts = [x for x in inplane if x[3]["len"] < 0.25 * max_len]
+    if not shorts or len(spine) < 2:
+        return spine
+
+    def key(p):
+        return tuple(np.round(p, 1).tolist())
+
+    ep2short = collections.defaultdict(list)
+    for i, x in enumerate(shorts):
+        e = x[3]
+        ep2short[key(e["start"])].append(i)
+        ep2short[key(e["end"])].append(i)
+    ep2spine = collections.defaultdict(set)
+    for x in spine:
+        e = x[3]
+        ep2spine[key(e["start"])].add(x[0])
+        ep2spine[key(e["end"])].add(x[0])
+
+    # Connected components of short edges; keep a component only if it
+    # touches >= 2 distinct spine edges (a corner bridge), not a
+    # dangling junction connector.
+    seen: set = set()
+    keep: list = []
+    for i in range(len(shorts)):
+        if i in seen:
+            continue
+        comp = []
+        stack = [i]
+        seen.add(i)
+        touched: set = set()
+        while stack:
+            j = stack.pop()
+            comp.append(j)
+            e = shorts[j][3]
+            for ep in (key(e["start"]), key(e["end"])):
+                touched |= ep2spine.get(ep, set())
+                for k in ep2short.get(ep, []):
+                    if k not in seen:
+                        seen.add(k)
+                        stack.append(k)
+        if len(touched) >= 2:
+            keep.extend(comp)
+    return spine + [shorts[i] for i in keep]
+
+
 def _apply_recognized_fillets_to_solid(
     wp: object,
     stitched_clusters: list[dict] | None = None,
@@ -3725,15 +3797,14 @@ def _apply_recognized_fillets_to_solid(
             circ.sort(key=lambda x: x[2])
             chosen = circ[:1]
         else:
-            usable = [
-                x for x in cand
-                if x[3]["len"] >= MIN_SPINE_LEN and x[2] <= snap
-            ]
-            if usable:
-                max_len = max(x[3]["len"] for x in usable)
-                chosen = [x for x in usable if x[3]["len"] >= 0.25 * max_len]
-            else:
-                chosen = [x for x in cand if x[3]["len"] >= MIN_SPINE_LEN]
+            # Crease = long spine edges + the SHORT corner-arc edges
+            # that bridge two spine edges (so the fillet wraps the U's
+            # 90° corners instead of leaving them sharp). Rim-thickness
+            # spanners (run along the band normal) and junction
+            # connectors (dangle off a single spine end) are excluded.
+            chosen = _select_crease_edges(
+                cand, snap, vh[2], MIN_SPINE_LEN,
+            )
         if not chosen:
             continue
         matched_by_cluster[ci] = [x[0] for x in chosen]

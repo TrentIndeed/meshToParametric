@@ -280,29 +280,81 @@ def match(clusters, edges):
             circ.sort(key=lambda x: x[2])
             chosen = circ[:1] if circ else []
         else:
-            # Straight/curve spine: the fillet's crease is the LONG
-            # edges that run along it, corner to corner. The many
-            # short edges in range are perpendicular noise — the rim-
-            # thickness spanners (run across the plate) and the small
-            # vertical connectors at the plate junction. They are not
-            # the crease. Keep only edges whose length is a
-            # meaningful fraction of the longest matched edge, so a
-            # perimeter wrap keeps its 3-4 long outline sides and a
-            # tab keeps its few short sides, but neither keeps the
-            # connector fragments.
-            usable = [
-                x for x in cand
-                if x[3]["len"] >= MIN_SPINE_LEN and x[2] <= snap
-            ]
-            if usable:
-                max_len = max(x[3]["len"] for x in usable)
-                spine = [x for x in usable if x[3]["len"] >= 0.25 * max_len]
-            else:
-                spine = [x for x in cand if x[3]["len"] >= MIN_SPINE_LEN]
-            chosen = spine
+            chosen = _select_crease(cand, snap, vh[2])
             chosen.sort(key=lambda x: (-x[3]["len"], x[2]))
         results.append((c, snap, chosen, principal))
     return results
+
+
+def _select_crease(cand, snap, band_normal):
+    """Select the connected crease edges for a curve/straight fillet.
+
+    The crease is the LONG outline edges plus the SHORT corner arcs
+    that bridge them — corner to corner. Excluded:
+      - rim-thickness spanners: run along the band normal (across the
+        plate), not in the outline plane.
+      - junction connectors at an OPEN end of the U: short edges that
+        dangle off a single spine edge instead of bridging two.
+    """
+    # In-plane edges only (drop edges running along the band normal).
+    inplane = []
+    for x in cand:
+        e = x[3]
+        d = e["end"] - e["start"]
+        n = float(np.linalg.norm(d))
+        if n < 1e-9 or e["len"] < 1.0 or x[2] > snap:
+            continue
+        d = d / n
+        if abs(float(d @ band_normal)) < 0.6:
+            inplane.append(x)
+    if not inplane:
+        return [x for x in cand if x[3]["len"] >= MIN_SPINE_LEN]
+    max_len = max(x[3]["len"] for x in inplane)
+    spine = [x for x in inplane if x[3]["len"] >= 0.25 * max_len]
+    shorts = [x for x in inplane if x[3]["len"] < 0.25 * max_len]
+    if not shorts or len(spine) < 2:
+        return spine
+
+    import collections
+
+    def key(p):
+        return tuple(np.round(p, 1).tolist())
+
+    ep2short = collections.defaultdict(list)
+    for i, x in enumerate(shorts):
+        e = x[3]
+        ep2short[key(e["start"])].append(i)
+        ep2short[key(e["end"])].append(i)
+    ep2spine = collections.defaultdict(set)
+    for x in spine:
+        e = x[3]
+        ep2spine[key(e["start"])].add(x[0])
+        ep2spine[key(e["end"])].add(x[0])
+
+    # Connected components of short edges; keep a component only if it
+    # touches >= 2 distinct spine edges (a corner bridge).
+    seen = set()
+    keep = []
+    for i in range(len(shorts)):
+        if i in seen:
+            continue
+        comp = []
+        stack = [i]
+        seen.add(i)
+        touched = set()
+        while stack:
+            j = stack.pop()
+            comp.append(j)
+            e = shorts[j][3]
+            for ep in (key(e["start"]), key(e["end"])):
+                touched |= ep2spine.get(ep, set())
+                for k in ep2short.get(ep, []):
+                    if k not in seen:
+                        seen.add(k)
+                        stack.append(k)
+        if len(touched) >= 2:
+            keep.extend(comp)
+    return spine + [shorts[i] for i in keep]
 
 
 def run():

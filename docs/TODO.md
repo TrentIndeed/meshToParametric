@@ -13,6 +13,10 @@
   unfittable (7/8 fitted), the coaxial bore is not recognized as a hole, and
   the base profile should be an annulus (circle + concentric cutout).
   test_all_meshes fit/has_holes + hole-accuracy gates xfailed.
+- [ ] **Tube CadQuery build takes ~73s** (800-face part; BottomMount takes
+  ~6s) with no progress updates — the silent window reads as a hang in the
+  UI. Profile the build (likely the ~100-segment circle polyline extrude +
+  per-feature passes) and emit progress heartbeats during stage 6.
 - [ ] **Multi-body test harness**: `test_step_comparison._run_pipeline` uses the
   single-body path, so RackMount (multi-body) gates are xfailed. Port the
   decompose + per-body-tree + stitched-clusters path into the harness so Mesh5

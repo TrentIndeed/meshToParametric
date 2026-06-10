@@ -8,7 +8,7 @@ classification.
 from __future__ import annotations
 
 import logging
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -264,14 +264,17 @@ def _region_growing(
         if seed is None:
             break
 
-        # Flood-fill from seed
-        queue = [seed]
+        # Flood-fill from seed. Keep a running sum of region normals —
+        # the mean gets normalized before use, so sum and mean give the
+        # same direction, and this stays O(1) per check instead of
+        # re-averaging the whole region for every candidate neighbor.
+        queue = deque([seed])
         labels[seed] = region_id
         assigned[seed] = True
-        region_normals = [normals[seed]]
+        normal_sum = normals[seed].copy()
 
         while queue:
-            current = queue.pop(0)
+            current = queue.popleft()
             for neighbor in adjacency.get(current, set()):
                 if assigned[neighbor]:
                     continue
@@ -281,8 +284,7 @@ def _region_growing(
                     continue
 
                 # Adaptive threshold
-                avg_normal = np.mean(region_normals, axis=0)
-                avg_normal /= np.linalg.norm(avg_normal) + 1e-15
+                avg_normal = normal_sum / (np.linalg.norm(normal_sum) + 1e-15)
 
                 dot = np.dot(normals[neighbor], avg_normal)
                 dot_local = np.dot(normals[neighbor], normals[current])
@@ -291,7 +293,7 @@ def _region_growing(
                     labels[neighbor] = region_id
                     assigned[neighbor] = True
                     queue.append(neighbor)
-                    region_normals.append(normals[neighbor])
+                    normal_sum += normals[neighbor]
 
         region_id += 1
 

@@ -607,53 +607,65 @@ def _fit_cylinder(
     if n < 6:
         return {"axis_point": [0, 0, 0], "axis_dir": [0, 0, 1], "radius": 0, "height": 0}, float("inf")
 
-    best_params = None
-    best_inliers = 0
-    best_rms = float("inf")
     rng = np.random.RandomState(42)
 
     use_normals = normals is not None and len(normals) >= n
 
-    for _ in range(config.ransac_iterations):
-        # Sample 2 points
-        idx = rng.choice(n, 2, replace=False)
+    # Sample all hypothesis pairs up front, then score every hypothesis
+    # against every point with batched matrix ops. The previous one-
+    # hypothesis-per-Python-iteration loop spent its time in thousands
+    # of tiny numpy calls (cross/norm/median per iteration).
+    iters = config.ransac_iterations
+    i1 = rng.randint(0, n, size=iters)
+    i2 = rng.randint(0, n - 1, size=iters)
+    i2[i2 >= i1] += 1  # distinct indices
 
-        if use_normals:
-            # Axis direction from cross product of two face normals
-            n1, n2 = normals[idx[0]], normals[idx[1]]
-            axis_dir = np.cross(n1, n2)
-        else:
-            # Fallback: direction between points
-            axis_dir = points[idx[1]] - points[idx[0]]
+    if use_normals:
+        axis_dirs = np.cross(normals[i1], normals[i2])
+    else:
+        axis_dirs = points[i2] - points[i1]
+    norms = np.linalg.norm(axis_dirs, axis=1)
+    valid = norms > 1e-10
+    axis_dirs = axis_dirs[valid] / norms[valid, None]
+    anchors = points[i1[valid]]
 
-        norm = np.linalg.norm(axis_dir)
-        if norm < 1e-10:
-            continue
-        axis_dir = axis_dir / norm
+    if len(axis_dirs) == 0:
+        return {"axis_point": [0, 0, 0], "axis_dir": [0, 0, 1], "radius": 0, "height": 0}, float("inf")
 
-        # Project all points onto the plane perpendicular to axis
-        axis_point = points[idx[0]]
-        vecs = points - axis_point
-        proj_along = np.outer(vecs @ axis_dir, axis_dir)
-        proj_perp = vecs - proj_along
-        dists_from_axis = np.linalg.norm(proj_perp, axis=1)
+    p_sq = np.einsum("ij,ij->i", points, points)
+    best_params = None
+    best_inliers = -1
+    best_rms = float("inf")
+    # Chunk hypotheses so the (N x chunk) score matrices stay ~150 MB max
+    chunk = max(1, int(2e7 // max(n, 1)))
+    for s in range(0, len(axis_dirs), chunk):
+        D = axis_dirs[s:s + chunk]                     # (C, 3)
+        A = anchors[s:s + chunk]                       # (C, 3)
+        ad = np.einsum("ij,ij->i", A, D)               # (C,)
+        a_sq = np.einsum("ij,ij->i", A, A)             # (C,)
+        t = points @ D.T - ad[None, :]                 # (N, C) axial coord
+        d_sq = p_sq[:, None] - 2.0 * (points @ A.T) + a_sq[None, :] - t ** 2
+        np.maximum(d_sq, 0.0, out=d_sq)
+        dist = np.sqrt(d_sq)                           # (N, C) radial distance
+        radius = np.median(dist, axis=0)               # (C,)
+        resid = np.abs(dist - radius[None, :])
+        inlier_mask = resid < inlier_thresh
+        n_inliers = inlier_mask.sum(axis=0)
+        sum_resid = np.where(inlier_mask, resid, 0.0).sum(axis=0)
+        mean_resid = np.where(
+            n_inliers > 0, sum_resid / np.maximum(n_inliers, 1), np.inf,
+        )
+        n_inliers = np.where(radius > 1e-10, n_inliers, -1)
 
-        # Radius = median of distances (robust)
-        radius = float(np.median(dists_from_axis))
-        if radius < 1e-10:
-            continue
+        b = int(np.lexsort((mean_resid, -n_inliers))[0])
+        if n_inliers[b] > best_inliers or (
+            n_inliers[b] == best_inliers and mean_resid[b] < best_rms
+        ):
+            best_inliers = int(n_inliers[b])
+            best_rms = float(mean_resid[b])
+            best_params = (A[b].copy(), D[b].copy(), float(radius[b]))
 
-        # Count inliers
-        residuals = np.abs(dists_from_axis - radius)
-        inlier_mask = residuals < inlier_thresh
-        n_inliers = int(inlier_mask.sum())
-
-        if n_inliers > best_inliers or (n_inliers == best_inliers and np.mean(residuals[inlier_mask]) < best_rms):
-            best_inliers = n_inliers
-            best_params = (axis_point.copy(), axis_dir.copy(), radius)
-            best_rms = float(np.mean(residuals[inlier_mask])) if n_inliers > 0 else float("inf")
-
-    if best_params is None:
+    if best_params is None or best_inliers < 0:
         return {"axis_point": [0, 0, 0], "axis_dir": [0, 0, 1], "radius": 0, "height": 0}, float("inf")
 
     axis_point, axis_dir, radius = best_params
@@ -740,59 +752,57 @@ def _fit_cone(
     if n < 6:
         return {"apex": [0, 0, 0], "axis_dir": [0, 0, 1], "half_angle": 0}, float("inf")
 
-    best_params = None
-    best_rms = float("inf")
     rng = np.random.RandomState(42)
 
     # Limit iterations for cones (more expensive)
     iters = min(config.ransac_iterations, 500)
 
-    for _ in range(iters):
-        idx = rng.choice(n, 3, replace=False)
-        p1, p2, p3 = points[idx]
+    # Sample all triplets up front; axes via one batched SVD; score all
+    # hypotheses against all points with matrix ops (same math as the
+    # previous per-iteration loop: axis from the best-fit line through 3
+    # samples, then a closed-form linear fit perp_dist = slope*t + b).
+    idx = np.array([rng.choice(n, 3, replace=False) for _ in range(iters)])
+    tri = points[idx]                                   # (K, 3, 3)
+    centroids = tri.mean(axis=1)                        # (K, 3)
+    _, _, vh = np.linalg.svd(tri - centroids[:, None, :])
+    axis_dirs = vh[:, 0, :]                             # (K, 3)
 
-        # Estimate axis as direction of best-fit line through sampled points
-        centroid = (p1 + p2 + p3) / 3
-        centered = np.array([p1 - centroid, p2 - centroid, p3 - centroid])
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        axis_dir = vh[0]
+    p_sq = np.einsum("ij,ij->i", points, points)
+    best_params = None
+    best_rms = float("inf")
+    chunk = max(1, int(2e7 // max(n, 1)))
+    for s in range(0, len(axis_dirs), chunk):
+        D = axis_dirs[s:s + chunk]                      # (C, 3)
+        Cc = centroids[s:s + chunk]                     # (C, 3)
+        cd = np.einsum("ij,ij->i", Cc, D)
+        c_sq = np.einsum("ij,ij->i", Cc, Cc)
+        t = points @ D.T - cd[None, :]                  # (N, C)
+        perp_sq = p_sq[:, None] - 2.0 * (points @ Cc.T) + c_sq[None, :] - t ** 2
+        np.maximum(perp_sq, 0.0, out=perp_sq)
+        perp = np.sqrt(perp_sq)                         # (N, C)
 
-        # Project points onto axis to estimate apex
-        vecs = points - centroid
-        t = vecs @ axis_dir
-        perp_dists = np.linalg.norm(vecs - np.outer(t, axis_dir), axis=1)
+        # Closed-form least squares of perp = slope * t + intercept
+        t_mean = t.mean(axis=0)
+        perp_mean = perp.mean(axis=0)
+        t_c = t - t_mean[None, :]
+        var_t = np.einsum("ij,ij->j", t_c, t_c) / n
+        cov = np.einsum("ij,ij->j", t_c, perp - perp_mean[None, :]) / n
+        ok = np.sqrt(np.maximum(var_t, 0.0)) > 1e-10
+        slope = np.divide(cov, var_t, out=np.zeros_like(cov), where=ok)
+        ok &= np.abs(slope) > 1e-10
+        intercept = perp_mean - slope * t_mean
+        t_apex = np.divide(-intercept, slope, out=np.zeros_like(slope), where=ok)
 
-        # Fit a linear model: perp_dist = |slope| * t + intercept
-        # This gives us the half angle: tan(half_angle) = slope
-        if np.std(t) < 1e-10:
-            continue
+        # Residuals vs the cone surface: expected radius |t - t_apex|*|slope|
+        expected_r = np.abs(t - t_apex[None, :]) * np.abs(slope)[None, :]
+        rms = np.sqrt(np.mean((perp - expected_r) ** 2, axis=0))
+        rms[~ok] = np.inf
 
-        A = np.column_stack([t, np.ones(n)])
-        try:
-            result_lr = np.linalg.lstsq(A, perp_dists, rcond=None)
-            slope, intercept = result_lr[0]
-        except Exception:
-            continue
-
-        if abs(slope) < 1e-10:
-            continue
-
-        half_angle = float(np.arctan(abs(slope)))
-        # Apex is where perp_dist = 0: t_apex = -intercept / slope
-        t_apex = -intercept / slope
-        apex = centroid + t_apex * axis_dir
-
-        # Compute residuals
-        vecs_apex = points - apex
-        t_from_apex = vecs_apex @ axis_dir
-        expected_r = np.abs(t_from_apex) * np.tan(half_angle)
-        actual_r = np.linalg.norm(vecs_apex - np.outer(t_from_apex, axis_dir), axis=1)
-        residuals = np.abs(actual_r - expected_r)
-        rms = float(np.sqrt(np.mean(residuals ** 2)))
-
-        if rms < best_rms:
-            best_rms = rms
-            best_params = (apex.copy(), axis_dir.copy(), half_angle)
+        b = int(np.argmin(rms))
+        if rms[b] < best_rms:
+            best_rms = float(rms[b])
+            apex = Cc[b] + t_apex[b] * D[b]
+            best_params = (apex, D[b].copy(), float(np.arctan(np.abs(slope[b]))))
 
     if best_params is None:
         return {"apex": [0, 0, 0], "axis_dir": [0, 0, 1], "half_angle": 0}, float("inf")

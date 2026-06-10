@@ -13,6 +13,10 @@ class IngestConfig(BaseModel):
     remesh: bool = True
     target_edge_ratio: float = 0.005
     max_hole_edges: int = 50
+    # Decimate meshes above this face count down to it (quadric edge
+    # collapse). Scans arrive at 300K-2.5M faces; segmentation cost is
+    # superlinear in faces, so cap before Stage 2. 0 disables.
+    max_faces: int = 30_000
 
     def model_post_init(self, __context) -> None:
         logger.debug(

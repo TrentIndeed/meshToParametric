@@ -56,6 +56,7 @@ def ingest_mesh(
     try:
         mesh = _remove_degenerate_faces(mesh, config.min_face_area)
         mesh = _merge_vertices(mesh, config.merge_tolerance)
+        mesh = _decimate(mesh, config.max_faces)
         mesh = _fix_normals(mesh)
         mesh = _fill_holes(mesh, config.max_hole_edges)
     except Exception:
@@ -89,6 +90,7 @@ def clean_trimesh_piece(mesh: trimesh.Trimesh, config: IngestConfig | None = Non
 
     mesh = _remove_degenerate_faces(mesh, config.min_face_area)
     mesh = _merge_vertices(mesh, config.merge_tolerance)
+    mesh = _decimate(mesh, config.max_faces)
     mesh = _fix_normals(mesh)
     mesh = _fill_holes(mesh, config.max_hole_edges)
     if config.remesh:
@@ -188,6 +190,57 @@ def _fill_holes(mesh: trimesh.Trimesh, max_hole_edges: int) -> trimesh.Trimesh:
         else:
             logger.warning("Attempted hole filling but mesh is still not watertight")
     return mesh
+
+
+def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:
+    """Quadric edge-collapse decimation down to max_faces.
+
+    Scanned meshes arrive at 300K-2.5M triangles while carrying the same
+    analytic surfaces as a 10K-face CAD export. Segmentation cost grows
+    superlinearly with face count, so cap it here. planarquadric keeps
+    flat areas well-tessellated; topology preservation keeps the mesh
+    manifold for downstream watertightness checks.
+    """
+    if max_faces <= 0 or len(mesh.faces) <= max_faces:
+        return mesh
+
+    try:
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=np.asarray(mesh.vertices),
+            face_matrix=np.asarray(mesh.faces),
+        ))
+        ms.meshing_decimation_quadric_edge_collapse(
+            targetfacenum=int(max_faces),
+            preservenormal=True,
+            preservetopology=True,
+            planarquadric=True,
+            qualitythr=0.3,
+        )
+        out = ms.current_mesh()
+        decimated = trimesh.Trimesh(
+            vertices=np.asarray(out.vertex_matrix()),
+            faces=np.asarray(out.face_matrix()),
+            process=True,
+        )
+        if len(decimated.faces) == 0:
+            logger.warning("Decimation produced an empty mesh — using original")
+            return mesh
+        logger.info(
+            "Decimated mesh: %d -> %d faces (target %d)",
+            len(mesh.faces), len(decimated.faces), max_faces,
+        )
+        return decimated
+    except ImportError:
+        logger.warning(
+            "pymeshlab not installed — cannot decimate %d-face mesh; "
+            "downstream stages will be slow", len(mesh.faces),
+        )
+        return mesh
+    except Exception as e:
+        logger.warning("Decimation failed (%s) — using original mesh", e)
+        return mesh
 
 
 def _subdivide_long_edges(mesh: trimesh.Trimesh) -> trimesh.Trimesh:

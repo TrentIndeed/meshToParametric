@@ -246,11 +246,22 @@ def match(clusters, edges):
     results = []
     for c in clusters:
         ctree = cKDTree(c["verts"])
-        snap = max(SNAP_TOL_BASE, 0.6 * c["radius"] + 2.0)
-        # fillet principal direction (the way the fillet runs)
+        # Robust fillet radius: topology's radius field is unreliable
+        # (stores the sphere-fit / hole radius, not the fillet tube
+        # radius). The cluster's SMALLEST PCA extent is the band
+        # thickness — a stable upper bound on the tube radius. Taking
+        # the min collapses garbage (19.9 -> 1.5) while leaving good
+        # small radii untouched. This stops the snap tolerance from
+        # blowing up on the two sphere-fit tab corners.
         cv = c["verts"] - c["verts"].mean(0)
         _, _, vh = np.linalg.svd(cv, full_matrices=False)
         principal = vh[0]
+        smallest_ext = float(
+            (cv @ vh[2]).max() - (cv @ vh[2]).min()
+        )
+        robust_r = min(c["radius"], smallest_ext) if c["radius"] > 0 else smallest_ext
+        c["robust_radius"] = robust_r
+        snap = max(SNAP_TOL_BASE, 0.6 * robust_r + 2.0)
         cand = []
         for ei, e in enumerate(edges):
             d, _ = ctree.query(e["samples"])
@@ -303,7 +314,7 @@ def run():
         if chosen:
             n_matched += 1
         print(f"[{tag}] cluster {c['gid']:>2} {c['category']:<13} "
-              f"r={c['radius']:.1f} cov={c['coverage_deg']:.0f}° "
+              f"r={c['radius']:.1f}->{c.get('robust_radius',0):.1f} cov={c['coverage_deg']:.0f}° "
               f"centroid=({cc[0]:.0f},{cc[1]:.0f},{cc[2]:.0f}) snap={snap:.1f}mm "
               f"-> {len(chosen)} edge(s)")
         for ei, frac, md, e in chosen[:6]:

@@ -4,10 +4,15 @@
 - [x] Reference STEPs for Mesh3 (Front Plate) and Mesh5 (RackMount) — found in
   `Documents/CAD_3MF/march2026/stp/`, geometrically verified (0.4% / 0.0%
   volume diff, identical frames), copied into `models/`.
-- [ ] **Reference STEPs still missing for Mesh2 (BottomMount) and Mesh4
-  (Component3)**. Note: `Component3.step` in the stp folder is a DIFFERENT part
-  (bbox matches the Mesh1 bracket family, 71% volume diff vs Component3.3mf);
-  none of the bottom-mount candidates match BottomMount.3mf. (Owner: Trenton)
+- [x] Reference STEPs for Mesh2 (BottomMount re-export) and Mesh4 (tube) —
+  both verified 0.0% volume diff, identical frames. All 5 models now have
+  ground truth.
+- [ ] **Mesh2 BottomMount rebuild is -23.2% volume vs reference** — same
+  profile-extraction failure class as Mesh3. Gates xfailed.
+- [ ] **Mesh4 tube: new part class (annular/revolved)**. One seam region
+  unfittable (7/8 fitted), the coaxial bore is not recognized as a hole, and
+  the base profile should be an annulus (circle + concentric cutout).
+  test_all_meshes fit/has_holes + hole-accuracy gates xfailed.
 - [ ] **Multi-body test harness**: `test_step_comparison._run_pipeline` uses the
   single-body path, so RackMount (multi-body) gates are xfailed. Port the
   decompose + per-body-tree + stitched-clusters path into the harness so Mesh5

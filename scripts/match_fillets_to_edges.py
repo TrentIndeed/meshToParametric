@@ -280,16 +280,26 @@ def match(clusters, edges):
             circ.sort(key=lambda x: x[2])
             chosen = circ[:1] if circ else []
         else:
-            # Straight/curve spine: real CAD-selectable edges, not
-            # polygon fragments. Keep meaningful-length edges that
-            # the fillet actually rides (high on-fraction, close
-            # mean distance), longest first — for a perimeter wrap
-            # that's the outline edges, for a tab the few short ones.
-            spine = [
+            # Straight/curve spine: the fillet's crease is the LONG
+            # edges that run along it, corner to corner. The many
+            # short edges in range are perpendicular noise — the rim-
+            # thickness spanners (run across the plate) and the small
+            # vertical connectors at the plate junction. They are not
+            # the crease. Keep only edges whose length is a
+            # meaningful fraction of the longest matched edge, so a
+            # perimeter wrap keeps its 3-4 long outline sides and a
+            # tab keeps its few short sides, but neither keeps the
+            # connector fragments.
+            usable = [
                 x for x in cand
-                if x[3]["len"] >= MIN_SPINE_LEN and x[1] >= 0.6 and x[2] <= snap
+                if x[3]["len"] >= MIN_SPINE_LEN and x[2] <= snap
             ]
-            chosen = spine if spine else [x for x in cand if x[3]["len"] >= MIN_SPINE_LEN]
+            if usable:
+                max_len = max(x[3]["len"] for x in usable)
+                spine = [x for x in usable if x[3]["len"] >= 0.25 * max_len]
+            else:
+                spine = [x for x in cand if x[3]["len"] >= MIN_SPINE_LEN]
+            chosen = spine
             chosen.sort(key=lambda x: (-x[3]["len"], x[2]))
         results.append((c, snap, chosen, principal))
     return results

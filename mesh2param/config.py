@@ -17,6 +17,19 @@ class IngestConfig(BaseModel):
     # collapse). Scans arrive at 300K-2.5M faces; segmentation cost is
     # superlinear in faces, so cap before Stage 2. 0 disables.
     max_faces: int = 30_000
+    # Scale normalization: the pipeline's absolute thresholds (snap
+    # tolerances, fillet radii, plate-thickness checks) are tuned for
+    # mm-scale parts with a bbox diagonal around 100-500. Parts far
+    # outside that regime (inch-unit exports read as numbers, 10x
+    # scans) are scaled to canonical_diag at ingest;
+    # CleanedMesh.metadata["unit_scale"] records
+    # mesh_units = original_units * unit_scale, and the STEP export
+    # scales the solid back to original units. In-range parts pass
+    # through untouched.
+    normalize_scale: bool = True
+    canonical_diag: float = 200.0
+    normalize_min_diag: float = 25.0
+    normalize_max_diag: float = 2000.0
 
     def model_post_init(self, __context) -> None:
         logger.debug(

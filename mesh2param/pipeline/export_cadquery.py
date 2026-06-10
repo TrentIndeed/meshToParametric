@@ -549,14 +549,33 @@ def export_cadquery(
     # Final tessellation
     tess_verts, tess_faces = _tessellate_solid(solid)
 
-    # Export STEP
+    # Export STEP. If ingest normalized the part's scale (unit_scale in
+    # CleanedMesh.metadata), scale the solid back so the STEP file is in
+    # the user's original units; everything in-pipeline stays normalized.
     step_path = ""
     if output_path is not None:
         try:
             import cadquery as cq
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            cq.exporters.export(solid, str(output_path))
+            export_solid = solid
+            unit_scale = float(
+                (getattr(cleaned, "metadata", None) or {}).get("unit_scale", 1.0) or 1.0
+            )
+            if unit_scale != 1.0 and solid is not None:
+                inv = 1.0 / unit_scale
+                mat = cq.Matrix([
+                    [inv, 0, 0, 0],
+                    [0, inv, 0, 0],
+                    [0, 0, inv, 0],
+                ])
+                export_solid = solid.newObject(
+                    [o.transformGeometry(mat) for o in solid.objects]
+                )
+                logger.info(
+                    "Scaling STEP back to original units (x%.6g)", inv,
+                )
+            cq.exporters.export(export_solid, str(output_path))
             step_path = str(output_path)
             logger.info("Exported STEP to %s", step_path)
         except Exception:

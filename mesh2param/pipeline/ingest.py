@@ -72,7 +72,11 @@ def ingest_mesh(
     # Re-fix normals after remeshing since it can introduce inconsistencies
     mesh = _fix_normals(mesh)
 
+    mesh, unit_scale = _normalize_scale(mesh, config)
+
     result = _build_cleaned_mesh(mesh, path)
+    if unit_scale != 1.0:
+        result.metadata["unit_scale"] = unit_scale
     logger.debug(
         "ingest_mesh completed: verts=%d, faces=%d, watertight=%s",
         len(result.vertices), len(result.faces), result.is_watertight,
@@ -190,6 +194,37 @@ def _fill_holes(mesh: trimesh.Trimesh, max_hole_edges: int) -> trimesh.Trimesh:
         else:
             logger.warning("Attempted hole filling but mesh is still not watertight")
     return mesh
+
+
+def _normalize_scale(
+    mesh: trimesh.Trimesh, config: IngestConfig,
+) -> tuple[trimesh.Trimesh, float]:
+    """Scale wildly out-of-range parts to the canonical size.
+
+    The pipeline's absolute thresholds assume mm-scale parts. A part
+    whose bbox diagonal falls outside [normalize_min_diag,
+    normalize_max_diag] (e.g. inch units read as raw numbers, or a 10x
+    scan) is scaled so its diagonal equals canonical_diag. Returns the
+    (possibly scaled) mesh and unit_scale, where
+    mesh_units = original_units * unit_scale.
+
+    Pieces cut from an already-ingested body must NOT be re-normalized
+    (they're legitimately small), so this runs only in ingest_mesh, not
+    clean_trimesh_piece.
+    """
+    if not config.normalize_scale:
+        return mesh, 1.0
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    if diag <= 0 or config.normalize_min_diag <= diag <= config.normalize_max_diag:
+        return mesh, 1.0
+    unit_scale = config.canonical_diag / diag
+    mesh.apply_scale(unit_scale)
+    logger.info(
+        "Normalized part scale: bbox diagonal %.4g -> %.1f (unit_scale=%.6g); "
+        "STEP export will scale back to original units",
+        diag, config.canonical_diag, unit_scale,
+    )
+    return mesh, unit_scale
 
 
 def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:

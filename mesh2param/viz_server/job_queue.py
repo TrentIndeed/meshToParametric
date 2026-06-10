@@ -858,10 +858,8 @@ class JobQueue:
                 regions, sub_cleaned, palette,
             )
             for region in regions:
-                color = color_for_region[region.region_id]
-                for fi in region.face_indices:
-                    if fi < len(fc):
-                        fc[fi] = color
+                idx = np.asarray(region.face_indices, dtype=np.int64)
+                fc[idx[idx < len(fc)]] = color_for_region[region.region_id]
             seg_colors.append((body, sub_cleaned, fc))
             # Debug summary: kind breakdown by mean-normal magnitude.
             n_plate = n_curve = n_cyl = 0

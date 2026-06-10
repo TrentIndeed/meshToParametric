@@ -6,20 +6,48 @@ $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 $env:PYTHONIOENCODING = "utf-8"
 
-# Free port 8080 if a previous instance is still bound to it.
+# Preferred port 8080; if it's busy we first try to evict a stale
+# previous instance, and if something still holds it (another app),
+# fall back to the next free port in 8081..8090.
 # Use netstat instead of Get-NetTCPConnection — Get-NetTCPConnection
 # sometimes misses zombie listeners that another snapshot interface
-# (netstat) still sees, and the server then fails to bind with WSAEADDRINUSE
-# even though Get-NetTCPConnection reported nothing.
-$listening = netstat -ano | Select-String ":8080\s+0\.0\.0\.0:0\s+LISTENING\s+(\d+)"
-foreach ($m in $listening) {
-    $pidStr = $m.Matches[0].Groups[1].Value
-    Write-Host "Stopping existing process on port 8080 (PID $pidStr)..."
-    Stop-Process -Id ([int]$pidStr) -Force -ErrorAction SilentlyContinue
+# (netstat) still sees, and the server then fails to bind with
+# WSAEADDRINUSE even though Get-NetTCPConnection reported nothing.
+function Get-PortListeners([int]$Port) {
+    netstat -ano | Select-String (":" + $Port + "\s+\S+\s+LISTENING\s+(\d+)") |
+        ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Select-Object -Unique
 }
-if ($listening) { Start-Sleep -Seconds 1 }
 
-Write-Host "Starting Paramesh AI server at http://127.0.0.1:8080 ..."
+$port = 8080
+$pids = @(Get-PortListeners $port)
+foreach ($p in $pids) {
+    Write-Host "Stopping existing process on port $port (PID $p)..."
+    Stop-Process -Id $p -Force -ErrorAction SilentlyContinue
+}
+if ($pids.Count -gt 0) {
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (-not (Get-PortListeners $port)) { break }
+    }
+}
+
+# Still busy (another application owns it)? Pick the next free port.
+if (Get-PortListeners $port) {
+    foreach ($candidate in 8081..8090) {
+        if (-not (Get-PortListeners $candidate)) {
+            Write-Host "Port 8080 is in use by another application; using port $candidate instead." -ForegroundColor Yellow
+            $port = $candidate
+            break
+        }
+    }
+    if (Get-PortListeners $port) {
+        Write-Host "ERROR: no free port found in 8080-8090." -ForegroundColor Red
+        exit 1
+    }
+}
+
+$env:PARAMESH_PORT = "$port"
+Write-Host "Starting Paramesh AI server at http://127.0.0.1:$port ..."
 Write-Host "Press Ctrl+C to stop."
 
 # Run python as a tracked child sharing this console (so Ctrl+C reaches it),

@@ -1270,8 +1270,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-def run(host: str = "127.0.0.1", port: int = 8080):
+def run(host: str | None = None, port: int | None = None):
     import uvicorn
+    if host is None:
+        host = os.getenv("PARAMESH_HOST", "127.0.0.1")
+    if port is None:
+        port = int(os.getenv("PARAMESH_PORT", "8080"))
     uvicorn.run(app, host=host, port=port)
 
 

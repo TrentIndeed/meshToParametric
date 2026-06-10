@@ -1,12 +1,21 @@
 # TODO
 
 ## Test coverage
-- [ ] **Add reference STEP files for Mesh2–Mesh5** (export from the original CAD
-  into `models/MeshN/`). Only `models/Mesh1/Body1Step.step` exists today, so the
-  per-feature accuracy gate (`tests/test_step_comparison.py::test_hole_accuracy`)
-  covers one part. The tests auto-discover mesh+STEP pairs — dropping the files
-  in extends hole-radius/axis accuracy checks to all models with zero code
-  changes. (Owner: Trenton)
+- [x] Reference STEPs for Mesh3 (Front Plate) and Mesh5 (RackMount) — found in
+  `Documents/CAD_3MF/march2026/stp/`, geometrically verified (0.4% / 0.0%
+  volume diff, identical frames), copied into `models/`.
+- [ ] **Reference STEPs still missing for Mesh2 (BottomMount) and Mesh4
+  (Component3)**. Note: `Component3.step` in the stp folder is a DIFFERENT part
+  (bbox matches the Mesh1 bracket family, 71% volume diff vs Component3.3mf);
+  none of the bottom-mount candidates match BottomMount.3mf. (Owner: Trenton)
+- [ ] **Multi-body test harness**: `test_step_comparison._run_pipeline` uses the
+  single-body path, so RackMount (multi-body) gates are xfailed. Port the
+  decompose + per-body-tree + stitched-clusters path into the harness so Mesh5
+  compares against its reference fairly.
+- [ ] **Mesh3 Front Plate rebuild is +36.7% volume, 72% bbox overlap vs its
+  reference** (single-body part, so this is a real reconstruction failure —
+  likely the same fragmented-section profile-extraction issue below).
+  Gates xfailed in test_step_comparison.KNOWN_FAILURES; remove entries as fixed.
 
 ## Recognition
 - [ ] Mesh1 hole recall is 2/6: the four Y-axis plate corner holes are not

@@ -12,8 +12,26 @@
   13mm edge and dropped all holes. Fixed in _find_base_extrusion (area-
   weighted dominant plane + principal-axis snap + thin-plate override).
   Volume -23.2% -> +9.8%; holes restored; volume/bbox gates now pass.
-- [ ] **Mesh2 remaining +9.8% volume**: the asymmetric chamfer is not cut
-  (0 chamfers detected) and the outline still insets slightly.
+- [ ] **Mesh2 tangential cut-extrude (user request)**: the "asymmetric
+  chamfer" is actually a ROUNDED/tangential swept transition — its faces'
+  normals fan ~130 deg in XY (e.g. [-0.92,-0.38,0]->[-0.61,-0.79,0]), so
+  _detect_mesh_chamfers rejects it ("band fans 133deg -> curved surface")
+  and nothing builds it (the +9.8% leftover material). User wants it
+  modeled as a TANGENTIAL CUT-EXTRUDE: sketch the swept cross-section
+  profile and cut-extrude it along the edge, tangent to the two adjacent
+  faces. This used to work at one point — check git history for a swept/
+  side-profile cut path that was removed. New feature path, not a tweak.
+- [ ] **Tube annular profile (user request, "eventually")**: build the
+  tube as TWO concentric circle sketches (outer + inner) extruded as the
+  ring between them, instead of extruding the outer circle then cutting a
+  slightly-smaller circle. Profile extraction should emit an annulus for
+  revolved/tubular parts.
+- [ ] **Single sketch for symmetric hole pattern (user request,
+  "eventually")**: the 4 identical bottom-plate holes should emit ONE
+  sketch with 4 circles + one cut-extrude, not 4 separate Sketch+Cut
+  steps. _group_symmetric_holes already groups them in recognize; the
+  build (_build_stepwise hole loop) still emits one step per hole — make
+  it emit one multi-circle sketch per group.
 - [ ] **Mesh4 tube: new part class (annular/revolved)**. One seam region
   unfittable (7/8 fitted), the coaxial bore is not recognized as a hole, and
   the base profile should be an annulus (circle + concentric cutout).

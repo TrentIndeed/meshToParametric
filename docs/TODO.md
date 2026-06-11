@@ -137,16 +137,31 @@
   a bigger-profile 91% run: BottomMount trapezoid), windowed-area
   preference otherwise ("largest single extrude area": base plate over
   U-channel sections). Engine: 1/1/1/1/3 segments on Mesh1-5.
-- [ ] **Phase 2b: single-body multi-extrude parity.** The new path lacks
-  the stitched-cluster blend stages (job_queue) and pocket cuts: the
-  side plates' corner chamfer cuts are missing (the +10% volume,
-  fidelity 0.79 vs multibody's clusters 12/12). Production still routes
-  RackMount through decompose, so the new path is dormant until parity:
-  apply stitched fillets/chamfers + pockets on the joined solid, gate on
-  cross_section_fidelity >= multibody baseline, then make multi-extrude
-  the default and keep decompose ONLY for disconnected shells (true
-  assemblies). Join profiles also need interior windows carried (a join
-  with a large bore would re-fill it; none of the 5 parts hits this yet).
+- [ ] **Phase 2b: single-body multi-extrude parity (diagnosed 2026-06-11).**
+  Current state: RackMount single-body builds base + 2 joins + holes +
+  stitched fillets (build_clusters(single_body=True)), join profiles
+  carry interior windows, fidelity 0.855 mean / vol -12% (UNDER, not
+  over). The root cause of the deficit is the SIDE READING: the engine
+  picks the X-axis web faces (area 12366) for the side joins, but the
+  real side structures are J-profiles with hooks, outer ear flanges and
+  lower rails — constant along Y (see y=123 section) — i.e. the user's
+  CAD extrudes the sides along Y with the full XZ profile. The X-web
+  reading misses hooks/flanges/rails entirely. Fix chain:
+    1. HONEST voxel claims: membership currently ORs +/-pitch (2.9mm)
+       tolerance, which on a thin-walled part lets wrong candidates
+       claim boundary bands (~87k mm^3 of slack) and hides real
+       segments. Use strict interior membership + pitch sized to the
+       thinnest feature (the 6mm webs need ~1.5mm pitch).
+    2. With honest claims the Y side-runs out-gain the X webs and the
+       0.95-residual rule (not the area window) decides — RackMount
+       becomes base-Z + two Y-side extrudes matching the user's CAD.
+    3. Tab undersides (sculpted 45deg reliefs under the 4 mounting tabs)
+       remain as cut features after that.
+  Then: gate on cross_section_fidelity >= multibody baseline, make
+  multi-extrude the default, keep decompose ONLY for disconnected
+  shells. Note: side-plate corner cuts are NOT chamfer blend records in
+  either path (zero chamfer records on all 5 parts) — they ride the
+  profiles.
 
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet

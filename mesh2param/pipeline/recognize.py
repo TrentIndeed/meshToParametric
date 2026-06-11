@@ -108,9 +108,14 @@ def recognize_features(
     if extrusion_plan is not None and len(extrusion_plan.segments) >= 2:
         primary = extrusion_plan.segments[0]
         if primary.gain_frac >= 0.4:
+            from mesh2param.pipeline.extrusion import segment_inner_rings
             for seg in extrusion_plan.segments[1:]:
                 if seg.gain_frac < 0.03:
                     continue
+                try:
+                    inner = segment_inner_rings(cleaned, seg)
+                except Exception:
+                    inner = []
                 features.append(Feature(
                     type=FeatureType.BOSS,
                     face_indices=np.array([], dtype=np.int64),
@@ -119,6 +124,8 @@ def recognize_features(
                         "points": [list(p) for p in seg.profile],
                         "span": [float(seg.start), float(seg.end)],
                         "axis_idx": int(seg.axis_idx),
+                        # Interior windows the outer outline would fill
+                        "inner": [[list(p) for p in ring] for ring in inner],
                     },
                     depth=float(seg.length),
                     direction=seg.direction.copy(),

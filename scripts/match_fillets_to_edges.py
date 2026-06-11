@@ -73,14 +73,22 @@ def build_clusters(cleaned, single_body: bool = False):
         body_results.append((body, sub, tree))
 
     records = []
+    chamfer_records = []
     for bidx, (sub, blends) in enumerate(body_stage):
         for rec in blends:
-            if rec.get("kind") != "fillet":
+            kind = rec.get("kind")
+            if kind not in ("fillet", "chamfer"):
                 continue
             fi = rec.get("face_indices")
             if fi is None or len(fi) == 0:
                 continue
             verts = sub.vertices[sub.faces[np.asarray(fi)]].reshape(-1, 3)
+            if kind == "chamfer":
+                chamfer_records.append({
+                    "body": bidx, "verts": verts,
+                    "radius": float(rec.get("radius", 0) or 0),
+                })
+                continue
             ad = rec.get("axis_dir")
             axis = np.asarray(ad, float) if ad is not None else None
             if axis is not None and np.linalg.norm(axis) > 1e-9:
@@ -177,8 +185,46 @@ def build_clusters(cleaned, single_body: bool = False):
             "gid": gid, "verts": verts, "category": cat,
             "radius": float(np.median(rs)) if rs else 0.0,
             "centroid": verts.mean(0), "coverage_deg": cov_deg,
-            "inplane": inplane,
+            "inplane": inplane, "kind": "fillet",
         })
+
+    # Chamfer clusters — mirror of job_queue's stitched chamfer block:
+    # union-find by direct vertex contact, one cluster per physical
+    # chamfer band, same apply path as fillets but kind="chamfer"
+    # (RackMount's side-plate corner cuts live here).
+    if chamfer_records:
+        n_ch = len(chamfer_records)
+        ch_parent = list(range(n_ch))
+
+        def _ch_find(x):
+            while ch_parent[x] != x:
+                ch_parent[x] = ch_parent[ch_parent[x]]
+                x = ch_parent[x]
+            return x
+
+        allv_ch = np.vstack([r["verts"] for r in chamfer_records])
+        allu_ch = np.concatenate([
+            np.full(len(r["verts"]), i) for i, r in enumerate(chamfer_records)
+        ])
+        for i, j in cKDTree(allv_ch).query_pairs(r=2.0):
+            a, b = int(allu_ch[i]), int(allu_ch[j])
+            ra, rb = _ch_find(a), _ch_find(b)
+            if ra != rb:
+                ch_parent[rb] = ra
+        ch_groups = {}
+        for i in range(n_ch):
+            ch_groups.setdefault(_ch_find(i), []).append(i)
+        gid0 = len(clusters)
+        for off, mem_ch in enumerate(ch_groups.values()):
+            cv = np.vstack([chamfer_records[i]["verts"] for i in mem_ch])
+            radii = [chamfer_records[i]["radius"] for i in mem_ch
+                     if chamfer_records[i]["radius"] > 0]
+            setback = max(1.0, float(np.median(radii)) if radii else 1.0)
+            clusters.append({
+                "gid": gid0 + off, "verts": cv, "category": "curve_edge",
+                "radius": setback, "centroid": cv.mean(0),
+                "coverage_deg": 0.0, "inplane": 0.0, "kind": "chamfer",
+            })
     return clusters, body_results, decomp
 
 

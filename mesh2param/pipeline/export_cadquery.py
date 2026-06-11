@@ -2015,6 +2015,13 @@ def _build_stepwise(
             )
             if len(j_pts) < 3:
                 continue
+            j_inner = []
+            for ring in sg.get("inner") or []:
+                ring_pts = _simplify_profile(
+                    [(float(p[0]), float(p[1])) for p in ring], tolerance=0.5,
+                )
+                if len(ring_pts) >= 3:
+                    j_inner.append(ring_pts)
             j_len = float(span[1]) - float(span[0])
             plane_j = plane_map[ax_j]
             origin_j = [0.0, 0.0, 0.0]
@@ -2045,7 +2052,8 @@ def _build_stepwise(
             for sign in (1.0, -1.0):
                 try:
                     wpj = cq.Workplane(plane_j, origin=tuple(origin_j))
-                    wpj = wpj.polyline(j_pts).close().extrude(sign * j_len)
+                    wpj = _draw_profile_with_holes(wpj, j_pts, j_inner)
+                    wpj = wpj.extrude(sign * j_len)
                     bbj = wpj.val().BoundingBox()
                     j_vals = [
                         (bbj.xmin, bbj.xmax), (bbj.ymin, bbj.ymax),

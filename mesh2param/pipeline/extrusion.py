@@ -309,6 +309,58 @@ def _candidate_runs(
     return out
 
 
+def segment_inner_rings(
+    cleaned: CleanedMesh,
+    segment: ExtrusionSegment,
+    min_frac: float = 0.01,
+) -> list[list[tuple[float, float]]]:
+    """Interior rings (windows/bores) of a segment's cross-section.
+
+    The segment's profile is the OUTER outline only — extruding it fills
+    any window in the plate (RackMount's side plates carry a 660mm²
+    window each). Slice at the segment's mid-station and return interior
+    rings larger than min_frac of the outer area, in the segment's (u, v)
+    plane coordinates, so the export can draw the join profile with its
+    holes in one sketch.
+    """
+    from shapely.geometry import Polygon
+
+    mesh = trimesh.Trimesh(
+        vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+    )
+    mid = 0.5 * (segment.start + segment.end)
+    n = np.zeros(3); n[segment.axis_idx] = 1.0
+    o = np.zeros(3); o[segment.axis_idx] = mid
+    section = mesh.section(plane_origin=o, plane_normal=n)
+    if section is None:
+        return []
+    ax_u, ax_v = segment.axes_uv
+    outer = Polygon(segment.profile)
+    if outer.is_empty or not outer.is_valid:
+        outer = outer.buffer(0)
+    rings = []
+    try:
+        discrete = section.discrete
+    except Exception:
+        return []
+    for ring3d in discrete:
+        p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty or p.area < min_frac * max(outer.area, 1.0):
+            continue
+        if p.area >= 0.9 * outer.area:
+            continue  # the outer outline itself
+        try:
+            if outer.contains(p.representative_point()):
+                rings.append([
+                    (float(x), float(y)) for x, y in p.exterior.coords[:-1]
+                ])
+        except Exception:
+            continue
+    return rings
+
+
 def _merge_step_runs(cands: list[dict]) -> list[dict]:
     """Merge coaxial adjacent runs separated by a FEATURE STEP, not a taper.
 

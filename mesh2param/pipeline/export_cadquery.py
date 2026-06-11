@@ -4102,7 +4102,6 @@ def _apply_recognized_fillets_to_solid(
     MIN_EDGE_FRAC = 0.5
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}
-    cluster_band_normal: dict[int, np.ndarray] = {}
     for ci, c in enumerate(clusters):
         verts = np.asarray(c.get("vertices"), dtype=float)
         if verts.ndim != 2 or len(verts) == 0:
@@ -4141,7 +4140,6 @@ def _apply_recognized_fillets_to_solid(
                 continue
             cand.append((ei, frac, float(d.mean()), e))
 
-        cluster_band_normal[ci] = vh[2].copy()
         if category == "hole_edge":
             circ = [x for x in cand if x[3]["type"] in ("CIRCLE", "ELLIPSE")]
             circ.sort(key=lambda x: x[2])
@@ -4296,52 +4294,14 @@ def _apply_recognized_fillets_to_solid(
             ],
         })
 
-    # --- Pair same-plate wraps for a JOINT fillet operation. ---
-    # The inner and outer perimeter wraps of one plate terminate on the
-    # same top face; rolling them sequentially makes OCC fail the
-    # second one's corner constructions ("command not done"). Rolling
-    # both in ONE MakeFillet builds the shared corners jointly — this
-    # is also the actual CAD intent (one fillet feature, N edges).
-    # Pairs are detected by parallel band normals + small normal-axis
-    # gap (plate thickness) + lateral overlap.
-    bucket_pairs: list[list[int]] = []
-    paired: set[int] = set()
-    for i in range(len(buckets)):
-        if i in paired:
-            continue
-        ci = buckets[i]["cluster_idx"]
-        ni = cluster_band_normal.get(ci)
-        partner = None
-        if ni is not None and len(buckets[i]["members"]) >= 3:
-            vi = np.asarray(clusters[ci]["vertices"], dtype=float)
-            for j in range(i + 1, len(buckets)):
-                if j in paired or len(buckets[j]["members"]) < 3:
-                    continue
-                cj = buckets[j]["cluster_idx"]
-                nj = cluster_band_normal.get(cj)
-                if nj is None or abs(float(ni @ nj)) < 0.95:
-                    continue
-                vj = np.asarray(clusters[cj]["vertices"], dtype=float)
-                gap = abs(float((vi.mean(0) - vj.mean(0)) @ ni))
-                if gap < 1.0 or gap > 12.0:
-                    continue
-                # lateral overlap perpendicular to the plate normal
-                lat_i = vi - np.outer(vi @ ni, ni)
-                lat_j = vj - np.outer(vj @ ni, ni)
-                lo = np.maximum(lat_i.min(0), lat_j.min(0))
-                hi = np.minimum(lat_i.max(0), lat_j.max(0))
-                inter = float(np.prod(np.maximum(hi - lo, 0) + 1.0))
-                area_i = float(np.prod(lat_i.max(0) - lat_i.min(0) + 1.0))
-                if inter < 0.5 * area_i:
-                    continue
-                partner = j
-                break
-        if partner is not None:
-            bucket_pairs.append([i, partner])
-            paired.update((i, partner))
-        else:
-            bucket_pairs.append([i])
-            paired.add(i)
+    # Each cluster is applied as ITS OWN fillet, one at a time. The two
+    # perimeter wraps of one plate (or the left/right plates) are
+    # SEPARATE physical fillets and must not be merged into one
+    # operation — the requirement is one continuous fillet per wrap, not
+    # one operation spanning two wraps. Continuity within a wrap comes
+    # from the arc-rebuilt profile + live edge re-resolution +
+    # leave-one-out below; cross-wrap OCC conflicts are handled by
+    # re-resolving each bucket's edges against the current solid.
 
     def _bucket_applied_radius(members: list) -> float:
         # --- Applied radius: whole millimetre, floor 2 mm. ---
@@ -4489,61 +4449,8 @@ def _apply_recognized_fillets_to_solid(
             )
         return applied_this_bucket
 
-    for group in bucket_pairs:
-        if len(group) == 2:
-            bA, bB = buckets[group[0]], buckets[group[1]]
-            rA = _bucket_applied_radius(bA["members"])
-            rB = _bucket_applied_radius(bB["members"])
-            if rA == rB:
-                try:
-                    eA = _live_bucket_edges(bA)
-                    eB = _live_bucket_edges(bB)
-                    seen_ids: set = set()
-                    joint = []
-                    for e in eA + eB:
-                        if id(e) not in seen_ids:
-                            joint.append(e)
-                            seen_ids.add(id(e))
-                    vol_before = abs(float(wp.val().Volume()))
-                    wp_test = wp.newObject(joint).fillet(rA)
-                    vol_after = abs(float(wp_test.val().Volume()))
-                    # Tight gate for joint ops: convex perimeter rolls
-                    # must REMOVE material. OCC occasionally "succeeds"
-                    # with a ballooned blend — reject and go sequential.
-                    if 0.95 * vol_before < vol_after < 1.002 * vol_before:
-                        wp = wp_test
-                        v, f = _tessellate_solid(wp, fast=True)
-                        applied_steps.append(ConstructionStep(
-                            name=f"Fillet (r={rA:.0f}mm) x{len(joint)}",
-                            tess_vertices=v, tess_faces=f, volume=vol_after,
-                        ))
-                        applied_script.append(
-                            f"# Fillet r={rA:.0f} on {len(joint)} crease "
-                            f"edge(s) (joint same-plate pair)"
-                        )
-                        logger.info(
-                            "Joint pair (clusters %d+%d): r=%.0fmm on %d "
-                            "edges, vol %.0f -> %.0f",
-                            bA["cluster_idx"], bB["cluster_idx"], rA,
-                            len(joint), vol_before, vol_after,
-                        )
-                        continue
-                    logger.info(
-                        "Joint pair (clusters %d+%d) rejected by volume "
-                        "gate (%.0f -> %.0f); applying sequentially",
-                        bA["cluster_idx"], bB["cluster_idx"],
-                        vol_before, vol_after,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Joint pair (clusters %d+%d) failed (%s); "
-                        "applying sequentially",
-                        bA["cluster_idx"], bB["cluster_idx"], exc,
-                    )
-            for gi in group:
-                _apply_bucket(gi, buckets[gi])
-        else:
-            _apply_bucket(group[0], buckets[group[0]])
+    for bi, bucket in enumerate(buckets):
+        _apply_bucket(bi, bucket)
 
     logger.info(
         "Fillet pass done: %d clusters, %d edges in buckets, %d buckets, "

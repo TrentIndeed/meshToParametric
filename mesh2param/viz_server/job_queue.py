@@ -683,13 +683,28 @@ class JobQueue:
         # of the run to recolor each fillet face by apply-stage fate.
         job._uid_to_group = {}
 
-        # Stage 1.5: Body Decomposition
+        # Stage 1.5: Body Decomposition — for genuinely DISCONNECTED
+        # shells only (a true assembly of separate parts). A connected
+        # solid is ONE part however many extrusions it takes: the
+        # extrusion engine decomposes it into base + JOIN extrudes in a
+        # single feature tree (RackMount = plus-base with its 4 tabs +
+        # two side plates), instead of virtual body cuts + recombination.
         from mesh2param.pipeline.decompose import decompose_bodies, extract_sub_mesh
         from mesh2param.config import DecomposeConfig
         from mesh2param.models.feature import FeatureType
         job.progress = 6
         job.progress_stage = "Decomposing bodies..."
-        decomposition = decompose_bodies(cleaned, DecomposeConfig())
+        import trimesh as _conn_tm
+        _conn_mesh = _conn_tm.Trimesh(
+            vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+        )
+        try:
+            _n_components = len(_conn_mesh.split(only_watertight=False))
+        except Exception:
+            _n_components = 1
+        decomposition = decompose_bodies(
+            cleaned, DecomposeConfig(enabled=_n_components > 1),
+        )
 
         # Fixed rotation: warm/cool alternating, punchy saturated.
         # Defined unconditionally — the fit/viz stages below index into

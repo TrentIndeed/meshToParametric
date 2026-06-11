@@ -443,7 +443,20 @@ def _find_base_extrusion(
     base_sketch = None
     if base_span is not None:
         depth = base_span[1] - base_span[0]
-        base_sketch = {"span": [float(base_span[0]), float(base_span[1])]}
+        primary = plan.segments[0]
+        try:
+            from mesh2param.pipeline.extrusion import segment_inner_rings
+            base_inner = segment_inner_rings(cleaned, primary)
+        except Exception:
+            base_inner = []
+        base_sketch = {
+            "span": [float(base_span[0]), float(base_span[1])],
+            # Engine profile: on a multi-extrude part the slice-ranking
+            # heuristics (volume-targeted) pick wrong sections — the
+            # engine already measured the base's cross-section.
+            "points": [list(p) for p in primary.profile],
+            "inner": [[list(p) for p in ring] for ring in base_inner],
+        }
 
     return (
         Feature(

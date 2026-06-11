@@ -683,7 +683,25 @@ def _find_holes(
             hole_verts = cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
             res_fitted = _axis_radial_spread(hole_verts, axis_dir)
             res_thin = _axis_radial_spread(hole_verts, thin_axis)
-            if res_thin <= res_fitted * 1.5:
+            # Physical plausibility: a real hole spans the full part extent
+            # only along its DRILL direction (a through-hole runs the plate's
+            # thickness). When the fitted axis is one of the part's LONG axes
+            # AND the cylinder height spans nearly that whole long extent, the
+            # short-cylinder fitter has latched onto the part's long axis
+            # rather than a real bore — BottomMount's two spurious r=5.6 "X
+            # holes" measure 140mm along the 152mm-wide X axis (span ≈ 0.9),
+            # so force them onto the thin axis to land on the large plane.
+            # Body1Mesh's legitimate Z tab holes are drilled only partway into
+            # a tab (height ≈ 27–47 of a 156mm Z extent, span ≈ 0.2) and so
+            # stay on their fitted axis. Both cases share low res_fitted/high
+            # res_thin, so radial spread alone can't separate them — the
+            # fraction of the axis the cylinder spans does.
+            part_proj_axis = cleaned.vertices @ axis_dir
+            part_extent_axis = float(part_proj_axis.max() - part_proj_axis.min())
+            spans_full_axis = (
+                part_extent_axis > 0 and height > 0.7 * part_extent_axis
+            )
+            if spans_full_axis or res_thin <= res_fitted * 1.5:
                 axis_dir = thin_axis * np.sign(np.dot(axis_dir, thin_axis) or 1.0)
             else:
                 logger.debug(
@@ -693,6 +711,19 @@ def _find_holes(
                 )
         elif is_thin_plate:
             axis_dir = thin_axis * np.sign(np.dot(axis_dir, thin_axis) or 1.0)
+
+        # If the axis was overridden, the fitter's height (measured along
+        # the OLD axis) no longer describes the hole — recompute the depth
+        # as the region's extent along the final axis so the drilled cut
+        # doesn't punch 140mm through a 13mm plate.
+        final_height = float(
+            np.ptp(
+                cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
+                @ axis_dir
+            )
+        )
+        if final_height > 0:
+            height = final_height
 
         # Determine through vs blind. A cylindrical region that wraps
         # more than 270° of arc (already checked above) and has a

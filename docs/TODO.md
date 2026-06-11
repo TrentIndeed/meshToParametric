@@ -52,6 +52,19 @@
   likely the same fragmented-section profile-extraction issue below).
   Gates xfailed in test_step_comparison.KNOWN_FAILURES; remove entries as fixed.
 
+## Chamfers
+- [x] Chamfers now ride the SAME cluster->match->robust-apply pipeline as
+  fillets (face-wire edge selection, live edge re-resolution, leave-one-
+  out), applying OCC .chamfer() instead of .fillet(). The stitched stage
+  builds chamfer clusters (kind="chamfer") from topology chamfer records
+  instead of skipping them. Validated by a synthetic box-edge chamfer
+  test; fillets unchanged (RackMount 12/12).
+- [ ] No current test MESH produces chamfer blend records (all 5 parts'
+  bevels are rounded fillets or baked into profiles). Need a chamfered
+  reference part to validate chamfer detection->apply end-to-end on real
+  geometry; the chamfer "setback" size estimate (currently the record's
+  band half-extent) should be checked against a known chamfer then.
+
 ## Recognition
 - [ ] Mesh1 hole recall is 2/6: the four Y-axis plate corner holes are not
   recognized as THROUGH_HOLE features (absorbed into other features). Measured

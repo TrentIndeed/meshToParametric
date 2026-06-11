@@ -4188,6 +4188,7 @@ def _apply_recognized_fillets_to_solid(
     MIN_EDGE_FRAC = 0.5
     matched_by_cluster: dict[int, list[int]] = {}
     cluster_radius: dict[int, float] = {}
+    cluster_kind: dict[int, str] = {}
     for ci, c in enumerate(clusters):
         verts = np.asarray(c.get("vertices"), dtype=float)
         if verts.ndim != 2 or len(verts) == 0:
@@ -4253,10 +4254,11 @@ def _apply_recognized_fillets_to_solid(
             continue
         matched_by_cluster[ci] = [x[0] for x in chosen]
         cluster_radius[ci] = robust_r
+        cluster_kind[ci] = str(c.get("kind", "fillet"))
         logger.info(
-            "  cluster %d (%s): r=%.1f->%.1f snap=%.1f -> %d edge(s)",
-            int(c.get("group_id", ci)), category, topo_r, robust_r,
-            snap, len(chosen),
+            "  cluster %d (%s %s): r=%.1f->%.1f snap=%.1f -> %d edge(s)",
+            int(c.get("group_id", ci)), cluster_kind[ci], category,
+            topo_r, robust_r, snap, len(chosen),
         )
 
     n_total_edges_matched = sum(len(v) for v in matched_by_cluster.values())
@@ -4435,9 +4437,18 @@ def _apply_recognized_fillets_to_solid(
             edges_obj = [solid_edges[m["edge_idx"]]["obj"] for m in members]
         return edges_obj
 
+    def _blend_edges(wp_solid, edges, size: float, kind: str):
+        """Apply the blend op for this cluster kind to the selected edges.
+        Chamfers and fillets share the entire matcher + robust-apply path;
+        only the OCC operation differs (.chamfer(d) vs .fillet(r))."""
+        sel = wp_solid.newObject(edges)
+        return sel.chamfer(size) if kind == "chamfer" else sel.fillet(size)
+
     def _apply_bucket(bi: int, bucket: dict) -> bool:
         nonlocal wp
         members = bucket["members"]
+        kind = cluster_kind.get(bucket["cluster_idx"], "fillet")
+        op_label = "Chamfer" if kind == "chamfer" else "Fillet"
         applied_r = _bucket_applied_radius(members)
         edges_obj = _live_bucket_edges(bucket)
         n_edges = len(edges_obj)
@@ -4457,23 +4468,23 @@ def _apply_recognized_fillets_to_solid(
         applied_this_bucket = False
         for r in r_candidates:
             try:
-                wp_test = wp.newObject(edges_obj).fillet(r)
+                wp_test = _blend_edges(wp, edges_obj, r, kind)
                 vol_after = abs(float(wp_test.val().Volume()))
                 if vol_after <= 0 or vol_after > vol_before * 1.05:
                     continue
                 wp = wp_test
                 v, f = _tessellate_solid(wp, fast=True)
                 applied_steps.append(ConstructionStep(
-                    name=f"Fillet (r={r:.0f}mm) x{n_edges}",
+                    name=f"{op_label} (r={r:.0f}mm) x{n_edges}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,
                 ))
                 applied_script.append(
-                    f"# Fillet r={r:.0f} on {n_edges} crease edge(s)"
+                    f"# {op_label} r={r:.0f} on {n_edges} crease edge(s)"
                 )
                 logger.info(
-                    "Bucket %d (cluster %d): r=%.0fmm on %d edges, "
+                    "Bucket %d (cluster %d, %s): r=%.0fmm on %d edges, "
                     "vol %.0f -> %.0f (dt=%.1fs)",
-                    bi, bucket["cluster_idx"], r, n_edges,
+                    bi, bucket["cluster_idx"], kind, r, n_edges,
                     vol_before, vol_after, _time.time() - t_bucket,
                 )
                 applied_this_bucket = True
@@ -4496,7 +4507,7 @@ def _apply_recognized_fillets_to_solid(
             for skip_i in range(n_edges):
                 subset = [e for k, e in enumerate(edges_obj) if k != skip_i]
                 try:
-                    wp_test = wp.newObject(subset).fillet(r_loo)
+                    wp_test = _blend_edges(wp, subset, r_loo, kind)
                     vol_after = abs(float(wp_test.val().Volume()))
                     if vol_after <= 0 or vol_after > vol_before * 1.05:
                         continue
@@ -4505,11 +4516,11 @@ def _apply_recognized_fillets_to_solid(
                 wp = wp_test
                 v, f = _tessellate_solid(wp, fast=True)
                 applied_steps.append(ConstructionStep(
-                    name=f"Fillet (r={r_loo:.0f}mm) x{len(subset)}",
+                    name=f"{op_label} (r={r_loo:.0f}mm) x{len(subset)}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,
                 ))
                 applied_script.append(
-                    f"# Fillet r={r_loo:.0f} on {len(subset)} crease "
+                    f"# {op_label} r={r_loo:.0f} on {len(subset)} crease "
                     f"edge(s) (1 degenerate edge dropped)"
                 )
                 dropped = edges_obj[skip_i]

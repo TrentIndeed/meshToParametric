@@ -202,6 +202,44 @@ def test_l_bracket_inside_corner():
     assert longest > 90.0, f"longest matched edge only {longest} mm; want >= 100"
 
 
+def test_chamfer_cluster_applies_chamfer_not_fillet():
+    """A cluster tagged kind='chamfer' rides the SAME matcher + robust
+    apply as a fillet, but the OCC operation is .chamfer(). On a plain
+    box's top edge it must produce a Chamfer step (a new flat bevel face),
+    remove material, and report a clean planar chamfer face."""
+    wp = cq.Workplane("XY").box(100, 60, 20)
+    # Top-front outer (convex) edge runs along X at y=+30, z=+10. The
+    # chamfer band hugs that edge wrapping OUTWARD across the two faces,
+    # so the center line sits ON the edge and the arc opens to +Y/+Z.
+    r = 3.0
+    axis_start = np.array([-40.0, 30.0, 10.0])
+    axis_end = np.array([40.0, 30.0, 10.0])
+    verts = _quarter_cylinder_cluster(
+        axis_start=axis_start, axis_end=axis_end,
+        plane_a_normal=np.array([0.0, -1.0, 0.0]),  # arc opens toward +Y
+        plane_b_normal=np.array([0.0, 0.0, -1.0]),  # and +Z
+        radius=r,
+    )
+    stitched = [{
+        "group_id": 0, "vertices": verts, "n_records": 1,
+        "radius": r, "category": "curve_edge", "kind": "chamfer",
+    }]
+    out_diag: list = []
+    vol_before = abs(float(wp.val().Volume()))
+    wp_after, steps, _ = _apply_recognized_fillets_to_solid(
+        wp, stitched_clusters=stitched,
+        out_edges=[], out_surfaces=[], out_diag=out_diag,
+    )
+    assert len(steps) == 1, f"expected 1 chamfer step, got {[s.name for s in steps]}"
+    assert steps[0].name.startswith("Chamfer"), (
+        f"step should be a Chamfer, got {steps[0].name!r}"
+    )
+    vol_after = abs(float(wp_after.val().Volume()))
+    assert vol_after < vol_before, "chamfer did not remove material"
+    matched = [d for d in out_diag if d["matched"]]
+    assert len(matched) == 1 and matched[0]["group_id"] == 0
+
+
 def test_does_not_fillet_when_cluster_is_far_away():
     """A cluster placed in mid-air, nowhere near any concave edge,
     must NOT cause any fillet operation."""

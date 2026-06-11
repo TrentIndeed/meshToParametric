@@ -1079,6 +1079,7 @@ class JobQueue:
             # back to the direct-contact rule only.
             from mesh2param.models.region import SurfaceType as _ST_pn
             records_info: list[dict] = []
+            chamfer_records: list[dict] = []
             n_chamfers = 0
             for body_idx, _bst in enumerate(body_stage_data):
                 _body, _sub, _regs, _fits, _g, _e, _bt, topo_blends = _bst
@@ -1113,6 +1114,20 @@ class JobQueue:
                     kind = rec.get("kind")
                     if kind == "chamfer":
                         n_chamfers += 1
+                        # Chamfers ride the SAME cluster->match->apply path
+                        # as fillets (apply uses OCC .chamfer instead of
+                        # .fillet). Collect the band's vertex cloud + a
+                        # setback estimate; build chamfer clusters after the
+                        # fillet payload below.
+                        fi_c = rec.get("face_indices")
+                        if fi_c is not None and len(fi_c) > 0:
+                            cverts = _sub.vertices[
+                                _sub.faces[np.asarray(fi_c, dtype=np.int64)]
+                            ].reshape(-1, 3)
+                            chamfer_records.append({
+                                "verts": cverts,
+                                "radius": float(rec.get("radius", 0.0) or 0.0),
+                            })
                         continue
                     if kind != "fillet":
                         continue
@@ -1782,6 +1797,55 @@ class JobQueue:
                     "coverage_deg": cov_deg,
                     "inplane_mm": inplane,
                 })
+            # --- Chamfer clusters: one per chamfer band, kind="chamfer" ---
+            # Merge chamfer bands whose vertex clouds touch (a chamfer that
+            # got split into several records) so each physical chamfer is
+            # one cluster, then hand them to the same apply path as fillets.
+            if chamfer_records:
+                from scipy.spatial import cKDTree as _cKDTree_ch
+                n_ch = len(chamfer_records)
+                ch_parent = list(range(n_ch))
+
+                def _ch_find(x):
+                    while ch_parent[x] != x:
+                        ch_parent[x] = ch_parent[ch_parent[x]]
+                        x = ch_parent[x]
+                    return x
+
+                allv = np.vstack([r["verts"] for r in chamfer_records])
+                allu = np.concatenate([
+                    np.full(len(r["verts"]), i) for i, r in enumerate(chamfer_records)
+                ])
+                for i, j in _cKDTree_ch(allv).query_pairs(r=2.0):
+                    a, b = int(allu[i]), int(allu[j])
+                    ra, rb = _ch_find(a), _ch_find(b)
+                    if ra != rb:
+                        ch_parent[rb] = ra
+                ch_groups: dict[int, list[int]] = {}
+                for i in range(n_ch):
+                    ch_groups.setdefault(_ch_find(i), []).append(i)
+
+                gid0 = len(stitched_clusters_payload)
+                for off, members_ch in enumerate(ch_groups.values()):
+                    cv = np.vstack([chamfer_records[i]["verts"] for i in members_ch])
+                    radii = [chamfer_records[i]["radius"] for i in members_ch
+                             if chamfer_records[i]["radius"] > 0]
+                    # Setback estimate: a flat chamfer band of width W spans
+                    # W = setback*sqrt(2) for a 45 deg cut; the record radius
+                    # already tracks the band half-extent, so use it directly,
+                    # floored at 1mm.
+                    setback = max(1.0, float(np.median(radii)) if radii else 1.0)
+                    stitched_clusters_payload.append({
+                        "group_id": gid0 + off,
+                        "vertices": cv.astype(np.float64),
+                        "n_records": len(members_ch),
+                        "radius": setback,
+                        "category": "curve_edge",
+                        "kind": "chamfer",
+                    })
+                logger.info("Stitched %d chamfer record(s) into %d chamfer cluster(s)",
+                            n_ch, len(ch_groups))
+
             job._stitched_clusters = stitched_clusters_payload
             # Stash uid → group_id so the reconcile-stage viz at the
             # end of the run can map each fillet face to the apply

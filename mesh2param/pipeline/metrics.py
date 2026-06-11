@@ -201,3 +201,90 @@ def blend_apply_report(fillet_match_diag: list[dict]) -> dict:
         "match_ratio": (matched / recognized) if recognized else None,
         "unmatched": [d for d in diag if not d.get("matched")],
     }
+
+
+def cross_section_fidelity(
+    verts_a, faces_a, verts_b, faces_b, n_per_axis: int = 7,
+) -> dict:
+    """Cross-section similarity between two solids (e.g. CAD vs mesh).
+
+    Volume error can be gamed — extruding the average cross-section of a
+    tapered part reproduces its volume while getting every section wrong.
+    This slices BOTH solids at matching stations along all three axes and
+    scores each station by the IoU of the full cross-sections (holes
+    included). Returns mean/worst IoU and a per-axis breakdown.
+    """
+    import trimesh as _tm
+    from shapely.geometry import Polygon as _P
+    from shapely.ops import unary_union as _uu
+
+    ma = _tm.Trimesh(vertices=verts_a, faces=faces_a, process=False)
+    mb = _tm.Trimesh(vertices=verts_b, faces=faces_b, process=False)
+    lo = np.minimum(ma.bounds[0], mb.bounds[0])
+    hi = np.maximum(ma.bounds[1], mb.bounds[1])
+
+    def _section_geom(mesh, axis, pos):
+        n = np.zeros(3); n[axis] = 1.0
+        o = np.zeros(3); o[axis] = pos
+        s = mesh.section(plane_origin=o, plane_normal=n)
+        if s is None:
+            return None
+        ax_u, ax_v = (i for i in range(3) if i != axis)
+        loops = []
+        try:
+            disc = s.discrete
+        except Exception:
+            return None
+        for ring in disc:
+            p = _P(np.column_stack([ring[:, ax_u], ring[:, ax_v]]))
+            if p.is_valid and p.area > 0.01:
+                loops.append(p)
+        if not loops:
+            return None
+        outers, holes = [], []
+        for i, p in enumerate(loops):
+            depth = sum(
+                1 for j, q in enumerate(loops)
+                if j != i and q.contains(p.representative_point())
+                and q.area > p.area
+            )
+            (outers if depth % 2 == 0 else holes).append(p)
+        geom = _uu(outers)
+        if holes:
+            geom = geom.difference(_uu(holes))
+        return geom if not geom.is_empty else None
+
+    per_axis = {}
+    all_ious = []
+    for axis in range(3):
+        extent = hi[axis] - lo[axis]
+        if extent <= 0:
+            continue
+        stations = np.linspace(
+            lo[axis] + 0.05 * extent, hi[axis] - 0.05 * extent, n_per_axis,
+        )
+        ious = []
+        for pos in stations:
+            ga = _section_geom(ma, axis, float(pos))
+            gb = _section_geom(mb, axis, float(pos))
+            if ga is None and gb is None:
+                continue
+            if ga is None or gb is None:
+                ious.append(0.0)
+                continue
+            try:
+                inter = ga.intersection(gb).area
+                union = ga.union(gb).area
+                ious.append(inter / union if union > 1e-9 else 0.0)
+            except Exception:
+                ious.append(0.0)
+        if ious:
+            per_axis["XYZ"[axis]] = float(np.mean(ious))
+            all_ious.extend(ious)
+
+    return {
+        "mean_iou": float(np.mean(all_ious)) if all_ious else 0.0,
+        "worst_iou": float(np.min(all_ious)) if all_ious else 0.0,
+        "per_axis": per_axis,
+        "n_sections": len(all_ious),
+    }

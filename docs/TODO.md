@@ -107,6 +107,37 @@
   work; truly organic shapes (spanner) belong on /clean. No reference STEPs
   for scans, so accuracy is volume-only.
 
+## Iterative extrusion engine (started 2026-06-11)
+- [x] **Phase 1+4: engine + metric.** `pipeline/extrusion.py` decomposes a
+  part into prismatic segments: slice every principal axis, track
+  cross-section component runs by reference-IoU (taper breaks the run —
+  no averaging through it), bridge hole-split stations, then greedily
+  pick segments by residual voxel coverage (marginal-gain stop, not a
+  fixed count; profile-area tie-break = "largest single extrude area").
+  `metrics.cross_section_fidelity` scores CAD-vs-mesh by section IoU
+  across all axes — the gate for modeling decisions (volume can be gamed
+  by an averaged cross-section; sections cannot). Engine now drives the
+  base-extrude axis in `_find_base_extrusion` (legacy logic = fallback
+  for ragged scans). Results: Mesh2 1 segment Y 100% (trapezoid from
+  first principles); Mesh3 is genuinely a STEPPED part (3 coaxial Y
+  segments, 99.9% — its 0.686 worst-section score under single-extrude
+  confirms the gap); Mesh5 base-Z + side joins, 90%.
+- [ ] **Phase 2/3: multi-extrude feature trees.** Emit segments 2..N as
+  JOIN extrudes in ONE feature tree/timeline (Extrude Base -> Extrude
+  Join x N -> holes -> blends). Mesh5 is one connected solid — present it
+  as one part with 3 extrusions, NOT bodies; keep `decompose` semantics
+  only for genuinely disconnected shells (true assemblies). Mesh3's
+  stepped flanges become the first single-body multi-extrude win (gated
+  by cross_section_fidelity beating the single-extrude baseline). Engine
+  segment spans should replace decompose's 5x-area-jump split heuristic;
+  delete legacy paths once parity is shown (engine-only end state).
+- [ ] Engine refinements observed on Mesh1/Mesh4/Mesh5: thin sliver
+  candidates from chamfer bands survive the 2% gain floor (Mesh1's
+  96/153-area X/Z segments); tube wall coverage reads 55% (suspect voxel
+  fill or wall-annulus membership — investigate before trusting coverage
+  on thin-walled parts); RackMount side plates fragment into coaxial
+  sub-runs that should chain into one join each.
+
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet
   matcher search; the structural fix for the blend apply ratio).

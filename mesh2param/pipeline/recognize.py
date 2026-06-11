@@ -349,39 +349,37 @@ def _find_base_extrusion(
     snapped[principal] = float(np.sign(direction[principal]) or 1.0)
     direction = snapped
 
-    # Thin-plate override: a plate is always extruded through its
-    # thickness. If one bbox dimension is much smaller than the other
-    # two, force the extrude axis to that thin direction regardless of
-    # which face has the most area — this is the canonical prismatic
-    # interpretation and is robust to chamfers/bosses dominating area.
-    size = cleaned.bbox[1] - cleaned.bbox[0]
-    order = np.argsort(size)
-    if size[order[0]] > 0 and size[order[1]] >= 3.0 * size[order[0]]:
-        thin_axis = int(order[0])
-        ax = thin_axis
-        # A TAPERED/drafted plate (one face wider than the other) is NOT
-        # prismatic through its thickness — extruding the thin-axis profile
-        # gives a constant cross-section that's wrong end-to-end. When the
-        # thin axis tapers and a perpendicular axis has a more-constant
-        # cross-section, extrude that perpendicular SIDE profile (the
-        # trapezoid silhouette) instead. Flat plates keep the thin axis.
-        if _thin_axis_tapered(cleaned.vertices, cleaned.bbox, ax):
-            perp = [a for a in range(3) if a != ax]
-            covs = {a: _cross_section_cov(cleaned.vertices, cleaned.bbox, a) for a in perp}
-            best_perp = min(perp, key=lambda a: covs[a])
-            if covs[best_perp] < _cross_section_cov(cleaned.vertices, cleaned.bbox, ax):
+    # Extrusion engine: decide the base axis from cross-section evidence.
+    # The engine slices along every principal axis, tracks runs of
+    # similar cross-sections (reference-IoU, so a taper breaks the run
+    # instead of averaging through it), and greedily picks the segment
+    # explaining the most volume. The primary segment's axis subsumes the
+    # old thin-plate and tapered-side-profile special cases: a flat plate
+    # has its longest constant-section run through the thickness; a
+    # drafted plate (BottomMount) is only prismatic along its constant
+    # side axis, so the trapezoid side profile wins from first
+    # principles. Legacy area/thin-axis logic above remains the fallback
+    # when the engine can't form a confident segment (ragged scans).
+    try:
+        from mesh2param.pipeline.extrusion import plan_extrusions
+        plan = plan_extrusions(cleaned)
+        if plan.segments and plan.segments[0].gain_frac >= 0.4:
+            engine_dir = plan.segments[0].direction
+            if int(np.argmax(np.abs(engine_dir))) != int(np.argmax(np.abs(direction))):
                 logger.info(
-                    "Base extrusion: tapered plate, extruding SIDE profile "
-                    "along axis %d instead of thin axis %d", best_perp, thin_axis,
+                    "Base extrusion: engine override axis %s -> %s "
+                    "(%d segments, primary gain %.0f%%)",
+                    np.argmax(np.abs(direction)), np.argmax(np.abs(engine_dir)),
+                    len(plan.segments), 100 * plan.segments[0].gain_frac,
                 )
-                ax = best_perp
-        if ax != principal:
+            direction = engine_dir.copy()
+        else:
             logger.info(
-                "Base extrusion: plate override, axis %d -> %d (bbox=%s)",
-                principal, ax, np.round(size, 1).tolist(),
+                "Extrusion engine inconclusive (%d segments); keeping "
+                "legacy axis choice", len(plan.segments),
             )
-        direction = np.zeros(3)
-        direction[ax] = 1.0
+    except Exception:
+        logger.exception("Extrusion engine failed; keeping legacy axis")
 
     # Estimate depth from bbox extent along the extrusion direction
     verts = cleaned.vertices

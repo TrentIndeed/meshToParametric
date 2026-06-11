@@ -201,6 +201,57 @@ def recognize_features(
 # ---------------------------------------------------------------------------
 
 
+def _cross_section_cov(verts: np.ndarray, bbox: np.ndarray, axis: int, n_bins: int = 10) -> float:
+    """Coefficient of variation of the cross-section bbox-area along `axis`.
+
+    Low = the part is prismatic along this axis (constant cross-section);
+    high = it tapers/steps. Used to pick the extrude axis that keeps the
+    cross-section most constant.
+    """
+    u, v = [x for x in range(3) if x != axis]
+    lo, hi = float(bbox[0][axis]), float(bbox[1][axis])
+    if hi - lo < 1e-9:
+        return float("inf")
+    coord = verts[:, axis]
+    edges = np.linspace(lo + 0.05 * (hi - lo), hi - 0.05 * (hi - lo), n_bins + 1)
+    areas = []
+    for k in range(n_bins):
+        m = (coord >= edges[k]) & (coord < edges[k + 1])
+        if int(m.sum()) < 3:
+            continue
+        pu, pv = verts[m][:, u], verts[m][:, v]
+        areas.append((pu.max() - pu.min()) * (pv.max() - pv.min()))
+    if len(areas) < 3:
+        return float("inf")
+    areas = np.asarray(areas, dtype=float)
+    mean = float(areas.mean())
+    return float(areas.std() / mean) if mean > 1e-9 else float("inf")
+
+
+def _thin_axis_tapered(verts: np.ndarray, bbox: np.ndarray, axis: int,
+                       band_frac: float = 0.15, ratio_thresh: float = 0.9) -> bool:
+    """True if the cross-section at the two ENDS of `axis` differ — a draft
+    /tapered plate (one face wider than the other), not a flat plate."""
+    u, v = [x for x in range(3) if x != axis]
+    lo, hi = float(bbox[0][axis]), float(bbox[1][axis])
+    if hi - lo < 1e-9:
+        return False
+    coord = verts[:, axis]
+    band = band_frac * (hi - lo)
+
+    def _area(mask: np.ndarray) -> float:
+        if int(mask.sum()) < 3:
+            return 0.0
+        pu, pv = verts[mask][:, u], verts[mask][:, v]
+        return float((pu.max() - pu.min()) * (pv.max() - pv.min()))
+
+    a_min = _area(coord < lo + band)
+    a_max = _area(coord > hi - band)
+    if max(a_min, a_max) < 1e-9:
+        return False
+    return (min(a_min, a_max) / max(a_min, a_max)) < ratio_thresh
+
+
 def _find_base_extrusion(
     regions: list[FaceRegion],
     fitted: list[FittedSurface],
@@ -295,13 +346,30 @@ def _find_base_extrusion(
     order = np.argsort(size)
     if size[order[0]] > 0 and size[order[1]] >= 3.0 * size[order[0]]:
         thin_axis = int(order[0])
-        if thin_axis != principal:
+        ax = thin_axis
+        # A TAPERED/drafted plate (one face wider than the other) is NOT
+        # prismatic through its thickness — extruding the thin-axis profile
+        # gives a constant cross-section that's wrong end-to-end. When the
+        # thin axis tapers and a perpendicular axis has a more-constant
+        # cross-section, extrude that perpendicular SIDE profile (the
+        # trapezoid silhouette) instead. Flat plates keep the thin axis.
+        if _thin_axis_tapered(cleaned.vertices, cleaned.bbox, ax):
+            perp = [a for a in range(3) if a != ax]
+            covs = {a: _cross_section_cov(cleaned.vertices, cleaned.bbox, a) for a in perp}
+            best_perp = min(perp, key=lambda a: covs[a])
+            if covs[best_perp] < _cross_section_cov(cleaned.vertices, cleaned.bbox, ax):
+                logger.info(
+                    "Base extrusion: tapered plate, extruding SIDE profile "
+                    "along axis %d instead of thin axis %d", best_perp, thin_axis,
+                )
+                ax = best_perp
+        if ax != principal:
             logger.info(
-                "Base extrusion: thin-plate override, axis %d -> %d "
-                "(bbox size=%s)", principal, thin_axis, np.round(size, 1).tolist(),
+                "Base extrusion: plate override, axis %d -> %d (bbox=%s)",
+                principal, ax, np.round(size, 1).tolist(),
             )
         direction = np.zeros(3)
-        direction[thin_axis] = 1.0
+        direction[ax] = 1.0
 
     # Estimate depth from bbox extent along the extrusion direction
     verts = cleaned.vertices

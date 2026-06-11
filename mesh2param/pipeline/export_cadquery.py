@@ -698,6 +698,37 @@ def _extract_profile_and_holes(
     all_proj = cleaned.vertices[:, primary_axis]
     extrude_start = float(all_proj.min())
 
+    # Tapered/drafted plate: recognize chose to extrude along a NON-thin
+    # axis (the side view). A single cross-section slice there is a flat
+    # rectangle — it misses the taper. The SILHOUETTE (outline of all
+    # vertices projected onto the extrude plane) is the trapezoid. Compute
+    # it here and use it as the outer profile below. Only for this
+    # tapered-side case; flat parts keep the slice path.
+    _bbsize = cleaned.bbox[1] - cleaned.bbox[0]
+    _thin_axis = int(np.argmin(_bbsize))
+    silhouette_profile = None
+    if primary_axis != _thin_axis:
+        try:
+            from shapely import concave_hull, simplify
+            from shapely.geometry import MultiPoint
+            pts2d = np.column_stack([
+                cleaned.vertices[:, ax_u], cleaned.vertices[:, ax_v],
+            ])
+            hull = concave_hull(MultiPoint(pts2d), ratio=0.2)
+            hull = simplify(hull, 0.5)
+            if hull.geom_type == "Polygon" and hull.area > 1.0:
+                coords = list(hull.exterior.coords)[:-1]
+                coords = _simplify_profile(coords, tolerance=0.5)
+                if len(coords) >= 3:
+                    silhouette_profile = coords
+                    logger.info(
+                        "Tapered side-extrude: using %d-pt silhouette profile "
+                        "(area=%.0f) along axis %d",
+                        len(coords), hull.area, primary_axis,
+                    )
+        except Exception as exc:
+            logger.debug("Silhouette profile failed (%s) — using slices", exc)
+
     normal = [0.0, 0.0, 0.0]
     normal[primary_axis] = 1.0
 
@@ -852,6 +883,13 @@ def _extract_profile_and_holes(
     # Pick best candidate
     candidates.sort(key=lambda x: (x[0], x[1]))
     best_profiles = candidates[0][2]
+
+    # Tapered side-extrude: the silhouette IS the outer profile (the
+    # trapezoid). It supersedes the slice-derived outer boundary, which is
+    # only a flat rectangle for this axis. Inner cutouts from the slice
+    # path (if any) are kept after it.
+    if silhouette_profile is not None:
+        best_profiles = [silhouette_profile] + best_profiles[1:]
 
     # If the best slice has multiple large outer polygons (frame split by
     # cutout), find a slice where the frame is one connected piece and

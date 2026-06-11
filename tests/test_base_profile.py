@@ -54,6 +54,39 @@ def test_bracket_bolt_holes_not_baked_into_base():
     assert res.status == "PASS"
 
 
+def test_tapered_plate_uses_trapezoid_side_profile():
+    """BottomMount is a drafted plate (one face wider than the other). The
+    base must extrude along the constant-length axis with the SILHOUETTE
+    side profile — a TRAPEZOID (two parallel edges of different width) —
+    not a thin-axis slice (a flat rectangle that misses the taper)."""
+    import numpy as np
+
+    from mesh2param.config import RecognizeConfig
+    from mesh2param.pipeline.export_cadquery import _extract_profile_and_holes
+    cleaned = ingest_mesh(str(MODELS / "Mesh2" / "BottomMount.3mf"), IngestConfig(remesh=False))
+    regions = segment_mesh(cleaned, SegmentConfig())
+    fitted = fit_surfaces(regions, cleaned, FitConfig())
+    graph, edges = build_topology(regions, fitted, cleaned, TopologyConfig())
+    tree = recognize_features(regions, fitted, graph, edges, cleaned, RecognizeConfig())
+    base = tree.features[0]
+    direction = np.asarray(base.direction, dtype=float)
+
+    # Extrudes along Y (the constant-length axis), not the thin Z axis.
+    assert int(np.argmax(np.abs(direction))) == 1, (
+        f"tapered plate should extrude along axis 1, got dir {direction.tolist()}"
+    )
+    profiles, *_ = _extract_profile_and_holes(tree, cleaned, direction)
+    prof = np.asarray(profiles[0], dtype=float)
+    # Trapezoid: at the two ends of the thickness (v axis) the width (u
+    # span) differs. A flat rectangle would have equal widths.
+    v = prof[:, 1]
+    lo_w = np.ptp(prof[v < v.mean()][:, 0])
+    hi_w = np.ptp(prof[v >= v.mean()][:, 0])
+    assert min(lo_w, hi_w) / max(lo_w, hi_w) < 0.95, (
+        f"side profile is not a trapezoid: widths {lo_w:.1f} vs {hi_w:.1f}"
+    )
+
+
 def test_tube_bore_is_baked_annular():
     """The tube's large concentric bore IS baked into the base — annular
     sketch, one extrude, no separate bore cut."""

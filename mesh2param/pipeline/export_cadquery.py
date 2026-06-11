@@ -701,12 +701,24 @@ def _extract_profile_and_holes(
     normal = [0.0, 0.0, 0.0]
     normal[primary_axis] = 1.0
 
-    # Collect profiles from multiple slices across the full depth.
-    # Pick the slice with the largest outer profile area — this finds the
-    # widest cross-section, avoiding positions where holes/pockets reduce it.
+    # Collect profiles from multiple slices across the full depth, then
+    # pick the one that best reproduces the part with a SINGLE extrude —
+    # the lowest-step base. The right profile is the cross-section whose
+    # area matches the part's AVERAGE cross-section (volume / depth), not
+    # the largest slice: for a tapered or corner-cut plate (BottomMount
+    # grows 27k->32k mm^2 bottom-to-top) the largest slice over-fills,
+    # while the average-area slice is the trapezoid that minimizes the
+    # residual the downstream cut/add features must fix. This also
+    # rejects fillet-inset slices (below average) without a special case.
     extent = float(all_proj.max() - all_proj.min())
+    target_area = 0.0
+    try:
+        if mesh.is_watertight and extent > 1e-6:
+            target_area = abs(float(mesh.volume)) / extent
+    except Exception:
+        target_area = 0.0
 
-    candidates: list[tuple[float, list]] = []  # (-area, profiles)
+    candidates: list[tuple[float, float, list]] = []  # (rank_key, -area, profiles)
 
     # Sample slices across the full depth: top, bottom, and intermediate
     # positions.  Intermediate slices avoid blind holes near the faces and
@@ -819,18 +831,17 @@ def _extract_profile_and_holes(
             if not slice_profiles:
                 continue
 
-            # Rank slices by the outer boundary's BBOX extent first,
-            # then by enclosed area. A slice cutting through a
-            # perimeter-fillet band has its outline inset by up to
-            # r*(1-cos45) — on RackMount the 90%-depth slice won the
-            # raw-area contest via a near-face bulge while being
-            # 0.5mm SHORT on every filleted side, shrinking the whole
-            # rebuilt plate. The design outline is the slice that
-            # reaches the part's full extent.
-            oc = np.asarray(outer_coords, dtype=float)
-            bbox_extent = float(np.prod(oc.max(axis=0) - oc.min(axis=0)))
+            # Rank key: closeness of this slice's outer area to the
+            # part's average cross-section (volume/depth) — the slice
+            # whose single extrude best matches the part. Falls back to
+            # largest-area (negative) when the mesh volume is unavailable
+            # (non-watertight), preserving the old behavior there.
+            if target_area > 0:
+                rank_key = abs(outer_boundary_area - target_area)
+            else:
+                rank_key = -outer_boundary_area
             candidates.append(
-                (-round(bbox_extent, 1), -outer_boundary_area, slice_profiles)
+                (rank_key, -outer_boundary_area, slice_profiles)
             )
         except Exception:
             continue
@@ -1121,7 +1132,18 @@ def _extract_profile_and_holes(
             if merged.geom_type == 'Polygon' and merged.interiors:
                 clean_outer = list(merged.exterior.coords)[:-1]
                 clean_outer = _simplify_profile(clean_outer, tolerance=0.5)
-                if len(clean_outer) >= 3:
+                # Only adopt the face-projection exterior to FIX hole-slit
+                # artifacts in the slice outline — not to enlarge it. The
+                # projection is the union of all top/bottom faces, i.e. the
+                # full silhouette; on a tapered or corner-cut plate that is
+                # bigger than the volume-matched slice and would over-fill
+                # the base (the +9.8% on BottomMount). Slit removal barely
+                # changes area; a taper adds ~10%. Keep the selected slice
+                # when the clean exterior would grow it materially.
+                cur_area = _polygon_area(best_profiles[0]) if best_profiles else 0.0
+                clean_area = _polygon_area(clean_outer) if len(clean_outer) >= 3 else 0.0
+                grows = cur_area > 0 and clean_area > cur_area * 1.03
+                if len(clean_outer) >= 3 and not grows:
                     # Keep any extra profiles (they'll be replaced/re-added below)
                     extras = best_profiles[1:] if len(best_profiles) > 1 else []
                     best_profiles = [clean_outer] + extras

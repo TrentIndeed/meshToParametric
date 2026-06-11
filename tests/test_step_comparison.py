@@ -48,8 +48,6 @@ MODEL_PAIRS = discover_model_pairs()
 #     path. Needs decompose + per-body trees to compare fairly.
 KNOWN_FAILURES: dict[tuple[str, str], str] = {
     ("Mesh2", "holes"): "BottomMount hole set unmatched vs reference",
-    ("Mesh3", "volume"): "Front Plate rebuild +36.7% volume (profile extraction)",
-    ("Mesh3", "bbox"): "Front Plate bbox overlap 72% (profile extraction)",
     ("Mesh3", "holes"): "Front Plate hole set unmatched vs reference",
     ("Mesh4", "holes"): "tube part class: coaxial bore not recognized as a hole",
     ("Mesh5", "volume"): "RackMount needs multi-body test harness",

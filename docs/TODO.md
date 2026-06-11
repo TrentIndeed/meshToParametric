@@ -12,15 +12,16 @@
   13mm edge and dropped all holes. Fixed in _find_base_extrusion (area-
   weighted dominant plane + principal-axis snap + thin-plate override).
   Volume -23.2% -> +9.8%; holes restored; volume/bbox gates now pass.
-- [ ] **Mesh2 tangential cut-extrude (user request)**: the "asymmetric
-  chamfer" is actually a ROUNDED/tangential swept transition — its faces'
-  normals fan ~130 deg in XY (e.g. [-0.92,-0.38,0]->[-0.61,-0.79,0]), so
-  _detect_mesh_chamfers rejects it ("band fans 133deg -> curved surface")
-  and nothing builds it (the +9.8% leftover material). User wants it
-  modeled as a TANGENTIAL CUT-EXTRUDE: sketch the swept cross-section
-  profile and cut-extrude it along the edge, tangent to the two adjacent
-  faces. This used to work at one point — check git history for a swept/
-  side-profile cut path that was removed. New feature path, not a tweak.
+- [x] Mesh2 corner cuts via the trapezoid profile (user: lowest-step
+  principle). The base profile now selects the slice whose outer area is
+  closest to the part's AVERAGE cross-section (mesh volume / depth) — the
+  single extrude that best reproduces the part — instead of the largest
+  slice. For BottomMount that IS the trapezoid (cut corners baked in), so
+  one extrude needs no separate corner cut. Also guarded the face-
+  projection "clean exterior" replacement so it only de-slits the outline,
+  never enlarges it to the full silhouette. Mesh2 9.8%->0.1%; the same
+  principle fixed Mesh3 Front Plate 36.7%->0.8% and the tube 0%. Mesh3
+  volume+bbox gates un-xfailed.
 - [ ] **Tube annular profile (user request, "eventually")**: build the
   tube as TWO concentric circle sketches (outer + inner) extruded as the
   ring between them, instead of extruding the outer circle then cutting a

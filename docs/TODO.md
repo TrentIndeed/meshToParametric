@@ -163,6 +163,25 @@
   either path (zero chamfer records on all 5 parts) — they ride the
   profiles.
 
+- [ ] **Phase 2c: step-cut emission (the actual blocker, found 2026-06-11).**
+  Branch wip/engine-honest-claims holds: honest voxel claims (half-cell
+  symmetric tolerance, wall-thickness pitch, generous claim dilation),
+  pure max-gain greedy (the area-window was a crutch for sloppy claims
+  and mispicked once claims were honest), engine base profile + parity
+  inner rings feeding the export, _clean_engine_polygon (self-
+  intersecting mesh outlines extrude EMPTY in CadQuery, silently).
+  With honest claims RackMount reads as U-channel-along-Y + base wings
+  (2 extrudes, fewer steps than the user's 3) -- but a step-merged
+  segment extrudes its LARGEST profile over the union span, and the
+  mid-span differences (the merged runs' diffs vs that profile) must be
+  emitted as CUT features. Nothing consumes the step_cuts flag yet, so
+  the U build over-fills (19% vol) and scores worse end-to-end than the
+  committed X-webs reading (fid 0.855). DO NOT merge the branch until
+  cut emission exists: per merged run, diff each constituent run's
+  profile against the segment profile and emit pocket/cut features over
+  that run's span. Same machinery then handles Front Plate's window lips
+  and the RackMount tab undersides.
+
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet
   matcher search; the structural fix for the blend apply ratio).

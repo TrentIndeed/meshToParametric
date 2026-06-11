@@ -119,17 +119,43 @@ def plan_extrusions(
         top_gain = int(gains.max()) if len(gains) else 0
         if top_gain < min_gain_frac * total:
             break
-        # Pure max-gain. With honest (half-cell, symmetric) claims the
-        # most-coverage candidate IS the right extrude: BottomMount's
-        # trapezoid run strictly out-claims the inscribed rectangle, and
-        # RackMount's Y side profile out-claims the X web faces. The old
-        # area-window preference was a crutch for sloppy claims and
-        # actively picked wrong candidates once claims were honest. Area
-        # only breaks exact ties (symmetric twins).
-        tied = [
-            ci for ci in range(len(candidates)) if gains[ci] == top_gain
+        # Selection (user's "largest single extrude area" principle, made
+        # safe by a DOMINATION filter):
+        #   1. window — candidates explaining at least 40% of the best
+        #      gain are contenders.
+        #   2. domination — drop any contender whose residual claim is a
+        #      subset of another contender's (BottomMount's inscribed
+        #      rectangle is dominated by the trapezoid; the side-plate
+        #      X-faces are NOT dominated by the base, they cover
+        #      different material).
+        #   3. area — among the survivors, extrude the largest profile
+        #      first (RackMount's plus-shaped base with its four tabs
+        #      beats the U-channel section).
+        window = [
+            ci for ci in range(len(candidates))
+            if gains[ci] >= max(0.4 * top_gain, min_gain_frac * total)
         ]
-        best_idx = max(tied, key=lambda ci: candidates[ci]["area"])
+        survivors = []
+        for ci in window:
+            mem_i = membership[ci] & unclaimed
+            dominated = False
+            for cj in window:
+                if cj == ci:
+                    continue
+                if gains[cj] < gains[ci]:
+                    continue
+                outside = int(np.count_nonzero(mem_i & ~membership[cj]))
+                if outside < 0.05 * max(int(gains[ci]), 1) and (
+                    gains[cj] > gains[ci]
+                    or candidates[cj]["area"] > candidates[ci]["area"]
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                survivors.append(ci)
+        if not survivors:
+            survivors = window
+        best_idx = max(survivors, key=lambda ci: candidates[ci]["area"])
         best_gain = int(gains[best_idx])
         cand = candidates[best_idx]
         # Claim removal uses a GENEROUS band so half-cell boundary crumbs
@@ -243,7 +269,7 @@ def _candidate_runs(
         except Exception:
             return 0.0
 
-    max_gap = 2  # stations a run may bridge without a match
+    max_gap_mm = max(0.08 * extent, 2.0 * 2 * half_step)
     runs: list[dict] = []          # finished candidates
     active: list[dict] = []        # {ref, best, start, last, gap}
     for pos in stations:
@@ -270,12 +296,16 @@ def _candidate_runs(
                     matched = True
                     break
             if not matched:
-                # Bridge stations that slice straight through a hole —
-                # the bore splits the outline into halves that fail IoU,
-                # but holes are features, not profile breaks. A taper
-                # never recovers within the gap, so it still terminates.
+                # Bridge stations that slice through a hole or a small
+                # local feature — those split/shrink the outline at a few
+                # stations without ending the extrude. The budget is in
+                # MILLIMETERS (a station count broke when density rose):
+                # small enough that a real profile change (RackMount's
+                # 62mm window region) still terminates the run, large
+                # enough for bolt-hole bands. A taper never recovers
+                # within the gap, so it still terminates too.
                 run["gap"] += 1
-                if run["gap"] <= max_gap:
+                if run["gap"] * 2 * half_step <= max_gap_mm:
                     next_active.append(run)
                 else:
                     runs.append(run)
@@ -289,14 +319,26 @@ def _candidate_runs(
     runs.extend(active)
 
     out = []
+    first_station = float(stations[0])
+    last_station = float(stations[-1])
     for run in runs:
         if run["last"] <= run["start"]:
             continue  # single-station blip, not a prismatic span
         poly = run["best"]
+        # A run reaching the terminal stations extends to the part FACE,
+        # not just half a station beyond: the 2% station inset left every
+        # boundary-touching segment short (RackMount's base 1.3mm thin,
+        # each side plate 0.6mm — 30k mm³ missing across the part).
+        start = run["start"] - half_step
+        end = run["last"] + half_step
+        if run["start"] <= first_station + 1e-9:
+            start = lo
+        if run["last"] >= last_station - 1e-9:
+            end = hi
         out.append({
             "axis": axis,
-            "start": run["start"] - half_step,
-            "end": run["last"] + half_step,
+            "start": start,
+            "end": end,
             "profile": list(poly.exterior.coords)[:-1],
             "area": float(poly.area),
             "shapely": poly,
@@ -323,51 +365,71 @@ def segment_inner_rings(
     mesh = trimesh.Trimesh(
         vertices=cleaned.vertices, faces=cleaned.faces, process=False,
     )
-    mid = 0.5 * (segment.start + segment.end)
-    n = np.zeros(3); n[segment.axis_idx] = 1.0
-    o = np.zeros(3); o[segment.axis_idx] = mid
-    section = mesh.section(plane_origin=o, plane_normal=n)
-    if section is None:
-        return []
     ax_u, ax_v = segment.axes_uv
     outer = Polygon(segment.profile)
     if outer.is_empty or not outer.is_valid:
         outer = outer.buffer(0)
-    loops = []
-    try:
-        discrete = section.discrete
-    except Exception:
-        return []
-    for ring3d in discrete:
-        p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
-        if not p.is_valid:
-            p = p.buffer(0)
-        if not p.is_empty and p.area > 1.0:
-            loops.append(p)
-    # A hole is a loop with ODD containment depth among the SECTION's
-    # own loops — merely lying inside the segment's outer outline is not
-    # enough: separate pieces (RackMount's rails/ears at a mid station)
-    # sit inside the merged outline's footprint but are MATERIAL, and
-    # subtracting them carved the base apart.
-    rings = []
-    for i, p in enumerate(loops):
-        depth = sum(
-            1 for j, q in enumerate(loops)
-            if j != i and q.contains(p.representative_point())
-            and q.area > p.area
-        )
-        if depth % 2 != 1:
-            continue
-        if p.area < min_frac * max(outer.area, 1.0):
-            continue
+
+    def _station_rings(frac: float) -> list:
+        pos = segment.start + frac * (segment.end - segment.start)
+        n = np.zeros(3); n[segment.axis_idx] = 1.0
+        o = np.zeros(3); o[segment.axis_idx] = pos
+        section = mesh.section(plane_origin=o, plane_normal=n)
+        if section is None:
+            return []
+        loops = []
         try:
-            if outer.contains(p.representative_point()):
-                rings.append([
-                    (float(x), float(y)) for x, y in p.exterior.coords[:-1]
-                ])
+            discrete = section.discrete
         except Exception:
-            continue
-    return rings
+            return []
+        for ring3d in discrete:
+            p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
+            if not p.is_valid:
+                p = p.buffer(0)
+            if not p.is_empty and p.area > 1.0:
+                loops.append(p)
+        # A hole is a loop with ODD containment depth among the
+        # SECTION's own loops — merely lying inside the segment outline
+        # is not enough: separate pieces (a station through other
+        # features) sit inside its footprint but are MATERIAL.
+        rings = []
+        for i, p in enumerate(loops):
+            depth = sum(
+                1 for j, q in enumerate(loops)
+                if j != i and q.contains(p.representative_point())
+                and q.area > p.area
+            )
+            if depth % 2 != 1:
+                continue
+            if p.area < min_frac * max(outer.area, 1.0):
+                continue
+            try:
+                if outer.contains(p.representative_point()):
+                    rings.append(p)
+            except Exception:
+                continue
+        return rings
+
+    # A baked-in window must run THROUGH the segment: require the ring
+    # at three stations (it would otherwise swallow partial-depth voids —
+    # RackMount's tab reliefs cut 40% out of the base when a single
+    # mid-station was trusted). Partial-depth voids are pocket features,
+    # not profile holes.
+    station_rings = [_station_rings(f) for f in (0.25, 0.5, 0.75)]
+    out = []
+    for p in station_rings[1]:
+        present_everywhere = all(
+            any(
+                p.intersection(q).area / max(p.union(q).area, 1e-9) > 0.7
+                for q in others
+            )
+            for others in (station_rings[0], station_rings[2])
+        )
+        if present_everywhere:
+            out.append([
+                (float(x), float(y)) for x, y in p.exterior.coords[:-1]
+            ])
+    return out
 
 
 def _merge_step_runs(cands: list[dict]) -> list[dict]:
@@ -466,7 +528,23 @@ def _voxel_occupancy(mesh: trimesh.Trimesh) -> tuple[np.ndarray | None, float]:
     pitch = float(np.clip(pitch, 0.8, 3.0))
     try:
         vox = mesh.voxelized(pitch).fill()
-        return np.asarray(vox.points, dtype=float), pitch
+        points = np.asarray(vox.points, dtype=float)
+        # Drop the SHELL: surface voxelization marks every cell touching
+        # a face as occupied, so a ring of centers OUTSIDE the solid
+        # (below the bottom face, beside the walls) reads as material.
+        # Big-profile candidates claim that phantom ring and poison the
+        # domination comparison. One binary erosion removes exactly the
+        # outermost layer; thin webs (3+ cells after the wall-thickness
+        # pitch rule) keep their interior layer.
+        try:
+            from scipy.ndimage import binary_erosion
+            eroded = binary_erosion(vox.matrix)
+            if eroded.any():
+                idx = np.argwhere(eroded)
+                points = vox.indices_to_points(idx).astype(float)
+        except Exception:
+            pass
+        return points, pitch
     except Exception as exc:
         logger.warning("Voxelization failed (%s); falling back", exc)
         return None, pitch

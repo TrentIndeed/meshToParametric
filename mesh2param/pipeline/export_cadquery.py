@@ -1442,6 +1442,43 @@ def _extract_profile_and_holes(
     except Exception as e:
         logger.debug("2D profile hole detection failed: %s", e)
 
+    # Dedupe near-identical profiles: the engine's interior rings and the
+    # 2D face-projection cutout detection can surface the SAME window,
+    # and even-odd drawing of two coincident holes flips the region back
+    # to solid (or corrupts the extrude outright).
+    if best_profiles and len(best_profiles) > 1:
+        from shapely.geometry import Polygon as _DedupPoly
+        kept_profiles = [best_profiles[0]]
+        for p in best_profiles[1:]:
+            try:
+                pp = _DedupPoly(p)
+                if not pp.is_valid:
+                    pp = pp.buffer(0)
+                dup = False
+                for q in kept_profiles:
+                    qq = _DedupPoly(q)
+                    if not qq.is_valid:
+                        qq = qq.buffer(0)
+                    union = pp.union(qq).area
+                    # True duplicates only — concentric circles of
+                    # different radius (a tube's bore is ~90% of its
+                    # outer circle) share most of their area but are
+                    # DISTINCT rings; deduping them turned the tube into
+                    # a rod. Double-detections are near-exact.
+                    if union > 1e-9 and pp.intersection(qq).area / union > 0.95:
+                        dup = True
+                        break
+                if not dup:
+                    kept_profiles.append(p)
+            except Exception:
+                kept_profiles.append(p)
+        if len(kept_profiles) != len(best_profiles):
+            logger.info(
+                "Deduped %d near-identical profile(s)",
+                len(best_profiles) - len(kept_profiles),
+            )
+        best_profiles = kept_profiles
+
     return best_profiles, extrude_start, holes, chamfers, fillets
 
 

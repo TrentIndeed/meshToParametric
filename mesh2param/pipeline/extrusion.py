@@ -82,9 +82,17 @@ def plan_extrusions(
     mesh = trimesh.Trimesh(
         vertices=cleaned.vertices, faces=cleaned.faces, process=False,
     )
+    if not mesh.is_watertight:
+        # Sections of an open shell trace wall bands, not cross-sections,
+        # and the voxel fill leaks — both pillars of the analysis are
+        # meaningless. Decomposed multibody pieces are UNCAPPED virtual
+        # cuts and land here; the caller falls back to face-normal logic.
+        logger.info("Extrusion engine: mesh not watertight, declining")
+        return ExtrusionPlan()
     candidates = []
     for axis in range(3):
         candidates.extend(_candidate_runs(mesh, axis, n_slices, iou_thresh))
+    candidates = _merge_step_runs(candidates)
     if not candidates:
         return ExtrusionPlan()
 
@@ -155,6 +163,7 @@ def _slice_components(mesh: trimesh.Trimesh, axis: int, pos: float):
     of the first prototype.
     """
     from shapely.geometry import Polygon
+    from shapely.ops import unary_union
 
     normal = np.zeros(3); normal[axis] = 1.0
     origin = np.zeros(3); origin[axis] = pos
@@ -162,27 +171,42 @@ def _slice_components(mesh: trimesh.Trimesh, axis: int, pos: float):
     if section is None:
         return []
     ax_u, ax_v = (i for i in range(3) if i != axis)
-    loops = []
+    filled = []
     try:
         discrete = section.discrete  # list of (n, 3) closed loops
     except Exception:
         return []
     for ring3d in discrete:
         p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
-        if p.is_valid and p.area > 1.0:
-            loops.append(p)
-    # Outer outlines have even containment depth (0 = outline, 1 = hole,
-    # 2 = island inside a hole, ...). trimesh's own classification needs
-    # rtree; loop counts here are tiny so O(n²) shapely containment is fine.
-    out = []
-    for i, p in enumerate(loops):
-        depth = sum(
-            1 for j, q in enumerate(loops)
-            if j != i and q.contains(p.representative_point()) and q.area > p.area
-        )
-        if depth % 2 == 0:
-            out.append(p)
-    return out
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty:
+            continue
+        # Heal degenerate SLIT loops: trimesh can trace an annular
+        # section (plate ring around a window) as ONE self-touching loop
+        # — outer boundary plus window boundary connected through a
+        # zero-width slit. Taken at face value its area is just the ring
+        # band and the outline looks like a different cross-section
+        # (Front Plate misread as a 3-segment stepped part). A small
+        # buffer round-trip closes the slit, turning the window into a
+        # proper interior ring that the exterior-fill below erases.
+        p = p.buffer(0.25, join_style=2).buffer(-0.25, join_style=2)
+        parts = p.geoms if p.geom_type == "MultiPolygon" else [p]
+        for part in parts:
+            if part.is_empty or part.area <= 1.0:
+                continue
+            # FILL each loop (drop interior rings) — holes are features,
+            # not profile. Hole loops become disks that the union below
+            # swallows into their surrounding outline.
+            filled.append(Polygon(part.exterior))
+    if not filled:
+        return []
+    merged = unary_union(filled)
+    geoms = merged.geoms if merged.geom_type == "MultiPolygon" else [merged]
+    return [
+        Polygon(g.exterior) for g in geoms
+        if not g.is_empty and g.area > 1.0
+    ]
 
 
 def _candidate_runs(
@@ -265,6 +289,72 @@ def _candidate_runs(
     return out
 
 
+def _merge_step_runs(cands: list[dict]) -> list[dict]:
+    """Merge coaxial adjacent runs separated by a FEATURE STEP, not a taper.
+
+    Front Plate's window opens to the bottom edge only through the middle
+    of the thickness: end stations see a closed ring (a hole, dropped),
+    mid stations see a concave outline — three coaxial runs for what a
+    CAD operator models as ONE extrude plus cut features. The signature
+    of such a step (vs a genuine taper, which must NOT merge):
+      • the smaller profile is a SUBSET of the larger (the difference is
+        removed material — a cut), and
+      • the transition is ABRUPT (profile IoU across the boundary is low;
+        a taper drifts smoothly, with boundary IoU near the run threshold).
+    Merged runs take the LARGER profile over the union span; the missing
+    material is the downstream cut features' job, exactly like Mesh2's
+    baked corner cuts.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(cands)):
+            for j in range(len(cands)):
+                if i == j:
+                    continue
+                a, b = cands[i], cands[j]
+                if a["axis"] != b["axis"]:
+                    continue
+                # Adjacent spans (a ends where b starts, within a station)
+                gap = b["start"] - a["end"]
+                step = max(a["end"] - a["start"], b["end"] - b["start"])
+                if not (-0.25 * step < gap < 0.25 * step):
+                    continue
+                try:
+                    inter = a["shapely"].intersection(b["shapely"]).area
+                    union = a["shapely"].union(b["shapely"]).area
+                except Exception:
+                    continue
+                if union <= 1e-9:
+                    continue
+                containment = inter / min(a["area"], b["area"])
+                boundary_iou = inter / union
+                # Rule 1: abrupt subset step — removed material is a cut
+                # feature, the extrude continues with the larger profile.
+                # Rule 2: same profile resuming — two runs of the SAME
+                # outline separated only because a feature interrupted
+                # the track (Front Plate's outline runs re-join across
+                # the merged mid span). A taper never satisfies either:
+                # its halves are neither identical nor an abrupt subset.
+                step_cut = containment > 0.85 and boundary_iou < 0.85
+                same_profile = boundary_iou > 0.93
+                if step_cut or same_profile:
+                    bigger = a if a["area"] >= b["area"] else b
+                    merged = dict(bigger)
+                    merged["start"] = min(a["start"], b["start"])
+                    merged["end"] = max(a["end"], b["end"])
+                    if step_cut:
+                        merged["step_cuts"] = True
+                    cands = [
+                        c for k, c in enumerate(cands) if k not in (i, j)
+                    ] + [merged]
+                    changed = True
+                    break
+            if changed:
+                break
+    return cands
+
+
 def _voxel_occupancy(mesh: trimesh.Trimesh) -> tuple[np.ndarray | None, float]:
     """Filled-interior voxel centers of the part."""
     diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
@@ -288,9 +378,14 @@ def _voxels_in_prism(points: np.ndarray, cand: dict, pitch: float) -> np.ndarray
     if not mask.any():
         return mask
     path = Path(np.asarray(cand["profile"], dtype=float))
-    inside = np.zeros(len(points), dtype=bool)
-    inside[mask] = path.contains_points(
-        np.column_stack([points[mask, ax_u], points[mask, ax_v]]),
-        radius=pitch,  # tolerance: voxel centers within half a cell of the wall count
+    pts2 = np.column_stack([points[mask, ax_u], points[mask, ax_v]])
+    # matplotlib's `radius` is SIGNED by ring winding (CW shrinks where
+    # CCW grows), and the profile's winding is whatever the section
+    # tracing produced. Test both signs and OR them: a voxel center
+    # within `pitch` of the wall counts as inside regardless of winding.
+    near = path.contains_points(pts2, radius=pitch) | path.contains_points(
+        pts2, radius=-pitch,
     )
+    inside = np.zeros(len(points), dtype=bool)
+    inside[mask] = near
     return inside

@@ -40,34 +40,41 @@ def test_tapered_plate_single_side_extrude():
 
 
 def test_flat_plate_primary_through_thickness():
-    """Body1Mesh: primary segment through the plate thickness (Y)."""
+    """Body1Mesh: ONE segment through the plate thickness (Y)."""
     _, plan = _plan("Mesh1/Body1Mesh.3mf")
-    assert plan.segments, "no segments found"
+    assert len(plan.segments) == 1
     assert plan.segments[0].axis_idx == 1
-    assert plan.segments[0].gain_frac > 0.5
+    assert plan.segments[0].gain_frac > 0.9
 
 
-def test_stepped_plate_finds_coaxial_segments():
-    """Front Plate is a stepped part (raised borders): the engine finds
-    multiple coaxial Y segments covering nearly everything — the basis
-    for future multi-extrude modeling."""
+def test_front_plate_is_one_extrude():
+    """Front Plate is ONE extrude (user-confirmed). Its window opens to
+    the bottom edge only through the middle of the thickness, so naive
+    run tracking splits it into 3 coaxial 'steps'. The step-merge rules
+    (abrupt subset = cut feature; identical profiles re-join) must fold
+    those back into a single full-depth segment."""
     _, plan = _plan("Mesh3/Front Plate.3mf")
-    assert len(plan.segments) >= 2
-    assert all(s.axis_idx == 1 for s in plan.segments)
+    assert len(plan.segments) == 1, (
+        f"expected 1 segment, got {len(plan.segments)}"
+    )
+    assert plan.segments[0].axis_idx == 1
     assert plan.coverage_frac > 0.95
+    # Full thickness, not a sub-span.
+    assert plan.segments[0].length > 11.0
 
 
-def test_rackmount_base_plus_joins():
-    """RackMount (one connected solid, not an assembly): largest segment
-    is the base plate along Z; additional join segments cover the side
-    plates. This is the part the user flagged as '3 extrusions that are
-    connected', not bodies."""
+def test_rackmount_three_connected_extrusions():
+    """RackMount (one connected solid, not an assembly) is exactly 3
+    extrusions: the base plate along Z plus two side-plate joins —
+    '3 extrusions that are connected', per the user."""
     _, plan = _plan("Mesh5/RackMount.3mf")
-    assert len(plan.segments) >= 3
+    assert len(plan.segments) == 3, (
+        f"expected 3 segments, got {len(plan.segments)}"
+    )
     assert plan.segments[0].axis_idx == 2, (
         f"base should sweep along Z, got axis {plan.segments[0].axis_idx}"
     )
-    assert plan.coverage_frac > 0.8
+    assert plan.coverage_frac > 0.95
 
 
 def test_fidelity_metric_identity():

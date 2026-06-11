@@ -366,6 +366,19 @@ def _disambiguate_sphere_cylinder(
     Also compare: for a true cylinder, the cylinder fit radius should be much
     smaller than the sphere fit radius (the sphere inflates to wrap the cylinder).
     """
+    # Cheap early-exit, CYLINDER only: a coplanar-normal signature is
+    # exactly the disambiguation's own "-> cylinder" path below, so
+    # short-circuiting it can't change the answer and avoids re-fitting
+    # both a cylinder and a sphere (the dominant cost). A SPHERE-fit
+    # region is NOT safe to keep here — it can still flip to cylinder via
+    # the radius-ratio test regardless of normal spread — so it falls
+    # through to the full comparison.
+    centered_n0 = normals - normals.mean(axis=0)
+    if len(centered_n0) >= 3 and current.surface_type == SurfaceType.CYLINDER:
+        _, sv0, _ = np.linalg.svd(centered_n0, full_matrices=False)
+        if (sv0 / (sv0[0] + 1e-15))[2] < 0.2:
+            return current  # clearly coplanar normals -> cylinder
+
     # Fit both types
     try:
         cyl_params, cyl_rms = _fit_cylinder(points, normals, config, inlier_thresh)
@@ -431,6 +444,18 @@ def _disambiguate_sphere_cone(
     countersinks (the main case here) are overwhelmingly more common
     than spherical caps in mechanical parts.
     """
+    # Cheap early-exit, CONE only: a clear 2D-fan signature is exactly
+    # the disambiguation's own "-> cone" path below, so short-circuiting
+    # it can't change the answer and skips the cone+sphere re-fits (the
+    # dominant cost). A SPHERE-fit region can still flip to cone via the
+    # RMS comparison, so it falls through to the full check.
+    centered_n0 = normals - normals.mean(axis=0)
+    if len(centered_n0) >= 3 and current.surface_type == SurfaceType.CONE:
+        _, sv0, _ = np.linalg.svd(centered_n0, full_matrices=False)
+        sn0 = sv0 / (sv0[0] + 1e-15)
+        if sn0[2] < 0.35 and sn0[1] > 0.3:
+            return current  # clear 2D fan -> cone
+
     try:
         cone_params, cone_rms = _fit_cone(points, normals, config, inlier_thresh)
         sph_params, sph_rms = _fit_sphere(points, normals, config, inlier_thresh)

@@ -97,6 +97,18 @@ def recognize_features(
     except Exception:
         logger.exception("Stage 5 failed finding holes")
         raise
+    # Thin-plate recall pass: holes whose walls fuse into a larger mixed
+    # region (BottomMount's countersunk corner holes merge bore + cone +
+    # the long edge wall, radial extent 2.5..130mm) never survive
+    # cylinder fitting. But every through-hole leaves a circular interior
+    # RING in BOTH large faces of the plate — project those faces along
+    # the thin axis and add rings with no recognized counterpart.
+    try:
+        hole_features.extend(
+            _find_thin_plate_ring_holes(cleaned, hole_features, config)
+        )
+    except Exception:
+        logger.exception("Thin-plate ring-hole pass failed")
     # Group symmetric holes (same radius, same axis, same entry plane)
     # into a single multi-position feature so the construction sequence
     # emits ONE "Sketch + Cut" step per group instead of one per hole.
@@ -760,9 +772,19 @@ def _find_holes(
             if d > best_dot:
                 best_dot = d
                 best_pa = pa
+        fitted_axis = np.asarray(axis_dir, dtype=float)
+        fitted_axis = fitted_axis / (np.linalg.norm(fitted_axis) + 1e-15)
         if best_pa is None or best_dot < np.cos(np.radians(15)):
-            continue  # axis too far from any principal direction
-        axis_dir = best_pa * np.sign(np.dot(axis_dir, best_pa))
+            if not is_thin_plate:
+                continue  # axis too far from any principal direction
+            # On a plate, a diagonal fitted axis is usually the unstable
+            # short-cylinder fitter latching onto a hole whose wall picked
+            # up neighboring geometry (BottomMount loses 3 real bolt holes
+            # to axes like [0.6, 0, -0.8]). Recover via the thin axis; the
+            # in-plane circle refit below validates or rejects it.
+            axis_dir = thin_axis * np.sign(np.dot(axis_dir, thin_axis) or 1.0)
+        else:
+            axis_dir = best_pa * np.sign(np.dot(axis_dir, best_pa))
 
         # Override snapped axis with the body's thin direction when the
         # body is plate-shaped — but only when the geometry doesn't
@@ -832,6 +854,66 @@ def _find_holes(
             hole_center
             + (axial_mid - float(hole_center @ axis_dir)) * axis_dir
         )
+
+        # When the axis was overridden away from the FITTED axis, neither
+        # the fitted radius nor the fitted axis_point describes the bore
+        # about the new axis. Refit a circle to the wall vertices in the
+        # plane perpendicular to the final axis:
+        #   • a true bore projects to a tight circle — adopt its center
+        #     and radius (fixes the recovered diagonal-axis holes)
+        #   • a countersink CONE projects to a smeared annulus — reject
+        #     it entirely (BottomMount's 45° countersinks were drilled as
+        #     misplaced r=4/r=5.6 holes offset from the real bore)
+        if abs(float(fitted_axis @ axis_dir)) < 0.95:
+            uniq_verts = cleaned.vertices[
+                np.unique(cleaned.faces[region.face_indices].flatten())
+            ]
+            def _bore_ok(pts, c2, r2, rms2) -> bool:
+                return (
+                    r2 >= 1.5
+                    and r2 <= config.hole_max_radius_ratio * bbox_diag
+                    and rms2 <= min(max(0.12 * r2, 0.3), 1.0)
+                    and _inplane_angular_coverage(pts, axis_dir, c2) >= 270.0
+                )
+
+            c2d, r2d, rms2d = _inplane_circle_fit(uniq_verts, axis_dir)
+            # The refit circle must be drill-hole-sized, tight, and a FULL
+            # wrap. A long corner/edge arc also projects onto a clean
+            # circle (r=98 centered outside the part) but only covers ~90°
+            # of it — a real bore's wall wraps ≥270°.
+            if not _bore_ok(uniq_verts, c2d, r2d, rms2d):
+                # A COUNTERSUNK hole's region merges the bore wall with
+                # the 45° cone, smearing the plain fit. The cone occupies
+                # one AXIAL end of the wall, so split the vertices into
+                # axial halves and fit each: the bore-only half projects
+                # to a tight full circle; a pure cone's halves both stay
+                # smeared and the candidate dies (it's not a hole — its
+                # bore is recognized from the wall region itself).
+                n_ax = axis_dir / (np.linalg.norm(axis_dir) + 1e-15)
+                prj = uniq_verts @ n_ax
+                pivot = float(np.median(prj))
+                best_half = None
+                for sel in (prj <= pivot, prj > pivot):
+                    sub = uniq_verts[sel]
+                    if len(sub) < 6:
+                        continue
+                    c2i, r2i, rms2i = _inplane_circle_fit(sub, axis_dir)
+                    if _bore_ok(sub, c2i, r2i, rms2i) and (
+                        best_half is None or rms2i < best_half[2]
+                    ):
+                        best_half = (c2i, r2i, rms2i)
+                if best_half is None:
+                    logger.debug(
+                        "Rejecting relocated hole candidate r=%.2f: in-plane "
+                        "refit r=%.2f rms %.3f (not a bore about %s)",
+                        radius, r2d, rms2d, axis_dir.tolist(),
+                    )
+                    continue
+                radius = best_half[1]
+                hole_center = best_half[0] + axial_mid * axis_dir
+            else:
+                radius = r2d
+                hole_center = c2d + axial_mid * axis_dir
 
         # Determine through vs blind. Radius alone is NOT enough:
         # Body1Mesh's small-radius edge holes are drilled only 27-47mm
@@ -999,6 +1081,202 @@ def _split_tangent_bores(
         radius, rms1, ra, rb, sep, rms2,
     )
     return out
+
+
+def _find_thin_plate_ring_holes(
+    cleaned: CleanedMesh,
+    existing: list[tuple[Feature, set[int]]],
+    config: RecognizeConfig,
+) -> list[tuple[Feature, set[int]]]:
+    """Recall pass for plate through-holes via 2D face-projection rings.
+
+    Projects the plate's two large faces (normals parallel to the thin
+    axis) into the plate plane and unions their triangles. A through-hole
+    appears as a circular interior ring in BOTH face unions regardless of
+    how badly its 3D wall region fused or fit — requiring the ring on
+    both sides also keeps pockets and blind features out. Rings already
+    covered by a recognized hole are skipped.
+    """
+    body_size = cleaned.bbox[1] - cleaned.bbox[0]
+    sorted_dims = np.sort(body_size)
+    if not (sorted_dims[0] > 0 and sorted_dims[1] >= 3.0 * sorted_dims[0]):
+        return []
+    try:
+        from shapely.geometry import Polygon as SPoly
+        from shapely.ops import unary_union
+    except ImportError:
+        return []
+
+    thin_idx = int(np.argmin(body_size))
+    n_ax = np.zeros(3)
+    n_ax[thin_idx] = 1.0
+    ax_u, ax_v = [i for i in range(3) if i != thin_idx]
+    bbox_diag = cleaned.bbox_diagonal
+
+    dots = cleaned.normals @ n_ax
+    rings_per_side = []
+    for side_mask in (dots > 0.9, dots < -0.9):
+        polys = []
+        for fi in np.where(side_mask)[0]:
+            tri = cleaned.faces[fi]
+            pts = [
+                (float(cleaned.vertices[v][ax_u]), float(cleaned.vertices[v][ax_v]))
+                for v in tri
+            ]
+            try:
+                p = SPoly(pts)
+                if p.is_valid and p.area > 0.01:
+                    polys.append(p)
+            except Exception:
+                pass
+        rings = []
+        if polys:
+            merged = unary_union(polys)
+            geoms = (
+                merged.geoms if merged.geom_type == "MultiPolygon" else [merged]
+            )
+            for gpoly in geoms:
+                for ring in gpoly.interiors:
+                    inner = SPoly(ring)
+                    if not inner.is_valid or inner.area < 1.0:
+                        continue
+                    perim = float(ring.length)
+                    if perim < 1e-6:
+                        continue
+                    circ = 4.0 * np.pi * float(inner.area) / (perim * perim)
+                    r_est = float((inner.area / np.pi) ** 0.5)
+                    if circ < 0.6 or r_est < 1.5:
+                        continue
+                    if r_est > config.hole_max_radius_ratio * bbox_diag:
+                        continue
+                    c = inner.centroid
+                    rings.append((np.array([c.x, c.y]), r_est))
+        rings_per_side.append(rings)
+
+    # A ring is a THROUGH hole when the mesh vertices inside its column
+    # span the full plate thickness (the hole's wall runs through); a
+    # pocket's verts stop at its floor. Requiring the ring on BOTH faces
+    # instead is too strict — a drafted plate's bottom-face union comes
+    # back fragmented and drops most rings.
+    thin_lo = float(cleaned.bbox[0][thin_idx])
+    thin_hi = float(cleaned.bbox[1][thin_idx])
+    thickness = thin_hi - thin_lo
+    in_plane_all = np.c_[cleaned.vertices[:, ax_u], cleaned.vertices[:, ax_v]]
+    axial_all = cleaned.vertices[:, thin_idx]
+    through = []
+    for c2, r2 in [ring for side in rings_per_side for ring in side]:
+        dists = np.linalg.norm(in_plane_all - c2, axis=1)
+        col = dists < r2 * 1.4
+        if not col.any():
+            continue
+        # Compare against the LOCAL thickness around the hole, not the
+        # global bbox — a drafted plate is thinner near its edges and the
+        # corner holes' walls span less than the global thickness.
+        neighborhood = dists < r2 * 3.0
+        local_thick = (
+            float(np.ptp(axial_all[neighborhood]))
+            if neighborhood.any() else thickness
+        )
+        if float(np.ptp(axial_all[col])) < 0.75 * min(local_thick, thickness):
+            continue  # wall stops short — pocket/blind, not a through ring
+        # Dedupe the same hole seen from both faces (a countersunk hole
+        # shows its bore ring on one face and the wider countersink rim
+        # on the other) — keep the SMALLER radius, the bore.
+        hit = None
+        for k, (kc, kr) in enumerate(through):
+            if float(np.linalg.norm(c2 - kc)) < max(r2, kr):
+                hit = k
+                break
+        if hit is None:
+            through.append((c2, r2))
+        elif r2 < through[hit][1]:
+            through[hit] = (c2, r2)
+
+    # Skip rings a recognized hole already covers.
+    known = []
+    for feat, _ in existing:
+        sg = feat.sketch_geometry or {}
+        for cc in (sg.get("centers") or [sg.get("center")]):
+            if cc is None:
+                continue
+            known.append((
+                np.array([float(cc[ax_u]), float(cc[ax_v])]),
+                float(sg.get("radius", 0.0)),
+            ))
+
+    out: list[tuple[Feature, set[int]]] = []
+    for c2, r2 in through:
+        if any(
+            float(np.linalg.norm(c2 - kc)) < (r2 + kr) for kc, kr in known
+        ):
+            continue
+        center = np.zeros(3)
+        center[ax_u], center[ax_v] = float(c2[0]), float(c2[1])
+        center[thin_idx] = (thin_lo + thin_hi) / 2.0
+        out.append((
+            Feature(
+                type=FeatureType.THROUGH_HOLE,
+                face_indices=np.array([], dtype=np.int64),
+                sketch_geometry={
+                    "type": "circle",
+                    "center": center.tolist(),
+                    "radius": float(r2),
+                    "fit_rms": 0.0,
+                },
+                depth=thin_hi - thin_lo,
+                direction=-n_ax,
+                operation="REMOVE",
+            ),
+            set(),
+        ))
+        logger.info(
+            "Ring-recall hole: r=%.2f at %s (missed by cylinder fitting)",
+            r2, np.round(center, 1).tolist(),
+        )
+    return out
+
+
+def _inplane_circle_fit(
+    verts: np.ndarray, axis: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """Algebraic circle fit of vertices projected perpendicular to axis.
+
+    Returns (center3d_in_plane, radius, residual_std). The center carries
+    only the in-plane component — add the axial position separately.
+    """
+    n = np.asarray(axis, dtype=float)
+    n = n / (np.linalg.norm(n) + 1e-15)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
+    w = np.cross(n, u)
+    x, y = verts @ u, verts @ w
+    A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+    try:
+        sol, *_ = np.linalg.lstsq(A, x**2 + y**2, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.zeros(3), 0.0, float("inf")
+    cx, cy = float(sol[0]), float(sol[1])
+    r = float(np.sqrt(max(sol[2] + cx**2 + cy**2, 0.0)))
+    res = np.hypot(x - cx, y - cy) - r
+    return cx * u + cy * w, r, float(np.std(res))
+
+
+def _inplane_angular_coverage(
+    verts: np.ndarray, axis: np.ndarray, center_in_plane: np.ndarray,
+) -> float:
+    """Degrees of arc the vertices cover around an in-plane center."""
+    n = np.asarray(axis, dtype=float)
+    n = n / (np.linalg.norm(n) + 1e-15)
+    rel = verts - center_in_plane
+    rel = rel - np.outer(rel @ n, n)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
+    w = np.cross(n, u)
+    ang = np.degrees(np.arctan2(rel @ w, rel @ u)) % 360.0
+    # Coverage via occupied 10° bins — robust to uneven tessellation.
+    bins = np.zeros(36, dtype=bool)
+    bins[(ang // 10).astype(int) % 36] = True
+    return float(bins.sum() * 10.0)
 
 
 def _hole_has_bottom_cap(

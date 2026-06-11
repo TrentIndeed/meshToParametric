@@ -90,9 +90,11 @@ def test_mesh1_edge_holes_are_blind(mesh1_tree):
         assert depth < 60, f"blind edge hole depth {depth} looks like a through-cut"
 
 
-def test_mesh2_holes_all_on_large_plane():
-    """BottomMount (13mm drafted plate): every hole pierces the large Z
-    face — no mis-axised X holes, no doubled fragments."""
+def test_mesh2_holes_match_reference():
+    """BottomMount (13mm drafted plate with 4 countersunk holes): exactly
+    the reference STEP's 13 bores — 9x r=2.5 + 4x r=4.0, all piercing the
+    large Z face, none intersecting (no misplaced countersink "holes", no
+    doubled fragments, none missing)."""
     cleaned = ingest_mesh(
         str(MODELS / "Mesh2" / "BottomMount.3mf"), IngestConfig(remesh=False),
     )
@@ -103,6 +105,21 @@ def test_mesh2_holes_all_on_large_plane():
         regions, fitted, graph, edges, cleaned, RecognizeConfig(),
     )
     holes = _holes(tree)
-    assert len(holes) >= 10, f"expected >=10 holes, got {len(holes)}"
+    assert len(holes) == 13, f"expected 13 holes, got {len(holes)}"
+    small = [h for h in holes if abs(h[1] - 2.5) < 0.3]
+    big = [h for h in holes if abs(h[1] - 4.0) < 0.3]
+    assert len(small) == 9, f"expected 9 r=2.5 holes, got {len(small)}"
+    assert len(big) == 4, f"expected 4 r=4.0 holes, got {len(big)}"
     for _t, _r, _c, d, _depth in holes:
         assert abs(d[2]) > 0.9, f"hole axis {d.tolist()} not on the Z large plane"
+    # No two holes may intersect (the countersink cones must not surface
+    # as offset overlapping bores).
+    for i in range(len(holes)):
+        for j in range(i + 1, len(holes)):
+            _, r1, c1, _, _ = holes[i]
+            _, r2, c2, _, _ = holes[j]
+            d = float(np.linalg.norm(np.asarray(c1) - np.asarray(c2)))
+            assert d >= r1 + r2, (
+                f"holes intersect: r={r1:.2f}@{np.round(c1,1).tolist()} and "
+                f"r={r2:.2f}@{np.round(c2,1).tolist()} (d={d:.2f})"
+            )

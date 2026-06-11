@@ -182,6 +182,19 @@
   that run's span. Same machinery then handles Front Plate's window lips
   and the RackMount tab undersides.
 
+- [ ] **Two side-plate rim creases still don't ROLL (matched 11/11, applied
+  9/11).** Root cause chain fully diagnosed 2026-06-11: the join outline's
+  corner arcs are threePointArc fits from mesh points, leaving micro-kinks
+  at arc/straight junctions; OCC BRepFilletAPI refuses the 13-edge rim
+  crease at any radius (leave-one-out exhausted). The proper fix — sharp
+  polygon + OCC MakeFillet2d for EXACTLY tangent corner arcs — was
+  prototyped and produces correct B-rep volumes, but the wire it returns
+  corrupts the workplane tessellation chain (faces accumulate per step,
+  final tess inverts to negative volume). Likely a pendingWires/object-
+  stack pollution issue in _draw_corner_filleted_wire; the prototype is
+  in the reflog (reverted working-tree change after a12837b). Resume in a
+  worktree with time to study how polyline().close() threads the stack.
+
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet
   matcher search; the structural fix for the blend apply ratio).

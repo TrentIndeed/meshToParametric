@@ -1290,6 +1290,32 @@ def _extract_profile_and_holes(
                         float(cleaned.bbox[1][primary_axis])
                     ) / 2
 
+                    # PIERCE CHECK: a 2D ring is only a through-hole if
+                    # the mesh vertices in its column span the LOCAL
+                    # thickness. RackMount's tab-relief cavities surface
+                    # as rings in the face projection but are partial-
+                    # depth sculpts — drilling them fabricated 4 holes
+                    # the reference part doesn't have.
+                    _col_d = np.linalg.norm(
+                        np.column_stack([
+                            cleaned.vertices[:, ax_u] - c_2d.x,
+                            cleaned.vertices[:, ax_v] - c_2d.y,
+                        ]), axis=1,
+                    )
+                    _col = _col_d < est_radius * 1.4
+                    _nb = _col_d < est_radius * 3.0
+                    _ax_all = cleaned.vertices[:, primary_axis]
+                    _local_t = (
+                        float(np.ptp(_ax_all[_nb])) if _nb.any() else extent
+                    )
+                    if not _col.any() or float(np.ptp(_ax_all[_col])) < 0.75 * min(_local_t, extent):
+                        logger.info(
+                            "2D ring at (%.1f, %.1f) r=%.2f rejected: column "
+                            "does not pierce (partial-depth cavity)",
+                            c_2d.x, c_2d.y, est_radius,
+                        )
+                        continue
+
                     hole_depth = extent  # full thickness (through hole)
                     detected_holes.append(Feature(
                         type=_FType.THROUGH_HOLE,
@@ -1330,16 +1356,48 @@ def _extract_profile_and_holes(
                 if jf.type == FeatureType.BOSS and jf.operation == "JOIN"
             }
 
+            from matplotlib.path import Path as _JoinPath
+            _join_lookup = []
+            for jf in feature_tree.features:
+                if jf.type != FeatureType.BOSS or jf.operation != "JOIN":
+                    continue
+                jsg = jf.sketch_geometry or {}
+                if not jsg.get("points") or not jsg.get("span"):
+                    continue
+                jax = int(jsg.get("axis_idx", 0))
+                _join_lookup.append((
+                    jax,
+                    [a for a in range(3) if a != jax],
+                    _JoinPath(np.asarray(jsg["points"], dtype=float)),
+                    jsg["span"],
+                ))
+
             def _trustworthy(rh) -> bool:
                 rdir = np.asarray(rh.direction, dtype=float)
                 rdir = rdir / (np.linalg.norm(rdir) + 1e-15)
                 if abs(float(rdir @ ext_axis)) >= 0.9:
                     return True
-                if int(np.argmax(np.abs(rdir))) in join_axes:
-                    # Hole through a JOIN body (RackMount's side-plate
-                    # bores run along X, the side plates' extrude axis) —
-                    # the base-plane rings can't see it, but it's real.
-                    return True
+                # A sideways hole is real only if it pierces a JOIN body:
+                # its center must lie inside that join's profile (in the
+                # join plane) — axis-parallel alone let tab-relief
+                # artifacts ride along as "side-plate holes".
+                sg_rh = rh.sketch_geometry or {}
+                for cc in (sg_rh.get("centers") or [sg_rh.get("center")]):
+                    if cc is None:
+                        continue
+                    c3 = np.asarray(cc, dtype=float)
+                    for jax, (ju, jv), jpath, jspan in _join_lookup:
+                        if abs(rdir[jax]) < 0.9:
+                            continue
+                        in_span = (
+                            jspan[0] - 1.0 <= c3[jax] <= jspan[1] + 1.0
+                        )
+                        pt = np.array([[c3[ju], c3[jv]]])
+                        if in_span and (
+                            jpath.contains_points(pt, radius=0.5)[0]
+                            or jpath.contains_points(pt, radius=-0.5)[0]
+                        ):
+                            return True
                 return rh.type == FeatureType.BLIND_HOLE
 
             dropped = [rh for rh in holes if not _trustworthy(rh)]
@@ -2131,13 +2189,14 @@ def _build_stepwise(
 
             # Sketch overlay wireframe in world coords
             j_overlay = []
-            n_pts = len(j_pts)
-            for pj in range(n_pts):
-                for uu, vv in (j_pts[pj], j_pts[(pj + 1) % n_pts]):
-                    p3 = [0.0, 0.0, 0.0]
-                    p3[jx_u], p3[jx_v] = uu, vv
-                    p3[ax_j] = float(span[0])
-                    j_overlay.append(p3)
+            for ring_pts in [j_pts, *j_inner]:
+                n_pts = len(ring_pts)
+                for pj in range(n_pts):
+                    for uu, vv in (ring_pts[pj], ring_pts[(pj + 1) % n_pts]):
+                        p3 = [0.0, 0.0, 0.0]
+                        p3[jx_u], p3[jx_v] = uu, vv
+                        p3[ax_j] = float(span[0])
+                        j_overlay.append(p3)
             v_pre, f_pre = _tessellate_solid(wp, fast=True)
             steps.append(ConstructionStep(
                 name=f"Sketch Join {ji}",

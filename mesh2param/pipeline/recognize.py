@@ -935,7 +935,8 @@ def _find_holes(
         #   • a countersink CONE projects to a smeared annulus — reject
         #     it entirely (BottomMount's 45° countersinks were drilled as
         #     misplaced r=4/r=5.6 holes offset from the real bore)
-        if abs(float(fitted_axis @ axis_dir)) < 0.95:
+        axis_changed = abs(float(fitted_axis @ axis_dir)) < 0.95
+        if True:  # in-plane refit runs for EVERY candidate (see below)
             uniq_verts = cleaned.vertices[
                 np.unique(cleaned.faces[region.face_indices].flatten())
             ]
@@ -974,17 +975,40 @@ def _find_holes(
                     ):
                         best_half = (c2i, r2i, rms2i)
                 if best_half is None:
-                    logger.debug(
-                        "Rejecting relocated hole candidate r=%.2f: in-plane "
-                        "refit r=%.2f rms %.3f (not a bore about %s)",
-                        radius, r2d, rms2d, axis_dir.tolist(),
-                    )
-                    continue
-                radius = best_half[1]
-                hole_center = best_half[0] + axial_mid * axis_dir
+                    if axis_changed:
+                        logger.debug(
+                            "Rejecting relocated hole candidate r=%.2f: "
+                            "in-plane refit r=%.2f rms %.3f (not a bore "
+                            "about %s)",
+                            radius, r2d, rms2d, axis_dir.tolist(),
+                        )
+                        continue
+                    # Axis unchanged: keep the fitter's values — the
+                    # embedding check below still guards artifacts.
+                elif axis_changed or abs(best_half[1] - radius) > 0.02 * radius:
+                    radius = best_half[1]
+                    hole_center = best_half[0] + axial_mid * axis_dir
             else:
-                radius = r2d
-                hole_center = c2d + axial_mid * axis_dir
+                # The measured wall circle is authoritative wherever it
+                # fits cleanly — the 3D RANSAC on RackMount's short wide
+                # bore reported r=8.2 for a wall that measures r=14.5.
+                if axis_changed or abs(r2d - radius) > 0.02 * radius:
+                    radius = r2d
+                    hole_center = c2d + axial_mid * axis_dir
+
+        # Embedding plausibility: a real drilled bore is SURROUNDED by
+        # material at its mid-station. Fitter artifacts are not —
+        # RackMount grew a Z-axis "hole" skimming a side plate's edge
+        # (half its ring in air) and X-axis "holes" through the tab
+        # reliefs (rings poking out of the base's underside). The
+        # reference STEP has exactly one real bore; these all shipped.
+        if not _hole_is_embedded(cleaned, axis_dir, hole_center, radius):
+            logger.info(
+                "Rejecting non-embedded hole candidate r=%.2f at %s "
+                "(ring not surrounded by material)",
+                radius, np.round(hole_center, 1).tolist(),
+            )
+            continue
 
         # Determine through vs blind. Radius alone is NOT enough:
         # Body1Mesh's small-radius edge holes are drilled only 27-47mm
@@ -1000,7 +1024,18 @@ def _find_holes(
             f.region_id, axis_dir, hole_center, radius, height,
             graph, region_lookup, fitted, cleaned,
         )
-        is_through = radius < bbox_diag * 0.1 and not has_cap
+        # A through-hole must EXIT both faces: probe just past each end
+        # of the wall for covering material (parity sections, so bores
+        # read as voids). The cap test alone missed ceilings whose plane
+        # region fused with other geometry, punching partial-depth
+        # recesses straight through.
+        wall_lo = float(wall_proj.min())
+        wall_hi = float(wall_proj.max())
+        both_open = (
+            _hole_end_open(cleaned, axis_dir, hole_center, radius, wall_lo, -1.0)
+            and _hole_end_open(cleaned, axis_dir, hole_center, radius, wall_hi, +1.0)
+        )
+        is_through = radius < bbox_diag * 0.1 and not has_cap and both_open
 
         hole_type = FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
 
@@ -1321,15 +1356,36 @@ def _inplane_circle_fit(
     u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
     w = np.cross(n, u)
     x, y = verts @ u, verts @ w
-    A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+
+    def _fit(xs, ys):
+        A = np.c_[2 * xs, 2 * ys, np.ones(len(xs))]
+        sol, *_ = np.linalg.lstsq(A, xs**2 + ys**2, rcond=None)
+        cx_, cy_ = float(sol[0]), float(sol[1])
+        r_ = float(np.sqrt(max(sol[2] + cx_**2 + cy_**2, 0.0)))
+        return cx_, cy_, r_
+
     try:
-        sol, *_ = np.linalg.lstsq(A, x**2 + y**2, rcond=None)
+        cx, cy, r = _fit(x, y)
+        # One inlier-trim pass: rim chamfer/fillet vertices riding along
+        # with the wall bias the center (RackMount's bore center came out
+        # 1.3mm off, pushing its rim edges outside the fillet matcher's
+        # snap window). Refit on the points consistent with the first
+        # circle.
+        res = np.hypot(x - cx, y - cy) - r
+        keep = np.abs(res) < max(0.35, 2.0 * float(np.std(res)))
+        if 6 <= keep.sum() < len(x):
+            cx, cy, r = _fit(x[keep], y[keep])
+            res = np.hypot(x - cx, y - cy) - r
+            inlier = np.abs(res) < max(0.35, 2.0 * float(np.std(res)))
+            rms = (
+                float(np.std(res[inlier]))
+                if inlier.sum() >= 6 else float(np.std(res))
+            )
+        else:
+            rms = float(np.std(res))
     except np.linalg.LinAlgError:
         return np.zeros(3), 0.0, float("inf")
-    cx, cy = float(sol[0]), float(sol[1])
-    r = float(np.sqrt(max(sol[2] + cx**2 + cy**2, 0.0)))
-    res = np.hypot(x - cx, y - cy) - r
-    return cx * u + cy * w, r, float(np.std(res))
+    return cx * u + cy * w, r, rms
 
 
 def _inplane_angular_coverage(
@@ -1348,6 +1404,134 @@ def _inplane_angular_coverage(
     bins = np.zeros(36, dtype=bool)
     bins[(ang // 10).astype(int) % 36] = True
     return float(bins.sum() * 10.0)
+
+
+def _section_material(mesh, axis_idx: int, pos: float):
+    """Shapely geometry of the REAL material at a station (outers minus
+    holes, by containment parity) — unlike the filled outlines used for
+    run tracking, this preserves bores as voids."""
+    from shapely.geometry import Polygon as _SMPoly
+    from shapely.ops import unary_union as _sm_union
+
+    n = np.zeros(3); n[axis_idx] = 1.0
+    o = np.zeros(3); o[axis_idx] = pos
+    section = mesh.section(plane_origin=o, plane_normal=n)
+    if section is None:
+        return None
+    ax_u, ax_v = [i for i in range(3) if i != axis_idx]
+    loops = []
+    try:
+        discrete = section.discrete
+    except Exception:
+        return None
+    for ring3d in discrete:
+        poly = _SMPoly(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if not poly.is_empty and poly.area > 0.5:
+            loops.append(poly)
+    if not loops:
+        return None
+    outers, holes = [], []
+    for i, poly in enumerate(loops):
+        depth = sum(
+            1 for j, q in enumerate(loops)
+            if j != i and q.contains(poly.representative_point())
+            and q.area > poly.area
+        )
+        (outers if depth % 2 == 0 else holes).append(poly)
+    geom = _sm_union(outers)
+    if holes:
+        geom = geom.difference(_sm_union(holes))
+    return None if geom.is_empty else geom
+
+
+def _hole_end_open(
+    cleaned: CleanedMesh,
+    axis_dir: np.ndarray,
+    hole_center: np.ndarray,
+    radius: float,
+    axial_end: float,
+    direction_sign: float,
+) -> bool:
+    """True if the bore OPENS past this axial end (no material covers it).
+
+    A through-hole exits both faces: just beyond each end there is either
+    no section at all or a void where the bore is. A blind recess has a
+    ceiling: material covers the bore circle past the closed end
+    (RackMount's tab reliefs were punched straight through the base when
+    radius alone decided through-vs-blind).
+    """
+    import trimesh as _tm
+    from shapely.geometry import Point as _SMPoint
+
+    try:
+        mesh = _tm.Trimesh(
+            vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+        )
+        if not mesh.is_watertight:
+            return True  # open shells section as wall bands — no signal
+        n = np.asarray(axis_dir, dtype=float)
+        n = n / (np.linalg.norm(n) + 1e-15)
+        axis_idx = int(np.argmax(np.abs(n)))
+        ax_u, ax_v = [i for i in range(3) if i != axis_idx]
+        probe = axial_end + direction_sign * 1.2
+        geom = _section_material(mesh, axis_idx, float(probe))
+        if geom is None:
+            return True  # no material at all past this end
+        center_pt = _SMPoint(
+            float(hole_center[ax_u]), float(hole_center[ax_v]),
+        )
+        return not geom.buffer(-min(0.3, 0.2 * radius)).contains(center_pt)
+    except Exception:
+        return True
+
+
+def _hole_is_embedded(
+    cleaned: CleanedMesh,
+    axis_dir: np.ndarray,
+    hole_center: np.ndarray,
+    radius: float,
+    min_frac: float = 0.7,
+) -> bool:
+    """True if the bore is surrounded by material at its mid-station.
+
+    A ring of samples just outside the hole wall must land on the part's
+    cross-section. Real holes pass wherever they live (plate face, plate
+    edge, boss); skimming/relief artifacts fail.
+    """
+    import trimesh as _tm
+    from matplotlib.path import Path as _MplPath
+
+    try:
+        mesh = _tm.Trimesh(
+            vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+        )
+        if not mesh.is_watertight:
+            return True  # open shells section as wall bands — no signal
+        from mesh2param.pipeline.extrusion import _slice_components
+        n = np.asarray(axis_dir, dtype=float)
+        n = n / (np.linalg.norm(n) + 1e-15)
+        axis_idx = int(np.argmax(np.abs(n)))
+        ax_u, ax_v = [i for i in range(3) if i != axis_idx]
+        comps = _slice_components(
+            mesh, axis_idx, float(hole_center[axis_idx]),
+        )
+        if not comps:
+            return False
+        c_u, c_v = float(hole_center[ax_u]), float(hole_center[ax_v])
+        ang = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+        ring = np.column_stack([
+            c_u + 1.15 * radius * np.cos(ang),
+            c_v + 1.15 * radius * np.sin(ang),
+        ])
+        inside = np.zeros(len(ring), dtype=bool)
+        for comp in comps:
+            path = _MplPath(np.asarray(comp.exterior.coords))
+            inside |= path.contains_points(ring)
+        return float(np.mean(inside)) >= min_frac
+    except Exception:
+        return True  # never reject on a diagnostic failure
 
 
 def _hole_has_bottom_cap(

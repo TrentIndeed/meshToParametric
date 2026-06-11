@@ -1192,9 +1192,46 @@ def _extract_profile_and_holes(
         # 2D detection guarantees holes go perpendicular to the plate face,
         # whereas recognition often picks up sideways cylindrical features.
         if detected_holes:
-            logger.info("2D detection replaced %d recognition holes with %d 2D holes",
-                        len(holes), len(detected_holes))
-            holes = detected_holes
+            # Group identical holes (same radius + axis) into ONE feature
+            # with a `centers` list, so the build emits a single sketch
+            # with N circles + one cut — matching how a CAD operator draws
+            # a hole pattern. Without this the 2D detector hands back one
+            # feature per hole and the build makes N separate Sketch+Cut
+            # steps. Grouping by rounded radius (0.1mm) and axis tolerates
+            # fit noise across symmetric holes.
+            grouped: dict[tuple, Feature] = {}
+            for h in detected_holes:
+                sg = h.sketch_geometry
+                axis = np.asarray(h.direction, dtype=float)
+                axis = axis / (np.linalg.norm(axis) + 1e-15)
+                key = (
+                    round(float(sg["radius"]), 1),
+                    h.type,
+                    round(float(axis[0]), 2),
+                    round(float(axis[1]), 2),
+                    round(float(axis[2]), 2),
+                )
+                if key not in grouped:
+                    sg0 = dict(sg)
+                    sg0["centers"] = [list(sg["center"])]
+                    grouped[key] = Feature(
+                        type=h.type,
+                        face_indices=h.face_indices,
+                        sketch_geometry=sg0,
+                        direction=h.direction,
+                        depth=h.depth,
+                    )
+                else:
+                    grouped[key].sketch_geometry["centers"].append(list(sg["center"]))
+            grouped_holes = list(grouped.values())
+            for g in grouped_holes:
+                g.sketch_geometry["count"] = len(g.sketch_geometry["centers"])
+            logger.info(
+                "2D detection replaced %d recognition holes with %d 2D holes "
+                "in %d pattern group(s)",
+                len(holes), len(detected_holes), len(grouped_holes),
+            )
+            holes = grouped_holes
     except Exception as e:
         logger.debug("2D profile hole detection failed: %s", e)
 

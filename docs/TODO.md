@@ -26,12 +26,13 @@
   ring between them, instead of extruding the outer circle then cutting a
   slightly-smaller circle. Profile extraction should emit an annulus for
   revolved/tubular parts.
-- [ ] **Single sketch for symmetric hole pattern (user request,
-  "eventually")**: the 4 identical bottom-plate holes should emit ONE
-  sketch with 4 circles + one cut-extrude, not 4 separate Sketch+Cut
-  steps. _group_symmetric_holes already groups them in recognize; the
-  build (_build_stepwise hole loop) still emits one step per hole — make
-  it emit one multi-circle sketch per group.
+- [x] Single sketch for symmetric hole pattern (user request): the 2D
+  profile hole detector in _extract_profile_and_holes replaced the
+  recognition's grouped features with one feature per hole, so the build
+  made N separate Sketch+Cut steps. It now re-groups the 2D-detected
+  holes by radius+axis into multi-center features. RackMount bottom
+  plate -> "Sketch Through Hole Pattern (4x r=4.0)" in one sketch; Mesh2
+  -> two patterns (9x r=2.5, 4x r=4.0).
 - [ ] **Mesh4 tube: new part class (annular/revolved)**. One seam region
   unfittable (7/8 fitted), the coaxial bore is not recognized as a hole, and
   the base profile should be an annulus (circle + concentric cutout).

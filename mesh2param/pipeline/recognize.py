@@ -501,7 +501,44 @@ def _group_symmetric_holes(
     for idx in standalone:
         merged.append(hole_features[idx])
 
-    for indices in groups.values():
+    def _dedupe_coaxial(indices: list[int]) -> list[int]:
+        """Collapse cylinder regions that lie on the SAME axis line into
+        one. A pattern of mounting holes sits far apart in the plane
+        perpendicular to the shared axis; but a single bore split during
+        segmentation (e.g. a wall fragmented by a curvature seam, or a
+        blind hole's barrel + a coaxial counterbore stub) yields two
+        regions whose centers project to nearly the same in-plane point
+        — different positions ALONG the axis, same axis line. Those are
+        one physical hole, not two, and drilling both doubles the hole.
+        Keep the lowest-RMS fragment per axis line."""
+        kept: list[tuple[int, np.ndarray, float]] = []  # idx, in-plane pt, rms
+        for idx in indices:
+            f, _ = hole_features[idx]
+            sg = f.sketch_geometry or {}
+            ctr = np.asarray(sg.get("center"), dtype=float)
+            ax = np.asarray(f.direction, dtype=float)
+            axn = float(np.linalg.norm(ax))
+            if axn < 1e-12:
+                kept.append((idx, ctr, float("inf")))
+                continue
+            ax = ax / axn
+            in_plane = ctr - np.dot(ctr, ax) * ax
+            rms = float(sg.get("fit_rms", float("inf")))
+            rad = float(sg.get("radius", 0.0))
+            tol = max(rad, 2.0)
+            hit = None
+            for k, (_, kpt, _) in enumerate(kept):
+                if float(np.linalg.norm(in_plane - kpt)) < tol:
+                    hit = k
+                    break
+            if hit is None:
+                kept.append((idx, in_plane, rms))
+            elif rms < kept[hit][2]:
+                kept[hit] = (idx, in_plane, rms)
+        return [k[0] for k in kept]
+
+    for raw_indices in groups.values():
+        indices = _dedupe_coaxial(raw_indices)
         if len(indices) == 1:
             merged.append(hole_features[indices[0]])
             continue

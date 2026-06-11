@@ -83,9 +83,25 @@
   `metrics.band_fidelity_report` — side-plate clusters read ~0.7mm vs
   ~0.08mm for base-plate clusters.
 
+## Scans
+- [x] Decimation speedup: 2.5M-face scans spent ~60s in quadric edge-collapse.
+  A cheap vertex-clustering pre-pass (when faces > 5x the cap) cuts the input
+  ~10x in ~2s, so the quality quadric runs on a small mesh. Scan2 ingest
+  82s -> 33s. CAD meshes (<cap) are unaffected.
+- [x] Scan smoke tests (tests/test_scans.py, slow-marked): all 3 scans
+  decimate to the cap and run stages 1-5 without crashing, ingest < 120s.
+- [ ] **Scan reconstruction quality is poor (volume err 100-1000%)** and this
+  is fundamental, not a quick bug: all 3 scans are NON-WATERTIGHT organic
+  geometry. Consequences: (a) no mesh volume, so the average-cross-section
+  base-profile principle can't engage (falls back to largest slice ->
+  over-extrude); (b) volume_error uses the inflated convex-hull estimate.
+  Real fix needs surface reconstruction (Poisson / alpha-wrap) to close the
+  large open boundaries BEFORE the parametric stages — pymeshlab
+  close_holes(maxhole=300) did NOT make them watertight. Until then, scans
+  belong on the /clean cleaner+resize path, not full parametric (the
+  complexity meter already routes organic meshes there).
+
 ## Pipeline (from the 2026-06-10 analysis)
-- [ ] Scans end-to-end: decimation + segmentation are fast now, but stages 3–6
-  on scan geometry are unvalidated (Scan3 → 228 regions).
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet
   matcher search; the structural fix for the blend apply ratio).
 - [ ] Scale normalization at ingest so mm-absolute thresholds become ratios.

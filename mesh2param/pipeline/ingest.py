@@ -246,6 +246,19 @@ def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:
             vertex_matrix=np.asarray(mesh.vertices),
             face_matrix=np.asarray(mesh.faces),
         ))
+        # Two-stage for very dense scans: quadric edge-collapse cost
+        # scales with the INPUT face count, so a million-triangle scan
+        # spends ~60s. A cheap vertex-clustering pre-pass knocks the
+        # count down by ~10x in ~2s, then the quality quadric runs on
+        # the much smaller mesh (~10s total instead of ~60s).
+        if len(mesh.faces) > 5 * max_faces:
+            ms.meshing_decimation_clustering(
+                threshold=pymeshlab.PercentageValue(0.3)
+            )
+            logger.info(
+                "Clustering pre-decimation: %d -> %d faces",
+                len(mesh.faces), ms.current_mesh().face_number(),
+            )
         ms.meshing_decimation_quadric_edge_collapse(
             targetfacenum=int(max_faces),
             preservenormal=True,

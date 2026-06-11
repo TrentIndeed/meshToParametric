@@ -445,6 +445,69 @@ def _group_symmetric_holes(
             "center": center,
         }))
 
+    # Dedupe coaxial fragments GLOBALLY, before pattern grouping. A single
+    # bore split during segmentation (a wall fragmented by a curvature
+    # seam, a barrel + coaxial stub) yields two candidates whose centers
+    # project to nearly the same point in the plane perpendicular to the
+    # axis. Their fitted radii can differ by ~10% (r=2.94 vs r=2.67 on
+    # Body1Mesh's edge bore), which lands them in DIFFERENT pattern
+    # groups — so a per-group dedup never compares them and the export
+    # drills the same hole twice. Compare every same-axis candidate pair
+    # here and keep the lowest-RMS fragment. Deliberately-split tangent
+    # pairs overlap in-plane by design and are exempt.
+    def _axial_span(idx: int, meta: dict) -> tuple[float, float]:
+        feat = hole_features[idx][0]
+        mid = float(np.dot(meta["center"], meta["axis"]))
+        half = max(float(feat.depth), 0.0) / 2.0
+        return (mid - half, mid + half)
+
+    deduped: list[tuple[int, dict]] = []
+    for idx, meta in candidates:
+        sg = hole_features[idx][0].sketch_geometry or {}
+        if sg.get("tangent_pair"):
+            deduped.append((idx, meta))
+            continue
+        ax = meta["axis"]
+        in_plane = meta["center"] - np.dot(meta["center"], ax) * ax
+        lo, hi = _axial_span(idx, meta)
+        rms = float(sg.get("fit_rms", float("inf")))
+        tol = max(meta["radius"], 2.0)
+        hit = None
+        for k, (kidx, kmeta) in enumerate(deduped):
+            ksg = hole_features[kidx][0].sketch_geometry or {}
+            if ksg.get("tangent_pair"):
+                continue
+            if kmeta["ax_idx"] != meta["ax_idx"]:
+                continue
+            k_in_plane = kmeta["center"] - np.dot(kmeta["center"], ax) * ax
+            if float(np.linalg.norm(in_plane - k_in_plane)) >= tol:
+                continue
+            # Same axis line is necessary but NOT sufficient: two plates
+            # of an assembly carry coaxial holes by design (a rod hole
+            # through both side plates of RackMount). Fragments of ONE
+            # bore also overlap along the axis; separate stacked holes
+            # don't. Require axial overlap (with 1mm slack for caps).
+            klo, khi = _axial_span(kidx, kmeta)
+            if min(hi, khi) - max(lo, klo) < -1.0:
+                continue
+            hit = k
+            break
+        if hit is None:
+            deduped.append((idx, meta))
+        else:
+            k_rms = float(
+                (hole_features[deduped[hit][0]][0].sketch_geometry or {})
+                .get("fit_rms", float("inf"))
+            )
+            if rms < k_rms:
+                deduped[hit] = (idx, meta)
+            logger.info(
+                "Deduped coaxial hole fragments at in-plane %s (r=%.2f/%.2f)",
+                np.round(in_plane, 1).tolist(),
+                meta["radius"], deduped[hit][1]["radius"],
+            )
+    candidates = deduped
+
     n = len(candidates)
     parent = list(range(n))
 
@@ -501,44 +564,38 @@ def _group_symmetric_holes(
     for idx in standalone:
         merged.append(hole_features[idx])
 
-    def _dedupe_coaxial(indices: list[int]) -> list[int]:
-        """Collapse cylinder regions that lie on the SAME axis line into
-        one. A pattern of mounting holes sits far apart in the plane
-        perpendicular to the shared axis; but a single bore split during
-        segmentation (e.g. a wall fragmented by a curvature seam, or a
-        blind hole's barrel + a coaxial counterbore stub) yields two
-        regions whose centers project to nearly the same in-plane point
-        — different positions ALONG the axis, same axis line. Those are
-        one physical hole, not two, and drilling both doubles the hole.
-        Keep the lowest-RMS fragment per axis line."""
-        kept: list[tuple[int, np.ndarray, float]] = []  # idx, in-plane pt, rms
-        for idx in indices:
-            f, _ = hole_features[idx]
-            sg = f.sketch_geometry or {}
-            ctr = np.asarray(sg.get("center"), dtype=float)
-            ax = np.asarray(f.direction, dtype=float)
-            axn = float(np.linalg.norm(ax))
-            if axn < 1e-12:
-                kept.append((idx, ctr, float("inf")))
-                continue
-            ax = ax / axn
-            in_plane = ctr - np.dot(ctr, ax) * ax
-            rms = float(sg.get("fit_rms", float("inf")))
-            rad = float(sg.get("radius", 0.0))
-            tol = max(rad, 2.0)
-            hit = None
-            for k, (_, kpt, _) in enumerate(kept):
-                if float(np.linalg.norm(in_plane - kpt)) < tol:
-                    hit = k
-                    break
-            if hit is None:
-                kept.append((idx, in_plane, rms))
-            elif rms < kept[hit][2]:
-                kept[hit] = (idx, in_plane, rms)
-        return [k[0] for k in kept]
+    def _partition_by_radius(indices: list[int], rel_tol: float = 0.2) -> list[list[int]]:
+        """Split a pattern group into sub-patterns of like radius.
 
-    for raw_indices in groups.values():
-        indices = _dedupe_coaxial(raw_indices)
+        The loose through-hole tolerance (60%) is needed so unstable
+        short-cylinder fits land in ONE group, but unifying the radius
+        across the whole group then drills genuinely different sizes the
+        same: BottomMount has 9× r=2.5 and 4× r=4.0 bolt holes, and one
+        unified group drilled all of them at r=4.0. Greedy-cluster the
+        sorted radii (20% relative gap starts a new sub-pattern) and emit
+        one merged feature per cluster.
+        """
+        order = sorted(indices, key=lambda i: float(
+            hole_features[i][0].sketch_geometry.get("radius", 0.0)))
+        parts: list[list[int]] = [[order[0]]]
+        for i in order[1:]:
+            r_i = float(hole_features[i][0].sketch_geometry.get("radius", 0.0))
+            r_prev = float(
+                hole_features[parts[-1][-1]][0].sketch_geometry.get("radius", 0.0))
+            if r_prev > 0 and (r_i - r_prev) / r_prev > rel_tol:
+                parts.append([i])
+            else:
+                parts[-1].append(i)
+        return parts
+
+    flat_groups: list[list[int]] = []
+    for indices in groups.values():
+        if len(indices) == 1:
+            flat_groups.append(indices)
+        else:
+            flat_groups.extend(_partition_by_radius(indices))
+
+    for indices in flat_groups:
         if len(indices) == 1:
             merged.append(hole_features[indices[0]])
             continue
@@ -753,25 +810,80 @@ def _find_holes(
         # the OLD axis) no longer describes the hole — recompute the depth
         # as the region's extent along the final axis so the drilled cut
         # doesn't punch 140mm through a 13mm plate.
-        final_height = float(
-            np.ptp(
-                cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
-                @ axis_dir
-            )
+        wall_proj = (
+            cleaned.vertices[cleaned.faces[region.face_indices].flatten()]
+            @ axis_dir
         )
+        final_height = float(np.ptp(wall_proj))
         if final_height > 0:
             height = final_height
+        # Re-center the hole's axial position at the WALL midpoint. The
+        # fitter's axis_point can sit anywhere along the axis line; a
+        # through-cut spans the whole part so it never mattered, but a
+        # blind cut starts at center - depth/2 and an off-mid center
+        # shifts the drilled hole off the real bore.
+        hole_center = np.asarray(
+            f.params.get("axis_point")
+            or region.vertices.mean(axis=0),
+            dtype=float,
+        )
+        axial_mid = float((wall_proj.min() + wall_proj.max()) / 2.0)
+        hole_center = (
+            hole_center
+            + (axial_mid - float(hole_center @ axis_dir)) * axis_dir
+        )
 
-        # Determine through vs blind. A cylindrical region that wraps
-        # more than 270° of arc (already checked above) and has a
-        # drill-hole-sized radius is almost always a through-hole.
-        # Blind holes have a distinct bottom cap that gets segmented
-        # as a separate planar region, leaving the cylindrical region
-        # smaller. We already filter span >= 270 above, so at this point
-        # we can safely classify as through for reasonable radii.
-        is_through = radius < bbox_diag * 0.1  # drill holes are small
+        # Determine through vs blind. Radius alone is NOT enough:
+        # Body1Mesh's small-radius edge holes are drilled only 27-47mm
+        # into the plate edge (Z extent 138mm), and classifying them as
+        # through made the export punch 138mm cuts out the far side
+        # (+6% volume error). The geometric signature of a blind hole is
+        # its BOTTOM CAP: an adjacent near-planar region perpendicular
+        # to the axis whose vertices all sit inside the bore. (A part
+        # extent test fails on multi-body assemblies, where the extent
+        # along the axis is the whole assembly, not the plate the hole
+        # pierces.)
+        has_cap = _hole_has_bottom_cap(
+            f.region_id, axis_dir, hole_center, radius, height,
+            graph, region_lookup, fitted, cleaned,
+        )
+        is_through = radius < bbox_diag * 0.1 and not has_cap
 
         hole_type = FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
+
+        # Two TANGENT holes whose walls overlap get segmented as ONE fused
+        # region (a "peanut" bore). The single-cylinder fit averages them
+        # (Body1Mesh: two r=2.5 bores 1.4mm apart fit as one r=2.67 with
+        # high residual). When a two-circle decomposition of the wall's
+        # cross-section explains the points dramatically better, emit BOTH
+        # holes instead of the averaged one.
+        split = _split_tangent_bores(
+            cleaned.vertices[np.unique(cleaned.faces[region.face_indices].flatten())],
+            axis_dir, radius,
+        )
+        if split is not None:
+            for (center3d, sub_radius) in split:
+                results.append((
+                    Feature(
+                        type=hole_type,
+                        face_indices=region.face_indices.copy(),
+                        sketch_geometry={
+                            "type": "circle",
+                            "center": center3d,
+                            "radius": sub_radius,
+                            "fit_rms": float(f.rms_error),
+                            # Deliberate tangent pair — exempt from
+                            # coaxial-fragment dedup, which would re-merge
+                            # the two centers (they overlap by design).
+                            "tangent_pair": True,
+                        },
+                        depth=height,
+                        direction=-axis_dir,
+                        operation="REMOVE",
+                    ),
+                    {f.region_id},
+                ))
+            continue
 
         results.append((
             Feature(
@@ -779,10 +891,7 @@ def _find_holes(
                 face_indices=region.face_indices.copy(),
                 sketch_geometry={
                     "type": "circle",
-                    "center": (
-                        f.params.get("axis_point")
-                        or region.vertices.mean(axis=0).tolist()
-                    ),
+                    "center": hole_center.tolist(),
                     "radius": radius,
                     # Carried so symmetric-hole grouping can prefer the
                     # cleanest fit's radius over the worst one.
@@ -796,6 +905,153 @@ def _find_holes(
         ))
 
     return results
+
+
+def _split_tangent_bores(
+    verts: np.ndarray,
+    axis_dir: np.ndarray,
+    radius: float,
+) -> list[tuple[list[float], float]] | None:
+    """Detect a fused pair of tangent bores and return their two circles.
+
+    Projects the wall vertices onto the plane perpendicular to the hole
+    axis and compares a one-circle fit against a two-circle alternating
+    fit (k-means-style point assignment, seeded from several split
+    directions). Returns [(center3d, radius), (center3d, radius)] only
+    when ALL of:
+      • the one-circle fit is poor (rms > 4 % of radius — clean bores fit
+        at tessellation noise, ~0)
+      • the two-circle fit cuts the rms by >60 %
+      • the sub-circles have similar radii (within 30 %)
+      • the centers are separated between 0.3r and 2.2r (overlapping or
+        tangent — farther apart and the walls couldn't have fused into
+        one region)
+      • each sub-circle owns enough points (≥ 8) to be a real wall
+    Otherwise returns None and the caller keeps the single-hole result.
+    """
+    n = np.asarray(axis_dir, dtype=float)
+    n = n / (np.linalg.norm(n) + 1e-15)
+    # Orthonormal in-plane basis
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
+    w = np.cross(n, u)
+    pts = np.c_[verts @ u, verts @ w]
+    if len(pts) < 24:
+        return None
+
+    def circle_fit(p: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+        x, y = p[:, 0], p[:, 1]
+        A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+        sol, *_ = np.linalg.lstsq(A, x**2 + y**2, rcond=None)
+        cx, cy = float(sol[0]), float(sol[1])
+        r = float(np.sqrt(max(sol[2] + cx**2 + cy**2, 0.0)))
+        res = np.hypot(x - cx, y - cy) - r
+        return np.array([cx, cy]), r, res
+
+    c1, _r1, res1 = circle_fit(pts)
+    rms1 = float(res1.std())
+    if rms1 < 0.04 * radius:
+        return None  # already a clean single bore
+
+    best: tuple | None = None
+    for ang in np.linspace(0.0, np.pi, 8, endpoint=False):
+        d = np.array([np.cos(ang), np.sin(ang)])
+        lab = (pts - c1) @ d > 0
+        for _ in range(20):
+            if lab.sum() < 8 or (~lab).sum() < 8:
+                break
+            ca, ra, _ = circle_fit(pts[lab])
+            cb, rb, _ = circle_fit(pts[~lab])
+            da = np.abs(np.hypot(*(pts - ca).T) - ra)
+            db = np.abs(np.hypot(*(pts - cb).T) - rb)
+            new_lab = da < db
+            if (new_lab == lab).all():
+                break
+            lab = new_lab
+        if lab.sum() < 8 or (~lab).sum() < 8:
+            continue
+        ca, ra, resa = circle_fit(pts[lab])
+        cb, rb, resb = circle_fit(pts[~lab])
+        rms2 = float(np.sqrt(np.mean(np.r_[resa, resb] ** 2)))
+        if best is None or rms2 < best[0]:
+            best = (rms2, ca, ra, cb, rb)
+    if best is None:
+        return None
+    rms2, ca, ra, cb, rb = best
+
+    rmean = 0.5 * (ra + rb)
+    sep = float(np.linalg.norm(ca - cb))
+    if (
+        rms2 > 0.4 * rms1
+        or min(ra, rb) <= 0
+        or abs(ra - rb) / max(ra, rb) > 0.3
+        or not (0.3 * rmean < sep < 2.2 * rmean)
+    ):
+        return None
+
+    axial = float(np.mean(verts @ n))
+    out: list[tuple[list[float], float]] = []
+    for c2d, r2d in ((ca, ra), (cb, rb)):
+        p3 = c2d[0] * u + c2d[1] * w + axial * n
+        out.append(([float(x) for x in p3], float(r2d)))
+    logger.info(
+        "Split fused tangent bore: r=%.2f rms=%.3f -> two r=%.2f/%.2f sep=%.2f rms=%.3f",
+        radius, rms1, ra, rb, sep, rms2,
+    )
+    return out
+
+
+def _hole_has_bottom_cap(
+    region_id: int,
+    axis_dir: np.ndarray,
+    hole_center: np.ndarray,
+    radius: float,
+    height: float,
+    graph: nx.Graph,
+    region_lookup: dict[int, FaceRegion],
+    fitted: list[FittedSurface],
+    cleaned: CleanedMesh,
+) -> bool:
+    """True if the hole wall has an adjacent bottom cap (blind hole).
+
+    The cap is a near-planar neighbor region perpendicular to the hole
+    axis whose vertices ALL lie inside the bore (within ~1.6r of the
+    axis line). The part faces the hole pierces are also planar and
+    perpendicular, but they surround the bore and extend far beyond it,
+    so the radial-containment test cleanly separates the two.
+    """
+    if graph is None or not graph.has_node(region_id):
+        return False
+    fitted_by_id = {s.region_id: s for s in fitted}
+    # The bore wall may be fragmented into several coaxial cylinder
+    # regions, with the cap adjacent to a DIFFERENT fragment than the one
+    # that survived dedup. Search the planar neighbors of the wall AND of
+    # any adjacent cylinder fragment (one hop through the bore).
+    to_scan = set(graph.neighbors(region_id))
+    for nb in list(to_scan):
+        nf = fitted_by_id.get(nb)
+        if nf is not None and nf.surface_type in (
+            SurfaceType.CYLINDER, SurfaceType.CONE,
+        ):
+            to_scan.update(graph.neighbors(nb))
+    to_scan.discard(region_id)
+    for nb in to_scan:
+        nf = fitted_by_id.get(nb)
+        nreg = region_lookup.get(nb)
+        if nf is None or nreg is None:
+            continue
+        if nf.surface_type != SurfaceType.PLANE:
+            continue
+        normal = np.asarray(nf.params.get("normal", [0, 0, 1]), dtype=float)
+        nn = float(np.linalg.norm(normal))
+        if nn < 1e-12 or abs(float(normal @ axis_dir)) / nn < 0.8:
+            continue
+        verts = cleaned.vertices[np.unique(cleaned.faces[nreg.face_indices].flatten())]
+        rel = verts - hole_center
+        radial = rel - np.outer(rel @ axis_dir, axis_dir)
+        if float(np.linalg.norm(radial, axis=1).max()) <= 1.6 * radius:
+            return True
+    return False
 
 
 def _faces_point_inward(

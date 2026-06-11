@@ -1248,9 +1248,86 @@ def _extract_profile_and_holes(
                         est_radius, np.round(hole_center_3d, 1).tolist(), circularity,
                     )
 
-        # If 2D detection found holes, REPLACE the recognition-based ones.
-        # 2D detection guarantees holes go perpendicular to the plate face,
-        # whereas recognition often picks up sideways cylindrical features.
+        # Merge 2D-detected holes with recognition-based ones. This used
+        # to wholesale-replace recognition holes whenever 2D found any
+        # ring, but that threw away every hole 2D can't see: side holes
+        # along non-extrude axes (Body1Mesh's two blind Z edge holes) and
+        # fused tangent pairs whose ring isn't a clean circle. Policy:
+        #   • recognition center MATCHED by a 2D ring → the ring wins
+        #     (its geometry comes straight from the mesh faces and keeps
+        #     hole edges where the fillet matcher expects them)
+        #   • 2D ring with no recognition match → added (recall)
+        #   • recognition hole 2D can't see → kept only if BLIND (a real
+        #     side hole has a bottom cap) or on the extrude axis; a
+        #     sideways THROUGH cylinder with no cap is fitter junk
+        #     (RackMount's base grew two 25mm horizontal tunnels that
+        #     chewed through real hole edges)
+        if detected_holes:
+            ext_axis = ext_norm
+
+            def _trustworthy(rh) -> bool:
+                rdir = np.asarray(rh.direction, dtype=float)
+                rdir = rdir / (np.linalg.norm(rdir) + 1e-15)
+                if abs(float(rdir @ ext_axis)) >= 0.9:
+                    return True
+                return rh.type == FeatureType.BLIND_HOLE
+
+            dropped = [rh for rh in holes if not _trustworthy(rh)]
+            if dropped:
+                logger.info(
+                    "Dropped %d sideways through-hole feature(s) without "
+                    "bottom caps (likely fitter artifacts)", len(dropped),
+                )
+                holes = [rh for rh in holes if _trustworthy(rh)]
+
+            ring_inplane = [
+                np.array([
+                    float(h.sketch_geometry["center"][ax_u]),
+                    float(h.sketch_geometry["center"][ax_v]),
+                ])
+                for h in detected_holes
+            ]
+            ring_radii = [float(h.sketch_geometry["radius"]) for h in detected_holes]
+
+            # Strip recognition centers that a 2D ring supersedes.
+            surviving: list = []
+            for rh in holes:
+                sg = rh.sketch_geometry or {}
+                rdir = np.asarray(rh.direction, dtype=float)
+                rdir = rdir / (np.linalg.norm(rdir) + 1e-15)
+                if abs(float(rdir @ ext_axis)) < 0.9:
+                    surviving.append(rh)  # different axis — rings can't see it
+                    continue
+                centers = sg.get("centers") or [sg.get("center")]
+                kept_centers = []
+                for cc in centers:
+                    if cc is None:
+                        continue
+                    c2 = np.array([float(cc[ax_u]), float(cc[ax_v])])
+                    matched = any(
+                        float(np.linalg.norm(c2 - rc)) < (rr + float(sg.get("radius", 0.0)))
+                        for rc, rr in zip(ring_inplane, ring_radii)
+                    )
+                    if not matched:
+                        kept_centers.append(list(cc))
+                if not kept_centers:
+                    continue  # every center superseded by a ring
+                if len(kept_centers) != len(centers):
+                    sg = dict(sg)
+                    sg["centers"] = kept_centers
+                    sg["count"] = len(kept_centers)
+                    sg["center"] = kept_centers[0]
+                    rh = Feature(
+                        type=rh.type,
+                        face_indices=rh.face_indices,
+                        sketch_geometry=sg,
+                        direction=rh.direction,
+                        depth=rh.depth,
+                        operation=rh.operation,
+                    )
+                surviving.append(rh)
+            holes = surviving
+
         if detected_holes:
             # Group identical holes (same radius + axis) into ONE feature
             # with a `centers` list, so the build emits a single sketch
@@ -1287,11 +1364,11 @@ def _extract_profile_and_holes(
             for g in grouped_holes:
                 g.sketch_geometry["count"] = len(g.sketch_geometry["centers"])
             logger.info(
-                "2D detection replaced %d recognition holes with %d 2D holes "
-                "in %d pattern group(s)",
-                len(holes), len(detected_holes), len(grouped_holes),
+                "2D detection added %d holes (%d pattern group(s)) alongside "
+                "%d recognition holes",
+                len(detected_holes), len(grouped_holes), len(holes),
             )
-            holes = grouped_holes
+            holes = holes + grouped_holes
     except Exception as e:
         logger.debug("2D profile hole detection failed: %s", e)
 
@@ -1361,6 +1438,18 @@ def _nudge_hole_into_solid(
         if shift_dist < 0.01:
             # The center is already close to the solid along the
             # perpendicular; the issue might be along the axis.
+            return None
+        if shift_dist > radius:
+            # The center is more than a radius away from any material.
+            # That isn't a sliver-miss from profile rounding — the hole
+            # simply has no solid where the mesh says it is (region cut
+            # away, or a misdetected feature). Relocating it (Mesh3's big
+            # bore was dragged 19.5mm) carves material the mesh never had
+            # removed. Leave the no-op cut in place instead.
+            logger.debug(
+                "Not nudging hole r=%.2f: nearest solid is %.1fmm away",
+                radius, shift_dist,
+            )
             return None
 
         # Nudge the center past the nearest point and deep enough that

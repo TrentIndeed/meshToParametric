@@ -1739,22 +1739,35 @@ def _build_stepwise(
     all_sketch_faces = []
     vert_offset = 0
 
-    # Partition the extra profiles: inner CUTOUTS (centroid inside the
-    # outer boundary) belong to the cross-section and are baked into the
-    # base sketch as holes — one annular/windowed extrude instead of
-    # extrude-then-cut (the lowest-step base; e.g. a tube = outer + bore
-    # circle). Outer EXTRAS (legs/bosses outside the boundary) and any
-    # blind pockets still get their own steps in the loop below.
+    # Partition the extra profiles. Only LARGE or NON-circular inner
+    # cutouts belong to the base cross-section and get baked into the base
+    # sketch as holes — a tube's bore or a plate's window — so the extrude
+    # is the ring/windowed shape in one step. Small CIRCULAR inner cutouts
+    # are bolt holes: they must NOT go in the base profile (that put a
+    # spurious hole in the sketch on Body1Mesh) — they fall through to the
+    # loop and get drilled as separate hole features. Outer extras
+    # (legs/bosses) are unioned in the loop.
     from shapely.geometry import Polygon as _BasePoly, Point as _BasePoint
     _main_poly = _BasePoly(profiles[0])
+    _main_area = abs(_main_poly.area)
     base_inner_cutouts: list = []
     extra_profiles: list = []
     for _p in profiles[1:]:
-        _c = np.mean(_p, axis=0)
-        if _main_poly.contains(_BasePoint(_c[0], _c[1])):
-            base_inner_cutouts.append(_p)
+        _poly = _BasePoly(_p)
+        _c = _poly.centroid
+        if not _main_poly.contains(_BasePoint(_c.x, _c.y)):
+            extra_profiles.append(_p)            # outer leg/boss -> union
+            continue
+        # Size is the reliable discriminator: a bore/window is a large
+        # fraction of the section (tube bore ~90%, frame window ~30-60%),
+        # a bolt hole is < ~1%. Circularity is NOT usable here — a coarse
+        # mesh traces a 2.5mm hole as a jagged 38-gon whose inflated
+        # perimeter gives a misleadingly low circularity (0.44).
+        _area = abs(_poly.area)
+        if _area > 0.05 * _main_area:
+            base_inner_cutouts.append(_p)        # window/bore -> bake into base
         else:
-            extra_profiles.append(_p)
+            extra_profiles.append(_p)            # bolt hole -> loop cut (own feature)
 
     # Sketch wireframe overlay: outer boundary + each baked-in hole.
     for profile in [profiles[0], *base_inner_cutouts]:
@@ -1820,11 +1833,13 @@ def _build_stepwise(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
 
-    # Extra OUTER profiles (legs/bosses outside the boundary) get their
-    # own union step. Inner cutouts were baked into the base sketch above.
+    # Remaining profiles: outer legs/bosses (union) and small circular
+    # bolt-hole cutouts (cut). Large window/bore cutouts were baked into
+    # the base sketch above.
     for pi, profile in enumerate(extra_profiles, 1):
         try:
-            is_inner = False
+            _cc = _BasePoly(profile).centroid
+            is_inner = _main_poly.contains(_BasePoint(_cc.x, _cc.y))
 
             # Build the sketch wireframe points for overlay display
             n_pts = len(profile)

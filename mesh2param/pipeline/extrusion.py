@@ -119,27 +119,22 @@ def plan_extrusions(
         top_gain = int(gains.max()) if len(gains) else 0
         if top_gain < min_gain_frac * total:
             break
-        residual = int(np.count_nonzero(unclaimed))
-        if top_gain >= 0.95 * residual:
-            # One candidate explains essentially everything that's left —
-            # that IS the extrude (BottomMount's full trapezoid run must
-            # beat a 91%-coverage rectangle with a bigger profile).
-            best_idx = int(np.argmax(gains))
-        else:
-            # Otherwise: "replicate the largest single extrude AREA" —
-            # among candidates within 80% of the best gain, prefer the
-            # largest profile. RackMount's U-channel sections (area 1901)
-            # edge out the base plate (area 15148) by a few percent of
-            # raw gain, but the base is what a CAD operator extrudes
-            # first.
-            window = [
-                ci for ci in range(len(candidates))
-                if gains[ci] >= 0.8 * top_gain
-            ]
-            best_idx = max(window, key=lambda ci: candidates[ci]["area"])
+        # Pure max-gain. With honest (half-cell, symmetric) claims the
+        # most-coverage candidate IS the right extrude: BottomMount's
+        # trapezoid run strictly out-claims the inscribed rectangle, and
+        # RackMount's Y side profile out-claims the X web faces. The old
+        # area-window preference was a crutch for sloppy claims and
+        # actively picked wrong candidates once claims were honest. Area
+        # only breaks exact ties (symmetric twins).
+        tied = [
+            ci for ci in range(len(candidates)) if gains[ci] == top_gain
+        ]
+        best_idx = max(tied, key=lambda ci: candidates[ci]["area"])
         best_gain = int(gains[best_idx])
         cand = candidates[best_idx]
-        unclaimed &= ~membership[best_idx]
+        # Claim removal uses a GENEROUS band so half-cell boundary crumbs
+        # don't surface as phantom follow-up segments.
+        unclaimed &= ~_voxels_in_prism(occupied, cand, pitch, tol_cells=1.5)
         covered = 1.0 - float(np.count_nonzero(unclaimed)) / total
         segments.append(_to_segment(cand, best_gain / total, covered))
         logger.info(
@@ -338,7 +333,7 @@ def segment_inner_rings(
     outer = Polygon(segment.profile)
     if outer.is_empty or not outer.is_valid:
         outer = outer.buffer(0)
-    rings = []
+    loops = []
     try:
         discrete = section.discrete
     except Exception:
@@ -347,10 +342,24 @@ def segment_inner_rings(
         p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
         if not p.is_valid:
             p = p.buffer(0)
-        if p.is_empty or p.area < min_frac * max(outer.area, 1.0):
+        if not p.is_empty and p.area > 1.0:
+            loops.append(p)
+    # A hole is a loop with ODD containment depth among the SECTION's
+    # own loops — merely lying inside the segment's outer outline is not
+    # enough: separate pieces (RackMount's rails/ears at a mid station)
+    # sit inside the merged outline's footprint but are MATERIAL, and
+    # subtracting them carved the base apart.
+    rings = []
+    for i, p in enumerate(loops):
+        depth = sum(
+            1 for j, q in enumerate(loops)
+            if j != i and q.contains(p.representative_point())
+            and q.area > p.area
+        )
+        if depth % 2 != 1:
             continue
-        if p.area >= 0.9 * outer.area:
-            continue  # the outer outline itself
+        if p.area < min_frac * max(outer.area, 1.0):
+            continue
         try:
             if outer.contains(p.representative_point()):
                 rings.append([
@@ -419,7 +428,7 @@ def _merge_step_runs(cands: list[dict]) -> list[dict]:
                 step_cut = (
                     containment > 0.85
                     and boundary_iou < 0.85
-                    and area_ratio > 0.3
+                    and area_ratio > 0.25
                 )
                 same_profile = boundary_iou > 0.93
                 if step_cut or same_profile:
@@ -442,7 +451,19 @@ def _merge_step_runs(cands: list[dict]) -> list[dict]:
 def _voxel_occupancy(mesh: trimesh.Trimesh) -> tuple[np.ndarray | None, float]:
     """Filled-interior voxel centers of the part."""
     diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
-    pitch = float(np.clip(diag / 90.0, 0.8, 3.0))
+    pitch = diag / 90.0
+    # Thin-walled parts need the pitch to resolve the WALL, not the
+    # bbox: at 2.9mm pitch a 6mm web carries barely one voxel layer and
+    # boundary tolerance dwarfs the interior, so wrong candidates claim
+    # whole features (RackMount's X webs out-claimed the true Y side
+    # profiles). Mean wall thickness ~ 2V/A.
+    try:
+        if mesh.area > 1e-9:
+            t_wall = 2.0 * abs(float(mesh.volume)) / float(mesh.area)
+            pitch = min(pitch, t_wall / 3.0)
+    except Exception:
+        pass
+    pitch = float(np.clip(pitch, 0.8, 3.0))
     try:
         vox = mesh.voxelized(pitch).fill()
         return np.asarray(vox.points, dtype=float), pitch
@@ -451,24 +472,37 @@ def _voxel_occupancy(mesh: trimesh.Trimesh) -> tuple[np.ndarray | None, float]:
         return None, pitch
 
 
-def _voxels_in_prism(points: np.ndarray, cand: dict, pitch: float) -> np.ndarray:
-    """Boolean mask of voxel centers inside the candidate's swept prism."""
+def _voxels_in_prism(
+    points: np.ndarray, cand: dict, pitch: float, tol_cells: float = 0.5,
+) -> np.ndarray:
+    """Boolean mask of voxel centers inside the candidate's swept prism.
+
+    tol_cells scales the boundary tolerance in cell units. Gains are
+    SCORED with the conservative half-cell band (a center within pitch/2
+    of the wall genuinely intersects material; a full-pitch band let
+    wrong candidates claim entire thin features). Claims are REMOVED
+    with a generous band (1.5 cells) so the boundary crumbs a strict
+    score can't reach don't surface as phantom follow-up segments.
+    """
     from matplotlib.path import Path
 
     axis = cand["axis"]
     ax_u, ax_v = (i for i in range(3) if i != axis)
     axial = points[:, axis]
-    mask = (axial >= cand["start"] - pitch) & (axial <= cand["end"] + pitch)
+    tol = tol_cells * pitch
+    # Symmetric tolerance axially and in-plane — an asymmetric band
+    # systematically favored short-axial candidates with big profiles
+    # over long-axial candidates with thin profiles.
+    mask = (axial >= cand["start"] - tol) & (axial <= cand["end"] + tol)
     if not mask.any():
         return mask
     path = Path(np.asarray(cand["profile"], dtype=float))
     pts2 = np.column_stack([points[mask, ax_u], points[mask, ax_v]])
     # matplotlib's `radius` is SIGNED by ring winding (CW shrinks where
     # CCW grows), and the profile's winding is whatever the section
-    # tracing produced. Test both signs and OR them: a voxel center
-    # within `pitch` of the wall counts as inside regardless of winding.
-    near = path.contains_points(pts2, radius=pitch) | path.contains_points(
-        pts2, radius=-pitch,
+    # tracing produced. Test both signs and OR them.
+    near = path.contains_points(pts2, radius=tol) | path.contains_points(
+        pts2, radius=-tol,
     )
     inside = np.zeros(len(points), dtype=bool)
     inside[mask] = near

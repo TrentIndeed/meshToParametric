@@ -713,8 +713,19 @@ def _extract_profile_and_holes(
     # rest). Slice within the span and start the extrude at its floor so
     # the base doesn't sweep through the side plates' territory.
     base_span = None
+    base_engine_profile = None
+    base_engine_inner: list = []
     if feature_tree.features:
-        base_span = (feature_tree.features[0].sketch_geometry or {}).get("span")
+        _bsg = feature_tree.features[0].sketch_geometry or {}
+        base_span = _bsg.get("span")
+        if _bsg.get("points"):
+            base_engine_profile = _clean_engine_polygon(_bsg["points"])
+            if len(base_engine_profile) < 3:
+                base_engine_profile = None
+            for ring in _bsg.get("inner") or []:
+                rp = _clean_engine_polygon(ring)
+                if len(rp) >= 3:
+                    base_engine_inner.append(rp)
     if base_span is not None:
         extrude_start = float(base_span[0])
 
@@ -726,8 +737,17 @@ def _extract_profile_and_holes(
     # tapered-side case; flat parts keep the slice path.
     _bbsize = cleaned.bbox[1] - cleaned.bbox[0]
     _thin_axis = int(np.argmin(_bbsize))
+    _has_joins = any(
+        f.type == FeatureType.BOSS and f.operation == "JOIN"
+        for f in feature_tree.features
+    )
     silhouette_profile = None
-    if primary_axis != _thin_axis:
+    # The silhouette is for single-extrude TAPERED plates (the trapezoid
+    # side view). On a multi-extrude part the base's own cross-section is
+    # already correct, and the silhouette would fill the hollow between
+    # joins (RackMount's U-channel got stuffed solid: volume looked right,
+    # every section was wrong).
+    if primary_axis != _thin_axis and not _has_joins and base_span is None:
         try:
             from shapely import concave_hull, simplify
             from shapely.geometry import MultiPoint
@@ -901,18 +921,30 @@ def _extract_profile_and_holes(
         except Exception:
             continue
 
-    if not candidates:
+    if not candidates and base_engine_profile is None:
         return None, extrude_start, [], [], []
 
     # Pick best candidate
-    candidates.sort(key=lambda x: (x[0], x[1]))
-    best_profiles = candidates[0][2]
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        best_profiles = candidates[0][2]
+    else:
+        best_profiles = []
+
+    # Multi-extrude base: the engine already measured this segment's
+    # cross-section (outer + interior windows). The slice-ranking
+    # heuristics target the FULL part's average area, which is wrong
+    # when joins carry part of the volume — RackMount's U-profile base
+    # was replaced by a volume-matched smaller slice, right volume,
+    # wrong everywhere.
+    if base_engine_profile is not None and len(base_engine_profile) >= 3:
+        best_profiles = [base_engine_profile] + base_engine_inner
 
     # Tapered side-extrude: the silhouette IS the outer profile (the
     # trapezoid). It supersedes the slice-derived outer boundary, which is
     # only a flat rectangle for this axis. Inner cutouts from the slice
     # path (if any) are kept after it.
-    if silhouette_profile is not None:
+    if silhouette_profile is not None and base_engine_profile is None:
         best_profiles = [silhouette_profile] + best_profiles[1:]
 
     # If the best slice has multiple large outer polygons (frame split by
@@ -1093,7 +1125,7 @@ def _extract_profile_and_holes(
     # If the slice-based profile is too small, fall back to projecting
     # all mesh faces onto the profile plane (works for thin plates where
     # slicing produces open contours instead of closed polygons).
-    if best_profiles:
+    if best_profiles and base_engine_profile is None:
         bbox_size = cleaned.bbox[1] - cleaned.bbox[0]
         sorted_dims = sorted(bbox_size.tolist(), reverse=True)
         expected_area = sorted_dims[0] * sorted_dims[1]
@@ -1191,7 +1223,10 @@ def _extract_profile_and_holes(
             # whenever we detect interior rings. The slice-based profile
             # sometimes traces cutouts as slits connected to the outer
             # boundary, which baked the cutout into the initial sketch.
-            if merged.geom_type == 'Polygon' and merged.interiors:
+            if (
+                merged.geom_type == 'Polygon' and merged.interiors
+                and base_engine_profile is None
+            ):
                 clean_outer = list(merged.exterior.coords)[:-1]
                 clean_outer = _simplify_profile(clean_outer, tolerance=0.5)
                 # Only adopt the face-projection exterior to FIX hole-slit
@@ -1408,6 +1443,39 @@ def _extract_profile_and_holes(
         logger.debug("2D profile hole detection failed: %s", e)
 
     return best_profiles, extrude_start, holes, chamfers, fillets
+
+
+def _clean_engine_polygon(
+    pts: list[tuple[float, float]], tolerance: float = 0.5,
+) -> list[tuple[float, float]]:
+    """Simplify + repair an engine-derived profile for CadQuery.
+
+    Mesh-traced outlines can self-intersect after corner simplification
+    (thin prongs at 0.5mm tolerance), and CadQuery's polyline().close()
+    extrudes a self-intersecting wire into an EMPTY shape with no error.
+    Round-trip through shapely: simplify, buffer(0)-repair, keep the
+    largest part, return its exterior.
+    """
+    from shapely.geometry import Polygon as _CP
+
+    if len(pts) < 3:
+        return []
+    try:
+        p = _CP([(float(a), float(b)) for a, b in pts])
+        if not p.is_valid:
+            p = p.buffer(0)
+        p = p.simplify(tolerance, preserve_topology=True)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty:
+            return []
+        if p.geom_type == "MultiPolygon":
+            p = max(p.geoms, key=lambda g: g.area)
+        if p.area < 1.0:
+            return []
+        return [(float(x), float(y)) for x, y in p.exterior.coords[:-1]]
+    except Exception:
+        return [(float(a), float(b)) for a, b in pts]
 
 
 def _polygon_area(pts: list[tuple[float, float]]) -> float:
@@ -2010,16 +2078,12 @@ def _build_stepwise(
             ax_j = int(sg.get("axis_idx", 0))
             if not span or not raw_pts:
                 continue
-            j_pts = _simplify_profile(
-                [(float(p[0]), float(p[1])) for p in raw_pts], tolerance=0.5,
-            )
+            j_pts = _clean_engine_polygon(raw_pts)
             if len(j_pts) < 3:
                 continue
             j_inner = []
             for ring in sg.get("inner") or []:
-                ring_pts = _simplify_profile(
-                    [(float(p[0]), float(p[1])) for p in ring], tolerance=0.5,
-                )
+                ring_pts = _clean_engine_polygon(ring)
                 if len(ring_pts) >= 3:
                     j_inner.append(ring_pts)
             j_len = float(span[1]) - float(span[0])

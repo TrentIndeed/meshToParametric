@@ -4330,6 +4330,21 @@ def _draw_profile_with_arcs(wp2d, pts: list):
     try:
         runs = _detect_profile_arc_runs(pts)
         if not runs:
+            # Finely sampled circles turn <4 degrees per vertex and form
+            # no arc runs at all — check for a circle before punting.
+            arr0 = np.asarray(pts, dtype=float)
+            if len(arr0) >= 12:
+                A0 = np.c_[2 * arr0[:, 0], 2 * arr0[:, 1], np.ones(len(arr0))]
+                sol0, *_ = np.linalg.lstsq(
+                    A0, (arr0**2).sum(axis=1), rcond=None,
+                )
+                cx0, cy0 = float(sol0[0]), float(sol0[1])
+                cr0 = float(np.sqrt(max(sol0[2] + cx0**2 + cy0**2, 0.0)))
+                resid0 = np.abs(
+                    np.hypot(arr0[:, 0] - cx0, arr0[:, 1] - cy0) - cr0
+                )
+                if cr0 > 0.5 and float(resid0.max()) < max(0.15, 0.02 * cr0):
+                    return wp2d.moveTo(cx0, cy0).circle(cr0)
             return wp2d.polyline(pts).close()
         P = [tuple(map(float, p)) for p in pts]
         n = len(P)
@@ -4356,7 +4371,18 @@ def _draw_profile_with_arcs(wp2d, pts: list):
                 start = k
                 break
         if start is None:
-            # every vertex is on an arc (circle-like profile) — punt
+            # Every vertex is on an arc — circle-like profile. Fit the
+            # circle and draw a TRUE circle edge: punting to polyline
+            # made a 62-sliver bore ring that the fillet matcher could
+            # not snap to and OCC could not roll.
+            arr = np.asarray(P, dtype=float)
+            A = np.c_[2 * arr[:, 0], 2 * arr[:, 1], np.ones(len(arr))]
+            sol, *_ = np.linalg.lstsq(A, (arr**2).sum(axis=1), rcond=None)
+            cx, cy = float(sol[0]), float(sol[1])
+            cr = float(np.sqrt(max(sol[2] + cx**2 + cy**2, 0.0)))
+            resid = np.abs(np.hypot(arr[:, 0] - cx, arr[:, 1] - cy) - cr)
+            if cr > 0.5 and float(resid.max()) < max(0.15, 0.02 * cr):
+                return wp2d.moveTo(cx, cy).circle(cr)
             return wp2d.polyline(pts).close()
 
         wp = wp2d.moveTo(*P[start])

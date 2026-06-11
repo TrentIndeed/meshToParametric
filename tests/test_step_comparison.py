@@ -305,15 +305,22 @@ class TestStepComparison:
         result = _export_cadquery_subprocess(tree, cleaned)
         ref = _load_reference_step(step_path)
 
-        # A plain extrusion of a 16-sided polygon has ~18 faces.
-        # With holes cut, there should be more faces.
+        # The reconstruction must carry at least the reference's
+        # subtractive features. Compare against the REFERENCE face count
+        # — the old hardcoded ">= 18" assumed polygonized outlines; once
+        # circles draw as true circle edges, an ideal tube is exactly 4
+        # faces (outer wall, bore, two annuli), same as its reference.
         cad_faces = result["n_faces"]
         ref_faces = ref["n_faces"]
 
         print(f"\n  {name}: ref={ref_faces} faces, cad={cad_faces} faces")
-        assert cad_faces >= 18, (
-            f"Only {cad_faces} faces — expected more from hole cuts "
-            f"(reference has {ref_faces})"
+        # The reference includes blend/countersink faces the rebuild may
+        # legitimately simplify, so don't demand >= ref; demand enough
+        # faces that holes clearly exist (or an exact ideal match when
+        # the reference itself is minimal, like the 4-face tube).
+        assert cad_faces >= min(18, ref_faces), (
+            f"Only {cad_faces} faces (reference has {ref_faces}): "
+            f"subtractive features are missing"
         )
 
     def test_hole_accuracy(self, name, mesh_path, step_path):

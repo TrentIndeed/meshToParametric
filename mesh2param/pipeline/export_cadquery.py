@@ -1739,11 +1739,25 @@ def _build_stepwise(
     all_sketch_faces = []
     vert_offset = 0
 
-    # Only the first profile (outer boundary) goes in the initial sketch.
-    # Any additional profiles (cutouts) will emit their own Sketch + Cut
-    # Extrude steps later in the function so the feature tree shows them
-    # as separate editable features.
-    for profile in profiles[:1]:
+    # Partition the extra profiles: inner CUTOUTS (centroid inside the
+    # outer boundary) belong to the cross-section and are baked into the
+    # base sketch as holes — one annular/windowed extrude instead of
+    # extrude-then-cut (the lowest-step base; e.g. a tube = outer + bore
+    # circle). Outer EXTRAS (legs/bosses outside the boundary) and any
+    # blind pockets still get their own steps in the loop below.
+    from shapely.geometry import Polygon as _BasePoly, Point as _BasePoint
+    _main_poly = _BasePoly(profiles[0])
+    base_inner_cutouts: list = []
+    extra_profiles: list = []
+    for _p in profiles[1:]:
+        _c = np.mean(_p, axis=0)
+        if _main_poly.contains(_BasePoint(_c[0], _c[1])):
+            base_inner_cutouts.append(_p)
+        else:
+            extra_profiles.append(_p)
+
+    # Sketch wireframe overlay: outer boundary + each baked-in hole.
+    for profile in [profiles[0], *base_inner_cutouts]:
         n_pts = len(profile)
         verts = np.zeros((n_pts, 3))
         for pi, (u, v_coord) in enumerate(profile):
@@ -1768,7 +1782,9 @@ def _build_stepwise(
     ))
     script_lines.append(f"# Step 1: Sketch profile on {plane_name} plane")
     script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
-    script_lines.append("result = result.polyline(profile).close()")
+    script_lines.append("result = result.polyline(outer_profile).close()")
+    for _ci in range(len(base_inner_cutouts)):
+        script_lines.append(f"result = result.polyline(hole_profile_{_ci}).close()")
 
     # --- Step 1: Extrude base profile ---
     # Try both directions, keep the one that overlaps with the actual part bbox.
@@ -1776,13 +1792,13 @@ def _build_stepwise(
     part_max = float(cleaned.bbox[1][primary_axis])
 
     wp_pos = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp_pos = _draw_profile_with_arcs(wp_pos, profiles[0]).extrude(depth)
+    wp_pos = _draw_profile_with_holes(wp_pos, profiles[0], base_inner_cutouts).extrude(depth)
     bb_pos = wp_pos.val().BoundingBox()
     pos_vals = [(bb_pos.xmin, bb_pos.xmax), (bb_pos.ymin, bb_pos.ymax), (bb_pos.zmin, bb_pos.zmax)]
     pos_overlap = min(pos_vals[primary_axis][1], part_max) - max(pos_vals[primary_axis][0], part_min)
 
     wp_neg = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp_neg = _draw_profile_with_arcs(wp_neg, profiles[0]).extrude(-depth)
+    wp_neg = _draw_profile_with_holes(wp_neg, profiles[0], base_inner_cutouts).extrude(-depth)
     bb_neg = wp_neg.val().BoundingBox()
     neg_vals = [(bb_neg.xmin, bb_neg.xmax), (bb_neg.ymin, bb_neg.ymax), (bb_neg.zmin, bb_neg.zmax)]
     neg_overlap = min(neg_vals[primary_axis][1], part_max) - max(neg_vals[primary_axis][0], part_min)
@@ -1804,15 +1820,11 @@ def _build_stepwise(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
 
-    # Additional profiles: each becomes its own Sketch + Extrude step.
-    # Inner profiles (centroid inside the main outer) are cut as pockets,
-    # outer profiles are unioned as additional material.
-    from shapely.geometry import Polygon, Point
-    main_poly = Polygon(profiles[0])
-    for pi, profile in enumerate(profiles[1:], 1):
+    # Extra OUTER profiles (legs/bosses outside the boundary) get their
+    # own union step. Inner cutouts were baked into the base sketch above.
+    for pi, profile in enumerate(extra_profiles, 1):
         try:
-            centroid = np.mean(profile, axis=0)
-            is_inner = main_poly.contains(Point(centroid[0], centroid[1]))
+            is_inner = False
 
             # Build the sketch wireframe points for overlay display
             n_pts = len(profile)
@@ -3670,6 +3682,21 @@ def build_blend_intent_edges(
     if not overlay_pairs:
         return None
     return np.asarray(overlay_pairs, dtype=np.float64).reshape(-1, 2, 3)
+
+
+def _draw_profile_with_holes(wp2d, outer: list, inners: list):
+    """Draw the outer boundary plus inner cutout wires on one workplane.
+
+    Extruding the result produces the cross-section WITH holes in a single
+    operation (CadQuery's even-odd rule turns nested wires into a washer/
+    windowed solid) — the lowest-step base for a tube (annular sketch) or
+    any prismatic part whose through-cutouts belong to the profile, rather
+    than extrude-then-cut.
+    """
+    wp = _draw_profile_with_arcs(wp2d, outer)
+    for inner in inners:
+        wp = _draw_profile_with_arcs(wp, inner)
+    return wp
 
 
 def _detect_profile_arc_runs(pts: list) -> list[tuple[int, int]]:

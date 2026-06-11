@@ -22,11 +22,12 @@
   never enlarges it to the full silhouette. Mesh2 9.8%->0.1%; the same
   principle fixed Mesh3 Front Plate 36.7%->0.8% and the tube 0%. Mesh3
   volume+bbox gates un-xfailed.
-- [ ] **Tube annular profile (user request, "eventually")**: build the
-  tube as TWO concentric circle sketches (outer + inner) extruded as the
-  ring between them, instead of extruding the outer circle then cutting a
-  slightly-smaller circle. Profile extraction should emit an annulus for
-  revolved/tubular parts.
+- [x] Tube annular profile (user request): inner cutouts that belong to
+  the cross-section (the bore, windows) are now drawn as holes in the
+  BASE sketch and extruded once (CadQuery even-odd), instead of
+  extrude-then-cut. Tube: 4 steps (Sketch+Extrude+Sketch+Cut) -> 2
+  (Sketch Profile with outer+inner circle, Extrude Base). 0% volume,
+  no regression across meshes.
 - [x] Single sketch for symmetric hole pattern (user request): the 2D
   profile hole detector in _extract_profile_and_holes replaced the
   recognition's grouped features with one feature per hole, so the build

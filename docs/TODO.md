@@ -122,21 +122,31 @@
   first principles); Mesh3 is genuinely a STEPPED part (3 coaxial Y
   segments, 99.9% — its 0.686 worst-section score under single-extrude
   confirms the gap); Mesh5 base-Z + side joins, 90%.
-- [ ] **Phase 2/3: multi-extrude feature trees.** Emit segments 2..N as
-  JOIN extrudes in ONE feature tree/timeline (Extrude Base -> Extrude
-  Join x N -> holes -> blends). Mesh5 is one connected solid — present it
-  as one part with 3 extrusions, NOT bodies; keep `decompose` semantics
-  only for genuinely disconnected shells (true assemblies). Mesh3's
-  stepped flanges become the first single-body multi-extrude win (gated
-  by cross_section_fidelity beating the single-extrude baseline). Engine
-  segment spans should replace decompose's 5x-area-jump split heuristic;
-  delete legacy paths once parity is shown (engine-only end state).
-- [ ] Engine refinements observed on Mesh1/Mesh4/Mesh5: thin sliver
-  candidates from chamfer bands survive the 2% gain floor (Mesh1's
-  96/153-area X/Z segments); tube wall coverage reads 55% (suspect voxel
-  fill or wall-annulus membership — investigate before trusting coverage
-  on thin-walled parts); RackMount side plates fragment into coaxial
-  sub-runs that should chain into one join each.
+- [x] **Phase 2a: JOIN extrudes in one feature tree (2026-06-11).**
+  recognize emits the plan's non-primary segments as BOSS/JOIN features
+  (profile polygon + axis span); the base carries its segment span so
+  its extrude stops where joins take over. export builds Sketch Join +
+  Extrude Join steps (own axis plane, sign by span overlap, union)
+  BEFORE holes. RackMount single-body now builds Extrude Base (bottom
+  plate) -> Join x2 (side plates) -> 4 hole patterns, vol err 10.1%,
+  fidelity 0.79. All earlier engine misreads fixed the same day:
+  per-axis station density (~3mm — 24 uniform stations can't see a 6.7mm
+  side plate), step-merge area-ratio floor 0.3 (Front Plate's mid
+  section is 49% of the plate = cuts; RackMount's side sections are 6%
+  of the base = joins), near-complete-candidate rule (a ~100% run beats
+  a bigger-profile 91% run: BottomMount trapezoid), windowed-area
+  preference otherwise ("largest single extrude area": base plate over
+  U-channel sections). Engine: 1/1/1/1/3 segments on Mesh1-5.
+- [ ] **Phase 2b: single-body multi-extrude parity.** The new path lacks
+  the stitched-cluster blend stages (job_queue) and pocket cuts: the
+  side plates' corner chamfer cuts are missing (the +10% volume,
+  fidelity 0.79 vs multibody's clusters 12/12). Production still routes
+  RackMount through decompose, so the new path is dormant until parity:
+  apply stitched fillets/chamfers + pockets on the joined solid, gate on
+  cross_section_fidelity >= multibody baseline, then make multi-extrude
+  the default and keep decompose ONLY for disconnected shells (true
+  assemblies). Join profiles also need interior windows carried (a join
+  with a large bore would re-fill it; none of the 5 parts hits this yet).
 
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet

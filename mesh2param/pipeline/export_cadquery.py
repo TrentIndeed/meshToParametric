@@ -203,10 +203,20 @@ def export_cadquery(
     # all downstream logic (chamfer detection, hole cutting bbox, etc.)
     # operates on that body's geometry, not the full assembly.
     build_cleaned = profile_mesh
+    # JOIN extrudes from the extrusion engine's plan (one part, several
+    # extrusions — RackMount's side plates). Decomposed multibody pieces
+    # never carry these (the engine declines open shells), so the two
+    # paths don't overlap.
+    join_features = [
+        f for f in profile_tree.features
+        if f.type == FeatureType.BOSS and f.operation == "JOIN"
+        and (f.sketch_geometry or {}).get("type") == "polygon"
+    ]
     build_args = dict(
         profiles=profiles, depth=depth, extrude_dir=extrude_dir,
         extrude_start=extrude_start, holes=hole_features,
         chamfers=chamfer_features, fillets=fillet_features, cleaned=build_cleaned,
+        joins=join_features,
     )
 
     logger.debug(
@@ -698,6 +708,16 @@ def _extract_profile_and_holes(
     all_proj = cleaned.vertices[:, primary_axis]
     extrude_start = float(all_proj.min())
 
+    # Multi-extrude part: the base covers only its engine segment's span
+    # (RackMount's base plate is 9mm of an 85mm Z extent — joins fill the
+    # rest). Slice within the span and start the extrude at its floor so
+    # the base doesn't sweep through the side plates' territory.
+    base_span = None
+    if feature_tree.features:
+        base_span = (feature_tree.features[0].sketch_geometry or {}).get("span")
+    if base_span is not None:
+        extrude_start = float(base_span[0])
+
     # Tapered/drafted plate: recognize chose to extrude along a NON-thin
     # axis (the side view). A single cross-section slice there is a flat
     # rectangle — it misses the taper. The SILHOUETTE (outline of all
@@ -757,6 +777,10 @@ def _extract_profile_and_holes(
     surface_inset = 0.1  # mm inside the surface
     z_min = float(all_proj.min())
     z_max = float(all_proj.max())
+    if base_span is not None:
+        z_min = max(z_min, float(base_span[0]))
+        z_max = min(z_max, float(base_span[1]))
+        extent = max(z_max - z_min, 1e-6)
     slice_positions = [
         z_min + surface_inset,                   # bottom face
         z_max - surface_inset,                   # top face
@@ -1265,10 +1289,21 @@ def _extract_profile_and_holes(
         if detected_holes:
             ext_axis = ext_norm
 
+            join_axes = {
+                int(np.argmax(np.abs(np.asarray(jf.direction, dtype=float))))
+                for jf in feature_tree.features
+                if jf.type == FeatureType.BOSS and jf.operation == "JOIN"
+            }
+
             def _trustworthy(rh) -> bool:
                 rdir = np.asarray(rh.direction, dtype=float)
                 rdir = rdir / (np.linalg.norm(rdir) + 1e-15)
                 if abs(float(rdir @ ext_axis)) >= 0.9:
+                    return True
+                if int(np.argmax(np.abs(rdir))) in join_axes:
+                    # Hole through a JOIN body (RackMount's side-plate
+                    # bores run along X, the side plates' extrude axis) —
+                    # the base-plane rings can't see it, but it's real.
                     return True
                 return rh.type == FeatureType.BLIND_HOLE
 
@@ -1819,6 +1854,7 @@ def _build_stepwise(
     cleaned: object = None,
     skip_fillets: bool = False,
     skip_chamfers: bool = False,
+    joins: list[Feature] | None = None,
 ) -> tuple[object, str, list[ConstructionStep], list[dict]]:
     """Build a clean CAD solid from scratch, step by step.
 
@@ -1959,6 +1995,93 @@ def _build_stepwise(
     steps.append(ConstructionStep(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
+
+    # --- Join extrusions: the engine plan's non-primary segments ---
+    # One part, one timeline: each join sketches its own profile on its
+    # own axis plane and extrudes over its span, unioned into the solid
+    # BEFORE holes are drilled (a side plate must exist before its bores
+    # are cut). RackMount: Extrude Base (bottom plate) -> Extrude Join x2
+    # (side plates) replaces the decomposed "bodies" presentation.
+    for ji, jf in enumerate(joins or [], 1):
+        try:
+            sg = jf.sketch_geometry or {}
+            span = sg.get("span")
+            raw_pts = sg.get("points")
+            ax_j = int(sg.get("axis_idx", 0))
+            if not span or not raw_pts:
+                continue
+            j_pts = _simplify_profile(
+                [(float(p[0]), float(p[1])) for p in raw_pts], tolerance=0.5,
+            )
+            if len(j_pts) < 3:
+                continue
+            j_len = float(span[1]) - float(span[0])
+            plane_j = plane_map[ax_j]
+            origin_j = [0.0, 0.0, 0.0]
+            origin_j[ax_j] = float(span[0])
+            jx_u, jx_v = [a for a in range(3) if a != ax_j]
+
+            # Sketch overlay wireframe in world coords
+            j_overlay = []
+            n_pts = len(j_pts)
+            for pj in range(n_pts):
+                for uu, vv in (j_pts[pj], j_pts[(pj + 1) % n_pts]):
+                    p3 = [0.0, 0.0, 0.0]
+                    p3[jx_u], p3[jx_v] = uu, vv
+                    p3[ax_j] = float(span[0])
+                    j_overlay.append(p3)
+            v_pre, f_pre = _tessellate_solid(wp, fast=True)
+            steps.append(ConstructionStep(
+                name=f"Sketch Join {ji}",
+                tess_vertices=np.asarray(v_pre, dtype=np.float64),
+                tess_faces=np.asarray(f_pre, dtype=np.int64),
+                volume=abs(float(wp.val().Volume())),
+                sketch_overlay=np.asarray(j_overlay, dtype=np.float64),
+            ))
+
+            # Extrude with the sign whose result overlaps the span
+            # (named CadQuery planes have fixed normals; XZ extrudes -Y).
+            best_wpj, best_overlap = None, -1e30
+            for sign in (1.0, -1.0):
+                try:
+                    wpj = cq.Workplane(plane_j, origin=tuple(origin_j))
+                    wpj = wpj.polyline(j_pts).close().extrude(sign * j_len)
+                    bbj = wpj.val().BoundingBox()
+                    j_vals = [
+                        (bbj.xmin, bbj.xmax), (bbj.ymin, bbj.ymax),
+                        (bbj.zmin, bbj.zmax),
+                    ]
+                    ov = (
+                        min(j_vals[ax_j][1], float(span[1]))
+                        - max(j_vals[ax_j][0], float(span[0]))
+                    )
+                    if ov > best_overlap:
+                        best_overlap, best_wpj = ov, wpj
+                except Exception:
+                    continue
+            if best_wpj is None:
+                logger.warning("Join %d failed to extrude; skipping", ji)
+                continue
+            wp = wp.union(best_wpj)
+            v_j, f_j = _tessellate_solid(wp, fast=True)
+            steps.append(ConstructionStep(
+                name=f"Extrude Join {ji}",
+                tess_vertices=v_j, tess_faces=f_j,
+                volume=abs(float(wp.val().Volume())),
+            ))
+            script_lines.append(f"# Join extrusion {ji}")
+            script_lines.append(
+                f'join{ji} = cq.Workplane("{plane_j}", origin={tuple(origin_j)})'
+                f".polyline(join_profile_{ji}).close().extrude({j_len:.4f})"
+            )
+            script_lines.append(f"result = result.union(join{ji})")
+            logger.info(
+                "Join %d: axis %d span %.1f..%.1f, %d pts, vol now %.0f",
+                ji, ax_j, span[0], span[1], len(j_pts),
+                abs(float(wp.val().Volume())),
+            )
+        except Exception:
+            logger.exception("Join extrusion %d failed; continuing", ji)
 
     # Remaining profiles: outer legs/bosses (union) and small circular
     # bolt-hole cutouts (cut). Large window/bore cutouts were baked into

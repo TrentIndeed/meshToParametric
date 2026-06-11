@@ -76,10 +76,21 @@ def recognize_features(
     assigned: set[int] = set()
     features: list[Feature] = []
 
+    # --- 0. Extrusion plan: cross-section segment decomposition ---
+    # Computed once; drives the base axis and, for multi-segment parts
+    # (RackMount = base plate + two side plates), emits the non-primary
+    # segments as JOIN extrude features below.
+    extrusion_plan = None
+    try:
+        from mesh2param.pipeline.extrusion import plan_extrusions
+        extrusion_plan = plan_extrusions(cleaned)
+    except Exception:
+        logger.exception("Extrusion engine failed; using legacy base logic")
+
     # --- 1. Base extrusion: the largest group of connected planar faces ---
     try:
         base_feature, base_rids = _find_base_extrusion(
-            regions, fitted, graph, cleaned,
+            regions, fitted, graph, cleaned, extrusion_plan,
         )
     except Exception:
         logger.exception("Stage 5 failed finding base extrusion: regions=%d", len(regions))
@@ -88,6 +99,38 @@ def recognize_features(
     assigned.update(base_rids)
     base_idx = 0
     logger.debug("Base extrusion found: %d region IDs, depth=%.2f", len(base_rids), base_feature.depth)
+
+    # --- 1b. Join extrusions: the plan's non-primary segments ---
+    # Each is a prismatic chunk the base doesn't cover (RackMount's side
+    # plates), carried with its own profile polygon and axis span so the
+    # export can sketch + extrude + union it. One feature tree, one
+    # timeline: Extrude Base -> Extrude Join x N -> holes -> blends.
+    if extrusion_plan is not None and len(extrusion_plan.segments) >= 2:
+        primary = extrusion_plan.segments[0]
+        if primary.gain_frac >= 0.4:
+            for seg in extrusion_plan.segments[1:]:
+                if seg.gain_frac < 0.03:
+                    continue
+                features.append(Feature(
+                    type=FeatureType.BOSS,
+                    face_indices=np.array([], dtype=np.int64),
+                    sketch_geometry={
+                        "type": "polygon",
+                        "points": [list(p) for p in seg.profile],
+                        "span": [float(seg.start), float(seg.end)],
+                        "axis_idx": int(seg.axis_idx),
+                    },
+                    depth=float(seg.length),
+                    direction=seg.direction.copy(),
+                    operation="JOIN",
+                    dependencies=[base_idx],
+                ))
+                logger.info(
+                    "Join extrusion: axis %d span %.1f..%.1f area=%.0f "
+                    "(%.0f%% of part)",
+                    seg.axis_idx, seg.start, seg.end, seg.area,
+                    100 * seg.gain_frac,
+                )
 
     # --- 2. Holes: full cylinders ---
     try:
@@ -269,6 +312,7 @@ def _find_base_extrusion(
     fitted: list[FittedSurface],
     graph: nx.Graph,
     cleaned: CleanedMesh,
+    extrusion_plan=None,
 ) -> tuple[Feature, set[int]]:
     """Find the base extrusion — the largest connected group of planes.
 
@@ -360,36 +404,45 @@ def _find_base_extrusion(
     # side axis, so the trapezoid side profile wins from first
     # principles. Legacy area/thin-axis logic above remains the fallback
     # when the engine can't form a confident segment (ragged scans).
-    try:
-        from mesh2param.pipeline.extrusion import plan_extrusions
-        plan = plan_extrusions(cleaned)
-        if plan.segments and plan.segments[0].gain_frac >= 0.4:
-            engine_dir = plan.segments[0].direction
-            if int(np.argmax(np.abs(engine_dir))) != int(np.argmax(np.abs(direction))):
-                logger.info(
-                    "Base extrusion: engine override axis %s -> %s "
-                    "(%d segments, primary gain %.0f%%)",
-                    np.argmax(np.abs(direction)), np.argmax(np.abs(engine_dir)),
-                    len(plan.segments), 100 * plan.segments[0].gain_frac,
-                )
-            direction = engine_dir.copy()
-        else:
+    base_span: list[float] | None = None
+    plan = extrusion_plan
+    if plan is not None and plan.segments and plan.segments[0].gain_frac >= 0.4:
+        primary = plan.segments[0]
+        engine_dir = primary.direction
+        if int(np.argmax(np.abs(engine_dir))) != int(np.argmax(np.abs(direction))):
             logger.info(
-                "Extrusion engine inconclusive (%d segments); keeping "
-                "legacy axis choice", len(plan.segments),
+                "Base extrusion: engine override axis %s -> %s "
+                "(%d segments, primary gain %.0f%%)",
+                np.argmax(np.abs(direction)), np.argmax(np.abs(engine_dir)),
+                len(plan.segments), 100 * primary.gain_frac,
             )
-    except Exception:
-        logger.exception("Extrusion engine failed; keeping legacy axis")
+        direction = engine_dir.copy()
+        if len(plan.segments) >= 2:
+            # Multi-extrude part: the base covers only its own segment's
+            # span (RackMount's base plate is 9mm of an 85mm Z extent) —
+            # joins fill the rest. Single-segment parts keep the full
+            # extent (the depth computation below).
+            base_span = [float(primary.start), float(primary.end)]
+    elif plan is not None:
+        logger.info(
+            "Extrusion engine inconclusive (%d segments); keeping "
+            "legacy axis choice", len(plan.segments),
+        )
 
     # Estimate depth from bbox extent along the extrusion direction
     verts = cleaned.vertices
     proj = verts @ direction
     depth = float(proj.max() - proj.min())
+    base_sketch = None
+    if base_span is not None:
+        depth = base_span[1] - base_span[0]
+        base_sketch = {"span": [float(base_span[0]), float(base_span[1])]}
 
     return (
         Feature(
             type=FeatureType.BASE_EXTRUSION,
             face_indices=base_faces,
+            sketch_geometry=base_sketch if base_sketch else {},
             depth=depth,
             direction=direction,
             operation="NEW",

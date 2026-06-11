@@ -109,20 +109,35 @@ def plan_extrusions(
     membership: dict[int, np.ndarray] = {}
 
     while len(segments) < max_segments:
-        best_idx, best_gain = -1, 0
+        gains = np.zeros(len(candidates), dtype=int)
         for ci, cand in enumerate(candidates):
             mem = membership.get(ci)
             if mem is None:
                 mem = _voxels_in_prism(occupied, cand, pitch)
                 membership[ci] = mem
-            gain = int(np.count_nonzero(mem & unclaimed))
-            if gain > best_gain or (
-                gain == best_gain and best_idx >= 0
-                and cand["area"] > candidates[best_idx]["area"]
-            ):
-                best_gain, best_idx = gain, ci
-        if best_idx < 0 or best_gain < min_gain_frac * total:
+            gains[ci] = int(np.count_nonzero(mem & unclaimed))
+        top_gain = int(gains.max()) if len(gains) else 0
+        if top_gain < min_gain_frac * total:
             break
+        residual = int(np.count_nonzero(unclaimed))
+        if top_gain >= 0.95 * residual:
+            # One candidate explains essentially everything that's left —
+            # that IS the extrude (BottomMount's full trapezoid run must
+            # beat a 91%-coverage rectangle with a bigger profile).
+            best_idx = int(np.argmax(gains))
+        else:
+            # Otherwise: "replicate the largest single extrude AREA" —
+            # among candidates within 80% of the best gain, prefer the
+            # largest profile. RackMount's U-channel sections (area 1901)
+            # edge out the base plate (area 15148) by a few percent of
+            # raw gain, but the base is what a CAD operator extrudes
+            # first.
+            window = [
+                ci for ci in range(len(candidates))
+                if gains[ci] >= 0.8 * top_gain
+            ]
+            best_idx = max(window, key=lambda ci: candidates[ci]["area"])
+        best_gain = int(gains[best_idx])
         cand = candidates[best_idx]
         unclaimed &= ~membership[best_idx]
         covered = 1.0 - float(np.count_nonzero(unclaimed)) / total
@@ -217,6 +232,11 @@ def _candidate_runs(
     extent = hi - lo
     if extent <= 0:
         return []
+    # Station density must resolve the THINNEST feature, not divide the
+    # extent uniformly: RackMount's 6.7mm side plates get at most one
+    # station from 24 over a 140mm axis, and a run needs two. Aim for
+    # ~3mm steps, clamped so small parts don't over-slice.
+    n_slices = int(np.clip(extent / 3.0, n_slices, 72))
     stations = np.linspace(lo + 0.02 * extent, hi - 0.02 * extent, n_slices)
     half_step = (stations[1] - stations[0]) / 2.0 if n_slices > 1 else extent / 2
 
@@ -336,7 +356,19 @@ def _merge_step_runs(cands: list[dict]) -> list[dict]:
                 # the track (Front Plate's outline runs re-join across
                 # the merged mid span). A taper never satisfies either:
                 # its halves are neither identical nor an abrupt subset.
-                step_cut = containment > 0.85 and boundary_iou < 0.85
+                # The cut-step merge also needs the continuation to be a
+                # substantial FRACTION of the larger profile: Front
+                # Plate's mid-section is 49% of the plate (cuts), but
+                # RackMount's side-plate sections are ~6% of the base
+                # outline — that's a JOIN landscape, and merging would
+                # model the side plates as a 60mm base extrude with 90%
+                # carved away.
+                area_ratio = min(a["area"], b["area"]) / max(a["area"], b["area"])
+                step_cut = (
+                    containment > 0.85
+                    and boundary_iou < 0.85
+                    and area_ratio > 0.3
+                )
                 same_profile = boundary_iou > 0.93
                 if step_cut or same_profile:
                     bigger = a if a["area"] >= b["area"] else b

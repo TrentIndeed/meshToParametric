@@ -218,8 +218,13 @@ def cross_section_fidelity(
     from shapely.geometry import Polygon as _P
     from shapely.ops import unary_union as _uu
 
+    # Weld duplicated vertices: OCC tessellations ship one vertex copy
+    # per face and trimesh.section silently fails on such soups — whole
+    # stations read as empty and score a spurious 0.0.
     ma = _tm.Trimesh(vertices=verts_a, faces=faces_a, process=False)
     mb = _tm.Trimesh(vertices=verts_b, faces=faces_b, process=False)
+    ma.merge_vertices(merge_tex=True, merge_norm=True)
+    mb.merge_vertices(merge_tex=True, merge_norm=True)
     lo = np.minimum(ma.bounds[0], mb.bounds[0])
     hi = np.maximum(ma.bounds[1], mb.bounds[1])
 
@@ -263,10 +268,21 @@ def cross_section_fidelity(
         stations = np.linspace(
             lo[axis] + 0.05 * extent, hi[axis] - 0.05 * extent, n_per_axis,
         )
+        step = stations[1] - stations[0] if len(stations) > 1 else extent
         ious = []
         for pos in stations:
-            ga = _section_geom(ma, axis, float(pos))
-            gb = _section_geom(mb, axis, float(pos))
+            # A station can land exactly on a coplanar boolean seam,
+            # where zero triangles cross the plane and section() returns
+            # None despite real material — nudge and retry before
+            # treating a side as empty.
+            ga = gb = None
+            for off in (0.0, 0.23 * step, -0.21 * step):
+                if ga is None:
+                    ga = _section_geom(ma, axis, float(pos + off))
+                if gb is None:
+                    gb = _section_geom(mb, axis, float(pos + off))
+                if ga is not None and gb is not None:
+                    break
             if ga is None and gb is None:
                 continue
             if ga is None or gb is None:

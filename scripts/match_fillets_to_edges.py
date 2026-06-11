@@ -52,8 +52,14 @@ MIN_EDGE_FRAC = 0.5     # >= this fraction of an edge's samples must be near
 # 1. Build stitched clusters (vertices + category) — compact mirror of the
 #    job_queue stitched stage, enough for matching.
 # ---------------------------------------------------------------------------
-def build_clusters(cleaned):
-    decomp = decompose_bodies(cleaned, DecomposeConfig())
+def build_clusters(cleaned, single_body: bool = False):
+    """Stitched blend clusters. single_body=True skips decomposition and
+    builds clusters from the full-mesh topology — the multi-extrude
+    (engine JOIN) path, where the part is one body with several
+    extrusions instead of decomposed pieces."""
+    decomp = decompose_bodies(
+        cleaned, DecomposeConfig(enabled=not single_body),
+    )
     body_stage = []
     body_results = []
     for body in decomp.bodies:

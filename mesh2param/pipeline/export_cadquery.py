@@ -1291,27 +1291,43 @@ def _extract_profile_and_holes(
                     ) / 2
 
                     # PIERCE CHECK: a 2D ring is only a through-hole if
-                    # the mesh vertices in its column span the LOCAL
-                    # thickness. RackMount's tab-relief cavities surface
-                    # as rings in the face projection but are partial-
-                    # depth sculpts — drilling them fabricated 4 holes
-                    # the reference part doesn't have.
+                    # the bore is VOID just inside BOTH faces of the
+                    # local material (parity sections, so bores read as
+                    # voids). A partial-depth cavity has material over
+                    # one end and is a pocket, not a hole. A stepped
+                    # bore (RackMount's tab holes drop into their relief
+                    # counterbores) is void at both probes and passes —
+                    # the earlier column-span test wrongly rejected it.
                     _col_d = np.linalg.norm(
                         np.column_stack([
                             cleaned.vertices[:, ax_u] - c_2d.x,
                             cleaned.vertices[:, ax_v] - c_2d.y,
                         ]), axis=1,
                     )
-                    _col = _col_d < est_radius * 1.4
                     _nb = _col_d < est_radius * 3.0
                     _ax_all = cleaned.vertices[:, primary_axis]
-                    _local_t = (
-                        float(np.ptp(_ax_all[_nb])) if _nb.any() else extent
+                    if not _nb.any():
+                        continue
+                    _lo, _hi = float(_ax_all[_nb].min()), float(_ax_all[_nb].max())
+                    from mesh2param.pipeline.recognize import _section_material
+                    from shapely.geometry import Point as _PiercePt
+                    import trimesh as _pierce_tm
+                    _pmesh = _pierce_tm.Trimesh(
+                        vertices=cleaned.vertices, faces=cleaned.faces,
+                        process=False,
                     )
-                    if not _col.any() or float(np.ptp(_ax_all[_col])) < 0.75 * min(_local_t, extent):
+                    _is_through_ring = True
+                    for _probe in (_lo + 0.8, _hi - 0.8):
+                        _geom = _section_material(_pmesh, primary_axis, _probe)
+                        if _geom is not None and _geom.buffer(-0.2).contains(
+                            _PiercePt(c_2d.x, c_2d.y)
+                        ):
+                            _is_through_ring = False
+                            break
+                    if not _is_through_ring:
                         logger.info(
-                            "2D ring at (%.1f, %.1f) r=%.2f rejected: column "
-                            "does not pierce (partial-depth cavity)",
+                            "2D ring at (%.1f, %.1f) r=%.2f rejected: bore "
+                            "covered at a face (partial-depth cavity)",
                             c_2d.x, c_2d.y, est_radius,
                         )
                         continue
@@ -1611,6 +1627,27 @@ def _nudge_hole_into_solid(
         from OCP.BRepExtrema import BRepExtrema_DistShapeShape
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
         from OCP.gp import gp_Pnt
+        from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+        from OCP.TopAbs import TopAbs_IN
+
+        # If the hole center is VOID (not inside the solid), the hole
+        # already exists — typically baked into a join/base profile as
+        # an interior ring. A no-op cut is SUCCESS; nudging it carved a
+        # phantom bore one diameter sideways into RackMount's side plate.
+        try:
+            classifier = BRepClass3d_SolidClassifier(
+                wp.val().wrapped,
+                gp_Pnt(float(center[0]), float(center[1]), float(center[2])),
+                1e-6,
+            )
+            if classifier.State() != TopAbs_IN:
+                logger.info(
+                    "Hole at %s already void (baked into a profile); "
+                    "skipping nudge", np.round(center, 1).tolist(),
+                )
+                return None
+        except Exception:
+            pass
 
         # Find the nearest point on the solid surface to the hole center
         vertex = BRepBuilderAPI_MakeVertex(
@@ -2637,6 +2674,15 @@ def _build_stepwise(
                 for c_each in centers_all:
                     shift = c_each - center
                     sketch_plane_origin = np.asarray(cut_start + shift, dtype=float)
+                    # Draw each sketch circle AT its hole (the wall's
+                    # axial midpoint), not at the cut start — a through
+                    # cut starts at the solid's far bbox face, which put
+                    # tab-hole sketches 85mm away from the tab.
+                    sketch_plane_origin = (
+                        sketch_plane_origin
+                        + (float(np.asarray(c_each) @ h_dir)
+                           - float(sketch_plane_origin @ h_dir)) * h_dir
+                    )
                     prev_pt = None
                     for k in range(N_SAMPLES + 1):
                         theta = 2 * np.pi * k / N_SAMPLES

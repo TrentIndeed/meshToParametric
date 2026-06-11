@@ -152,7 +152,7 @@ def build_clusters(cleaned, single_body: bool = False):
     for root, mem in proto.items():
         pv = np.vstack([m["verts"] for m in mem])
         axis, loop = proto_axis_loop(pv)
-        if not loop or axis is None or len(mem) < 2:
+        if len(mem) < 2:
             continue
         if len({m["body"] for m in mem}) > 1:
             continue
@@ -160,7 +160,18 @@ def build_clusters(cleaned, single_body: bool = False):
         thin = int(np.argmin(dims))
         if dims[thin] > 30:
             continue
-        mid = 0.5 * (pv.min(0)[thin] + pv.max(0)[thin])
+        if loop and axis is not None:
+            mid = 0.5 * (pv.min(0)[thin] + pv.max(0)[thin])
+        else:
+            # Non-loop: split only on a clear bimodal gap (two parallel
+            # bands separated by plate thickness) — mirrors job_queue.
+            vt = np.sort(pv[:, thin])
+            gaps = np.diff(vt)
+            gi = int(np.argmax(gaps))
+            frac_low = (gi + 1) / len(vt)
+            if gaps[gi] < 1.5 or not (0.15 < frac_low < 0.85):
+                continue
+            mid = 0.5 * (float(vt[gi]) + float(vt[gi + 1]))
         for m in mem:
             m["side"] = 0 if m["verts"].mean(0)[thin] < mid else 1
 

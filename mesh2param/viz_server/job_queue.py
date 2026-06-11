@@ -625,8 +625,15 @@ class JobQueue:
         def _set_body_viz(body_colors_list):
             """Unified viz for one or more bodies. Each entry is (body, sub_cleaned, face_colors).
             Single body: renders on its own mesh. Multi body: renders each as a piece."""
+            # Clear the PREVIOUS stage's overlays — leftover edge overlays
+            # (topology) and piece renders (decompose) stacked under the
+            # new stage's colors (the stitched-fillets view rendered on
+            # top of the primitive-fits visual).
+            job.progress_edges = None
+            job.progress_edge_colors = None
             if len(body_colors_list) == 1:
                 body, sub_cleaned, fc = body_colors_list[0]
+                job._decomp_pieces = None
                 _set_mesh_viz(sub_cleaned, face_colors=fc)
             else:
                 pieces = []
@@ -1421,12 +1428,11 @@ class JobQueue:
                 proto_axis, proto_is_loop = _proto_cluster_axis_and_loop(
                     proto_verts
                 )
-                if not proto_is_loop or proto_axis is None:
-                    continue
-                for m in members_:
-                    m["is_closed_loop"] = True
-                    if m.get("category") == "curve_edge":
-                        m["category"] = "hole_edge"
+                if proto_is_loop and proto_axis is not None:
+                    for m in members_:
+                        m["is_closed_loop"] = True
+                        if m.get("category") == "curve_edge":
+                            m["category"] = "hole_edge"
                 # Opposite-plate-face split. The rule the user
                 # asked for: fillets on opposite sides of a plate
                 # must NEVER share a cluster, no matter how close
@@ -1470,8 +1476,28 @@ class JobQueue:
                     float(proto_min[thin_axis])
                     + float(proto_max[thin_axis])
                 )
+                if proto_is_loop:
+                    split_at = midplane
+                else:
+                    # NON-loop proto clusters split too, but only on a
+                    # clear BIMODAL gap in the vertex distribution along
+                    # the thin axis: RackMount's +X plate rim creases
+                    # (inner face, outer face, bridged by the base-
+                    # junction band) merged into one 13-record group
+                    # because the rim ring's angular coverage gap was
+                    # 91 deg — one degree past the loop test. Two
+                    # parallel bands separated by plate thickness show a
+                    # >=1.5mm void in the histogram; an L-band that
+                    # legitimately spans the thin dim does not.
+                    vt = np.sort(proto_verts[:, thin_axis])
+                    gaps = np.diff(vt)
+                    gi = int(np.argmax(gaps))
+                    frac_low = (gi + 1) / len(vt)
+                    if gaps[gi] < 1.5 or not (0.15 < frac_low < 0.85):
+                        continue
+                    split_at = 0.5 * (float(vt[gi]) + float(vt[gi + 1]))
                 side_a = {
-                    i for i, v in enumerate(rec_thin) if v < midplane
+                    i for i, v in enumerate(rec_thin) if v < split_at
                 }
                 side_b = set(range(len(members_))) - side_a
                 if not side_a or not side_b:

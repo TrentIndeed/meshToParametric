@@ -81,16 +81,40 @@ def test_rackmount_fidelity_vs_reference(rackmount_result):
 
 @pytest.mark.slow
 def test_rackmount_hole_inventory(rackmount_result):
-    """Exactly the reference's holes: one 2x r~14.5 side-bore pattern and
-    one 4x r~4 tab-hole pattern — no phantoms, no fabrications, no
-    sideways relief tunnels."""
+    """Exactly the reference's holes, verified GEOMETRICALLY: each side
+    plate carries its r~14.5 bore (baked into the join profile — no
+    duplicate drill step, no phantom offset bore), and the four tab
+    holes drill as one pattern."""
+    import trimesh
+
     _, res, _, _ = rackmount_result
     hole_steps = [
         s.name for s in res.construction_steps
         if "Hole" in s.name and not s.name.startswith("Sketch")
     ]
-    assert len(hole_steps) == 2, f"hole steps: {hole_steps}"
-    big = [n for n in hole_steps if "r=14.5" in n and "2" in n]
-    small = [n for n in hole_steps if "r=4.0" in n and "4" in n]
-    assert big, f"missing 2x r=14.5 side bores: {hole_steps}"
-    assert small, f"missing 4x r=4.0 tab holes: {hole_steps}"
+    assert len(hole_steps) == 1, f"hole steps: {hole_steps}"
+    assert "r=4.0" in hole_steps[0] and "4" in hole_steps[0], hole_steps
+
+    final = res.construction_steps[-1]
+    solid = trimesh.Trimesh(
+        vertices=final.tess_vertices, faces=final.tess_faces, process=True,
+    )
+    # Section through each side plate: exactly one bore ring at the
+    # reference position (125.5, -133.4), r~14.5 — and no second ring.
+    for x_plate in (42.5, -40.5):
+        section = solid.section(
+            plane_origin=[x_plate, 0, 0], plane_normal=[1, 0, 0],
+        )
+        assert section is not None
+        rings = []
+        for ring in section.discrete:
+            ctr = ring.mean(axis=0)
+            span = np.ptp(ring[:, 1])
+            if 20 < span < 40:  # bore-sized loop
+                rings.append((ctr[1], ctr[2], span / 2))
+        assert len(rings) == 1, (
+            f"plate x={x_plate}: expected exactly 1 bore ring, got {rings}"
+        )
+        cy, cz, r_est = rings[0]
+        assert abs(cy - 125.5) < 2.0 and abs(cz - -133.4) < 2.0, rings
+        assert abs(r_est - 14.5) < 1.5, rings

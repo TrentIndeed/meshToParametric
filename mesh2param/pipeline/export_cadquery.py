@@ -1284,11 +1284,26 @@ def _extract_profile_and_holes(
                     hole_center_3d = np.zeros(3)
                     hole_center_3d[ax_u] = c_2d.x
                     hole_center_3d[ax_v] = c_2d.y
-                    # Use the body's midpoint along the extrude axis
-                    hole_center_3d[primary_axis] = (
-                        float(cleaned.bbox[0][primary_axis]) +
-                        float(cleaned.bbox[1][primary_axis])
-                    ) / 2
+                    # The hole's LOCAL axial midpoint (its sketch draws
+                    # here) — the global bbox midpoint put tab-hole
+                    # sketches 40mm below the tabs they pierce.
+                    _cb_d = np.linalg.norm(
+                        np.column_stack([
+                            cleaned.vertices[:, ax_u] - c_2d.x,
+                            cleaned.vertices[:, ax_v] - c_2d.y,
+                        ]), axis=1,
+                    )
+                    _cb_nb = _cb_d < est_radius * 3.0
+                    if _cb_nb.any():
+                        _cb_ax = cleaned.vertices[_cb_nb, primary_axis]
+                        hole_center_3d[primary_axis] = (
+                            float(_cb_ax.min()) + float(_cb_ax.max())
+                        ) / 2.0
+                    else:
+                        hole_center_3d[primary_axis] = (
+                            float(cleaned.bbox[0][primary_axis])
+                            + float(cleaned.bbox[1][primary_axis])
+                        ) / 2.0
 
                     # PIERCE CHECK: a 2D ring is only a through-hole if
                     # the bore is VOID just inside BOTH faces of the
@@ -1575,7 +1590,11 @@ def _clean_engine_polygon(
         p = _CP([(float(a), float(b)) for a, b in pts])
         if not p.is_valid:
             p = p.buffer(0)
-        p = p.simplify(tolerance, preserve_topology=True)
+        # Repair + light dedupe ONLY. Aggressive simplification flattened
+        # the mesh-traced corner ARCS into sharp corners (297 -> 11 pts),
+        # so _draw_profile_with_arcs had nothing to rebuild and the
+        # stitched outline-fillet clusters found no edge within snap.
+        p = p.simplify(0.05, preserve_topology=True)
         if not p.is_valid:
             p = p.buffer(0)
         if p.is_empty:
@@ -2625,6 +2644,60 @@ def _build_stepwise(
             # Start the cut slightly outside the entry surface.
             cut_start = center - h_dir * (h_depth / 2) - h_dir * 1.0
             cut_length = h_depth + 2.0
+
+        # Drop centers whose bore ALREADY exists in the current solid
+        # (baked into a join/base profile as an interior ring) — drilling
+        # them again added duplicate no-op sketch+cut steps to the
+        # timeline after the join already showed the hole.
+        try:
+            from OCP.BRepClass3d import BRepClass3d_SolidClassifier as _HoleCls
+            from OCP.gp import gp_Pnt as _HolePnt
+            from OCP.TopAbs import TopAbs_IN as _HoleIn
+            still_solid = []
+            solid_shape = wp.val().wrapped
+            for c_each in centers_all:
+                c_arr = np.asarray(c_each, dtype=float)
+                c_ax = float(c_arr @ h_dir)
+                half = max(float(h_depth) / 2.0 - 1.0, 0.5)
+                # Probe SEVERAL stations along the bore: a stepped tab
+                # hole's midpoint sits in its relief counterbore (already
+                # void) while the bore above is still solid — a single
+                # mid probe skipped 3 of the 4 tab holes.
+                any_solid = False
+                # Tight near-center offsets too: grouped 2D holes carry
+                # depth = full part extent, so half-depth probes overshoot
+                # a 10mm tab entirely and land in air on both sides.
+                for off in (
+                    -half, -half / 2, -2.0, -1.0, 0.0, 1.0, 2.0,
+                    half / 2, half,
+                ):
+                    pt = c_arr + (off) * h_dir
+                    cls = _HoleCls(
+                        solid_shape,
+                        _HolePnt(float(pt[0]), float(pt[1]), float(pt[2])),
+                        1e-6,
+                    )
+                    if cls.State() == _HoleIn:
+                        any_solid = True
+                        break
+                if any_solid:
+                    still_solid.append(c_each)
+            if not still_solid:
+                logger.info(
+                    "Skipping hole feature r=%.2f: all %d bore(s) already "
+                    "exist (baked into profiles)", radius, len(centers_all),
+                )
+                continue
+            if len(still_solid) < len(centers_all):
+                logger.info(
+                    "Hole r=%.2f: %d of %d bores already baked; drilling "
+                    "the rest", radius, len(centers_all) - len(still_solid),
+                    len(centers_all),
+                )
+                centers_all = still_solid
+                center = centers_all[0]
+        except Exception:
+            pass
 
         n_holes = len(centers_all)
         if n_holes > 1:

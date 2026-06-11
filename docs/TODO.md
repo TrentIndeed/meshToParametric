@@ -43,10 +43,14 @@
   ~6s) with no progress updates — the silent window reads as a hang in the
   UI. Profile the build (likely the ~100-segment circle polyline extrude +
   per-feature passes) and emit progress heartbeats during stage 6.
-- [ ] **Multi-body test harness**: `test_step_comparison._run_pipeline` uses the
-  single-body path, so RackMount (multi-body) gates are xfailed. Port the
-  decompose + per-body-tree + stitched-clusters path into the harness so Mesh5
-  compares against its reference fairly.
+- [x] Multi-body test harness: tests/test_multibody.py (slow) runs RackMount
+  through decompose -> per-body -> stitched clusters -> production
+  export_cadquery, locking 3-body decomposition, 12/12 fillet apply
+  (match_ratio 1.0), volume < 10%, the 4-hole bottom-plate pattern grouping,
+  and whole-mm fillet radii. Guards the most-iterated subsystem (fillet/apply)
+  against silent regression.
+- [ ] test_step_comparison Mesh5 gates remain xfailed (single-body harness);
+  could fold the multibody helper into that comparison to un-xfail them.
 - [ ] **Mesh3 Front Plate rebuild is +36.7% volume, 72% bbox overlap vs its
   reference** (single-body part, so this is a real reconstruction failure —
   likely the same fragmented-section profile-extraction issue below).

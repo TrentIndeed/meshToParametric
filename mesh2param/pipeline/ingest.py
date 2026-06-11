@@ -59,6 +59,11 @@ def ingest_mesh(
         mesh = _decimate(mesh, config.max_faces)
         mesh = _fix_normals(mesh)
         mesh = _fill_holes(mesh, config.max_hole_edges)
+        # Ragged scans still have large open boundaries small-hole filling
+        # can't close. Screened-Poisson reconstruction (scan input only)
+        # closes them so the part has a real volume downstream.
+        if config.poisson_reconstruct and not mesh.is_watertight:
+            mesh = _poisson_reconstruct(mesh, config)
     except Exception:
         logger.exception(
             "Stage 1 failed during mesh cleanup: file=%s, verts=%d, faces=%d",
@@ -288,6 +293,57 @@ def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:
         return mesh
     except Exception as e:
         logger.warning("Decimation failed (%s) — using original mesh", e)
+        return mesh
+
+
+def _poisson_reconstruct(mesh: trimesh.Trimesh, config: IngestConfig) -> trimesh.Trimesh:
+    """Screened-Poisson surface reconstruction to close a ragged scan.
+
+    Runs only on non-watertight input (the caller gates this). Poisson
+    fits a smooth closed surface to the mesh's points+normals, sealing
+    large open boundaries that small-hole filling can't. The result is
+    re-decimated back to the face cap. Returns the original mesh on any
+    failure or if the result isn't actually watertight (don't trade a
+    valid open mesh for a broken closed one).
+    """
+    try:
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=np.asarray(mesh.vertices),
+            face_matrix=np.asarray(mesh.faces),
+        ))
+        ms.generate_surface_reconstruction_screened_poisson(
+            depth=int(config.poisson_depth), preclean=True,
+        )
+        if config.max_faces > 0:
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=int(config.max_faces),
+                preservenormal=True, planarquadric=True, qualitythr=0.3,
+            )
+        out = ms.current_mesh()
+        recon = trimesh.Trimesh(
+            vertices=np.asarray(out.vertex_matrix()),
+            faces=np.asarray(out.face_matrix()),
+            process=True,
+        )
+        if len(recon.faces) == 0 or not recon.is_watertight:
+            logger.warning(
+                "Poisson reconstruction did not yield a watertight mesh "
+                "(%d faces) — keeping the original open mesh",
+                len(recon.faces),
+            )
+            return mesh
+        logger.info(
+            "Poisson reconstruction: %d -> %d faces, now watertight",
+            len(mesh.faces), len(recon.faces),
+        )
+        return recon
+    except ImportError:
+        logger.warning("pymeshlab not installed — cannot Poisson-reconstruct scan")
+        return mesh
+    except Exception as e:
+        logger.warning("Poisson reconstruction failed (%s) — keeping original", e)
         return mesh
 
 

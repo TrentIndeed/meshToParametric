@@ -17,6 +17,15 @@ class IngestConfig(BaseModel):
     # collapse). Scans arrive at 300K-2.5M faces; segmentation cost is
     # superlinear in faces, so cap before Stage 2. 0 disables.
     max_faces: int = 30_000
+    # Screened-Poisson surface reconstruction for ragged scan input. Only
+    # runs when the cleaned mesh is NOT watertight after normal repair —
+    # clean CAD meshes are left untouched, because Poisson SMOOTHS the
+    # surface and would round sharp prismatic edges. Closing the open
+    # boundaries of a scan gives it a real volume, which the
+    # average-cross-section base-profile principle and the volume metric
+    # both need. Uses pymeshlab's built-in filter (already a dependency).
+    poisson_reconstruct: bool = True
+    poisson_depth: int = 8
     # Scale normalization: the pipeline's absolute thresholds (snap
     # tolerances, fillet radii, plate-thickness checks) are tuned for
     # mm-scale parts with a bbox diagonal around 100-500. Parts far

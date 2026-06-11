@@ -90,16 +90,18 @@
   82s -> 33s. CAD meshes (<cap) are unaffected.
 - [x] Scan smoke tests (tests/test_scans.py, slow-marked): all 3 scans
   decimate to the cap and run stages 1-5 without crashing, ingest < 120s.
-- [ ] **Scan reconstruction quality is poor (volume err 100-1000%)** and this
-  is fundamental, not a quick bug: all 3 scans are NON-WATERTIGHT organic
-  geometry. Consequences: (a) no mesh volume, so the average-cross-section
-  base-profile principle can't engage (falls back to largest slice ->
-  over-extrude); (b) volume_error uses the inflated convex-hull estimate.
-  Real fix needs surface reconstruction (Poisson / alpha-wrap) to close the
-  large open boundaries BEFORE the parametric stages — pymeshlab
-  close_holes(maxhole=300) did NOT make them watertight. Until then, scans
-  belong on the /clean cleaner+resize path, not full parametric (the
-  complexity meter already routes organic meshes there).
+- [x] Scans made watertight via screened-Poisson reconstruction
+  (pymeshlab, already a dependency; IngestConfig.poisson_reconstruct).
+  Gated on non-watertight input ONLY — clean CAD meshes are untouched
+  because Poisson smooths/rounds sharp edges. All 3 scans -> watertight
+  in 1-4s; volume errors dropped Scan1 1002%->173%, Scan2 157%->134%,
+  Scan3 112%->74% (now a real-volume comparison, not inflated convex
+  hull). Smoke test asserts watertight after ingest.
+- [ ] **Residual scan volume error is still 74-173%** — the organic-part
+  ceiling: Poisson makes a spanner watertight, not prismatic. The genuinely
+  prismatic scan (Scan2 Industrial Part) is the best candidate for further
+  work; truly organic shapes (spanner) belong on /clean. No reference STEPs
+  for scans, so accuracy is volume-only.
 
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet

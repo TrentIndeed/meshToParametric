@@ -47,6 +47,12 @@ def test_scan_decimates_and_runs(name, path):
     assert cleaned.num_faces <= cfg.max_faces * 1.1, (
         f"{name}: {cleaned.num_faces} faces exceeds cap {cfg.max_faces}"
     )
+    # Poisson reconstruction (on by default) must leave scans watertight,
+    # so the downstream volume metric and average-cross-section base
+    # profile have a real volume to work with.
+    assert cleaned.is_watertight, (
+        f"{name}: not watertight after ingest (Poisson reconstruction failed)"
+    )
     # Ingest (load + 2-stage decimate) must stay bounded even for 2.5M-face
     # scans — the clustering pre-pass keeps it well under two minutes.
     assert ingest_s < 120, f"{name}: ingest took {ingest_s:.0f}s"

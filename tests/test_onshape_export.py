@@ -129,10 +129,11 @@ def test_join_y_axis_sign_conventions():
     cp = next(pf for pf in plan.features if pf.name == "Extrude Join 1 plane")
     ex = next(pf for pf in plan.features if pf.name == "Extrude Join 1")
     pcp = {x["parameterId"]: x for x in cp.btm["parameters"]}
-    # world y=+40 on the Front plane (normal -Y): positive offset with
+    # span lo 40 + origin shift (+20 on Y, from bbox lo -20) = world
+    # y=+60 on the Front plane (normal -Y): positive offset with
     # oppositeDirection=True (negative offset expressions are rejected
     # by the feature spec)
-    assert pcp["offset"]["expression"].startswith("40.")
+    assert pcp["offset"]["expression"].startswith("60.")
     assert pcp["oppositeDirection"]["value"] is True
     pex = {x["parameterId"]: x for x in ex.btm["parameters"]}
     # extruding toward +Y from a Front-derived plane needs the flip
@@ -194,7 +195,8 @@ def test_as_built_overrides_tree_holes_and_adds_blends():
         if p["parameterId"] == "entities"
     )["queries"][0]["queryString"]
     assert qs.count("qClosestTo") == 2
-    assert "vector(1.0000, 2.0000, 3.0000)" in qs
+    # midpoints carry the origin shift (+10, +20, 0 from bbox lo)
+    assert "vector(11.0000, 22.0000, 3.0000)" in qs
     cham_pf = next(pf for pf in plan.features if "Chamfer" in pf.name)
     assert cham_pf.btm["featureType"] == "chamfer"
     assert not any("FILLET" in s for s in plan.skipped)

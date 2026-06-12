@@ -57,6 +57,12 @@ class PlannedFeature:
     plane_dep: int | None = None   # index into the plan list
     sketch_dep: int | None = None  # index into the plan list
     feature_id: str = ""           # filled in as features are created
+    # Fallback definitions tried in order when the primary errors (the
+    # errored feature is deleted first). Used for blends: an explicit
+    # edge set Parasolid refuses often applies as a single seed edge
+    # with tangent propagation (RackMount's outer ring chains — which
+    # even OCC could only partially roll — apply COMPLETELY this way).
+    retry_btms: list = field(default_factory=list)
 
 
 @dataclass
@@ -147,6 +153,115 @@ def _ring_entities(prefix: str, pts_mm: list) -> list[dict]:
     return _polygon_entities(prefix, pts)
 
 
+def _arc_entity(eid: str, cx: float, cy: float, r: float,
+                a0: float, a1: float) -> dict:
+    """Arc segment: CCW from angle a0 to a1 (radians from +x at the
+    center). clockwise=True is rejected by the extrude (probe6); a CW
+    arc is expressed by swapping the angles."""
+    return {
+        "btType": "BTMSketchCurveSegment-155",
+        "entityId": eid,
+        "startPointId": f"{eid}.start",
+        "endPointId": f"{eid}.end",
+        "startParam": a0,
+        "endParam": a1,
+        "geometry": {
+            "btType": "BTCurveGeometryCircle-115",
+            "radius": r, "xCenter": cx, "yCenter": cy,
+            "xDir": 1.0, "yDir": 0.0, "clockwise": False,
+        },
+    }
+
+
+def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
+    """Outer-profile entities with EXACT tangent corner arcs.
+
+    Mesh-derived profiles arrive with corner radii sampled as chains of
+    short kinked segments. CadQuery collapses them to sharp corners +
+    radii (_sharp_polygon_with_fillets) and rebuilds exact tangent arcs
+    with MakeFillet2d; drawing the sampled polygon here instead left
+    the Onshape body with different edges near every corner, and the
+    side plates' outline ring fillets failed on the mismatched chains.
+    This computes the same tangent arcs analytically (for straight-line
+    corners the construction is identical to MakeFillet2d): tangent
+    length r/tan(phi/2) along each leg, center on the bisector at
+    r/sin(phi/2).
+    """
+    pts = _clean_polygon(pts_mm)
+    sharp = fillets = None
+    try:
+        from mesh2param.pipeline.export_cadquery import (
+            _sharp_polygon_with_fillets,
+        )
+        sharp, fillets = _sharp_polygon_with_fillets(pts)
+    except Exception:
+        logger.debug("Sharp-corner reconstruction failed", exc_info=True)
+    if not sharp or not fillets:
+        return _polygon_entities(prefix, pts)
+
+    P = np.asarray(sharp, dtype=float) / 1000.0  # meters
+    n = len(P)
+    # Per-vertex tangent trim distances (0 for sharp vertices).
+    node_pts: list[tuple] = []  # (entry_pt, exit_pt, arc or None)
+    for i in range(n):
+        V = P[i]
+        r_mm = fillets.get(i)
+        if not r_mm:
+            node_pts.append((V, V, None))
+            continue
+        r = float(r_mm) / 1000.0
+        a = P[(i - 1) % n] - V
+        b = P[(i + 1) % n] - V
+        la, lb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        if la < 1e-9 or lb < 1e-9:
+            node_pts.append((V, V, None))
+            continue
+        a, b = a / la, b / lb
+        cos_phi = float(np.clip(a @ b, -1.0, 1.0))
+        phi = float(np.arccos(cos_phi))
+        if phi < np.radians(10) or phi > np.radians(170):
+            node_pts.append((V, V, None))
+            continue
+        t = r / np.tan(phi / 2.0)
+        if t > 0.6 * min(la, lb):
+            # radius too big for the legs — keep the corner sharp
+            # rather than emit a self-intersecting outline
+            node_pts.append((V, V, None))
+            continue
+        T1 = V + a * t
+        T2 = V + b * t
+        C = V + (a + b) / np.linalg.norm(a + b) * (r / np.sin(phi / 2.0))
+        ang1 = float(np.arctan2(T1[1] - C[1], T1[0] - C[0]))
+        ang2 = float(np.arctan2(T2[1] - C[1], T2[0] - C[0]))
+        # minor arc from T1 to T2 (corner sweep is pi - phi < 170 deg):
+        # express CCW, swapping ends if the CCW sweep is the long way.
+        sweep = (ang2 - ang1) % (2.0 * np.pi)
+        if sweep > np.pi:
+            ang1, ang2 = ang2, ang1
+        if ang2 < ang1:
+            ang2 += 2.0 * np.pi
+        node_pts.append((T1, T2, (C, r, ang1, ang2)))
+
+    ents: list[dict] = []
+    for i in range(n):
+        _, exit_pt, _ = node_pts[i]
+        entry_next, _, arc_next = node_pts[(i + 1) % n]
+        d = entry_next - exit_pt
+        seg_len = float(np.linalg.norm(d))
+        if seg_len > 1e-9:
+            ents.append(_line(
+                f"{prefix}_l{i}", float(exit_pt[0]), float(exit_pt[1]),
+                float(d[0] / seg_len), float(d[1] / seg_len), 0.0, seg_len,
+            ))
+        if arc_next is not None:
+            C, r, a0, a1 = arc_next
+            ents.append(_arc_entity(
+                f"{prefix}_a{(i + 1) % n}", float(C[0]), float(C[1]),
+                float(r), a0, a1,
+            ))
+    return ents
+
+
 def _polygon_entities(prefix: str, pts_mm: list) -> list[dict]:
     """Closed polyline entities for one ring (mm -> meters)."""
     ents = []
@@ -234,7 +349,8 @@ def _cplane(name: str, axis_idx: int, position_mm: float,
 
 
 def _blend_feature(name: str, kind: str, size_mm: float,
-                   edge_midpoints_mm: list) -> dict:
+                   edge_midpoints_mm: list,
+                   tangent_propagation: bool = False) -> dict:
     """Fillet/chamfer with edges selected by closest-point queries.
 
     The Onshape rebuild is geometrically identical to the CadQuery
@@ -268,6 +384,12 @@ def _blend_feature(name: str, kind: str, size_mm: float,
             {"btType": "BTMParameterQuantity-147", "parameterId": "radius",
              "expression": f"{size_mm:.4f} mm"},
         )
+    if tangent_propagation:
+        params.append({
+            "btType": "BTMParameterBoolean-144",
+            "parameterId": "tangentPropagation",
+            "value": True,
+        })
     return {
         "btType": "BTMFeature-134",
         "featureType": "chamfer" if kind == "chamfer" else "fillet",
@@ -327,12 +449,13 @@ def _axis_of(direction) -> tuple[int, float]:
 
 
 def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
-                       op: str) -> bool:
+                       op: str, offset_mm: np.ndarray) -> bool:
     """Sketch+extrude for a base/join profile carried by the engine.
 
     sketch_geometry: {points: [[u,v]...] mm, span: [lo,hi] on the axis,
     inner: [rings], axis_idx (joins) — base derives axis from
-    feature.direction}.
+    feature.direction}. offset_mm translates the model so it builds at
+    the origin instead of wherever the scan happened to sit.
     """
     sg = feat.sketch_geometry or {}
     pts = sg.get("points")
@@ -344,16 +467,21 @@ def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
         ax = int(sg["axis_idx"])
     else:
         ax, _ = _axis_of(feat.direction)
-    lo, hi = float(span[0]), float(span[1])
+    u_ax, v_ax = UV_AXES[ax]
+    off_uv = np.array([offset_mm[u_ax], offset_mm[v_ax]])
+    pts = (np.asarray(pts, dtype=float) + off_uv).tolist()
+    lo = float(span[0]) + float(offset_mm[ax])
+    hi = float(span[1]) + float(offset_mm[ax])
 
     cp_idx = plan.add(PlannedFeature(
         name=f"{label} plane",
         btm=_cplane(f"{label} plane", ax, lo),
     ))
-    entities = _polygon_entities("outer", _clean_polygon(pts))
+    entities = _outline_entities("outer", pts)
     for ri, ring in enumerate(sg.get("inner") or []):
         if len(ring) >= 3:
-            entities += _ring_entities(f"inner{ri}", ring)
+            ring_s = (np.asarray(ring, dtype=float) + off_uv).tolist()
+            entities += _ring_entities(f"inner{ri}", ring_s)
     sk_idx = plan.add(PlannedFeature(
         name=f"{label} sketch",
         btm=_sketch(f"{label} sketch", _plane_param_created_by("PENDING"),
@@ -373,7 +501,7 @@ def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
 
 
 def _hole_cut(plan: OnshapePlan, feat: Feature, label: str,
-              bbox_mm: tuple) -> bool:
+              bbox_mm: tuple, offset_mm: np.ndarray) -> bool:
     sg = feat.sketch_geometry or {}
     radius = float(sg.get("radius", 0.0) or 0.0)
     centers = sg.get("centers") or (
@@ -383,6 +511,7 @@ def _hole_cut(plan: OnshapePlan, feat: Feature, label: str,
     if radius <= 0 or not centers:
         plan.skipped.append(f"{label}: no center/radius")
         return False
+    centers = (np.asarray(centers, dtype=float) + offset_mm).tolist()
     return _hole_cut_raw(
         plan, centers, radius, feat.direction,
         feat.type == FeatureType.THROUGH_HOLE, float(feat.depth),
@@ -452,15 +581,23 @@ def build_onshape_plan(feature_tree: FeatureTree,
     list becomes fillet/chamfer features with closest-point edge
     queries. Without as_built, blends are skipped and tree holes are
     used as-is.
+
+    The whole model is TRANSLATED so its bbox-min corner lands on the
+    origin — mesh coordinates are wherever the scanner/exporter put
+    them, and a part floating 100 mm from the origin reads as broken
+    in CAD (user request).
     """
     plan = OnshapePlan()
     features = list(feature_tree.features)
+    off = -np.asarray(bbox_mm[0], dtype=float)
+    size = np.asarray(bbox_mm[1], dtype=float) + off
+    bbox_shifted = (np.zeros(3), size)
 
     base = next(
         (f for f in features if f.type == FeatureType.BASE_EXTRUSION), None,
     )
     if base is not None:
-        _profile_extrusion(plan, base, "Extrude Base", "NEW")
+        _profile_extrusion(plan, base, "Extrude Base", "NEW", off)
     else:
         plan.skipped.append("no BASE_EXTRUSION in tree")
 
@@ -468,7 +605,7 @@ def build_onshape_plan(feature_tree: FeatureTree,
     for f in features:
         if f.type == FeatureType.BOSS and f.operation == "JOIN":
             n_join += 1
-            _profile_extrusion(plan, f, f"Extrude Join {n_join}", "ADD")
+            _profile_extrusion(plan, f, f"Extrude Join {n_join}", "ADD", off)
 
     n_hole = 0
     if as_built and as_built.get("holes"):
@@ -478,10 +615,11 @@ def build_onshape_plan(feature_tree: FeatureTree,
             kind = "Through" if h.get("through") else "Blind"
             label = (f"{kind} Hole {n_hole}" if n_c == 1
                      else f"{kind} Hole Pattern {n_hole} ({n_c}x)")
+            centers = (np.asarray(h["centers"], dtype=float) + off).tolist()
             _hole_cut_raw(
-                plan, h["centers"], float(h["radius"]), h["axis_dir"],
+                plan, centers, float(h["radius"]), h["axis_dir"],
                 bool(h.get("through")), float(h.get("depth", 0.0)),
-                label, bbox_mm,
+                label, bbox_shifted,
             )
     else:
         for f in features:
@@ -493,7 +631,7 @@ def build_onshape_plan(feature_tree: FeatureTree,
                         else "Blind")
                 label = (f"{kind} Hole {n_hole}" if n_c == 1
                          else f"{kind} Hole Pattern {n_hole} ({n_c}x)")
-                _hole_cut(plan, f, label, bbox_mm)
+                _hole_cut(plan, f, label, bbox_shifted, off)
 
     if as_built and as_built.get("blends"):
         # Emit in the exact order CadQuery applied them — each blend
@@ -508,12 +646,20 @@ def build_onshape_plan(feature_tree: FeatureTree,
             else:
                 n_f += 1
                 label = f"Fillet {n_f} (r={b['radius']:.0f}mm)"
+            mids = (np.asarray(b.get("edge_midpoints") or [], dtype=float)
+                    + off).tolist()
+            retries = []
+            if len(mids) > 1:
+                retries.append(_blend_feature(
+                    label, kind, float(b["radius"]), mids[:1],
+                    tangent_propagation=True,
+                ))
             plan.add(PlannedFeature(
                 name=label,
                 btm=_blend_feature(
-                    label, kind, float(b["radius"]),
-                    b.get("edge_midpoints") or [],
+                    label, kind, float(b["radius"]), mids,
                 ),
+                retry_btms=retries,
             ))
     else:
         for f in features:

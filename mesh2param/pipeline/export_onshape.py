@@ -446,6 +446,30 @@ def _live_export(
         except OnshapeApiError as exc:
             logger.warning("Feature %r rejected: %s", pf.name, exc)
             fid, ok = "", False
+        # Fallback ladder: delete the errored feature and try the next
+        # definition (blends retry as a single seed edge with tangent
+        # propagation — Parasolid rolls whole chains OCC couldn't).
+        if not ok and pf.retry_btms:
+            for ri, retry in enumerate(pf.retry_btms, 1):
+                if fid:
+                    try:
+                        client.delete_feature(did, wid, eid, fid)
+                    except OnshapeApiError:
+                        pass
+                try:
+                    fid, status = client.add_feature(did, wid, eid, retry)
+                    pf.feature_id = fid
+                    ok = status == "OK"
+                except OnshapeApiError as exc:
+                    logger.warning(
+                        "Feature %r retry %d rejected: %s", pf.name, ri, exc,
+                    )
+                    fid, ok = "", False
+                if ok:
+                    logger.info(
+                        "Feature %r applied via fallback %d", pf.name, ri,
+                    )
+                    break
         _log_call(pf.name, t, ok)
         if ok:
             n_ok += 1

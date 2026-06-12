@@ -4318,6 +4318,254 @@ def _detect_profile_arc_runs(pts: list) -> list[tuple[int, int]]:
     return runs
 
 
+def _sharp_polygon_with_fillets(pts: list):
+    """Collapse polygonized corner arcs to SHARP corners + radii.
+
+    Returns (sharp_pts, fillets) where fillets maps sharp-vertex index ->
+    radius, or (None, None) when the outline has no usable corner-arc
+    structure. Feeding these to OCC MakeFillet2d yields EXACTLY tangent
+    corner arcs; mesh-fitted threePointArc reconstructions leave
+    micro-kinks at arc/straight junctions that BRepFilletAPI refuses to
+    roll over (RackMount's 13-edge side-plate rim creases).
+    """
+    runs = _detect_profile_arc_runs(pts)
+    P = np.asarray(pts, dtype=float)
+    n = len(P)
+    if n < 6:
+        return None, None
+    in_run_member = set()
+    run_info = []
+    for (a, b) in runs:
+        idxs = []
+        j = a
+        while True:
+            idxs.append(j)
+            if j == b:
+                break
+            j = (j + 1) % n
+        runP = P[idxs]
+        A = np.c_[2 * runP[:, 0], 2 * runP[:, 1], np.ones(len(runP))]
+        try:
+            sol, *_ = np.linalg.lstsq(A, (runP**2).sum(axis=1), rcond=None)
+        except np.linalg.LinAlgError:
+            return None, None
+        cx, cy = float(sol[0]), float(sol[1])
+        cr = float(np.sqrt(max(sol[2] + cx**2 + cy**2, 0.0)))
+        if cr < 0.3 or cr > 60.0:
+            return None, None
+        prev_i = (idxs[0] - 1) % n
+        next_i = (idxs[-1] + 1) % n
+        p0, p1 = P[prev_i], P[idxs[0]]
+        q0, q1 = P[idxs[-1]], P[next_i]
+        d1 = p1 - p0
+        d2 = q1 - q0
+        denom = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(denom) < 1e-9:
+            return None, None
+        t = ((q0[0] - p0[0]) * d2[1] - (q0[1] - p0[1]) * d2[0]) / denom
+        corner = p0 + t * d1
+        if np.hypot(corner[0] - cx, corner[1] - cy) > 3.5 * cr:
+            return None, None
+        run_info.append((idxs, corner, cr))
+        in_run_member.update(idxs)
+
+    # SECOND PASS — tight corner chains. Small-radius corners (r~2 at
+    # ~1.5mm sampling) turn >40 deg per vertex, past the arc detector's
+    # cap, and survive as raw 2-3 segment fragments with kinked
+    # junctions — exactly the sliver pairs that break the rim fillet.
+    # Detect sign-consistent chains of sharp short turns and treat them
+    # as fillet corners too.
+    seg = np.roll(P, -1, axis=0) - P
+    L = np.linalg.norm(seg, axis=1)
+    D = seg / (L[:, None] + 1e-12)
+    Dp = np.roll(D, 1, axis=0)
+    cosv = np.clip(np.einsum("ij,ij->i", Dp, D), -1.0, 1.0)
+    crossv = Dp[:, 0] * D[:, 1] - Dp[:, 1] * D[:, 0]
+    turn = np.arctan2(crossv, cosv)
+    tight = (
+        (np.abs(turn) >= np.radians(25.0))
+        & (np.abs(turn) <= np.radians(80.0))
+        & (L < 4.0) & (np.roll(L, 1) < 4.0)
+    )
+    visited2 = set(in_run_member)
+    for (a, b) in runs:
+        visited2.add(a)
+    k = 0
+    while k < n:
+        if k in visited2 or not tight[k]:
+            k += 1
+            continue
+        chain = [k]
+        j = (k + 1) % n
+        while (
+            j not in visited2 and tight[j]
+            and np.sign(turn[j]) == np.sign(turn[k])
+            and len(chain) < 4
+        ):
+            chain.append(j)
+            j = (j + 1) % n
+        total_turn = float(np.abs(turn[list(chain)]).sum())
+        if total_turn < np.radians(35.0) or total_turn > np.radians(150.0):
+            k += 1
+            continue
+        prev_i = (chain[0] - 1) % n
+        next_i = (chain[-1] + 1) % n
+        p0, p1 = P[prev_i], P[chain[0]]
+        q0, q1 = P[chain[-1]], P[next_i]
+        d1 = p1 - p0
+        d2 = q1 - q0
+        denom = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(denom) < 1e-9:
+            k += 1
+            continue
+        t = ((q0[0] - p0[0]) * d2[1] - (q0[1] - p0[1]) * d2[0]) / denom
+        corner = p0 + t * d1
+        # Tangent-circle radius through the chain's first point: the
+        # clipped vertex approximates the tangency point, which sits
+        # r/tan(theta/2) before the sharp corner (theta = total turn).
+        d_clip = float(np.linalg.norm(P[chain[0]] - corner))
+        r_est = d_clip * np.tan(total_turn / 2.0)
+        if not (0.3 <= r_est <= 30.0):
+            k += 1
+            continue
+        run_info.append((list(chain), corner, float(r_est)))
+        in_run_member.update(chain)
+        for ci in chain:
+            visited2.add(ci)
+        k += 1
+
+    if not run_info:
+        return None, None
+
+    sharp_pts = []
+    fillets = {}
+    handled = set()
+    i = 0
+    while i < n:
+        if i in in_run_member:
+            run = next(r for r in run_info if i in r[0])
+            key = id(run)
+            if key not in handled:
+                handled.add(key)
+                fillets[len(sharp_pts)] = float(run[2])
+                sharp_pts.append((float(run[1][0]), float(run[1][1])))
+            i += 1
+            continue
+        sharp_pts.append((float(P[i][0]), float(P[i][1])))
+        i += 1
+    if len(sharp_pts) < 3 or not fillets:
+        return None, None
+    return sharp_pts, fillets
+
+
+def _draw_exact_corner_arcs(wp2d, sharp_pts, fillets):
+    """Draw the profile via OCC MakeFillet2d, re-expressed as NATIVE
+    CadQuery moveTo/lineTo/threePointArc commands.
+
+    MakeFillet2d generates corner arcs EXACTLY tangent to their flanking
+    straights. We then walk the resulting wire IN ORDER and re-draw it
+    with stock workplane primitives, sampling each edge's exact curve
+    points — so the workplane's pending-wire bookkeeping stays
+    completely stock (a previous attempt that pushed the OCC wire onto
+    the stack corrupted downstream step tessellation).
+    """
+    import cadquery as cq
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet2d
+    from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
+    from OCP.TopAbs import TopAbs_REVERSED, TopAbs_VERTEX
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    plane = wp2d.plane
+    tmp = cq.Workplane(plane).polyline(sharp_pts).close()
+    wire = tmp.ctx.pendingWires[-1]
+    face_builder = BRepBuilderAPI_MakeFace(wire.wrapped, True)
+    if not face_builder.IsDone():
+        raise RuntimeError("face build failed")
+    face = face_builder.Face()
+    mk = BRepFilletAPI_MakeFillet2d(face)
+    targets = []
+    for vi, rad in fillets.items():
+        loc3 = plane.toWorldCoords(sharp_pts[vi])
+        targets.append((np.array([loc3.x, loc3.y, loc3.z]), rad))
+    seen = set()
+    n_added = 0
+    exp = TopExp_Explorer(face, TopAbs_VERTEX)
+    while exp.More():
+        v = TopoDS.Vertex_s(exp.Current())
+        pnt = BRep_Tool.Pnt_s(v)
+        key = (round(pnt.X(), 4), round(pnt.Y(), 4), round(pnt.Z(), 4))
+        if key not in seen:
+            seen.add(key)
+            wpt = np.array([pnt.X(), pnt.Y(), pnt.Z()])
+            for tpos, rad in targets:
+                if np.linalg.norm(wpt - tpos) < 0.2:
+                    mk.AddFillet(v, rad)
+                    n_added += 1
+                    break
+        exp.Next()
+    if n_added == 0:
+        raise RuntimeError("no fillet vertices matched")
+    mk.Build()
+    if not mk.IsDone():
+        raise RuntimeError("MakeFillet2d failed")
+    out_face = TopoDS.Face_s(mk.Shape())
+    out_wire = BRepTools.OuterWire_s(out_face)
+
+    # Walk the wire in order, sampling exact curve points
+    def _local(p3):
+        lp = plane.toLocalCoords(cq.Vector(p3.X(), p3.Y(), p3.Z()))
+        return (float(lp.x), float(lp.y))
+
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+
+    segments = []  # ("line", end) | ("arc", mid, end)
+    wexp = BRepTools_WireExplorer(out_wire)
+    start_pt = None
+    while wexp.More():
+        edge = wexp.Current()
+        crv = BRepAdaptor_Curve(edge)
+        ufirst, ulast = crv.FirstParameter(), crv.LastParameter()
+        if edge.Orientation() == TopAbs_REVERSED:
+            ufirst, ulast = ulast, ufirst
+        p_first = crv.Value(ufirst)
+        p_mid = crv.Value(0.5 * (ufirst + ulast))
+        p_last = crv.Value(ulast)
+        if start_pt is None:
+            start_pt = _local(p_first)
+        chord = np.hypot(
+            p_last.X() - p_first.X(), p_last.Y() - p_first.Y(),
+        ) + abs(p_last.Z() - p_first.Z())
+        mid_dev = np.linalg.norm(
+            np.array([p_mid.X(), p_mid.Y(), p_mid.Z()])
+            - 0.5 * (
+                np.array([p_first.X(), p_first.Y(), p_first.Z()])
+                + np.array([p_last.X(), p_last.Y(), p_last.Z()])
+            )
+        )
+        if mid_dev < 1e-6 * max(chord, 1.0) + 1e-7:
+            segments.append(("line", _local(p_last)))
+        else:
+            segments.append(("arc", _local(p_mid), _local(p_last)))
+        wexp.Next()
+    if start_pt is None or len(segments) < 3:
+        raise RuntimeError("wire walk produced no segments")
+
+    wp = wp2d.moveTo(*start_pt)
+    for seg in segments[:-1]:
+        if seg[0] == "line":
+            wp = wp.lineTo(*seg[1])
+        else:
+            wp = wp.threePointArc(seg[1], seg[2])
+    # Final segment returns to start: draw it then close.
+    last = segments[-1]
+    if last[0] == "arc":
+        wp = wp.threePointArc(last[1], last[2])
+    return wp.close()
+
+
 def _draw_profile_with_arcs(wp2d, pts: list):
     """Draw a closed profile, rebuilding polygonized corner arcs as true
     arcs (threePointArc) so the solid gets ONE arc edge per outline
@@ -4328,6 +4576,19 @@ def _draw_profile_with_arcs(wp2d, pts: list):
     Falls back to a plain polyline on any irregularity.
     """
     try:
+        # Preferred: EXACT tangent corner arcs (OCC MakeFillet2d on a
+        # sharp polygon, re-drawn with native workplane commands).
+        # Mesh-fitted arcs leave micro-kinks that block downstream rim
+        # fillets (RackMount's 13-edge creases).
+        try:
+            sharp_pts, corner_fillets = _sharp_polygon_with_fillets(pts)
+            if sharp_pts is not None:
+                return _draw_exact_corner_arcs(
+                    wp2d, sharp_pts, corner_fillets,
+                )
+        except Exception as exc:
+            logger.debug("Exact corner arcs failed (%s); falling back", exc)
+
         runs = _detect_profile_arc_runs(pts)
         if not runs:
             # Finely sampled circles turn <4 degrees per vertex and form
@@ -5050,8 +5311,31 @@ def _apply_recognized_fillets_to_solid(
                 vol_after = abs(float(wp_test.val().Volume()))
                 if vol_after <= 0 or vol_after > vol_before * 1.05:
                     continue
+                # OCC can report SUCCESS while emitting a broken shell:
+                # rolling RackMount's outer-face ring returned a sane
+                # B-rep volume but a self-intersecting, non-watertight
+                # shape whose tessellation inverted (and poisoned every
+                # later step). Verify the result by SIGNED tessellation
+                # volume before accepting the bucket.
+                v, f = _tessellate_solid(wp_test, fast=True)
+                _va = np.asarray(v, dtype=float)
+                _fa = np.asarray(f, dtype=np.int64)
+                _tri = _va[_fa]
+                signed_vol = float(np.einsum(
+                    "ij,ij->i", _tri[:, 0],
+                    np.cross(_tri[:, 1], _tri[:, 2]),
+                ).sum() / 6.0)
+                if signed_vol <= 0 or not (
+                    0.7 < signed_vol / max(vol_after, 1e-9) < 1.3
+                ):
+                    logger.warning(
+                        "Bucket %d r=%.0f on %d edges: OCC reported "
+                        "success but the shell is broken (signed tess "
+                        "vol %.0f vs B-rep %.0f); rejecting",
+                        bi, r, n_edges, signed_vol, vol_after,
+                    )
+                    continue
                 wp = wp_test
-                v, f = _tessellate_solid(wp, fast=True)
                 applied_steps.append(ConstructionStep(
                     name=f"{op_label} (r={r:.0f}mm) x{n_edges}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,
@@ -5089,10 +5373,30 @@ def _apply_recognized_fillets_to_solid(
                     vol_after = abs(float(wp_test.val().Volume()))
                     if vol_after <= 0 or vol_after > vol_before * 1.05:
                         continue
+                    # Same broken-shell gate as the primary path: OCC
+                    # can report success while emitting an inverted,
+                    # non-watertight shape (the unguarded leave-one-out
+                    # acceptance was the corruption's second way in).
+                    v, f = _tessellate_solid(wp_test, fast=True)
+                    _va = np.asarray(v, dtype=float)
+                    _fa = np.asarray(f, dtype=np.int64)
+                    _tri = _va[_fa]
+                    signed_vol = float(np.einsum(
+                        "ij,ij->i", _tri[:, 0],
+                        np.cross(_tri[:, 1], _tri[:, 2]),
+                    ).sum() / 6.0)
+                    if signed_vol <= 0 or not (
+                        0.7 < signed_vol / max(vol_after, 1e-9) < 1.3
+                    ):
+                        logger.warning(
+                            "Bucket %d LOO subset %d: broken shell "
+                            "(signed %.0f vs %.0f); rejecting",
+                            bi, skip_i, signed_vol, vol_after,
+                        )
+                        continue
                 except Exception:
                     continue
                 wp = wp_test
-                v, f = _tessellate_solid(wp, fast=True)
                 applied_steps.append(ConstructionStep(
                     name=f"{op_label} (r={r_loo:.0f}mm) x{len(subset)}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,

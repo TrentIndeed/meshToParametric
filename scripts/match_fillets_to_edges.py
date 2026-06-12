@@ -101,18 +101,45 @@ def build_clusters(cleaned, single_body: bool = False):
             import numpy as _np_split
             halves = [(verts, None, None)]
             dims = verts.max(axis=0) - verts.min(axis=0)
-            thin = int(_np_split.argmin(dims))
-            if float(dims[thin]) <= 12.0 and len(verts) >= 24:
-                vt = _np_split.sort(verts[:, thin])
-                gaps = _np_split.diff(vt)
-                gi = int(_np_split.argmax(gaps))
-                frac = (gi + 1) / len(vt)
-                if float(gaps[gi]) >= 1.5 and (
+            # Search every plate-thickness-like axis for the widest void
+            # (the record's own thinnest dim is wrong for side bands).
+            thin, best_gap = -1, 0.0
+            vt = gaps = None
+            gi = 0
+            frac = 0.0
+            # Single-body records only — per-piece records are already
+            # face-separated (mirrors job_queue).
+            if single_body and len(verts) >= 24:
+                for _ax in range(3):
+                    if float(dims[_ax]) > 12.0:
+                        continue
+                    vt_a = _np_split.sort(verts[:, _ax])
+                    gaps_a = _np_split.diff(vt_a)
+                    gi_a = int(_np_split.argmax(gaps_a))
+                    if float(gaps_a[gi_a]) > best_gap:
+                        best_gap = float(gaps_a[gi_a])
+                        thin = _ax
+                        vt, gaps, gi = vt_a, gaps_a, gi_a
+                        frac = (gi_a + 1) / len(vt_a)
+            if thin >= 0:
+                rec_r = float(rec.get("radius", 0) or 0)
+                void_split = float(gaps[gi]) >= 1.5 and (
                     0.2 < frac < 0.8 or float(gaps[gi]) >= 2.5
-                ):
-                    mid = 0.5 * (float(vt[gi]) + float(vt[gi + 1]))
-                    vA = verts[verts[:, thin] < mid]
-                    vB = verts[verts[:, thin] >= mid]
+                )
+                fused_split = (
+                    not void_split and rec_r > 0
+                    and float(dims[thin]) >= max(5.0, 1.6 * 1.5708 * rec_r)
+                )
+                if void_split or fused_split:
+                    if void_split:
+                        # Split at the void's boundaries — the void is
+                        # the dead zone.
+                        vA = verts[verts[:, thin] <= float(vt[gi]) + 1e-6]
+                        vB = verts[verts[:, thin] >= float(vt[gi + 1]) - 1e-6]
+                    else:
+                        mid = 0.5 * (float(vt[0]) + float(vt[-1]))
+                        vA = verts[verts[:, thin] < mid - 1.2]
+                        vB = verts[verts[:, thin] > mid + 1.2]
                     if len(vA) >= 9 and len(vB) >= 9:
                         halves = [(vA, id(rec), 0), (vB, id(rec), 1)]
                     elif len(vA) >= 9:

@@ -5325,14 +5325,28 @@ def _apply_recognized_fillets_to_solid(
                     "ij,ij->i", _tri[:, 0],
                     np.cross(_tri[:, 1], _tri[:, 2]),
                 ).sum() / 6.0)
-                if signed_vol <= 0 or not (
-                    0.7 < signed_vol / max(vol_after, 1e-9) < 1.3
+                # Weld first: OCC tessellations duplicate vertices per
+                # face, making every edge look open.
+                _rv = np.round(_va, 4)
+                _uv, _inv = np.unique(_rv, axis=0, return_inverse=True)
+                _fw = _inv[_fa]
+                _ed = np.sort(
+                    _fw[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1,
+                )
+                _, _ec = np.unique(_ed, axis=0, return_counts=True)
+                n_open_edges = int((_ec != 2).sum())
+                if (
+                    signed_vol <= 0
+                    or not (0.7 < signed_vol / max(vol_after, 1e-9) < 1.3)
+                    or n_open_edges > 0
                 ):
                     logger.warning(
                         "Bucket %d r=%.0f on %d edges: OCC reported "
                         "success but the shell is broken (signed tess "
-                        "vol %.0f vs B-rep %.0f); rejecting",
+                        "vol %.0f vs B-rep %.0f, %d open edges); "
+                        "rejecting",
                         bi, r, n_edges, signed_vol, vol_after,
+                        n_open_edges,
                     )
                     continue
                 wp = wp_test
@@ -5385,13 +5399,25 @@ def _apply_recognized_fillets_to_solid(
                         "ij,ij->i", _tri[:, 0],
                         np.cross(_tri[:, 1], _tri[:, 2]),
                     ).sum() / 6.0)
-                    if signed_vol <= 0 or not (
-                        0.7 < signed_vol / max(vol_after, 1e-9) < 1.3
+                    _rv = np.round(_va, 4)
+                    _uv, _inv = np.unique(_rv, axis=0, return_inverse=True)
+                    _fw = _inv[_fa]
+                    _ed = np.sort(
+                        _fw[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1,
+                    )
+                    _, _ec = np.unique(_ed, axis=0, return_counts=True)
+                    n_open_edges = int((_ec != 2).sum())
+                    if (
+                        signed_vol <= 0
+                        or not (0.7 < signed_vol / max(vol_after, 1e-9) < 1.3)
+                        or n_open_edges > 0
                     ):
                         logger.warning(
                             "Bucket %d LOO subset %d: broken shell "
-                            "(signed %.0f vs %.0f); rejecting",
+                            "(signed %.0f vs %.0f, %d open edges); "
+                            "rejecting",
                             bi, skip_i, signed_vol, vol_after,
+                            n_open_edges,
                         )
                         continue
                 except Exception:

@@ -1171,26 +1171,79 @@ class JobQueue:
                     # joins its own face's group.
                     halves = [(rec, fi_arr, verts)]
                     _dims = verts.max(axis=0) - verts.min(axis=0)
-                    _thin = int(np.argmin(_dims))
-                    if float(_dims[_thin]) <= 12.0 and len(verts) >= 24:
-                        _vt = np.sort(verts[:, _thin])
-                        _gaps = np.diff(_vt)
-                        _gi = int(np.argmax(_gaps))
-                        _frac = (_gi + 1) / len(_vt)
-                        # Balanced split for moderate voids; for WIDE
-                        # voids (>=2.5mm) split regardless of balance —
-                        # a rim record carrying 3 stray vertices on the
-                        # opposite face bridged the contact union and
-                        # bled its color across the plate.
-                        if float(_gaps[_gi]) >= 1.5 and (
+                    # Search EVERY plate-thickness-like axis for the
+                    # widest interior void — the record's own thinnest
+                    # bbox dim is the WRONG axis for the short-side
+                    # bands (5mm tall in Y but spanning the plate's X
+                    # thickness; testing Y found nothing and the bands
+                    # kept bridging the two faces).
+                    _thin, _best_gap = -1, 0.0
+                    _vt = _gaps = None
+                    _gi = 0
+                    _frac = 0.0
+                    # Only the single-body path needs record splitting:
+                    # whole-mesh topology emits face-spanning records.
+                    # The body-decompose path's per-piece records are
+                    # already face-separated, and splitting them creates
+                    # unmatched noise halves.
+                    if len(body_stage_data) == 1 and len(verts) >= 24:
+                        for _ax in range(3):
+                            if float(_dims[_ax]) > 12.0:
+                                continue
+                            _vt_a = np.sort(verts[:, _ax])
+                            _gaps_a = np.diff(_vt_a)
+                            _gi_a = int(np.argmax(_gaps_a))
+                            if float(_gaps_a[_gi_a]) > _best_gap:
+                                _best_gap = float(_gaps_a[_gi_a])
+                                _thin = _ax
+                                _vt, _gaps, _gi = _vt_a, _gaps_a, _gi_a
+                                _frac = (_gi_a + 1) / len(_vt_a)
+                    if _thin >= 0:
+                        # Two split triggers:
+                        # (a) a VOID in the distribution — balanced for
+                        #     moderate voids, unconditional for wide
+                        #     (>=2.5mm) ones (3 stray vertices on the
+                        #     opposite face bled color across the plate);
+                        # (b) a FUSED WRAP band with no void: continuous
+                        #     bridge vertices crossing the thickness. The
+                        #     user's rule: a fillet must not continue
+                        #     TANGENTIALLY out of its face plane — so
+                        #     excise the descending connector strip (a
+                        #     1.2mm dead zone each side of the midplane,
+                        #     orphaned unpainted) and keep the two face
+                        #     rims, now separated by >2.4mm so the
+                        #     contact union can never re-chain them
+                        #     through a neighboring band's corner.
+                        _rec_r = float(rec.get("radius", 0.0) or 0.0)
+                        _void_split = float(_gaps[_gi]) >= 1.5 and (
                             0.2 < _frac < 0.8 or float(_gaps[_gi]) >= 2.5
-                        ):
-                            _mid = 0.5 * (float(_vt[_gi]) + float(_vt[_gi + 1]))
+                        )
+                        _fused_split = (
+                            not _void_split
+                            and _rec_r > 0
+                            and float(_dims[_thin])
+                            >= max(5.0, 1.6 * 1.5708 * _rec_r)
+                        )
+                        if _void_split or _fused_split:
                             _cent = _sub.vertices[
                                 _sub.faces[fi_arr]
                             ].mean(axis=1)[:, _thin]
-                            _fA = fi_arr[_cent < _mid]
-                            _fB = fi_arr[_cent >= _mid]
+                            if _void_split:
+                                # Split at the void's BOUNDARIES, not its
+                                # midpoint: the void itself is the dead
+                                # zone keeping the halves out of contact
+                                # range of each other and of neighboring
+                                # bands' opposite halves at the corners.
+                                _lo_b = float(_vt[_gi]) + 1e-6
+                                _hi_b = float(_vt[_gi + 1]) - 1e-6
+                                _fA = fi_arr[_cent <= _lo_b]
+                                _fB = fi_arr[_cent >= _hi_b]
+                            else:
+                                _mid = 0.5 * (
+                                    float(_vt[0]) + float(_vt[-1])
+                                )
+                                _fA = fi_arr[_cent < _mid - 1.2]
+                                _fB = fi_arr[_cent > _mid + 1.2]
                             # A TINY side (a few stray faces) is not a
                             # fillet feature: keep only the substantial
                             # half and orphan the strays (unpainted gray

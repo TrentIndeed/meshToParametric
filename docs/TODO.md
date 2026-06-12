@@ -226,17 +226,25 @@ Deferred (need the de-stacked topology viz to diagnose):
   THEN extend the animation/tree as fillets get applied. Requires
   emitting timeline/tree snapshots incrementally from the export
   subprocess instead of one final payload.
-- [ ] **Intent overlay missing the right side plate's right-edge
-  group.** The matcher claims it (it appears in reconciliation) but no
-  intent patch/polyline renders — check `_append_intent` for that
-  cluster (is it skipping because the cluster matched only a curve, or
-  is the patch builder failing silently?).
-- [ ] **3/4 side-plate edge wraps not applied** even though
-  reconciliation shows all groups correct. The greedy-subset fallback
-  added this round should recover partial chains; if OCC still refuses,
-  the next step is a full fillet-applicable-edge INVENTORY on the
-  rebuilt solid (score every edge for blend feasibility up front) and
-  match each stitched group to the most-similar feasible edge chain, so
+- [x] **Intent overlay missing one side plate's edge group (root
+  cause found 2026-06-12).** Not an overlay bug: the stitched stage's
+  pass-2b axial-continuation union merged the +X plate's inner and
+  outer outline rings into ONE group (11 instead of 12). Topology had
+  fitted both faces' short-side bands to the same axis LINE between
+  the plates, so the endpoint perpendicular-distance gate read ~0 mm
+  while the actual vertex clouds sat a plate thickness apart. Fixed
+  with a cloud-centroid perpendicular-offset gate (checked against
+  both records' axes). The merged group had matched only one face's
+  5-edge chain — the other face's ring was invisible to intent AND
+  apply. After the fix + greedy subset: 12/12 matched, 12 applied.
+  Found because the production grouping and the
+  scripts/match_fillets_to_edges.py mirror DIVERGED (the mirror lacks
+  pass 2b and was producing the correct 12) — see the extraction item
+  under Pipeline.
+- [ ] If OCC still refuses some chains on other parts, the next
+  escalation is a full fillet-applicable-edge INVENTORY on the rebuilt
+  solid (score every edge for blend feasibility up front) and match
+  each stitched group to the most-similar feasible edge chain, so
   apply targets are valid-by-construction (user request).
 - [ ] **Corner band enlargement.** The bled-fillet splitter works, but
   band length grows near corners (split halves keep corner-arc faces
@@ -254,3 +262,8 @@ Deferred (need the de-stacked topology viz to diagnose):
 - [ ] Scale normalization at ingest so mm-absolute thresholds become ratios.
 - [ ] Promote stitched-fillets (job_queue.py) and fillet apply
   (export_cadquery.py) into first-class pipeline stages with dataclass I/O.
+  Urgency raised 2026-06-12: the grouping logic now exists in THREE
+  copies (job_queue stitched block, scripts/match_fillets_to_edges.py,
+  scripts/diag_plate_edge_groups.py) and they drifted — production had
+  pass-2b axial unions the mirror lacked, which hid the ring-merge bug
+  from every test while the user saw it on every run.

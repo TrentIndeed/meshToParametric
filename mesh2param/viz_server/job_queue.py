@@ -1019,23 +1019,23 @@ class JobQueue:
         edge_cols = np.array(edge_col_list) if edge_col_list else None
         job.progress_edges = edge_pts.flatten().tolist() if edge_pts is not None else None
         job.progress_edge_colors = edge_cols.flatten().tolist() if edge_cols is not None else None
-        # Reuse Stage 3's projected-primitive GEOMETRY but repaint it
-        # a uniform neutral gray: stacking the fit-stage region colors
-        # under the edge overlay made the two stages visually
-        # indistinguishable and hid mis-classified edges. Here the
-        # classified edge lines are the only colored content. Keep
-        # PER-FACE colors (all neutral) rather than colors=None — the
-        # colorless piece path is the decompose viz (translucent +
-        # explode animation), wrong for this stage.
-        topo_pieces = [
-            {
-                "vertices": p["vertices"],
-                "faces": p["faces"],
-                "colors": [0.62, 0.64, 0.68] * (len(p["faces"]) // 3),
-                "color": p.get("color"),
-            }
-            for p in fit_pieces
-        ]
+        # Topology gets its OWN base geometry: the raw cleaned mesh in
+        # uniform neutral gray. Reusing the fit stage's primitive
+        # projection (even recolored) kept the two stages visually
+        # entangled — projection gaps and region seams read as topology
+        # artifacts. Here the classified edge lines are the only
+        # colored content, drawn over the true mesh they were computed
+        # on. Keep PER-FACE colors (all neutral) rather than
+        # colors=None — the colorless piece path is the decompose viz
+        # (translucent + explode animation), wrong for this stage.
+        topo_pieces = []
+        for body, sub_cleaned, *_rest in body_stage_data:
+            topo_pieces.append({
+                "vertices": sub_cleaned.vertices.flatten().tolist(),
+                "faces": sub_cleaned.faces.flatten().tolist(),
+                "colors": [0.62, 0.64, 0.68] * len(sub_cleaned.faces),
+                "color": None,
+            })
         job.progress_colors = None
         job.progress_colors_per_face = False
         job._decomp_pieces = topo_pieces
@@ -1707,6 +1707,28 @@ class JobQueue:
                     # only small axis-fit slop (~r).
                     eps_perp = max(1.5, 1.5 * r_min)
                     eps_axial = max(4.0, 3.0 * r_min)
+                    # Continuation means the VERTEX CLOUDS line up along
+                    # the shared axis. The endpoint test below can't see
+                    # this on its own: both bands' endpoints are computed
+                    # from each record's FITTED axis line, and when
+                    # topology fits both short-side bands of a plate to
+                    # the same line between the two faces, the endpoint
+                    # perp distance reads ~0 while the actual clouds sit
+                    # a plate thickness apart (RackMount +X plate: the
+                    # inner and outer outline rings fused into one group
+                    # this way, leaving one face's ring unmatched).
+                    # Gate on the cloud-centroid offset perpendicular to
+                    # BOTH axes — parallel offset bands fail, genuine
+                    # along-axis continuations pass.
+                    d_c = B["verts"].mean(axis=0) - A["verts"].mean(axis=0)
+                    perp_ok = True
+                    for ax_chk in (A["axis_dir"], B["axis_dir"]):
+                        perp_c = d_c - float(d_c @ ax_chk) * ax_chk
+                        if float(np.linalg.norm(perp_c)) >= eps_perp:
+                            perp_ok = False
+                            break
+                    if not perp_ok:
+                        continue
                     stitched = False
                     for EA in A["endpoints"]:
                         for EB in B["endpoints"]:

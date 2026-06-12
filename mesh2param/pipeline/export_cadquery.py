@@ -78,6 +78,14 @@ class CadQueryResult:
     # why-not), for debugging the blend-vs-apply gap. See
     # _apply_recognized_fillets_to_solid(out_diag=...).
     fillet_match_diag: list = field(default_factory=list)
+    # AS-BUILT record: what the rebuild actually cut/blended after all
+    # recovery passes (2D ring recall, duplicate-drill skip, greedy
+    # fillet subsets). The Onshape live export consumes this instead of
+    # the raw recognition tree — exporting the tree directly dropped 3
+    # of 4 tab holes because hole recovery lives in this module.
+    #   {"holes": [{centers, radius, axis_dir, through, depth}],
+    #    "blends": [{kind, radius, edge_midpoints}]}
+    as_built: dict = field(default_factory=dict)
     construction_steps: list[ConstructionStep] = field(default_factory=list)
     variants: list[BuildVariant] = field(default_factory=list)
     script: str = ""
@@ -255,6 +263,7 @@ def export_cadquery(
     blend_edge_overlay_out: list = []
     blend_surface_patches_out: list = []
     fillet_match_diag_out: list = []
+    as_built_record: dict = {"holes": [], "blends": []}
     try:
         # Multi-body: skip per-body fillet application so the union doesn't
         # freeze fillets at body boundaries. Fillets get applied once to the
@@ -267,6 +276,7 @@ def export_cadquery(
         solid, script, steps, body0_chamfers = _build_stepwise(
             **build_args, build_order=llm_order,
             skip_fillets=is_multi_body, skip_chamfers=True,
+            as_built_out=as_built_record,
         )
         deferred_chamfers_all.extend(body0_chamfers)
 
@@ -282,6 +292,7 @@ def export_cadquery(
                         holes=abd['holes'], chamfers=abd['chamfers'],
                         fillets=abd['fillets'], cleaned=abd['cleaned'],
                         skip_fillets=True, skip_chamfers=True,
+                        as_built_out=as_built_record,
                     )
                     deferred_chamfers_all.extend(body_chamfers)
                     if body_solid is None:
@@ -473,6 +484,7 @@ def export_cadquery(
                             out_edges=blend_edge_overlay,
                             out_surfaces=blend_surface_patches,
                             out_diag=fillet_match_diag_out,
+                            as_built_out=as_built_record,
                         )
                     )
                     for fs in fillet_steps:
@@ -648,6 +660,7 @@ def export_cadquery(
         blend_edge_overlay=blend_edge_overlay_out,
         intent_mesh=intent_mesh_out,
         fillet_match_diag=fillet_match_diag_out,
+        as_built=as_built_record,
         construction_steps=steps,
         variants=variants,
         script=script,
@@ -2074,6 +2087,7 @@ def _build_stepwise(
     skip_fillets: bool = False,
     skip_chamfers: bool = False,
     joins: list[Feature] | None = None,
+    as_built_out: dict | None = None,
 ) -> tuple[object, str, list[ConstructionStep], list[dict]]:
     """Build a clean CAD solid from scratch, step by step.
 
@@ -2813,6 +2827,21 @@ def _build_stepwise(
             steps.append(ConstructionStep(
                 name=hole_name, tess_vertices=v, tess_faces=f, volume=vol,
             ))
+            # AS-BUILT: this hole group was actually drilled (after all
+            # recovery + duplicate-skip logic) — record it for exports
+            # that rebuild elsewhere (Onshape). The raw recognition tree
+            # is NOT equivalent: 2D-ring-recalled holes only exist here.
+            if as_built_out is not None:
+                as_built_out.setdefault("holes", []).append({
+                    "centers": [
+                        np.asarray(c, dtype=float).tolist()
+                        for c in centers_all
+                    ],
+                    "radius": float(radius),
+                    "axis_dir": h_dir.tolist(),
+                    "through": bool(is_through),
+                    "depth": float(h_depth),
+                })
 
             step_num = len(steps) + 1
             script_lines.append(f"# Step {step_num}: Cut {hole_name}")
@@ -4896,6 +4925,7 @@ def _apply_recognized_fillets_to_solid(
     out_edges: list | None = None,
     out_surfaces: list | None = None,
     out_diag: list | None = None,
+    as_built_out: dict | None = None,
 ) -> tuple[object, list[object], list[str]]:
     """Apply stitched fillets to the rebuilt solid by category-aware
     vertex-proximity snapping.
@@ -5300,6 +5330,27 @@ def _apply_recognized_fillets_to_solid(
         sel = wp_solid.newObject(edges)
         return sel.chamfer(size) if kind == "chamfer" else sel.fillet(size)
 
+    def _record_blend(edges_applied, size: float, kind: str) -> None:
+        """AS-BUILT: midpoints of the PRE-blend edges that actually got
+        rolled, so a geometrically identical rebuild elsewhere (Onshape)
+        can re-select the same edges by closest-point queries. Must be
+        called with the edge objects from BEFORE the blend op (they're
+        invalid afterwards)."""
+        if as_built_out is None:
+            return
+        mids = []
+        for e in edges_applied:
+            try:
+                p = e.positionAt(0.5)
+                mids.append([float(p.x), float(p.y), float(p.z)])
+            except Exception:
+                continue
+        if mids:
+            as_built_out.setdefault("blends", []).append({
+                "kind": kind, "radius": float(size),
+                "edge_midpoints": mids,
+            })
+
     def _gate_blend_result(wp_test, vol_before: float):
         """Volume sanity + broken-shell gate for a candidate blend result.
 
@@ -5383,6 +5434,7 @@ def _apply_recognized_fillets_to_solid(
                         )
                     continue
                 wp = wp_test
+                _record_blend(edges_obj, r, kind)
                 applied_steps.append(ConstructionStep(
                     name=f"{op_label} (r={r:.0f}mm) x{n_edges}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,
@@ -5433,6 +5485,7 @@ def _apply_recognized_fillets_to_solid(
                 except Exception:
                     continue
                 wp = wp_test
+                _record_blend(subset, r_loo, kind)
                 applied_steps.append(ConstructionStep(
                     name=f"{op_label} (r={r_loo:.0f}mm) x{len(subset)}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,
@@ -5494,6 +5547,7 @@ def _apply_recognized_fillets_to_solid(
             if best is not None and kept:
                 wp_test, v, f, vol_after = best
                 wp = wp_test
+                _record_blend([edges_obj[t] for t in kept], r_g, kind)
                 applied_steps.append(ConstructionStep(
                     name=f"{op_label} (r={r_g:.0f}mm) x{len(kept)}",
                     tess_vertices=v, tess_faces=f, volume=vol_after,

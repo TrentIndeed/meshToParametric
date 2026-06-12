@@ -69,6 +69,7 @@ def export_to_onshape(
     feature_tree: FeatureTree,
     cleaned: CleanedMesh,
     config: ExportConfig | None = None,
+    as_built: dict | None = None,
 ) -> ExportResult:
     """Export a feature tree to Onshape (or produce a dry-run plan).
 
@@ -76,6 +77,10 @@ def export_to_onshape(
         feature_tree: Output of Stage 5 (Feature Recognition).
         cleaned: Output of Stage 1 (for volume estimation).
         config: Export configuration. Uses defaults (dry_run=True) if None.
+        as_built: Optional CadQueryResult.as_built record. When given,
+            the live export rebuilds the AS-BUILT holes and blends
+            (everything the CadQuery recovery passes actually cut)
+            instead of the raw recognition tree's hole list.
 
     Returns:
         ExportResult with operations, API log, and validation report.
@@ -106,6 +111,7 @@ def export_to_onshape(
     else:
         result = _live_export(
             operations, feature_tree, cleaned, mesh_volume, config,
+            as_built=as_built,
         )
 
     logger.info(
@@ -368,6 +374,7 @@ def _live_export(
     cleaned: CleanedMesh,
     mesh_volume: float,
     config: ExportConfig,
+    as_built: dict | None = None,
 ) -> ExportResult:
     """Execute the export against the Onshape REST API.
 
@@ -397,7 +404,7 @@ def _live_export(
         return _dry_run(operations, feature_tree, mesh_volume, config)
 
     plan = build_onshape_plan(
-        feature_tree, (cleaned.bbox[0], cleaned.bbox[1]),
+        feature_tree, (cleaned.bbox[0], cleaned.bbox[1]), as_built=as_built,
     )
     if not plan.features:
         logger.warning(

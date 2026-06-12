@@ -102,10 +102,28 @@
   (live smoke gated behind ONSHAPE_LIVE_TESTS=1). Probe scripts kept in
   scripts/onshape_*.py. NOTE: free-tier accounts can only create PUBLIC
   documents (private creation 409s; the client falls back automatically).
-- [ ] **Phase 2: fillets/chamfers in Onshape.** Needs edge queries
-  against Onshape's own topology — likely queryString FS queries
-  (qClosestTo / qContainsPoint with the stitched-cluster vertex data),
-  mirroring the CadQuery matcher's vertex-proximity approach.
+- [x] **AS-BUILT export (2026-06-12, round 2).** Exporting the raw
+  recognition tree dropped 3 of 4 tab holes (hole recovery lives in
+  export_cadquery) and had no fillets. CadQueryResult.as_built now
+  records every hole group actually drilled and every blend actually
+  applied (with pre-blend edge midpoints); the Onshape builder replays
+  them — fillets/chamfers as native features with
+  qUnion([qClosestTo(qEverything(EntityType.EDGE), vector)]) edge
+  queries, which transfer because the two rebuilds are geometrically
+  identical. Inner rings now use CadQuery's exact circle recognition
+  (_clean_engine_polygon + algebraic LSQ + n>=12 + max-resid gate) so
+  bores are true cylinders, not 60-gon prisms — that alone fixed all 4
+  rim fillets. cPlanes get an explicit small "size" so they stop
+  swamping the view. RackMount v4: 22/24 features OK — all 4 tab
+  holes, 10/12 fillets, volume matches the CadQuery rebuild.
+- [ ] **2 ring fillets still ERROR in Onshape** (the side plates' big
+  outline ring chains): CadQuery profiles carry EXACT tangent corner
+  arcs (MakeFillet2d) while the Onshape sketch draws the sharp
+  polygon, so the chain edges near corners differ and Parasolid
+  refuses the same selection. Fix = profile-arc parity: capture the
+  as-built profile geometry (line/arc runs from
+  _draw_exact_corner_arcs) and emit sketch ARC entities
+  (BTMSketchCurveSegment-155 with circle geometry + start/endParam).
 - [ ] **Web UI hookup** (Pro tier "Onshape" feature): an "Export to
   Onshape" button on /app that runs the live path for the job's tree
   and links the created document. Needs per-user credentials
@@ -145,9 +163,12 @@
   on scan noise but apparently doesn't), and (b) no
   smoothing/regularization stage that snaps near-circles to circles,
   near-90° corners to 90°, and near-parallel runs to parallel before
-  fitting. Attack order suggestion: profile/span honesty first (cheap,
-  bounded), then a 2D outline regularizer (RANSAC lines/arcs on the
-  section polygon with angle snapping), then surface-level smoothing.
+  fitting. ORDER (user-corrected 2026-06-12): the scan CLEANER +
+  REGULARIZER come FIRST — the wrench IS a scan (Scan1 spanner), so
+  fixing its profile/span reading without de-noising the input is
+  working on garbage. Sequence: surface smoothing / scan cleanup, then
+  the 2D outline regularizer (RANSAC lines/arcs with angle snapping),
+  then revisit the engine's profile/span honesty on the cleaned data.
 - [ ] Scan failures currently visible in tests: Scan3 fit drops 2/105
   regions, Scan1 recognizes only a BASE feature (no holes) — both
   pre-existing (confirmed on 4b51b30, 2026-06-12), xfail candidates

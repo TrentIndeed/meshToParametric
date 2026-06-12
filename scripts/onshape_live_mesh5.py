@@ -22,6 +22,7 @@ for noisy in ("trimesh", "matplotlib", "PIL", "urllib3"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 from mesh2param.config import ExportConfig, IngestConfig
+from mesh2param.pipeline.export_cadquery import export_cadquery
 from mesh2param.pipeline.export_onshape import export_to_onshape
 from mesh2param.pipeline.ingest import ingest_mesh
 import match_fillets_to_edges as mfe
@@ -32,12 +33,27 @@ def main() -> int:
     cleaned = ingest_mesh(
         str(ROOT / "models/Mesh5/RackMount.3mf"), IngestConfig(remesh=False),
     )
-    _, body_results, _ = mfe.build_clusters(cleaned, single_body=True)
+    raw, body_results, _ = mfe.build_clusters(cleaned, single_body=True)
+    clusters = [{
+        "group_id": cl["gid"], "vertices": cl["verts"],
+        "radius": cl["radius"], "category": cl["category"],
+        "kind": cl.get("kind", "fillet"), "n_records": 0,
+    } for cl in raw]
     _, _, tree = body_results[0]
     print(f"tree: {tree.num_features} features")
+    # CadQuery rebuild FIRST: its as-built record (post-recovery holes +
+    # actually-applied blends with edge midpoints) is what the Onshape
+    # export replays — the raw tree is missing recovered holes.
+    cq_res = export_cadquery(
+        tree, cleaned, use_llm=False, stitched_clusters=clusters,
+    )
+    ab = cq_res.as_built or {}
+    print(f"as-built: {len(ab.get('holes', []))} hole group(s), "
+          f"{len(ab.get('blends', []))} blend(s); "
+          f"CadQuery vol err {cq_res.volume_error_pct:.1f}%")
     res = export_to_onshape(tree, cleaned, ExportConfig(
         dry_run=False, document_name=name,
-    ))
+    ), as_built=ab)
     print()
     print(f"status:    {res.status}")
     print(f"features:  {res.feature_count}/{res.expected_features}")

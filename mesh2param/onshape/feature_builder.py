@@ -102,6 +102,51 @@ def _circle(eid: str, cx: float, cy: float, r: float) -> dict:
     }
 
 
+def _clean_polygon(pts_mm: list) -> list:
+    """CadQuery's profile cleaning (repair + simplify) — REQUIRED for
+    parity: raw engine rings carry duplicate/noisy points that defeat
+    circle recognition, and CadQuery draws the cleaned points."""
+    try:
+        from mesh2param.pipeline.export_cadquery import (
+            _clean_engine_polygon,
+        )
+        cleaned = _clean_engine_polygon(pts_mm)
+        if len(cleaned) >= 3:
+            return cleaned
+    except Exception:
+        logger.debug("Polygon cleaning failed; using raw", exc_info=True)
+    return pts_mm
+
+
+def _ring_entities(prefix: str, pts_mm: list) -> list[dict]:
+    """Entities for one closed ring: a true CIRCLE when the points fit
+    one, else a polyline.
+
+    Mesh-derived inner rings (bores, tube walls) arrive as ~60-gon
+    point lists; drawing them literally makes the Onshape bore a
+    62-sided prism whose "rim" is 62 sliver edges — rim fillets then
+    fail and the bore isn't a real cylinder. This is EXACTLY CadQuery's
+    circle recognition (clean -> algebraic least-squares -> max-residual
+    gate, n >= 12): the mean-center fit on raw points rejected rings
+    CadQuery accepted (resid 0.008 after cleaning vs std 1.2 raw), and
+    the n >= 12 floor matters because any 4 rectangle corners lie
+    exactly on their circumcircle (resid 0.000).
+    """
+    pts = _clean_polygon(pts_mm)
+    arr = np.asarray(pts, dtype=float)
+    if len(arr) >= 12:
+        A = np.c_[2 * arr[:, 0], 2 * arr[:, 1], np.ones(len(arr))]
+        sol, *_ = np.linalg.lstsq(A, (arr**2).sum(axis=1), rcond=None)
+        cx, cy = float(sol[0]), float(sol[1])
+        cr = float(np.sqrt(max(sol[2] + cx * cx + cy * cy, 0.0)))
+        resid = np.abs(np.hypot(arr[:, 0] - cx, arr[:, 1] - cy) - cr)
+        if cr > 0.5 and float(resid.max()) < max(0.15, 0.02 * cr):
+            return [_circle(
+                f"{prefix}_c", cx / 1000.0, cy / 1000.0, cr / 1000.0,
+            )]
+    return _polygon_entities(prefix, pts)
+
+
 def _polygon_entities(prefix: str, pts_mm: list) -> list[dict]:
     """Closed polyline entities for one ring (mm -> meters)."""
     ents = []
@@ -155,8 +200,14 @@ def _sketch(name: str, plane_param: dict, entities: list[dict]) -> dict:
     }
 
 
-def _cplane(name: str, axis_idx: int, position_mm: float) -> dict:
-    """Construction plane at world position `position_mm` on the axis."""
+def _cplane(name: str, axis_idx: int, position_mm: float,
+            size_mm: float = 15.0) -> dict:
+    """Construction plane at world position `position_mm` on the axis.
+
+    An explicit small `size` keeps the rendered plane local instead of
+    the giant auto-fit rectangles that visually swamped the model (the
+    plane is mathematically infinite for sketching either way).
+    """
     det_id, normal_sign = PLANE_FOR_AXIS[axis_idx]
     offset = position_mm * normal_sign
     opposite = offset < 0
@@ -176,7 +227,52 @@ def _cplane(name: str, axis_idx: int, position_mm: float) -> dict:
              "expression": f"{abs(offset):.6f} mm"},
             {"btType": "BTMParameterBoolean-144",
              "parameterId": "oppositeDirection", "value": bool(opposite)},
+            {"btType": "BTMParameterQuantity-147", "parameterId": "size",
+             "expression": f"{size_mm:.1f} mm"},
         ],
+    }
+
+
+def _blend_feature(name: str, kind: str, size_mm: float,
+                   edge_midpoints_mm: list) -> dict:
+    """Fillet/chamfer with edges selected by closest-point queries.
+
+    The Onshape rebuild is geometrically identical to the CadQuery
+    rebuild (same profiles, same hole cylinders, same blend order), so
+    the midpoints of the edges OCC actually rolled transfer directly:
+    each qClosestTo picks the nearest edge to that midpoint on the
+    current regenerated body. Validated live (probe5: 4-edge box fillet
+    volume exact to 0.1 mm^3).
+    """
+    qparts = ", ".join(
+        f"qClosestTo(qEverything(EntityType.EDGE), "
+        f"vector({m[0]:.4f}, {m[1]:.4f}, {m[2]:.4f}) * millimeter)"
+        for m in edge_midpoints_mm
+    )
+    params = [
+        {"btType": "BTMParameterQueryList-148", "parameterId": "entities",
+         "queries": [{
+             "btType": "BTMIndividualQuery-138",
+             "queryString": f"query=qUnion([{qparts}]);",
+         }]},
+    ]
+    if kind == "chamfer":
+        params += [
+            {"btType": "BTMParameterEnum-145", "parameterId": "chamferType",
+             "value": "EQUAL_OFFSETS", "enumName": "ChamferType"},
+            {"btType": "BTMParameterQuantity-147", "parameterId": "width",
+             "expression": f"{size_mm:.4f} mm"},
+        ]
+    else:
+        params.append(
+            {"btType": "BTMParameterQuantity-147", "parameterId": "radius",
+             "expression": f"{size_mm:.4f} mm"},
+        )
+    return {
+        "btType": "BTMFeature-134",
+        "featureType": "chamfer" if kind == "chamfer" else "fillet",
+        "name": name,
+        "parameters": params,
     }
 
 
@@ -254,10 +350,10 @@ def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
         name=f"{label} plane",
         btm=_cplane(f"{label} plane", ax, lo),
     ))
-    entities = _polygon_entities("outer", pts)
+    entities = _polygon_entities("outer", _clean_polygon(pts))
     for ri, ring in enumerate(sg.get("inner") or []):
         if len(ring) >= 3:
-            entities += _polygon_entities(f"inner{ri}", ring)
+            entities += _ring_entities(f"inner{ri}", ring)
     sk_idx = plan.add(PlannedFeature(
         name=f"{label} sketch",
         btm=_sketch(f"{label} sketch", _plane_param_created_by("PENDING"),
@@ -287,9 +383,18 @@ def _hole_cut(plan: OnshapePlan, feat: Feature, label: str,
     if radius <= 0 or not centers:
         plan.skipped.append(f"{label}: no center/radius")
         return False
-    ax, dir_sign = _axis_of(feat.direction)
+    return _hole_cut_raw(
+        plan, centers, radius, feat.direction,
+        feat.type == FeatureType.THROUGH_HOLE, float(feat.depth),
+        label, bbox_mm,
+    )
+
+
+def _hole_cut_raw(plan: OnshapePlan, centers: list, radius: float,
+                  direction, through: bool, depth: float, label: str,
+                  bbox_mm: tuple) -> bool:
+    ax, dir_sign = _axis_of(direction)
     u_ax, v_ax = UV_AXES[ax]
-    through = feat.type == FeatureType.THROUGH_HOLE
 
     if through:
         # Sketch just outside the part on the LOW side, cut THROUGH_ALL
@@ -302,7 +407,7 @@ def _hole_cut(plan: OnshapePlan, feat: Feature, label: str,
         # Blind: the recognized center sits at the bore's axial middle;
         # the opening is half a depth back along the cut direction.
         c0 = np.asarray(centers[0], dtype=float)
-        depth = float(feat.depth)
+        depth = float(depth)
         plane_pos = float(c0[ax]) - dir_sign * depth / 2.0
         want_positive = dir_sign > 0
         end_bound = "BLIND"
@@ -335,13 +440,18 @@ def _hole_cut(plan: OnshapePlan, feat: Feature, label: str,
 
 
 def build_onshape_plan(feature_tree: FeatureTree,
-                       bbox_mm: tuple) -> OnshapePlan:
+                       bbox_mm: tuple,
+                       as_built: dict | None = None) -> OnshapePlan:
     """Convert the recognized FeatureTree into an ordered Onshape plan.
 
     Mirrors the CadQuery timeline: base extrusion -> join extrusions ->
-    hole cuts. Fillets/chamfers are not exported yet (they need edge
-    queries against Onshape's own topology — phase 2); they're listed
-    in plan.skipped so the caller can report them.
+    hole cuts -> blends. When the CadQuery export's AS-BUILT record is
+    provided, its hole list replaces the tree's hole features (the tree
+    misses every hole the CadQuery recovery passes found — 3 of 4
+    RackMount tab holes came only from 2D ring recall) and its blend
+    list becomes fillet/chamfer features with closest-point edge
+    queries. Without as_built, blends are skipped and tree holes are
+    used as-is.
     """
     plan = OnshapePlan()
     features = list(feature_tree.features)
@@ -361,24 +471,59 @@ def build_onshape_plan(feature_tree: FeatureTree,
             _profile_extrusion(plan, f, f"Extrude Join {n_join}", "ADD")
 
     n_hole = 0
-    for f in features:
-        if f.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
+    if as_built and as_built.get("holes"):
+        for h in as_built["holes"]:
             n_hole += 1
-            sg = f.sketch_geometry or {}
-            n_c = len(sg.get("centers") or []) or 1
-            kind = ("Through" if f.type == FeatureType.THROUGH_HOLE
-                    else "Blind")
+            n_c = len(h["centers"])
+            kind = "Through" if h.get("through") else "Blind"
             label = (f"{kind} Hole {n_hole}" if n_c == 1
                      else f"{kind} Hole Pattern {n_hole} ({n_c}x)")
-            _hole_cut(plan, f, label, bbox_mm)
-
-    for f in features:
-        if f.type in (FeatureType.FILLET, FeatureType.CHAMFER):
-            sg = f.sketch_geometry or {}
-            r = sg.get("radius") or sg.get("width") or 0
-            plan.skipped.append(
-                f"{f.type.value} r={r} (edge-query export is phase 2)"
+            _hole_cut_raw(
+                plan, h["centers"], float(h["radius"]), h["axis_dir"],
+                bool(h.get("through")), float(h.get("depth", 0.0)),
+                label, bbox_mm,
             )
+    else:
+        for f in features:
+            if f.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
+                n_hole += 1
+                sg = f.sketch_geometry or {}
+                n_c = len(sg.get("centers") or []) or 1
+                kind = ("Through" if f.type == FeatureType.THROUGH_HOLE
+                        else "Blind")
+                label = (f"{kind} Hole {n_hole}" if n_c == 1
+                         else f"{kind} Hole Pattern {n_hole} ({n_c}x)")
+                _hole_cut(plan, f, label, bbox_mm)
+
+    if as_built and as_built.get("blends"):
+        # Emit in the exact order CadQuery applied them — each blend
+        # trims neighboring edges, so the closest-point selections only
+        # transfer if the regen sequence matches.
+        n_f = n_c2 = 0
+        for b in as_built["blends"]:
+            kind = b.get("kind", "fillet")
+            if kind == "chamfer":
+                n_c2 += 1
+                label = f"Chamfer {n_c2}"
+            else:
+                n_f += 1
+                label = f"Fillet {n_f} (r={b['radius']:.0f}mm)"
+            plan.add(PlannedFeature(
+                name=label,
+                btm=_blend_feature(
+                    label, kind, float(b["radius"]),
+                    b.get("edge_midpoints") or [],
+                ),
+            ))
+    else:
+        for f in features:
+            if f.type in (FeatureType.FILLET, FeatureType.CHAMFER):
+                sg = f.sketch_geometry or {}
+                r = sg.get("radius") or sg.get("width") or 0
+                plan.skipped.append(
+                    f"{f.type.value} r={r} (needs the CadQuery as-built "
+                    f"record for edge queries)"
+                )
 
     logger.info(
         "Onshape plan: %d features (%d skipped: %s)",

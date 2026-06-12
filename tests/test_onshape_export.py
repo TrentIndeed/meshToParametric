@@ -164,6 +164,61 @@ def test_through_hole_outside_part_and_blind_opening():
     assert pex["oppositeDirection"]["value"] is True
 
 
+def test_as_built_overrides_tree_holes_and_adds_blends():
+    as_built = {
+        "holes": [{
+            "centers": [[5.0, 5.0, 6.0], [15.0, 5.0, 6.0],
+                        [25.0, 5.0, 6.0], [35.0, 5.0, 6.0]],
+            "radius": 4.0,
+            "axis_dir": [0.0, 0.0, -1.0],
+            "through": True,
+            "depth": 12.0,
+        }],
+        "blends": [
+            {"kind": "fillet", "radius": 2.0,
+             "edge_midpoints": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]},
+            {"kind": "chamfer", "radius": 1.0,
+             "edge_midpoints": [[7.0, 8.0, 9.0]]},
+        ],
+    }
+    plan = build_onshape_plan(_tree(), BBOX, as_built=as_built)
+    names = [pf.name for pf in plan.features]
+    # tree's 2 hole features replaced by the single as-built 4x group
+    assert sum(1 for n in names if "Hole" in n and not n.endswith(
+        ("plane", "sketch"))) == 1
+    assert any("(4x)" in n for n in names)
+    # blends emitted in order, as real features (not skipped)
+    fillet_pf = next(pf for pf in plan.features if "Fillet" in pf.name)
+    qs = next(
+        p for p in fillet_pf.btm["parameters"]
+        if p["parameterId"] == "entities"
+    )["queries"][0]["queryString"]
+    assert qs.count("qClosestTo") == 2
+    assert "vector(1.0000, 2.0000, 3.0000)" in qs
+    cham_pf = next(pf for pf in plan.features if "Chamfer" in pf.name)
+    assert cham_pf.btm["featureType"] == "chamfer"
+    assert not any("FILLET" in s for s in plan.skipped)
+
+
+def test_ring_circle_recognition():
+    from mesh2param.onshape.feature_builder import _ring_entities
+    # 60-gon circle ring -> single CIRCLE entity
+    ang = np.linspace(0, 2 * np.pi, 60, endpoint=False)
+    ring = [[20 + 14.5 * np.cos(a), 30 + 14.5 * np.sin(a)] for a in ang]
+    ents = _ring_entities("r", ring)
+    assert len(ents) == 1
+    g = ents[0]["geometry"]
+    assert g["btType"] == "BTCurveGeometryCircle-115"
+    assert abs(g["radius"] - 0.0145) < 1e-4
+    # rectangle (4 corners lie exactly on their circumcircle!) must NOT
+    # become a circle
+    rect = [[0, 0], [40, 0], [40, 30], [0, 30]]
+    ents = _ring_entities("r2", rect)
+    assert all(
+        e["geometry"]["btType"] == "BTCurveGeometryLine-117" for e in ents
+    )
+
+
 def test_resolve_pending_patches_references():
     plan = build_onshape_plan(_tree(), BBOX)
     cp, sk, ex = plan.features[0:3]

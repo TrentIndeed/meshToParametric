@@ -50,7 +50,7 @@ mesh2param/
   viz_server/    — FastAPI + Three.js web UI (app.py, job_queue.py, static/)
   db/            — SQLite database models (database.py: User, MeshJob, JobStep, WaitlistEntry, SupportTicket)
   api/           — REST endpoints (auth.py, chat.py, settings.py)
-  onshape/       — API wrapper: client.py, auth.py, feature_builder.py
+  onshape/       — REST client (client.py: API-key Basic auth, no HMAC) + FeatureTree→BTM builder (feature_builder.py); live export wired in pipeline/export_onshape.py, BTM conventions documented in feature_builder docstring
   ai.py          — Claude CLI wrapper with injection protection + budget caps
   config.py      — Pydantic settings (IngestConfig, SegmentConfig, FitConfig, TopologyConfig, RecognizeConfig, ExportConfig)
 tests/           — pytest suite with fixtures per stage + STEP comparison + all-mesh parametric tests

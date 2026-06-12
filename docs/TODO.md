@@ -87,6 +87,34 @@
   `metrics.band_fidelity_report` — side-plate clusters read ~0.7mm vs
   ~0.08mm for base-plate clusters.
 
+## Onshape live export (started 2026-06-12)
+- [x] **Live export works end-to-end.** `onshape/client.py` (API key
+  pair via HTTP Basic — no HMAC needed; creds in .env, gitignored) +
+  `onshape/feature_builder.py` (FeatureTree -> native BTM features) +
+  `_live_export` in export_onshape.py. RackMount: 15/15 features OK in
+  a real document — base + 2 joins (with baked windows/bores via
+  filterInnerLoops) + 4 hole patterns; bbox matches the mesh to 0.1mm,
+  volume -7.7% (fillets + relief counterbores unmodeled). CLI:
+  `mesh2param convert x.3mf --onshape-doc "Name" --no-dry-run`-style
+  flags already existed; document_name now plumbed through.
+  Serialization details that cost probing time are documented in
+  feature_builder.py's docstring and locked by tests/test_onshape_export.py
+  (live smoke gated behind ONSHAPE_LIVE_TESTS=1). Probe scripts kept in
+  scripts/onshape_*.py. NOTE: free-tier accounts can only create PUBLIC
+  documents (private creation 409s; the client falls back automatically).
+- [ ] **Phase 2: fillets/chamfers in Onshape.** Needs edge queries
+  against Onshape's own topology — likely queryString FS queries
+  (qClosestTo / qContainsPoint with the stitched-cluster vertex data),
+  mirroring the CadQuery matcher's vertex-proximity approach.
+- [ ] **Web UI hookup** (Pro tier "Onshape" feature): an "Export to
+  Onshape" button on /app that runs the live path for the job's tree
+  and links the created document. Needs per-user credentials
+  eventually; today the server's .env key exports to the OWNER's
+  account, fine for single-user testing.
+- [ ] Blind-hole opening derivation assumes the recognized center sits
+  at the bore's axial midpoint — verify against a part with deep blind
+  holes (Mesh1's tangent blind pair) before trusting depth direction.
+
 ## Scans
 - [x] Decimation speedup: 2.5M-face scans spent ~60s in quadric edge-collapse.
   A cheap vertex-clustering pre-pass (when faces > 5x the cap) cuts the input
@@ -106,6 +134,24 @@
   prismatic scan (Scan2 Industrial Part) is the best candidate for further
   work; truly organic shapes (spanner) belong on /clean. No reference STEPs
   for scans, so accuracy is volume-only.
+- [ ] **Scan intent recovery (user direction, 2026-06-12).** "We need to
+  do very heavy work on smoothing out surfaces, recovering intent such
+  as circles, 90 degree angles, etc. There is extreme distortion causing
+  horrible results." Concrete observed failure on the wrench (Scan1):
+  the extrusion engine takes the SIDE profile — extremely jagged — and
+  extrudes it far past the wrench's true width. Two separate problems:
+  (a) profile selection trusting a noisy silhouette's bbox span instead
+  of the measured cross-section run (the run-tracking IoU should break
+  on scan noise but apparently doesn't), and (b) no
+  smoothing/regularization stage that snaps near-circles to circles,
+  near-90° corners to 90°, and near-parallel runs to parallel before
+  fitting. Attack order suggestion: profile/span honesty first (cheap,
+  bounded), then a 2D outline regularizer (RANSAC lines/arcs on the
+  section polygon with angle snapping), then surface-level smoothing.
+- [ ] Scan failures currently visible in tests: Scan3 fit drops 2/105
+  regions, Scan1 recognizes only a BASE feature (no holes) — both
+  pre-existing (confirmed on 4b51b30, 2026-06-12), xfail candidates
+  until the intent-recovery work lands.
 
 ## Iterative extrusion engine (started 2026-06-11)
 - [x] **Phase 1+4: engine + metric.** `pipeline/extrusion.py` decomposes a

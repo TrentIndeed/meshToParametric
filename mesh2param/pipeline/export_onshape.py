@@ -104,7 +104,9 @@ def export_to_onshape(
     if config.dry_run:
         result = _dry_run(operations, feature_tree, mesh_volume, config)
     else:
-        result = _live_export(operations, feature_tree, mesh_volume, config)
+        result = _live_export(
+            operations, feature_tree, cleaned, mesh_volume, config,
+        )
 
     logger.info(
         "Export %s: %d operations, volume error %.2f%%, status %s",
@@ -363,19 +365,119 @@ def _dry_run(
 def _live_export(
     operations: list[ExportOperation],
     feature_tree: FeatureTree,
+    cleaned: CleanedMesh,
     mesh_volume: float,
     config: ExportConfig,
 ) -> ExportResult:
-    """Execute the export plan against the Onshape REST API.
+    """Execute the export against the Onshape REST API.
 
-    Requires ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY environment variables,
-    or ONSHAPE_OAUTH_TOKEN.
+    Creates a real document, builds the feature tree as native Onshape
+    features (construction planes + sketches + extrudes — see
+    onshape/feature_builder.py for the validated serialization), then
+    validates the resulting solid volume against the mesh volume.
 
-    This is a placeholder — full implementation requires the onshape/ client module.
+    Requires ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY (env or .env).
     """
-    logger.warning(
-        "Live export not yet implemented. Use dry_run=True or implement "
-        "onshape/client.py with API authentication."
+    import time as _time
+
+    from mesh2param.onshape.client import OnshapeApiError, OnshapeClient
+    from mesh2param.onshape.feature_builder import (
+        build_onshape_plan, resolve_pending,
     )
-    # Fall back to dry-run for now
-    return _dry_run(operations, feature_tree, mesh_volume, config)
+
+    client = OnshapeClient.from_env(
+        base_url=config.onshape_base_url, timeout=config.api_timeout,
+    )
+    if client is None:
+        logger.warning(
+            "Live export requested but ONSHAPE_ACCESS_KEY / "
+            "ONSHAPE_SECRET_KEY are not configured; falling back to "
+            "dry-run.",
+        )
+        return _dry_run(operations, feature_tree, mesh_volume, config)
+
+    plan = build_onshape_plan(
+        feature_tree, (cleaned.bbox[0], cleaned.bbox[1]),
+    )
+    if not plan.features:
+        logger.warning(
+            "Live export: plan is empty (%s); falling back to dry-run",
+            "; ".join(plan.skipped),
+        )
+        return _dry_run(operations, feature_tree, mesh_volume, config)
+
+    api_log: list[dict] = []
+    t0 = _time.time()
+
+    def _log_call(name: str, start: float, ok: bool) -> None:
+        api_log.append({
+            "name": name,
+            "start": round(start - t0, 2),
+            "duration": round(_time.time() - start, 2),
+            "status_code": 200 if ok else 400,
+        })
+
+    doc_name = config.document_name or "mesh2param export"
+    t = _time.time()
+    did, wid = client.create_document(doc_name)
+    _log_call("Create Document", t, True)
+    t = _time.time()
+    eid = client.partstudio_id(did, wid)
+    _log_call("Locate Part Studio", t, True)
+    url = client.document_url(did, wid, eid)
+    logger.info("Live export -> %s", url)
+
+    n_ok = 0
+    n_err = 0
+    for pf in plan.features:
+        btm = resolve_pending(plan, pf)
+        t = _time.time()
+        try:
+            fid, status = client.add_feature(did, wid, eid, btm)
+            pf.feature_id = fid
+            ok = status == "OK"
+        except OnshapeApiError as exc:
+            logger.warning("Feature %r rejected: %s", pf.name, exc)
+            fid, ok = "", False
+        _log_call(pf.name, t, ok)
+        if ok:
+            n_ok += 1
+        else:
+            n_err += 1
+            logger.warning(
+                "Feature %r created with errors (id=%s)", pf.name, fid,
+            )
+        if config.rate_limit_delay > 0:
+            _time.sleep(min(config.rate_limit_delay, 0.2))
+
+    t = _time.time()
+    cad_volume = client.volume_mm3(did, wid, eid) or 0.0
+    _log_call("Mass Properties (validate)", t, cad_volume > 0)
+
+    volume_error = (
+        abs(cad_volume - mesh_volume) / (mesh_volume + 1e-15) * 100
+    )
+    status = (
+        "PASS"
+        if n_err == 0 and volume_error < config.volume_tolerance_pct
+        else "FAIL"
+    )
+    logger.info(
+        "Live export done: %d/%d features OK, %d skipped (%s), "
+        "volume %.0f vs mesh %.0f (%.1f%%), %s",
+        n_ok, len(plan.features), len(plan.skipped),
+        "; ".join(plan.skipped) or "none",
+        cad_volume, mesh_volume, volume_error, url,
+    )
+
+    return ExportResult(
+        operations=operations,
+        api_log=api_log,
+        mesh_volume=mesh_volume,
+        cad_volume=cad_volume,
+        feature_count=n_ok,
+        expected_features=len(plan.features),
+        volume_error_pct=volume_error,
+        status=status,
+        document_url=url,
+    )

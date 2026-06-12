@@ -135,6 +135,7 @@ class ExportConfig(BaseModel):
     """Configuration for Stage 6: Onshape Export."""
 
     dry_run: bool = True  # generate plan without calling API
+    document_name: str = ""  # live export: Onshape document name ("" = auto)
     onshape_base_url: str = "https://cad.onshape.com"
     api_timeout: float = 30.0
     rate_limit_delay: float = 1.0

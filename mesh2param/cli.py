@@ -83,9 +83,13 @@ def convert(input_file: Path, dry_run: bool, output: Path | None, step_path: Pat
                    f"(workspace {onshape_workspace!r}) ...")
     else:
         click.echo("Stage 6/6: planning Onshape export (dry run) ...")
-    result = export_to_onshape(feature_tree, cleaned, ExportConfig(dry_run=effective_dry_run))
+    result = export_to_onshape(feature_tree, cleaned, ExportConfig(
+        dry_run=effective_dry_run, document_name=onshape_doc or "",
+    ))
     click.echo(f"  status={result.status}, features={result.feature_count}, "
                f"volume_error={result.volume_error_pct:.2f}%")
+    if result.document_url and not effective_dry_run:
+        click.echo(f"  document: {result.document_url}")
 
     if output is not None:
         payload = {

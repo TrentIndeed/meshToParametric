@@ -210,6 +210,44 @@
   (per-piece topology); this reconstructs that property on the
   single-part path.
 
+## Fillet UX/robustness round (user feedback 2026-06-12)
+Done this round: apply order holes -> plate-edge wraps -> tab outlines
+(bucket sort by category + extent); greedy maximal-subset fallback after
+leave-one-out so a stitched group never fails outright (full broken-shell
+gate per trial); topology viz repainted neutral gray (was stacked on the
+fit-stage colors, hiding edge classification); >= 2.5s dwell on EVERY
+stage visual (was only stitched/build/intent/apply/reconcile — others
+flashed for a frame in non-step-through runs).
+
+Deferred (need the de-stacked topology viz to diagnose):
+- [ ] **Progressive build animation + feature tree.** Today both appear
+  only at the very end. Wanted sequence: show the build animation +
+  feature tree for the steps built so far, THEN the fillet intent stage,
+  THEN extend the animation/tree as fillets get applied. Requires
+  emitting timeline/tree snapshots incrementally from the export
+  subprocess instead of one final payload.
+- [ ] **Intent overlay missing the right side plate's right-edge
+  group.** The matcher claims it (it appears in reconciliation) but no
+  intent patch/polyline renders — check `_append_intent` for that
+  cluster (is it skipping because the cluster matched only a curve, or
+  is the patch builder failing silently?).
+- [ ] **3/4 side-plate edge wraps not applied** even though
+  reconciliation shows all groups correct. The greedy-subset fallback
+  added this round should recover partial chains; if OCC still refuses,
+  the next step is a full fillet-applicable-edge INVENTORY on the
+  rebuilt solid (score every edge for blend feasibility up front) and
+  match each stitched group to the most-similar feasible edge chain, so
+  apply targets are valid-by-construction (user request).
+- [ ] **Corner band enlargement.** The bled-fillet splitter works, but
+  band length grows near corners (split halves keep corner-arc faces
+  belonging to the adjacent band). Likely the same plane-association
+  fix as the bore-rim item above.
+- [ ] **Left and right edge fillets incorrectly grouped together** on
+  the left side plate (two colors on the short sides). The user suspects
+  the topology stage (now visually debuggable after de-stacking) — check
+  whether one topology record genuinely spans both edges or the stitched
+  union merges them.
+
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet
   matcher search; the structural fix for the blend apply ratio).

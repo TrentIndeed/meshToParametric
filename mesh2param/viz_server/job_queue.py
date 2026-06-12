@@ -582,11 +582,12 @@ class JobQueue:
 
         def _dwell_if_not_step_through(stage_key: str | None = None, seconds: float = 2.5):
             """Hold the current progress viz long enough for the frontend's
-            poll loop to catch it. Only needed for stages that have no
-            real computation work (pure viz updates) — without this,
-            non-step-through mode races past them before the next poll.
-            In step-through mode (or when this stage is the breakpoint
-            target) the explicit pause handles visibility instead.
+            poll loop to catch it. Called after EVERY stage's viz
+            emission: stages whose follow-on computation is fast would
+            otherwise flash for a fraction of a second in non-step-through
+            mode. In step-through mode (or when this stage is the
+            breakpoint target) the explicit pause handles visibility
+            instead.
             """
             if job.step_through:
                 return
@@ -750,6 +751,7 @@ class JobQueue:
             job.progress_version += 1
             logger.info("Multi-body: %d bodies detected", len(decomposition.bodies))
             if job.step_through or job.pause_at_stage == "decompose":
+                _dwell_if_not_step_through("decompose")
                 _pause_for_review("decompose")
             else:
                 # Step mode off — still let the explode animation play (3s)
@@ -907,6 +909,7 @@ class JobQueue:
                 f"({n_plate} plate, {n_curve} curve, {n_cyl} cyl) median={median_f}f"
             )
         _set_body_viz(seg_colors)
+        _dwell_if_not_step_through("segment")
         _pause_for_review("segment")
 
         # Stage 3: Fitting
@@ -974,6 +977,7 @@ class JobQueue:
         job.progress_colors_per_face = False
         job._decomp_pieces = fit_pieces
         job.progress_version += 1
+        _dwell_if_not_step_through("fit")
         _pause_for_review("fit")
 
         # Stage 4: Topology — same face colors as fitting + edge lines
@@ -1015,12 +1019,28 @@ class JobQueue:
         edge_cols = np.array(edge_col_list) if edge_col_list else None
         job.progress_edges = edge_pts.flatten().tolist() if edge_pts is not None else None
         job.progress_edge_colors = edge_cols.flatten().tolist() if edge_cols is not None else None
-        # Reuse Stage 3's projected-primitive pieces as the base
-        # face geometry; edges classified above are overlaid on top.
+        # Reuse Stage 3's projected-primitive GEOMETRY but repaint it
+        # a uniform neutral gray: stacking the fit-stage region colors
+        # under the edge overlay made the two stages visually
+        # indistinguishable and hid mis-classified edges. Here the
+        # classified edge lines are the only colored content. Keep
+        # PER-FACE colors (all neutral) rather than colors=None — the
+        # colorless piece path is the decompose viz (translucent +
+        # explode animation), wrong for this stage.
+        topo_pieces = [
+            {
+                "vertices": p["vertices"],
+                "faces": p["faces"],
+                "colors": [0.62, 0.64, 0.68] * (len(p["faces"]) // 3),
+                "color": p.get("color"),
+            }
+            for p in fit_pieces
+        ]
         job.progress_colors = None
         job.progress_colors_per_face = False
-        job._decomp_pieces = fit_pieces
+        job._decomp_pieces = topo_pieces
         job.progress_version += 1
+        _dwell_if_not_step_through("topology")
         _pause_for_review("topology")
 
         # Stage 4.5: Blend graph — highlight each plane-to-plane
@@ -1055,6 +1075,7 @@ class JobQueue:
             job.progress_edges = None
             job.progress_edge_colors = None
             _set_body_viz(blend_face_colors_by_body)
+            _dwell_if_not_step_through("blend_graph")
             _pause_for_review("blend_graph")
         except Exception as _bg_exc:
             logger.debug("Blend graph viz failed: %s", _bg_exc)
@@ -2144,6 +2165,7 @@ class JobQueue:
                 f"[Body {bi}] Stage 5: {len(body_tree.features)} features ({type_str})"
             )
         _set_body_viz(feat_colors)
+        _dwell_if_not_step_through("features")
         _pause_for_review("features")
 
         tree = all_body_results[0][2]

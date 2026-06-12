@@ -5221,6 +5221,23 @@ def _apply_recognized_fillets_to_solid(
             ],
         })
 
+    # --- Apply order: holes first, then large edge wraps, then small
+    # outlines. Grouping similar blends together (all hole rims, then
+    # all plate-edge wraps, then tab outlines) keeps the construction
+    # timeline readable and applies big structural blends before small
+    # detail blends, so a tab fillet never reshapes an edge a plate
+    # wrap still needs to resolve against. Within a tier, larger
+    # features go first; ties break by cluster index for determinism.
+    def _bucket_sort_key(bucket: dict) -> tuple:
+        ci = bucket["cluster_idx"]
+        cat = clusters[ci].get("category", "curve_edge")
+        v = np.asarray(clusters[ci]["vertices"], dtype=float)
+        max_ext = float((v.max(axis=0) - v.min(axis=0)).max()) if len(v) else 0.0
+        tier = 0 if cat == "hole_edge" else 1
+        return (tier, -max_ext, ci)
+
+    buckets.sort(key=_bucket_sort_key)
+
     # Each cluster is applied as ITS OWN fillet, one at a time. The two
     # perimeter wraps of one plate (or the left/right plates) are
     # SEPARATE physical fillets and must not be merged into one
@@ -5283,6 +5300,51 @@ def _apply_recognized_fillets_to_solid(
         sel = wp_solid.newObject(edges)
         return sel.chamfer(size) if kind == "chamfer" else sel.fillet(size)
 
+    def _gate_blend_result(wp_test, vol_before: float):
+        """Volume sanity + broken-shell gate for a candidate blend result.
+
+        OCC can report SUCCESS while emitting a broken shell: rolling
+        RackMount's outer-face ring returned a sane B-rep volume but a
+        self-intersecting, non-watertight shape whose tessellation
+        inverted (and poisoned every later step). Verify by SIGNED
+        tessellation volume AND welded open-edge count (vertices must be
+        deduplicated first — OCC tessellations duplicate vertices per
+        face, which makes every edge look open otherwise).
+
+        Returns (ok, v, f, vol_after, why) — v/f are the tessellation so
+        the caller can reuse it for the ConstructionStep.
+        """
+        vol_after = abs(float(wp_test.val().Volume()))
+        if vol_after <= 0 or vol_after > vol_before * 1.05:
+            return False, None, None, vol_after, "volume out of range"
+        v, f = _tessellate_solid(wp_test, fast=True)
+        _va = np.asarray(v, dtype=float)
+        _fa = np.asarray(f, dtype=np.int64)
+        _tri = _va[_fa]
+        signed_vol = float(np.einsum(
+            "ij,ij->i", _tri[:, 0],
+            np.cross(_tri[:, 1], _tri[:, 2]),
+        ).sum() / 6.0)
+        _rv = np.round(_va, 4)
+        _uv, _inv = np.unique(_rv, axis=0, return_inverse=True)
+        _fw = _inv[_fa]
+        _ed = np.sort(
+            _fw[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1,
+        )
+        _, _ec = np.unique(_ed, axis=0, return_counts=True)
+        n_open_edges = int((_ec != 2).sum())
+        if (
+            signed_vol <= 0
+            or not (0.7 < signed_vol / max(vol_after, 1e-9) < 1.3)
+            or n_open_edges > 0
+        ):
+            why = (
+                f"broken shell (signed tess vol {signed_vol:.0f} vs "
+                f"B-rep {vol_after:.0f}, {n_open_edges} open edges)"
+            )
+            return False, v, f, vol_after, why
+        return True, v, f, vol_after, "ok"
+
     def _apply_bucket(bi: int, bucket: dict) -> bool:
         nonlocal wp
         members = bucket["members"]
@@ -5295,11 +5357,12 @@ def _apply_recognized_fillets_to_solid(
         vol_before = abs(float(wp.val().Volume()))
 
         # --- Apply the WHOLE crease in one rolling operation. ---
-        # Never fall back to per-edge: filleting the sides separately
-        # leaves the corners sharp (the exact failure the user saw).
-        # If OCC can't roll the chain at applied_r, retry the whole
-        # chain at successively smaller whole-mm radii down to 2 mm;
-        # if even 2 mm fails, skip the cluster (no broken partial).
+        # Prefer the full chain: filleting the sides separately leaves
+        # the corners sharp. If OCC can't roll the chain at applied_r,
+        # retry the whole chain at successively smaller whole-mm radii
+        # down to 2 mm, then leave-one-out, then a greedy maximal
+        # subset — a cluster only fails if NO sub-chain passes the
+        # shell gate.
         r_candidates = [applied_r]
         for rr in range(int(applied_r) - 1, 1, -1):
             if rr >= 2:
@@ -5308,46 +5371,16 @@ def _apply_recognized_fillets_to_solid(
         for r in r_candidates:
             try:
                 wp_test = _blend_edges(wp, edges_obj, r, kind)
-                vol_after = abs(float(wp_test.val().Volume()))
-                if vol_after <= 0 or vol_after > vol_before * 1.05:
-                    continue
-                # OCC can report SUCCESS while emitting a broken shell:
-                # rolling RackMount's outer-face ring returned a sane
-                # B-rep volume but a self-intersecting, non-watertight
-                # shape whose tessellation inverted (and poisoned every
-                # later step). Verify the result by SIGNED tessellation
-                # volume before accepting the bucket.
-                v, f = _tessellate_solid(wp_test, fast=True)
-                _va = np.asarray(v, dtype=float)
-                _fa = np.asarray(f, dtype=np.int64)
-                _tri = _va[_fa]
-                signed_vol = float(np.einsum(
-                    "ij,ij->i", _tri[:, 0],
-                    np.cross(_tri[:, 1], _tri[:, 2]),
-                ).sum() / 6.0)
-                # Weld first: OCC tessellations duplicate vertices per
-                # face, making every edge look open.
-                _rv = np.round(_va, 4)
-                _uv, _inv = np.unique(_rv, axis=0, return_inverse=True)
-                _fw = _inv[_fa]
-                _ed = np.sort(
-                    _fw[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1,
+                ok, v, f, vol_after, why = _gate_blend_result(
+                    wp_test, vol_before,
                 )
-                _, _ec = np.unique(_ed, axis=0, return_counts=True)
-                n_open_edges = int((_ec != 2).sum())
-                if (
-                    signed_vol <= 0
-                    or not (0.7 < signed_vol / max(vol_after, 1e-9) < 1.3)
-                    or n_open_edges > 0
-                ):
-                    logger.warning(
-                        "Bucket %d r=%.0f on %d edges: OCC reported "
-                        "success but the shell is broken (signed tess "
-                        "vol %.0f vs B-rep %.0f, %d open edges); "
-                        "rejecting",
-                        bi, r, n_edges, signed_vol, vol_after,
-                        n_open_edges,
-                    )
+                if not ok:
+                    if v is not None:
+                        logger.warning(
+                            "Bucket %d r=%.0f on %d edges: OCC reported "
+                            "success but %s; rejecting",
+                            bi, r, n_edges, why,
+                        )
                     continue
                 wp = wp_test
                 applied_steps.append(ConstructionStep(
@@ -5384,41 +5417,18 @@ def _apply_recognized_fillets_to_solid(
                 subset = [e for k, e in enumerate(edges_obj) if k != skip_i]
                 try:
                     wp_test = _blend_edges(wp, subset, r_loo, kind)
-                    vol_after = abs(float(wp_test.val().Volume()))
-                    if vol_after <= 0 or vol_after > vol_before * 1.05:
-                        continue
-                    # Same broken-shell gate as the primary path: OCC
-                    # can report success while emitting an inverted,
-                    # non-watertight shape (the unguarded leave-one-out
-                    # acceptance was the corruption's second way in).
-                    v, f = _tessellate_solid(wp_test, fast=True)
-                    _va = np.asarray(v, dtype=float)
-                    _fa = np.asarray(f, dtype=np.int64)
-                    _tri = _va[_fa]
-                    signed_vol = float(np.einsum(
-                        "ij,ij->i", _tri[:, 0],
-                        np.cross(_tri[:, 1], _tri[:, 2]),
-                    ).sum() / 6.0)
-                    _rv = np.round(_va, 4)
-                    _uv, _inv = np.unique(_rv, axis=0, return_inverse=True)
-                    _fw = _inv[_fa]
-                    _ed = np.sort(
-                        _fw[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1,
+                    # Same broken-shell gate as the primary path: the
+                    # unguarded leave-one-out acceptance was the
+                    # corruption's second way in.
+                    ok, v, f, vol_after, why = _gate_blend_result(
+                        wp_test, vol_before,
                     )
-                    _, _ec = np.unique(_ed, axis=0, return_counts=True)
-                    n_open_edges = int((_ec != 2).sum())
-                    if (
-                        signed_vol <= 0
-                        or not (0.7 < signed_vol / max(vol_after, 1e-9) < 1.3)
-                        or n_open_edges > 0
-                    ):
-                        logger.warning(
-                            "Bucket %d LOO subset %d: broken shell "
-                            "(signed %.0f vs %.0f, %d open edges); "
-                            "rejecting",
-                            bi, skip_i, signed_vol, vol_after,
-                            n_open_edges,
-                        )
+                    if not ok:
+                        if v is not None:
+                            logger.warning(
+                                "Bucket %d LOO subset %d: %s; rejecting",
+                                bi, skip_i, why,
+                            )
                         continue
                 except Exception:
                     continue
@@ -5445,11 +5455,66 @@ def _apply_recognized_fillets_to_solid(
                 )
                 applied_this_bucket = True
                 break
+        # Greedy maximal-subset recovery: when the whole chain AND every
+        # leave-one-out subset fail, grow the largest sub-chain OCC can
+        # roll instead of skipping the cluster outright. Long spine
+        # edges are tried first (they carry the visible fillet); each
+        # candidate is re-tested as one rolling op with the full shell
+        # gate, so a poison edge is simply never admitted. A partial
+        # fillet with a sharp corner near the degenerate edge beats the
+        # user-visible alternative — the whole wrap staying sharp
+        # (RackMount: 3 of 4 side-plate edge wraps were dropped this
+        # way).
+        if not applied_this_bucket and n_edges >= 2:
+            r_g = r_candidates[-1]
+
+            def _elen(e) -> float:
+                try:
+                    return float(e.Length())
+                except Exception:
+                    return 0.0
+
+            order = sorted(
+                range(n_edges), key=lambda k: -_elen(edges_obj[k]),
+            )
+            kept: list[int] = []
+            best = None  # (wp_test, v, f, vol_after)
+            for k in order:
+                trial = [edges_obj[t] for t in (*kept, k)]
+                try:
+                    wp_test = _blend_edges(wp, trial, r_g, kind)
+                    ok, v, f, vol_after, _why = _gate_blend_result(
+                        wp_test, vol_before,
+                    )
+                except Exception:
+                    continue
+                if ok:
+                    kept.append(k)
+                    best = (wp_test, v, f, vol_after)
+            if best is not None and kept:
+                wp_test, v, f, vol_after = best
+                wp = wp_test
+                applied_steps.append(ConstructionStep(
+                    name=f"{op_label} (r={r_g:.0f}mm) x{len(kept)}",
+                    tess_vertices=v, tess_faces=f, volume=vol_after,
+                ))
+                applied_script.append(
+                    f"# {op_label} r={r_g:.0f} on {len(kept)}/{n_edges} "
+                    f"crease edge(s) (greedy maximal subset)"
+                )
+                logger.info(
+                    "Bucket %d (cluster %d): greedy subset rolled %d/%d "
+                    "edges at r=%.0fmm, vol %.0f -> %.0f",
+                    bi, bucket["cluster_idx"], len(kept), n_edges, r_g,
+                    vol_before, vol_after,
+                )
+                applied_this_bucket = True
+
         if not applied_this_bucket:
             logger.warning(
                 "Bucket %d (cluster %d): could not roll %d-edge crease at "
-                "any radius >= 2mm, even with leave-one-out; skipped "
-                "(no partial per-edge apply so corners aren't left sharp)",
+                "any radius >= 2mm, even with leave-one-out or greedy "
+                "subsets; skipped",
                 bi, bucket["cluster_idx"], n_edges,
             )
         return applied_this_bucket

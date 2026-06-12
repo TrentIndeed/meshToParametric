@@ -1132,6 +1132,7 @@ class JobQueue:
                         return None
                     return n / nrm
 
+                _pending_blend_halves = []
                 for rec in topo_blends:
                     kind = rec.get("kind")
                     if kind == "chamfer":
@@ -1158,48 +1159,98 @@ class JobQueue:
                         continue
                     fi_arr = np.asarray(fi, dtype=np.int64)
                     verts = _sub.vertices[_sub.faces[fi_arr]].reshape(-1, 3)
-                    ad_raw = rec.get("axis_dir")
-                    ap_raw = rec.get("axis_point")
-                    if ad_raw is not None:
-                        axis_dir = np.asarray(ad_raw, dtype=float)
-                        an = float(np.linalg.norm(axis_dir))
-                    else:
-                        axis_dir = None
-                        an = 0.0
-                    if axis_dir is not None and an >= 1e-9:
-                        axis_dir = axis_dir / an
-                        axis_point = (
-                            np.asarray(ap_raw, dtype=float)
-                            if ap_raw is not None
-                            else verts.mean(axis=0)
-                        )
-                        t = (verts - axis_point) @ axis_dir
-                        t_min, t_max = float(t.min()), float(t.max())
-                        endpoints = np.array([
-                            axis_point + t_min * axis_dir,
-                            axis_point + t_max * axis_dir,
-                        ])
-                    else:
-                        axis_dir = None
-                        endpoints = None
-                    # Collect the adjacent plate normals for this
-                    # record (one per plane_region_id).  Empty list
-                    # is fine — the matcher just won't have a plane
-                    # gate for that record's cluster.
-                    plane_normals_rec: list[list[float]] = []
-                    for prid in (rec.get("plane_region_ids") or []):
-                        n = _plane_normal_for(int(prid))
-                        if n is not None:
-                            plane_normals_rec.append(n.tolist())
-                    records_info.append({
-                        "body_idx": body_idx,
-                        "rec": rec,
-                        "verts": verts,
-                        "axis_dir": axis_dir,
-                        "endpoints": endpoints,
-                        "radius": float(rec.get("radius", 0.0) or 0.0),
-                        "plane_normals": plane_normals_rec,
-                    })
+
+                    # PLATE-WRAP SPLIT: a band that wraps BOTH faces of a
+                    # thin plate (RackMount's side-plate corner/bottom
+                    # bands) physically touches each face's outline
+                    # fillet, so contact-union chained the left-face and
+                    # right-face outline fillets into ONE unappliable
+                    # group. Such a band's vertex cloud is bimodal across
+                    # the thickness with a void WIDER than the 2mm
+                    # contact radius — split it there and each half
+                    # joins its own face's group.
+                    halves = [(rec, fi_arr, verts)]
+                    _dims = verts.max(axis=0) - verts.min(axis=0)
+                    _thin = int(np.argmin(_dims))
+                    if float(_dims[_thin]) <= 12.0 and len(verts) >= 24:
+                        _vt = np.sort(verts[:, _thin])
+                        _gaps = np.diff(_vt)
+                        _gi = int(np.argmax(_gaps))
+                        _frac = (_gi + 1) / len(_vt)
+                        if float(_gaps[_gi]) >= 2.0 and 0.2 < _frac < 0.8:
+                            _mid = 0.5 * (float(_vt[_gi]) + float(_vt[_gi + 1]))
+                            _cent = _sub.vertices[
+                                _sub.faces[fi_arr]
+                            ].mean(axis=1)[:, _thin]
+                            _fA = fi_arr[_cent < _mid]
+                            _fB = fi_arr[_cent >= _mid]
+                            if len(_fA) >= 3 and len(_fB) >= 3:
+                                rec_b = dict(rec)
+                                rec_b["face_indices"] = _fB.tolist()
+                                rec["face_indices"] = _fA.tolist()
+                                _pending_blend_halves.append(rec_b)
+                                _vA = _sub.vertices[
+                                    _sub.faces[_fA]
+                                ].reshape(-1, 3)
+                                _vB = _sub.vertices[
+                                    _sub.faces[_fB]
+                                ].reshape(-1, 3)
+                                halves = [
+                                    (rec, _fA, _vA), (rec_b, _fB, _vB),
+                                ]
+                                logger.info(
+                                    "Split plate-wrap blend record into "
+                                    "face-side halves (%d/%d faces, gap "
+                                    "%.1fmm)",
+                                    len(_fA), len(_fB), float(_gaps[_gi]),
+                                )
+
+                    for rec_h, fi_h, verts_h in halves:
+                        ad_raw = rec_h.get("axis_dir")
+                        ap_raw = rec_h.get("axis_point")
+                        if ad_raw is not None:
+                            axis_dir = np.asarray(ad_raw, dtype=float)
+                            an = float(np.linalg.norm(axis_dir))
+                        else:
+                            axis_dir = None
+                            an = 0.0
+                        if axis_dir is not None and an >= 1e-9:
+                            axis_dir = axis_dir / an
+                            axis_point = (
+                                np.asarray(ap_raw, dtype=float)
+                                if ap_raw is not None
+                                else verts_h.mean(axis=0)
+                            )
+                            t = (verts_h - axis_point) @ axis_dir
+                            t_min, t_max = float(t.min()), float(t.max())
+                            endpoints = np.array([
+                                axis_point + t_min * axis_dir,
+                                axis_point + t_max * axis_dir,
+                            ])
+                        else:
+                            axis_dir = None
+                            endpoints = None
+                        # Collect the adjacent plate normals for this
+                        # record (one per plane_region_id).  Empty list
+                        # is fine — the matcher just won't have a plane
+                        # gate for that record's cluster.
+                        plane_normals_rec: list[list[float]] = []
+                        for prid in (rec_h.get("plane_region_ids") or []):
+                            n = _plane_normal_for(int(prid))
+                            if n is not None:
+                                plane_normals_rec.append(n.tolist())
+                        records_info.append({
+                            "body_idx": body_idx,
+                            "rec": rec_h,
+                            "verts": verts_h,
+                            "axis_dir": axis_dir,
+                            "endpoints": endpoints,
+                            "radius": float(rec_h.get("radius", 0.0) or 0.0),
+                            "plane_normals": plane_normals_rec,
+                        })
+
+                if _pending_blend_halves:
+                    topo_blends.extend(_pending_blend_halves)
 
             # Per-record geometry classification. Four categories:
             #   hole_edge   — closed ring around an axis, tight axial span
@@ -1583,7 +1634,7 @@ class JobQueue:
                 [1.00, 0.20, 0.20], [0.20, 1.00, 0.40], [0.30, 0.55, 1.00],
                 [1.00, 0.70, 0.20], [0.90, 0.20, 0.95], [0.20, 0.95, 0.95],
                 [1.00, 0.45, 0.80], [0.60, 0.95, 0.20], [0.50, 0.30, 1.00],
-                [1.00, 0.85, 0.30], [0.30, 0.85, 0.65], [0.95, 0.50, 0.30],
+                [0.10, 0.50, 0.10], [0.30, 0.85, 0.65], [0.95, 0.95, 0.95],
                 [0.65, 0.20, 0.55], [0.25, 0.65, 0.40], [0.95, 0.30, 0.55],
                 [0.40, 0.40, 0.95], [0.85, 0.60, 0.95], [0.20, 0.75, 0.95],
             ])

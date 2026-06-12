@@ -95,10 +95,29 @@ def build_clusters(cleaned, single_body: bool = False):
                 axis = axis / np.linalg.norm(axis)
             else:
                 axis = None
-            records.append({
-                "body": bidx, "verts": verts, "axis": axis,
-                "radius": float(rec.get("radius", 0) or 0),
-            })
+            # Plate-wrap split — mirrors job_queue: a band wrapping
+            # both faces of a thin plate splits at the bimodal void so
+            # each half joins its own face's group.
+            import numpy as _np_split
+            halves = [verts]
+            dims = verts.max(axis=0) - verts.min(axis=0)
+            thin = int(_np_split.argmin(dims))
+            if float(dims[thin]) <= 12.0 and len(verts) >= 24:
+                vt = _np_split.sort(verts[:, thin])
+                gaps = _np_split.diff(vt)
+                gi = int(_np_split.argmax(gaps))
+                frac = (gi + 1) / len(vt)
+                if float(gaps[gi]) >= 2.0 and 0.2 < frac < 0.8:
+                    mid = 0.5 * (float(vt[gi]) + float(vt[gi + 1]))
+                    vA = verts[verts[:, thin] < mid]
+                    vB = verts[verts[:, thin] >= mid]
+                    if len(vA) >= 9 and len(vB) >= 9:
+                        halves = [vA, vB]
+            for vh in halves:
+                records.append({
+                    "body": bidx, "verts": vh, "axis": axis,
+                    "radius": float(rec.get("radius", 0) or 0),
+                })
     for i, r in enumerate(records):
         r["uid"] = i
 

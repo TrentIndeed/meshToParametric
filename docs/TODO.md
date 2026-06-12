@@ -195,6 +195,21 @@
   in the reflog (reverted working-tree change after a12837b). Resume in a
   worktree with time to study how polyline().close() threads the stack.
 
+- [ ] **+X plate bore-rim bleed: per-face record separation for fused
+  wrap bands (diagnosed 2026-06-12).** The single-body topology emits
+  the +X plate's short-side/bottom outline-fillet bands as records that
+  WRAP both plate faces with sparse-but-continuous bridge vertices (no
+  void to split at). Midplane splitting fragments worse: at the plate
+  corners the inner half of one band contacts the outer half of the
+  neighboring band, and a global cross-side union guard reshuffles
+  rather than fixes the chains (tried 2026-06-12, reverted). The robust
+  approach is PLANE-ASSOCIATION: each blend record carries
+  plane_region_ids — assign each face of a wrap record to the plate
+  face whose plane it blends from, splitting by adjacency rather than
+  geometry. The old body-decompose path got per-face records for free
+  (per-piece topology); this reconstructs that property on the
+  single-part path.
+
 ## Pipeline (from the 2026-06-10 analysis)
 - [ ] Feature-tree-driven CAD rebuild (replaces profile-extrusion + fillet
   matcher search; the structural fix for the blend apply ratio).

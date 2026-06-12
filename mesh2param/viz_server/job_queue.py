@@ -1177,17 +1177,44 @@ class JobQueue:
                         _gaps = np.diff(_vt)
                         _gi = int(np.argmax(_gaps))
                         _frac = (_gi + 1) / len(_vt)
-                        if float(_gaps[_gi]) >= 2.0 and 0.2 < _frac < 0.8:
+                        # Balanced split for moderate voids; for WIDE
+                        # voids (>=2.5mm) split regardless of balance —
+                        # a rim record carrying 3 stray vertices on the
+                        # opposite face bridged the contact union and
+                        # bled its color across the plate.
+                        if float(_gaps[_gi]) >= 1.5 and (
+                            0.2 < _frac < 0.8 or float(_gaps[_gi]) >= 2.5
+                        ):
                             _mid = 0.5 * (float(_vt[_gi]) + float(_vt[_gi + 1]))
                             _cent = _sub.vertices[
                                 _sub.faces[fi_arr]
                             ].mean(axis=1)[:, _thin]
                             _fA = fi_arr[_cent < _mid]
                             _fB = fi_arr[_cent >= _mid]
+                            # A TINY side (a few stray faces) is not a
+                            # fillet feature: keep only the substantial
+                            # half and orphan the strays (unpainted gray
+                            # beats a bleeding color or a noise group).
+                            if len(_fA) >= 3 and len(_fB) < 3:
+                                rec["face_indices"] = _fA.tolist()
+                                _fB = _fB[:0]
+                            elif len(_fB) >= 3 and len(_fA) < 3:
+                                rec["face_indices"] = _fB.tolist()
+                                _fA = _fA[:0]
                             if len(_fA) >= 3 and len(_fB) >= 3:
                                 rec_b = dict(rec)
                                 rec_b["face_indices"] = _fB.tolist()
                                 rec["face_indices"] = _fA.tolist()
+                                # Tag the halves so contact-union can't
+                                # re-merge what we deliberately split (a
+                                # 1.9mm void is inside the 2mm contact
+                                # radius — the left plate's bore rims
+                                # re-merged and bled across both faces).
+                                _split_tag = id(rec)
+                                rec["_split_parent"] = _split_tag
+                                rec["_split_side"] = 0
+                                rec_b["_split_parent"] = _split_tag
+                                rec_b["_split_side"] = 1
                                 _pending_blend_halves.append(rec_b)
                                 _vA = _sub.vertices[
                                     _sub.faces[_fA]
@@ -1394,12 +1421,26 @@ class JobQueue:
                     for ri in records_info
                 ])
                 tree = cKDTree(all_verts_arr)
+                _uid_to_split = {
+                    ri["uid"]: (
+                        ri["rec"].get("_split_parent"),
+                        ri["rec"].get("_split_side"),
+                    )
+                    for ri in records_info
+                }
                 for i, j in tree.query_pairs(r=DIRECT_EPS):
                     ua = int(all_uids_arr[i])
                     ub = int(all_uids_arr[j])
-                    if ua != ub and _find(ua) != _find(ub):
-                        _union(ua, ub)
-                        n_direct_unions += 1
+                    if ua == ub or _find(ua) == _find(ub):
+                        continue
+                    # Never re-merge the two sides of a deliberately
+                    # split plate-wrap record.
+                    pa, sa = _uid_to_split.get(ua, (None, None))
+                    pb, sb = _uid_to_split.get(ub, (None, None))
+                    if pa is not None and pa == pb and sa != sb:
+                        continue
+                    _union(ua, ub)
+                    n_direct_unions += 1
 
             # Proto-cluster closed-loop check. The per-record
             # classifier above looks at a SINGLE topology record

@@ -99,7 +99,7 @@ def build_clusters(cleaned, single_body: bool = False):
             # both faces of a thin plate splits at the bimodal void so
             # each half joins its own face's group.
             import numpy as _np_split
-            halves = [verts]
+            halves = [(verts, None, None)]
             dims = verts.max(axis=0) - verts.min(axis=0)
             thin = int(_np_split.argmin(dims))
             if float(dims[thin]) <= 12.0 and len(verts) >= 24:
@@ -107,16 +107,23 @@ def build_clusters(cleaned, single_body: bool = False):
                 gaps = _np_split.diff(vt)
                 gi = int(_np_split.argmax(gaps))
                 frac = (gi + 1) / len(vt)
-                if float(gaps[gi]) >= 2.0 and 0.2 < frac < 0.8:
+                if float(gaps[gi]) >= 1.5 and (
+                    0.2 < frac < 0.8 or float(gaps[gi]) >= 2.5
+                ):
                     mid = 0.5 * (float(vt[gi]) + float(vt[gi + 1]))
                     vA = verts[verts[:, thin] < mid]
                     vB = verts[verts[:, thin] >= mid]
                     if len(vA) >= 9 and len(vB) >= 9:
-                        halves = [vA, vB]
-            for vh in halves:
+                        halves = [(vA, id(rec), 0), (vB, id(rec), 1)]
+                    elif len(vA) >= 9:
+                        halves = [(vA, None, None)]  # drop stray minority
+                    elif len(vB) >= 9:
+                        halves = [(vB, None, None)]
+            for vh, sp, ss in halves:
                 records.append({
                     "body": bidx, "verts": vh, "axis": axis,
                     "radius": float(rec.get("radius", 0) or 0),
+                    "split_parent": sp, "split_side": ss,
                 })
     for i, r in enumerate(records):
         r["uid"] = i
@@ -141,8 +148,16 @@ def build_clusters(cleaned, single_body: bool = False):
         t = cKDTree(allv)
         for i, j in t.query_pairs(r=2.0):
             a, b = int(allu[i]), int(allu[j])
-            if a != b:
-                union(a, b)
+            if a == b:
+                continue
+            ra_, rb_ = records[a], records[b]
+            if (
+                ra_.get("split_parent") is not None
+                and ra_.get("split_parent") == rb_.get("split_parent")
+                and ra_.get("split_side") != rb_.get("split_side")
+            ):
+                continue
+            union(a, b)
 
     # proto closed-loop + opposite-plate split
     proto = {}

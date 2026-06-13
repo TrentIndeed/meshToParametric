@@ -46,6 +46,16 @@ class User(Base):
     referral = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # ── Onshape account link (per-user OAuth) ──
+    # Access/refresh tokens are stored ENCRYPTED (Fernet); see
+    # onshape/oauth.py. Null until the user connects their account.
+    onshape_access_token_enc = Column(Text)
+    onshape_refresh_token_enc = Column(Text)
+    onshape_token_expiry = Column(DateTime)      # UTC
+    onshape_user_id = Column(String)
+    onshape_user_name = Column(String)           # "Connected as <name>"
+    onshape_connected_at = Column(DateTime)
+
     jobs = relationship("MeshJob", back_populates="user")
 
 
@@ -73,6 +83,17 @@ class MeshJob(Base):
     variants_blob = Column(LargeBinary)  # pickled list of variant data
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
+
+    # ── Onshape document link (set on live export) ──
+    # The job remembers the document it was exported to so a re-export
+    # UPDATES it instead of spawning duplicates, and so the UI can
+    # deep-link in both directions.
+    onshape_document_id = Column(String)
+    onshape_workspace_id = Column(String)
+    onshape_element_id = Column(String)
+    onshape_url = Column(Text)
+    onshape_exported_at = Column(DateTime)
+    onshape_export_status = Column(String)  # ok | partial | error
 
     user = relationship("User", back_populates="jobs")
     steps = relationship("JobStep", back_populates="job", cascade="all, delete-orphan")
@@ -172,6 +193,22 @@ def _migrate_db():
         _add_col("mesh_jobs", "bbox_min_json", "TEXT")
         _add_col("mesh_jobs", "bbox_max_json", "TEXT")
         _add_col("mesh_jobs", "features_json", "TEXT")
+
+        # User: Onshape account link (per-user OAuth)
+        _add_col("users", "onshape_access_token_enc", "TEXT")
+        _add_col("users", "onshape_refresh_token_enc", "TEXT")
+        _add_col("users", "onshape_token_expiry", "TIMESTAMP")
+        _add_col("users", "onshape_user_id", "TEXT")
+        _add_col("users", "onshape_user_name", "TEXT")
+        _add_col("users", "onshape_connected_at", "TIMESTAMP")
+
+        # MeshJob: Onshape document link (set on live export)
+        _add_col("mesh_jobs", "onshape_document_id", "TEXT")
+        _add_col("mesh_jobs", "onshape_workspace_id", "TEXT")
+        _add_col("mesh_jobs", "onshape_element_id", "TEXT")
+        _add_col("mesh_jobs", "onshape_url", "TEXT")
+        _add_col("mesh_jobs", "onshape_exported_at", "TIMESTAMP")
+        _add_col("mesh_jobs", "onshape_export_status", "TEXT")
 
         # JobStep new columns (blob-based tessellation)
         _add_col("job_steps", "vertices_blob", "BLOB")

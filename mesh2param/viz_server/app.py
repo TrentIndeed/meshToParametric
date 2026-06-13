@@ -176,6 +176,8 @@ def _safe_suffix(filename: str | None) -> str | None:
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
+from mesh2param.api.onshape_oauth import router as onshape_oauth_router  # noqa: E402
+app.include_router(onshape_oauth_router)
 
 
 # ── Pages ──

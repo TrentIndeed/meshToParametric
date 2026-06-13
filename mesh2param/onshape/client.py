@@ -59,20 +59,29 @@ class OnshapeClient:
 
     def __init__(
         self,
-        access_key: str,
-        secret_key: str,
+        access_key: str | None = None,
+        secret_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 30.0,
+        *,
+        auth_header: str | None = None,
     ):
+        """Two auth modes, same API surface:
+          - API key pair (Basic auth) — the server-owner / CLI path.
+          - OAuth bearer token (auth_header="Bearer <token>") — the
+            per-user path; use OnshapeClient.from_oauth_token().
+        """
         self.base_url = base_url.rstrip("/")
         self.api = f"{self.base_url}/api/{API_VERSION}"
         self.timeout = timeout
         self._session = requests.Session()
-        token = base64.b64encode(
-            f"{access_key}:{secret_key}".encode()
-        ).decode()
+        if auth_header is None:
+            token = base64.b64encode(
+                f"{access_key}:{secret_key}".encode()
+            ).decode()
+            auth_header = f"Basic {token}"
         self._session.headers.update({
-            "Authorization": f"Basic {token}",
+            "Authorization": auth_header,
             "Accept": "application/json;charset=UTF-8; qs=0.09",
             "Content-Type": "application/json",
         })
@@ -92,6 +101,18 @@ class OnshapeClient:
         if not ak or not sk:
             return None
         return cls(ak, sk, base_url=base_url, timeout=timeout)
+
+    @classmethod
+    def from_oauth_token(cls, access_token: str,
+                         base_url: str = DEFAULT_BASE_URL,
+                         timeout: float = 30.0) -> "OnshapeClient":
+        """Build a per-user client from an OAuth access token."""
+        return cls(auth_header=f"Bearer {access_token}",
+                   base_url=base_url, timeout=timeout)
+
+    def set_oauth_token(self, access_token: str) -> None:
+        """Swap in a refreshed OAuth access token."""
+        self._session.headers["Authorization"] = f"Bearer {access_token}"
 
     # -- plumbing ----------------------------------------------------------
 

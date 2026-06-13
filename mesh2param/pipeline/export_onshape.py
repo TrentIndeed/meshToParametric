@@ -51,6 +51,9 @@ class ExportResult:
     volume_error_pct: float = 0.0
     status: str = "PASS"
     document_url: str = ""
+    document_id: str = ""
+    workspace_id: str = ""
+    element_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +65,9 @@ class ExportResult:
             "volume_error_pct": round(self.volume_error_pct, 2),
             "status": self.status,
             "document_url": self.document_url,
+            "document_id": self.document_id,
+            "workspace_id": self.workspace_id,
+            "element_id": self.element_id,
         }
 
 
@@ -70,6 +76,7 @@ def export_to_onshape(
     cleaned: CleanedMesh,
     config: ExportConfig | None = None,
     as_built: dict | None = None,
+    client=None,
 ) -> ExportResult:
     """Export a feature tree to Onshape (or produce a dry-run plan).
 
@@ -81,6 +88,9 @@ def export_to_onshape(
             the live export rebuilds the AS-BUILT holes and blends
             (everything the CadQuery recovery passes actually cut)
             instead of the raw recognition tree's hole list.
+        client: Optional authenticated OnshapeClient. Pass a per-USER
+            client (OAuth) so the export lands in that user's account;
+            None falls back to the server's env API keys (CLI/testing).
 
     Returns:
         ExportResult with operations, API log, and validation report.
@@ -111,7 +121,7 @@ def export_to_onshape(
     else:
         result = _live_export(
             operations, feature_tree, cleaned, mesh_volume, config,
-            as_built=as_built,
+            as_built=as_built, client=client,
         )
 
     logger.info(
@@ -375,6 +385,7 @@ def _live_export(
     mesh_volume: float,
     config: ExportConfig,
     as_built: dict | None = None,
+    client=None,
 ) -> ExportResult:
     """Execute the export against the Onshape REST API.
 
@@ -383,7 +394,9 @@ def _live_export(
     onshape/feature_builder.py for the validated serialization), then
     validates the resulting solid volume against the mesh volume.
 
-    Requires ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY (env or .env).
+    With `client` (a per-user OAuth OnshapeClient) the export lands in
+    that user's account; without it, falls back to the server's env API
+    keys (ONSHAPE_ACCESS_KEY / ONSHAPE_SECRET_KEY) for CLI/testing.
     """
     import time as _time
 
@@ -392,14 +405,14 @@ def _live_export(
         build_onshape_plan, resolve_pending,
     )
 
-    client = OnshapeClient.from_env(
-        base_url=config.onshape_base_url, timeout=config.api_timeout,
-    )
+    if client is None:
+        client = OnshapeClient.from_env(
+            base_url=config.onshape_base_url, timeout=config.api_timeout,
+        )
     if client is None:
         logger.warning(
-            "Live export requested but ONSHAPE_ACCESS_KEY / "
-            "ONSHAPE_SECRET_KEY are not configured; falling back to "
-            "dry-run.",
+            "Live export requested but no Onshape client (per-user OAuth "
+            "or ONSHAPE_ACCESS_KEY/SECRET_KEY); falling back to dry-run.",
         )
         return _dry_run(operations, feature_tree, mesh_volume, config)
 
@@ -511,4 +524,7 @@ def _live_export(
         volume_error_pct=volume_error,
         status=status,
         document_url=url,
+        document_id=did,
+        workspace_id=wid,
+        element_id=eid,
     )

@@ -2392,6 +2392,23 @@ except BaseException as _exc:
         finally:
             Path(tmp_out.name).unlink(missing_ok=True)
 
+        # Persist exactly what the per-user Onshape export needs (feature
+        # tree, cleaned mesh, as-built holes/blends) keyed by job id, so
+        # "Export to Onshape" works even after the in-memory job is
+        # evicted (the endpoint is api/onshape_oauth.py::export_job).
+        try:
+            _ox_dir = Path("data")
+            _ox_dir.mkdir(exist_ok=True)
+            with open(_ox_dir / f"onshape_export_{job.id}.pkl", "wb") as _oxf:
+                pickle.dump({
+                    "tree": tree,
+                    "cleaned": cleaned,
+                    "as_built": getattr(result, "as_built", {}) or {},
+                }, _oxf)
+        except Exception:
+            logger.debug("Could not persist Onshape export data for job %s",
+                         job.id, exc_info=True)
+
         job.steps = result.construction_steps
         job.cad_volume = result.cad_volume
         # Store variants

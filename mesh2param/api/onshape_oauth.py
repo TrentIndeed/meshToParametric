@@ -147,3 +147,88 @@ def disconnect(request: Request, db: Session = Depends(get_db)):
     if os_oauth.is_connected(user):
         os_oauth.disconnect_user(user, db)
     return {"status": "ok", "connected": False}
+
+
+@router.post("/export/{job_uuid}")
+def export_job(job_uuid: str, request: Request, force: int = 0,
+               db: Session = Depends(get_db)):
+    """Export a finished job to the current user's own Onshape account
+    and link the document to the job. Idempotent: a job that already has
+    a linked document returns it unless force=1."""
+    import pickle
+    from datetime import datetime
+    from pathlib import Path
+
+    from mesh2param.config import ExportConfig
+    from mesh2param.db.database import MeshJob
+    from mesh2param.pipeline.export_onshape import export_to_onshape
+
+    user = _current_user(request, db)
+    if user is None:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    if not _can_use_onshape(user):
+        return JSONResponse({"error": "upgrade", "detail":
+                             "Onshape export is a Pro feature."},
+                            status_code=403)
+
+    job_row = db.query(MeshJob).filter(
+        MeshJob.job_uuid == job_uuid).first()
+    if job_row is None:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    if job_row.user_id and job_row.user_id != user.id:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    # Already linked → return it (don't spawn a duplicate document).
+    if job_row.onshape_url and not force:
+        return {"status": "ok", "already": True, "url": job_row.onshape_url}
+
+    client = os_oauth.get_onshape_client_for_user(user, db)
+    if client is None:
+        return JSONResponse(
+            {"error": "not_connected",
+             "detail": "Connect your Onshape account first."},
+            status_code=409)
+
+    art = Path("data") / f"onshape_export_{job_uuid}.pkl"
+    if not art.exists():
+        return JSONResponse(
+            {"error": "expired",
+             "detail": "Export data has expired; re-run the pipeline."},
+            status_code=410)
+    try:
+        with open(art, "rb") as f:
+            data = pickle.load(f)
+    except Exception:
+        logger.exception("Failed to load Onshape export data %s", job_uuid)
+        return JSONResponse({"error": "load_failed"}, status_code=500)
+
+    doc_name = f"{Path(job_row.filename or 'part').stem} (Paramesh)"
+    try:
+        res = export_to_onshape(
+            data["tree"], data["cleaned"],
+            ExportConfig(dry_run=False, document_name=doc_name),
+            as_built=data.get("as_built"), client=client,
+        )
+    except Exception:
+        logger.exception("Onshape export failed for job %s", job_uuid)
+        return JSONResponse({"error": "export_failed"}, status_code=502)
+
+    job_row.onshape_document_id = res.document_id
+    job_row.onshape_workspace_id = res.workspace_id
+    job_row.onshape_element_id = res.element_id
+    job_row.onshape_url = res.document_url
+    job_row.onshape_exported_at = datetime.utcnow()
+    job_row.onshape_export_status = (
+        "ok" if res.feature_count == res.expected_features else "partial")
+    db.add(job_row)
+    db.commit()
+    logger.info("Job %s exported to Onshape: %d/%d features -> %s",
+                job_uuid, res.feature_count, res.expected_features,
+                res.document_url)
+    return {
+        "status": "ok",
+        "url": res.document_url,
+        "features": f"{res.feature_count}/{res.expected_features}",
+        "volume_error_pct": round(res.volume_error_pct, 1),
+        "export_status": job_row.onshape_export_status,
+    }

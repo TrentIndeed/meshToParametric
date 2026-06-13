@@ -52,9 +52,11 @@ def test_bearer_client_header():
 
 def test_authorize_url_has_required_params():
     u = o.build_authorize_url("STATE", "https://x/cb")
-    for frag in ("response_type=code", "client_id=CID", "state=STATE",
-                 "scope=OAuth2"):
+    for frag in ("response_type=code", "client_id=CID", "state=STATE"):
         assert frag in u
+    # Onshape rejects a scope query param ("Invalid request") — scopes
+    # come from the registered app's permissions. Must NOT be sent.
+    assert "scope=" not in u
 
 
 def test_authorize_url_unconfigured_raises(monkeypatch):

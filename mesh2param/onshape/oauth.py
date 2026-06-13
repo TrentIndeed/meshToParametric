@@ -113,7 +113,12 @@ def decrypt_token(ciphertext: str | None) -> str | None:
 # ── OAuth flow ────────────────────────────────────────────────────────
 
 def build_authorize_url(state: str, redirect_uri: str,
-                        scope: str = DEFAULT_SCOPE) -> str:
+                        scope: str | None = None) -> str:
+    """Onshape OAuth authorize URL. Onshape takes the granted scopes from
+    the registered app's configured permissions — it does NOT accept a
+    `scope` query parameter, and sending one ("OAuth2Read OAuth2Write
+    …") makes it reject the request as 'Invalid request'. So scope is
+    omitted by default."""
     if not is_configured():
         raise OnshapeOAuthError("Onshape OAuth app is not configured "
                                 "(ONSHAPE_OAUTH_CLIENT_ID/SECRET).")
@@ -122,8 +127,9 @@ def build_authorize_url(state: str, redirect_uri: str,
         "client_id": _client_id(),
         "redirect_uri": redirect_uri,
         "state": state,
-        "scope": scope,
     }
+    if scope:
+        params["scope"] = scope
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
 

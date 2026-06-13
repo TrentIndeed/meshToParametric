@@ -2760,42 +2760,84 @@ window.onshapeConnectClick = function () {
   }
 };
 
+function _onshapeProgressEl() {
+  const d = document.createElement('div');
+  d.className = 'chat-msg ai';
+  chatMessages.appendChild(d);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  return d;
+}
+
+// Live SYNCED build: create the doc, open it in a tab, then watch the
+// features stream in (Onshape's collaborative sync updates the viewport)
+// while Paramesh's own build animation advances in step.
 window.exportToOnshape = async function () {
   if (!currentJobId) { alert('Run a conversion first, then push it to Onshape.'); return; }
-  // Open the tab synchronously so the popup blocker allows it; fill it
-  // with the document URL once the export returns (or close it on error).
-  const win = window.open('', '_blank');
-  addChatMessage('ai', 'Exporting to your Onshape account…');
-  let r;
+  const win = window.open('', '_blank');   // popup-safe; filled on 'document'
+  addChatMessage('ai', 'Building in your Onshape account…');
+  let resp;
   try {
-    r = await fetch('/api/onshape/export/' + currentJobId, { method: 'POST' });
-  } catch (e) {
-    if (win) win.close();
-    addChatMessage('ai', 'Onshape export failed: network error.');
-    return;
-  }
-  if (r.status === 409) {            // not connected -> start OAuth, return here
+    resp = await fetch('/api/onshape/export/' + currentJobId + '/live', { method: 'POST' });
+  } catch (e) { if (win) win.close(); addChatMessage('ai', 'Onshape build failed: network error.'); return; }
+  if (resp.status === 409) {           // not connected -> start OAuth, return here
     if (win) win.close();
     addChatMessage('ai', 'Connecting your Onshape account…');
     window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
     return;
   }
-  if (r.status === 403) {
+  if (resp.status === 403) {
     if (win) win.close();
     addChatMessage('ai', 'Pushing to Onshape is a Pro feature — upgrade to enable it.');
     return;
   }
-  let data = {};
-  try { data = await r.json(); } catch (e) {}
-  if (!r.ok) {
+  if (!resp.ok || !resp.body) {
+    let d = {}; try { d = await resp.json(); } catch (e) {}
     if (win) win.close();
-    addChatMessage('ai', 'Onshape export failed: ' + (data.detail || data.error || ('HTTP ' + r.status)));
+    addChatMessage('ai', 'Onshape build failed: ' + (d.detail || d.error || ('HTTP ' + resp.status)));
     return;
   }
-  const feat = data.features ? (' (' + data.features + ' features)') : '';
-  addChatMessage('ai', (data.already ? 'Already in your Onshape. ' : 'Exported to Onshape' + feat + '. ') + 'Opening it now…');
-  if (win) { win.location = data.url; } else { window.open(data.url, '_blank', 'noopener'); }
-  refreshOnshapeStatus();
+
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', docUrl = null, total = 0, progEl = null, lastStep = -1;
+  while (true) {
+    let chunk;
+    try { chunk = await reader.read(); } catch (e) { break; }
+    if (chunk.done) break;
+    buf += dec.decode(chunk.value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, nl); buf = buf.slice(nl + 2);
+      const dline = block.split('\n').find(l => l.startsWith('data:'));
+      if (!dline) continue;
+      let ev; try { ev = JSON.parse(dline.slice(5).trim()); } catch (e) { continue; }
+      if (ev.type === 'document') {
+        docUrl = ev.url; total = ev.total || 0;
+        if (win) win.location = ev.url;        // open the doc; watch it build
+        addChatMessage('ai', ev.already
+          ? 'Opening your existing Onshape document…'
+          : 'Document ready — keep that Onshape tab visible to watch it build.');
+      } else if (ev.type === 'feature') {
+        // drive Paramesh's own build animation in step with Onshape
+        if (steps && steps.length && total) {
+          const si = Math.min(steps.length - 1, Math.max(0,
+            Math.round((ev.index + 1) / total * steps.length) - 1));
+          if (si !== lastStep) { lastStep = si; try { loadStep(si); } catch (e) {} }
+        }
+        const txt = 'Building ' + ev.n_ok + '/' + ev.total + ': ' + ev.name + (ev.ok ? '' : ' (skipped)');
+        if (!progEl) progEl = _onshapeProgressEl();
+        progEl.textContent = txt;
+      } else if (ev.type === 'done') {
+        addChatMessage('ai', ev.already
+          ? 'Opened your existing Onshape document.'
+          : 'Done — built ' + ev.n_ok + '/' + ev.total + ' features in Onshape.');
+        refreshOnshapeStatus();
+      } else if (ev.type === 'error') {
+        if (win && !docUrl) win.close();
+        addChatMessage('ai', 'Onshape build error: ' + (ev.detail || 'unknown'));
+      }
+    }
+  }
 };
 
 // Handle the ?onshape=... flag the OAuth round-trip lands back on, and

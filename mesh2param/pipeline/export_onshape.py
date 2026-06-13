@@ -71,6 +71,66 @@ class ExportResult:
         }
 
 
+def apply_planned_feature(client, did, wid, eid, plan, pf):
+    """Add ONE planned feature to the part studio, walking its fallback
+    ladder (blends retry as a single seed edge + tangent propagation —
+    Parasolid rolls whole chains OCC couldn't). Returns (ok, feature_id).
+    Shared by the batch export and the live/streamed build."""
+    from mesh2param.onshape.client import OnshapeApiError
+    from mesh2param.onshape.feature_builder import resolve_pending
+
+    btm = resolve_pending(plan, pf)
+    try:
+        fid, status = client.add_feature(did, wid, eid, btm)
+        pf.feature_id = fid
+        ok = status == "OK"
+    except OnshapeApiError as exc:
+        logger.warning("Feature %r rejected: %s", pf.name, exc)
+        fid, ok = "", False
+    if not ok and pf.retry_btms:
+        for ri, retry in enumerate(pf.retry_btms, 1):
+            if fid:
+                try:
+                    client.delete_feature(did, wid, eid, fid)
+                except OnshapeApiError:
+                    pass
+            try:
+                fid, status = client.add_feature(did, wid, eid, retry)
+                pf.feature_id = fid
+                ok = status == "OK"
+            except OnshapeApiError as exc:
+                logger.warning("Feature %r retry %d rejected: %s",
+                               pf.name, ri, exc)
+                fid, ok = "", False
+            if ok:
+                logger.info("Feature %r applied via fallback %d", pf.name, ri)
+                break
+    return ok, fid
+
+
+def prepare_live_export(client, feature_tree: FeatureTree,
+                        cleaned: CleanedMesh, as_built: dict | None,
+                        doc_name: str) -> dict | None:
+    """Build the plan and create an EMPTY document/part studio for a
+    streamed live build. The caller then adds the plan's features one at
+    a time (apply_planned_feature) with pacing while the user watches
+    the document. Returns {plan, did, wid, eid, url} or None if the plan
+    is empty."""
+    from mesh2param.onshape.feature_builder import build_onshape_plan
+
+    plan = build_onshape_plan(
+        feature_tree, (cleaned.bbox[0], cleaned.bbox[1]), as_built=as_built,
+    )
+    if not plan.features:
+        return None
+    did, wid = client.create_document(doc_name)
+    eid = client.partstudio_id(did, wid)
+    return {
+        "plan": plan, "did": did, "wid": wid, "eid": eid,
+        "url": client.document_url(did, wid, eid),
+    }
+
+
 def export_to_onshape(
     feature_tree: FeatureTree,
     cleaned: CleanedMesh,
@@ -400,10 +460,8 @@ def _live_export(
     """
     import time as _time
 
-    from mesh2param.onshape.client import OnshapeApiError, OnshapeClient
-    from mesh2param.onshape.feature_builder import (
-        build_onshape_plan, resolve_pending,
-    )
+    from mesh2param.onshape.client import OnshapeClient
+    from mesh2param.onshape.feature_builder import build_onshape_plan
 
     if client is None:
         client = OnshapeClient.from_env(
@@ -450,39 +508,8 @@ def _live_export(
     n_ok = 0
     n_err = 0
     for pf in plan.features:
-        btm = resolve_pending(plan, pf)
         t = _time.time()
-        try:
-            fid, status = client.add_feature(did, wid, eid, btm)
-            pf.feature_id = fid
-            ok = status == "OK"
-        except OnshapeApiError as exc:
-            logger.warning("Feature %r rejected: %s", pf.name, exc)
-            fid, ok = "", False
-        # Fallback ladder: delete the errored feature and try the next
-        # definition (blends retry as a single seed edge with tangent
-        # propagation — Parasolid rolls whole chains OCC couldn't).
-        if not ok and pf.retry_btms:
-            for ri, retry in enumerate(pf.retry_btms, 1):
-                if fid:
-                    try:
-                        client.delete_feature(did, wid, eid, fid)
-                    except OnshapeApiError:
-                        pass
-                try:
-                    fid, status = client.add_feature(did, wid, eid, retry)
-                    pf.feature_id = fid
-                    ok = status == "OK"
-                except OnshapeApiError as exc:
-                    logger.warning(
-                        "Feature %r retry %d rejected: %s", pf.name, ri, exc,
-                    )
-                    fid, ok = "", False
-                if ok:
-                    logger.info(
-                        "Feature %r applied via fallback %d", pf.name, ri,
-                    )
-                    break
+        ok, fid = apply_planned_feature(client, did, wid, eid, plan, pf)
         _log_call(pf.name, t, ok)
         if ok:
             n_ok += 1

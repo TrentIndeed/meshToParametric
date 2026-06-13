@@ -19,7 +19,11 @@ import secrets
 import time
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import (
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from sqlalchemy.orm import Session
 
 from mesh2param.api.auth import (
@@ -177,86 +181,206 @@ def disconnect(request: Request, db: Session = Depends(get_db)):
     return {"status": "ok", "connected": False}
 
 
-@router.post("/export/{job_uuid}")
-def export_job(job_uuid: str, request: Request, force: int = 0,
-               db: Session = Depends(get_db)):
-    """Export a finished job to the current user's own Onshape account
-    and link the document to the job. Idempotent: a job that already has
-    a linked document returns it unless force=1."""
+# Seconds between feature adds in the live build — paced so the user
+# can watch each one appear in their Onshape viewport.
+_LIVE_PACE = 0.45
+
+
+def _export_context(job_uuid: str, request: Request, db: Session):
+    """Shared preamble for the export endpoints. Returns
+    (error_response | None, ctx). ctx = {user, job_row, client, data}
+    when everything is ready; otherwise error_response is set."""
     import pickle
-    from datetime import datetime
     from pathlib import Path
 
-    from mesh2param.config import ExportConfig
     from mesh2param.db.database import MeshJob
-    from mesh2param.pipeline.export_onshape import export_to_onshape
 
     user = _current_user(request, db)
     if user is None:
-        return JSONResponse({"error": "not authenticated"}, status_code=401)
+        return JSONResponse({"error": "not authenticated"},
+                            status_code=401), None
     if not _can_use_onshape(user):
         return JSONResponse({"error": "upgrade", "detail":
                              "Onshape export is a Pro feature."},
-                            status_code=403)
-
-    job_row = db.query(MeshJob).filter(
-        MeshJob.job_uuid == job_uuid).first()
+                            status_code=403), None
+    job_row = db.query(MeshJob).filter(MeshJob.job_uuid == job_uuid).first()
     if job_row is None:
-        return JSONResponse({"error": "job not found"}, status_code=404)
+        return JSONResponse({"error": "job not found"},
+                            status_code=404), None
     if job_row.user_id and job_row.user_id != user.id:
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-
-    # Already linked → return it (don't spawn a duplicate document).
-    if job_row.onshape_url and not force:
-        return {"status": "ok", "already": True, "url": job_row.onshape_url}
-
+        return JSONResponse({"error": "forbidden"}, status_code=403), None
     client = os_oauth.get_onshape_client_for_user(user, db)
     if client is None:
         return JSONResponse(
             {"error": "not_connected",
              "detail": "Connect your Onshape account first."},
-            status_code=409)
-
+            status_code=409), None
     art = Path("data") / f"onshape_export_{job_uuid}.pkl"
     if not art.exists():
         return JSONResponse(
             {"error": "expired",
              "detail": "Export data has expired; re-run the pipeline."},
-            status_code=410)
+            status_code=410), None
     try:
         with open(art, "rb") as f:
             data = pickle.load(f)
     except Exception:
         logger.exception("Failed to load Onshape export data %s", job_uuid)
-        return JSONResponse({"error": "load_failed"}, status_code=500)
+        return JSONResponse({"error": "load_failed"}, status_code=500), None
+    return None, {"user": user, "job_row": job_row,
+                  "client": client, "data": data}
 
+
+def _link_job(job_uuid: str, did: str, wid: str, eid: str, url: str,
+              status: str) -> None:
+    """Persist the Onshape document link onto the job (own session, so
+    it's safe to call from inside a streaming generator)."""
+    from datetime import datetime
+
+    from mesh2param.db.database import MeshJob, SessionLocal
+    s = SessionLocal()
+    try:
+        jr = s.query(MeshJob).filter(MeshJob.job_uuid == job_uuid).first()
+        if jr is not None:
+            jr.onshape_document_id = did
+            jr.onshape_workspace_id = wid
+            jr.onshape_element_id = eid
+            jr.onshape_url = url
+            jr.onshape_exported_at = datetime.utcnow()
+            jr.onshape_export_status = status
+            s.commit()
+    finally:
+        s.close()
+
+
+@router.post("/export/{job_uuid}")
+def export_job(job_uuid: str, request: Request, force: int = 0,
+               db: Session = Depends(get_db)):
+    """Export a finished job to the current user's own Onshape account
+    (all features at once) and link the document. Idempotent: an already
+    linked job returns its url unless force=1."""
+    from datetime import datetime
+    from pathlib import Path
+
+    from mesh2param.config import ExportConfig
+    from mesh2param.pipeline.export_onshape import export_to_onshape
+
+    err, ctx = _export_context(job_uuid, request, db)
+    if err is not None:
+        return err
+    job_row = ctx["job_row"]
+    if job_row.onshape_url and not force:
+        return {"status": "ok", "already": True, "url": job_row.onshape_url}
+
+    data = ctx["data"]
     doc_name = f"{Path(job_row.filename or 'part').stem} (Paramesh)"
     try:
         res = export_to_onshape(
             data["tree"], data["cleaned"],
             ExportConfig(dry_run=False, document_name=doc_name),
-            as_built=data.get("as_built"), client=client,
+            as_built=data.get("as_built"), client=ctx["client"],
         )
     except Exception:
         logger.exception("Onshape export failed for job %s", job_uuid)
         return JSONResponse({"error": "export_failed"}, status_code=502)
 
-    job_row.onshape_document_id = res.document_id
-    job_row.onshape_workspace_id = res.workspace_id
-    job_row.onshape_element_id = res.element_id
-    job_row.onshape_url = res.document_url
-    job_row.onshape_exported_at = datetime.utcnow()
-    job_row.onshape_export_status = (
-        "ok" if res.feature_count == res.expected_features else "partial")
-    db.add(job_row)
-    db.commit()
-    logger.info("Job %s exported to Onshape: %d/%d features -> %s",
-                job_uuid, res.feature_count, res.expected_features,
-                res.document_url)
+    status = ("ok" if res.feature_count == res.expected_features
+              else "partial")
+    _link_job(job_uuid, res.document_id, res.workspace_id, res.element_id,
+              res.document_url, status)
+    logger.info("Job %s exported to Onshape: %d/%d -> %s", job_uuid,
+                res.feature_count, res.expected_features, res.document_url)
     return {
         "status": "ok",
         "url": res.document_url,
         "features": f"{res.feature_count}/{res.expected_features}",
         "volume_error_pct": round(res.volume_error_pct, 1),
-        "export_status": job_row.onshape_export_status,
+        "export_status": status,
     }
+
+
+@router.post("/export/{job_uuid}/live")
+def export_job_live(job_uuid: str, request: Request, force: int = 0,
+                    db: Session = Depends(get_db)):
+    """Streamed LIVE build: create the document, hand the URL back
+    immediately (so the UI can open it), then add features one at a time
+    with pacing. The user watches the model build up in their Onshape
+    viewport (Onshape's collaborative microversion sync), in step with
+    Paramesh's animation. Server-Sent Events:
+      {type: document, url, total} | {type: feature, index, name, ok,
+      n_ok, total} | {type: done, url, n_ok, total} | {type: error, ...}
+    Non-2xx (not authed / upgrade / not connected / expired) come back as
+    plain JSON so the UI can react (e.g. start OAuth)."""
+    import json
+    import time as _t
+    from pathlib import Path
+
+    from mesh2param.pipeline.export_onshape import (
+        apply_planned_feature, prepare_live_export,
+    )
+
+    err, ctx = _export_context(job_uuid, request, db)
+    if err is not None:
+        return err
+    job_row = ctx["job_row"]
+    client = ctx["client"]
+    data = ctx["data"]
+    already_url = job_row.onshape_url
+    doc_name = f"{Path(job_row.filename or 'part').stem} (Paramesh)"
+
+    def _sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    def gen():
+        # Already built and not forced → just point the UI at it.
+        if already_url and not force:
+            yield _sse({"type": "document", "url": already_url,
+                        "total": 0, "already": True})
+            yield _sse({"type": "done", "url": already_url, "already": True,
+                        "n_ok": 0, "total": 0})
+            return
+        try:
+            prep = prepare_live_export(
+                client, data["tree"], data["cleaned"],
+                data.get("as_built"), doc_name)
+        except Exception as exc:
+            logger.exception("Live export prep failed for %s", job_uuid)
+            yield _sse({"type": "error", "detail": str(exc)[:200]})
+            return
+        if prep is None:
+            yield _sse({"type": "error", "detail": "empty export plan"})
+            return
+        plan = prep["plan"]
+        did, wid, eid, url = (prep["did"], prep["wid"],
+                              prep["eid"], prep["url"])
+        total = len(plan.features)
+        logger.info("Live build %s -> %s (%d features)",
+                    job_uuid, url, total)
+        yield _sse({"type": "document", "url": url, "total": total})
+        # Give the user's browser a moment to load the (empty) part
+        # studio before features start streaming in, so they see it
+        # build from the start rather than catching up mid-way.
+        _t.sleep(1.8)
+        n_ok = 0
+        for i, pf in enumerate(plan.features):
+            try:
+                ok, _fid = apply_planned_feature(client, did, wid, eid,
+                                                 plan, pf)
+            except Exception:
+                logger.exception("Live feature %s failed", pf.name)
+                ok = False
+            if ok:
+                n_ok += 1
+            yield _sse({"type": "feature", "index": i, "name": pf.name,
+                        "ok": ok, "n_ok": n_ok, "total": total})
+            _t.sleep(_LIVE_PACE)
+        _link_job(job_uuid, did, wid, eid, url,
+                  "ok" if n_ok == total else "partial")
+        logger.info("Live build %s done: %d/%d features", job_uuid,
+                    n_ok, total)
+        yield _sse({"type": "done", "url": url, "n_ok": n_ok,
+                    "total": total})
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})

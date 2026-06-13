@@ -159,12 +159,21 @@ All of this works on track 1 (no Store listing needed).
   features and rebuild (clean, loses user edits); (b) create a new
   VERSION then rebuild on a branch (preserves history); (c) diff and
   patch (hard). Start with (a) + a warning, move to (b).
-- **Live incremental build the user can watch in Onshape (goal).** Why
-  it works: we already add features one at a time (base → joins →
-  holes → each fillet). Each POST creates a new microversion, and
-  Onshape's real-time collaborative sync pushes every change to ALL
-  open sessions of that document — so a part studio the user has open
-  updates feature-by-feature, live, as we build. Make it watchable:
+- **Live incremental build the user can watch in Onshape (IMPLEMENTED
+  2026-06-13, pre-Store form).** `POST /api/onshape/export/{job}/live`
+  is an SSE stream: it creates the doc, emits a `document` event with
+  the URL (the UI opens that tab), waits ~1.8 s for the viewport to
+  load, then adds features one at a time with `_LIVE_PACE` spacing,
+  emitting a `feature` event each. The frontend (`exportToOnshape` in
+  app.js) opens the tab, drives Paramesh's own `loadStep` animation in
+  step, and shows progress; the user watches the model build in their
+  Onshape viewport via collaborative sync. Shared helpers
+  `prepare_live_export` + `apply_planned_feature` (export_onshape.py)
+  back both the batch and live paths. Verify "Supports collaboration"
+  is on if propagation lags. Why it works: we already add features one
+  at a time (base → joins → holes → each fillet); each POST creates a
+  new microversion, and Onshape's real-time collaborative sync pushes
+  every change to ALL open sessions of that document. Remaining knobs:
     - an **incremental, paced export mode** (space the feature POSTs;
       reuse `ExportConfig.rate_limit_delay`) targeting an EXISTING
       document/element instead of only create-new-doc-all-at-once;

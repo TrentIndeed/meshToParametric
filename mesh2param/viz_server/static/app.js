@@ -2748,16 +2748,31 @@ async function refreshOnshapeStatus() {
 }
 window.refreshOnshapeStatus = refreshOnshapeStatus;
 
-window.onshapeConnectClick = function () {
-  if (_onshapeStatus && _onshapeStatus.connected) {
+window.onshapeConnectClick = async function () {
+  // re-read live status so the message matches reality
+  let st = _onshapeStatus;
+  try { st = await (await fetch('/api/onshape/status')).json(); _onshapeStatus = st; } catch (e) {}
+  console.log('[onshape] Connect clicked; status =', st);
+  if (st && st.connected) {
     if (confirm('Disconnect your Onshape account from Paramesh?')) {
       fetch('/api/onshape/disconnect', { method: 'POST' })
         .then(() => { addChatMessage('ai', 'Onshape account disconnected.'); refreshOnshapeStatus(); })
         .catch(() => addChatMessage('ai', 'Could not disconnect Onshape.'));
     }
-  } else {
-    window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
+    return;
   }
+  if (st && !st.configured) {
+    addChatMessage('ai', 'Onshape is not configured on the server (missing OAuth app credentials).');
+    return;
+  }
+  if (st && !st.eligible) {
+    // Either not logged in, or not a Pro/developer account.
+    addChatMessage('ai', 'To connect Onshape you must be logged in with a Pro account. Taking you to sign in…');
+    window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
+    return;
+  }
+  addChatMessage('ai', 'Opening Onshape to connect your account…');
+  window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
 };
 
 function _onshapeProgressEl() {
@@ -2772,6 +2787,7 @@ function _onshapeProgressEl() {
 // features stream in (Onshape's collaborative sync updates the viewport)
 // while Paramesh's own build animation advances in step.
 window.exportToOnshape = async function () {
+  console.log('[onshape] Push clicked; jobId =', currentJobId);
   if (!currentJobId) { alert('Run a conversion first, then push it to Onshape.'); return; }
   const win = window.open('', '_blank');   // popup-safe; filled on 'document'
   addChatMessage('ai', 'Building in your Onshape account…');
@@ -2779,6 +2795,13 @@ window.exportToOnshape = async function () {
   try {
     resp = await fetch('/api/onshape/export/' + currentJobId + '/live', { method: 'POST' });
   } catch (e) { if (win) win.close(); addChatMessage('ai', 'Onshape build failed: network error.'); return; }
+  console.log('[onshape] /live responded', resp.status);
+  if (resp.status === 401) {
+    if (win) win.close();
+    addChatMessage('ai', 'You need to be logged in to push to Onshape. Taking you to sign in…');
+    window.location = '/login?next=' + encodeURIComponent(location.pathname);
+    return;
+  }
   if (resp.status === 409) {           // not connected -> start OAuth, return here
     if (win) win.close();
     addChatMessage('ai', 'Connecting your Onshape account…');
@@ -2787,7 +2810,7 @@ window.exportToOnshape = async function () {
   }
   if (resp.status === 403) {
     if (win) win.close();
-    addChatMessage('ai', 'Pushing to Onshape is a Pro feature — upgrade to enable it.');
+    addChatMessage('ai', 'Pushing to Onshape needs a Pro account (and you must be logged in).');
     return;
   }
   if (!resp.ok || !resp.body) {

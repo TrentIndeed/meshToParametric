@@ -173,36 +173,155 @@ def _arc_entity(eid: str, cx: float, cy: float, r: float,
     }
 
 
-def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
-    """Outer-profile entities with EXACT tangent corner arcs.
+def _fit_circle_2d(arr: np.ndarray) -> tuple[float, float, float]:
+    """Algebraic least-squares circle fit. Returns (cx, cy, r) in input
+    units."""
+    A = np.c_[2 * arr[:, 0], 2 * arr[:, 1], np.ones(len(arr))]
+    sol, *_ = np.linalg.lstsq(A, (arr ** 2).sum(axis=1), rcond=None)
+    cx, cy = float(sol[0]), float(sol[1])
+    r = float(np.sqrt(max(sol[2] + cx * cx + cy * cy, 0.0)))
+    return cx, cy, r
 
-    Mesh-derived profiles arrive with corner radii sampled as chains of
-    short kinked segments. CadQuery collapses them to sharp corners +
-    radii (_sharp_polygon_with_fillets) and rebuilds exact tangent arcs
-    with MakeFillet2d; drawing the sampled polygon here instead left
-    the Onshape body with different edges near every corner, and the
-    side plates' outline ring fillets failed on the mismatched chains.
-    This computes the same tangent arcs analytically (for straight-line
-    corners the construction is identical to MakeFillet2d): tangent
-    length r/tan(phi/2) along each leg, center on the bisector at
-    r/sin(phi/2).
+
+def _nearest_axis(d, tol_deg: float = 15.0):
+    """Return the sketch axis (±x / ±y unit vector) nearest direction d
+    when within tol_deg, else None."""
+    d = np.asarray(d, dtype=float)
+    nrm = float(np.linalg.norm(d))
+    if nrm < 1e-12:
+        return None
+    d = d / nrm
+    best, best_ang = None, tol_deg
+    for axis in (np.array([1.0, 0.0]), np.array([0.0, 1.0]),
+                 np.array([-1.0, 0.0]), np.array([0.0, -1.0])):
+        ang = float(np.degrees(np.arccos(np.clip(d @ axis, -1, 1))))
+        if ang < best_ang:
+            best, best_ang = axis, ang
+    return best
+
+
+def _line_intersect(p1, d1, p2, d2):
+    denom = float(d1[0] * d2[1] - d1[1] * d2[0])
+    if abs(denom) < 1e-9:
+        return None
+    t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / denom
+    return np.asarray(p1, dtype=float) + t * np.asarray(d1, dtype=float)
+
+
+def _regularize_profile(pts_mm: list):
+    """Reduce a sampled outline to SHARP corners + per-corner radii.
+
+    Driven by the STRAIGHT sides (prismatic parts are axis-aligned), so
+    it handles mixed sharp and rounded corners uniformly:
+
+      1. Mark each segment that is axis-aligned and long enough as
+         straight; group consecutive same-axis straights into runs and
+         fit each run's line (snapped exactly to its axis).
+      2. Each consecutive pair of straight runs meets at a corner =
+         their line intersection. If sampled bend vertices sit between
+         the runs, circle-fit them for the rounding radius; otherwise
+         the corner is sharp (no fillet).
+
+    Feeding the sharp corners + radii to the analytic tangent-arc builder
+    yields exactly-90-deg corners with arcs exactly tangent to the sides,
+    so the outline reads clean AND the outer edge is one tangent loop a
+    single fillet propagates around. Returns (sharp_pts_mm, {idx: r}) or
+    (None, None) when the outline isn't a prismatic axis-aligned shape.
     """
     pts = _clean_polygon(pts_mm)
-    sharp = fillets = None
-    try:
-        from mesh2param.pipeline.export_cadquery import (
-            _sharp_polygon_with_fillets,
-        )
-        sharp, fillets = _sharp_polygon_with_fillets(pts)
-    except Exception:
-        logger.debug("Sharp-corner reconstruction failed", exc_info=True)
-    if not sharp or not fillets:
-        return _polygon_entities(prefix, pts)
+    P = np.asarray(pts, dtype=float)
+    n = len(P)
+    if n < 6:
+        return None, None
+    seg = np.roll(P, -1, axis=0) - P
+    L = np.linalg.norm(seg, axis=1)
+    axis_of = [_nearest_axis(seg[i]) for i in range(n)]
+    straight = [axis_of[i] is not None and L[i] >= 2.0 for i in range(n)]
+    if sum(straight) < 3:
+        return None, None
+    # start at the first straight segment whose predecessor is not the
+    # same straight axis (a run boundary)
+    def _same(a, b):
+        return a is not None and b is not None and bool(np.allclose(a, b))
 
+    start = next(
+        (i for i in range(n)
+         if straight[i] and not (straight[(i - 1) % n]
+                                 and _same(axis_of[(i - 1) % n], axis_of[i]))),
+        None,
+    )
+    if start is None:
+        return None, None
+    runs = []  # (axis, [segment indices])
+    i = start
+    guard = 0
+    while guard < 4 * n:
+        guard += 1
+        if straight[i]:
+            ax = axis_of[i]
+            members = [i]
+            j = (i + 1) % n
+            while (guard < 4 * n and straight[j]
+                   and _same(axis_of[j], ax)):
+                members.append(j)
+                j = (j + 1) % n
+                guard += 1
+            runs.append((ax, members))
+            i = j
+        else:
+            i = (i + 1) % n
+        if i == start:
+            break
+    if len(runs) < 3:
+        return None, None
+    # line per run: axis direction, centroid of its spanned vertices
+    run_lines = []
+    for ax, members in runs:
+        vidx = members + [(members[-1] + 1) % n]
+        ctr = P[vidx].mean(axis=0)
+        run_lines.append((ctr, np.asarray(ax, dtype=float), members))
+    m = len(runs)
+    sharp_pts = []
+    fillets = {}
+    for k in range(m):
+        ctr1, ax1, mem1 = run_lines[k]
+        ctr2, ax2, mem2 = run_lines[(k + 1) % m]
+        X = _line_intersect(ctr1, ax1, ctr2, ax2)
+        if X is None:
+            return None, None
+        # corner (bend) vertices strictly between the two runs
+        bend = []
+        j = (mem1[-1] + 1) % n
+        g = 0
+        while j != mem2[0] and g < n:
+            bend.append(j)
+            j = (j + 1) % n
+            g += 1
+        r = 0.0
+        if len(bend) >= 2:
+            try:
+                _, _, rr = _fit_circle_2d(P[bend])
+                if 0.3 < rr < 60.0:
+                    r = rr
+            except np.linalg.LinAlgError:
+                r = 0.0
+        if r > 0:
+            fillets[len(sharp_pts)] = r
+        sharp_pts.append((float(X[0]), float(X[1])))
+    if len(sharp_pts) < 3 or not fillets:
+        return None, None
+    return sharp_pts, fillets
+
+
+def _analytic_tangent_arcs(prefix: str, sharp, fillets):
+    """Sharp polygon + per-corner radii -> line/arc entities with arcs
+    EXACTLY tangent to the flanking legs (tangent length r/tan(phi/2),
+    center on the bisector at r/sin(phi/2)). Returns None if nothing
+    rounds."""
     P = np.asarray(sharp, dtype=float) / 1000.0  # meters
     n = len(P)
-    # Per-vertex tangent trim distances (0 for sharp vertices).
     node_pts: list[tuple] = []  # (entry_pt, exit_pt, arc or None)
+    any_arc = False
     for i in range(n):
         V = P[i]
         r_mm = fillets.get(i)
@@ -217,15 +336,12 @@ def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
             node_pts.append((V, V, None))
             continue
         a, b = a / la, b / lb
-        cos_phi = float(np.clip(a @ b, -1.0, 1.0))
-        phi = float(np.arccos(cos_phi))
+        phi = float(np.arccos(np.clip(a @ b, -1.0, 1.0)))
         if phi < np.radians(10) or phi > np.radians(170):
             node_pts.append((V, V, None))
             continue
         t = r / np.tan(phi / 2.0)
         if t > 0.6 * min(la, lb):
-            # radius too big for the legs — keep the corner sharp
-            # rather than emit a self-intersecting outline
             node_pts.append((V, V, None))
             continue
         T1 = V + a * t
@@ -233,15 +349,15 @@ def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
         C = V + (a + b) / np.linalg.norm(a + b) * (r / np.sin(phi / 2.0))
         ang1 = float(np.arctan2(T1[1] - C[1], T1[0] - C[0]))
         ang2 = float(np.arctan2(T2[1] - C[1], T2[0] - C[0]))
-        # minor arc from T1 to T2 (corner sweep is pi - phi < 170 deg):
-        # express CCW, swapping ends if the CCW sweep is the long way.
         sweep = (ang2 - ang1) % (2.0 * np.pi)
         if sweep > np.pi:
             ang1, ang2 = ang2, ang1
         if ang2 < ang1:
             ang2 += 2.0 * np.pi
         node_pts.append((T1, T2, (C, r, ang1, ang2)))
-
+        any_arc = True
+    if not any_arc:
+        return None
     ents: list[dict] = []
     for i in range(n):
         _, exit_pt, _ = node_pts[i]
@@ -260,6 +376,141 @@ def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
                 float(r), a0, a1,
             ))
     return ents
+
+
+def _fit_arc_entity(eid: str, run_pts_mm: np.ndarray, E_m, X_m):
+    """One arc through a sampled corner run: circle-fit the run, sweep
+    the run's winding direction from endpoint E to endpoint X. Smooth
+    but only approximately tangent (the secondary path when exact
+    regularization fails)."""
+    arr = np.asarray(run_pts_mm, dtype=float) / 1000.0
+    if len(arr) < 3:
+        return None
+    try:
+        cx, cy, cr = _fit_circle_2d(arr)
+    except np.linalg.LinAlgError:
+        return None
+    if cr < 0.0003 or cr > 0.060:
+        return None
+    E = np.asarray(E_m, dtype=float)
+    X = np.asarray(X_m, dtype=float)
+    if (abs(np.hypot(E[0] - cx, E[1] - cy) - cr) > 0.5 * cr
+            or abs(np.hypot(X[0] - cx, X[1] - cy) - cr) > 0.5 * cr):
+        return None
+    mid = arr[len(arr) // 2]
+    turn_sign = np.sign(
+        (mid[0] - E[0]) * (X[1] - mid[1]) - (mid[1] - E[1]) * (X[0] - mid[0])
+    )
+    Ea = float(np.arctan2(E[1] - cy, E[0] - cx))
+    Xa = float(np.arctan2(X[1] - cy, X[0] - cx))
+    if turn_sign >= 0:  # CCW
+        a0, a1 = Ea, Ea + (Xa - Ea) % (2 * np.pi)
+    else:               # CW expressed as CCW from X to E
+        a0, a1 = Xa, Xa + (Ea - Xa) % (2 * np.pi)
+    return _arc_entity(eid, cx, cy, cr, a0, a1)
+
+
+def _line_seg(eid: str, p0_m, p1_m):
+    d = np.asarray(p1_m, dtype=float) - np.asarray(p0_m, dtype=float)
+    L = float(np.linalg.norm(d))
+    if L < 1e-12:
+        return None
+    return _line(eid, float(p0_m[0]), float(p0_m[1]),
+                 float(d[0] / L), float(d[1] / L), 0.0, L)
+
+
+def _walk_outline_with_arcs(prefix: str, pts_mm: list):
+    """Replace each detected corner arc-run with one fitted arc, joining
+    straight spans with lines. Smooth corners without exact tangency."""
+    try:
+        from mesh2param.pipeline.export_cadquery import (
+            _detect_profile_arc_runs,
+        )
+    except Exception:
+        return None
+    runs = _detect_profile_arc_runs(pts_mm)
+    if not runs:
+        return None
+    P = np.asarray(pts_mm, dtype=float)
+    n = len(P)
+    in_run = {}
+    member = set()
+    for (a, b) in runs:
+        idxs = []
+        j = a
+        while True:
+            idxs.append(j)
+            if j == b:
+                break
+            j = (j + 1) % n
+        in_run[a] = idxs
+        member.update(idxs[1:])
+    start = next((k for k in range(n)
+                  if k not in member and k not in in_run), None)
+    if start is None:
+        return None
+    ents = []
+    cur = P[start] / 1000.0
+    i = (start + 1) % n
+    guard = 0
+    eid = 0
+    while i != start and guard < 2 * n:
+        guard += 1
+        if i in in_run:
+            idxs = in_run[i]
+            E = P[idxs[0]] / 1000.0
+            X = P[idxs[-1]] / 1000.0
+            seg = _line_seg(f"{prefix}_l{eid}", cur, E)
+            if seg:
+                ents.append(seg)
+                eid += 1
+            arc = _fit_arc_entity(f"{prefix}_a{eid}", P[idxs], E, X)
+            ents.append(arc if arc else _line_seg(f"{prefix}_l{eid}", E, X))
+            cur = X
+            i = (idxs[-1] + 1) % n
+        else:
+            nxt = P[i] / 1000.0
+            seg = _line_seg(f"{prefix}_l{eid}", cur, nxt)
+            if seg:
+                ents.append(seg)
+            cur = nxt
+            i = (i + 1) % n
+        eid += 1
+    seg = _line_seg(f"{prefix}_l{eid}", cur, P[start] / 1000.0)
+    if seg:
+        ents.append(seg)
+    ents = [e for e in ents if e is not None]
+    return ents if len(ents) >= 3 else None
+
+
+def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
+    """Outer-profile entities. Three paths, best first:
+
+      A. Regularize to sharp axis-aligned corners + radii, build EXACT
+         tangent arcs -> clean 90 deg corners + a tangent-continuous
+         outer edge (a single fillet propagates the whole ring).
+      B. Fit one arc per sampled corner run -> smooth but only
+         approximately tangent (complex outlines the regularizer rejects).
+      C. Raw polyline (last resort).
+    """
+    pts = _clean_polygon(pts_mm)
+    sharp, fillets = _regularize_profile(pts_mm)
+    if not (sharp and fillets):
+        try:
+            from mesh2param.pipeline.export_cadquery import (
+                _sharp_polygon_with_fillets,
+            )
+            sharp, fillets = _sharp_polygon_with_fillets(pts)
+        except Exception:
+            sharp = fillets = None
+    if sharp and fillets:
+        ents = _analytic_tangent_arcs(prefix, sharp, fillets)
+        if ents:
+            return ents
+    ents = _walk_outline_with_arcs(prefix, pts)
+    if ents:
+        return ents
+    return _polygon_entities(prefix, pts)
 
 
 def _polygon_entities(prefix: str, pts_mm: list) -> list[dict]:
@@ -473,10 +724,22 @@ def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
     lo = float(span[0]) + float(offset_mm[ax])
     hi = float(span[1]) + float(offset_mm[ax])
 
-    cp_idx = plan.add(PlannedFeature(
-        name=f"{label} plane",
-        btm=_cplane(f"{label} plane", ax, lo),
-    ))
+    # Sketch ON a default origin plane when the profile sits at the
+    # origin (the base plate after anchoring) — no construction plane,
+    # the part is built directly on Onshape's own Top/Front/Right plane
+    # (user request). Other profiles (joins) sit away from the origin
+    # and keep their own construction planes.
+    if abs(lo) < 1e-6:
+        det_id, _ = PLANE_FOR_AXIS[ax]
+        plane_param = _plane_param_default(det_id)
+        plane_dep = None
+    else:
+        cp_idx = plan.add(PlannedFeature(
+            name=f"{label} plane",
+            btm=_cplane(f"{label} plane", ax, lo),
+        ))
+        plane_param = _plane_param_created_by("PENDING")
+        plane_dep = cp_idx
     entities = _outline_entities("outer", pts)
     for ri, ring in enumerate(sg.get("inner") or []):
         if len(ring) >= 3:
@@ -484,9 +747,8 @@ def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
             entities += _ring_entities(f"inner{ri}", ring_s)
     sk_idx = plan.add(PlannedFeature(
         name=f"{label} sketch",
-        btm=_sketch(f"{label} sketch", _plane_param_created_by("PENDING"),
-                    entities),
-        plane_dep=cp_idx,
+        btm=_sketch(f"{label} sketch", plane_param, entities),
+        plane_dep=plane_dep,
     ))
     plan.add(PlannedFeature(
         name=label,
@@ -526,10 +788,15 @@ def _hole_cut_raw(plan: OnshapePlan, centers: list, radius: float,
     u_ax, v_ax = UV_AXES[ax]
 
     if through:
-        # Sketch just outside the part on the LOW side, cut THROUGH_ALL
-        # toward +axis: plane position can't affect the result as long
-        # as it's outside the material.
-        plane_pos = float(bbox_mm[0][ax]) - 2.0
+        # Sketch just outside the LOCAL material at the holes, then cut
+        # THROUGH_ALL into the part. Using the global bbox extreme put
+        # the tab-hole sketch ~80 mm 'in front of' the model (the bbox
+        # min on the hole axis is the far side-plate edge, nowhere near
+        # the base-plate tabs — user report). Anchor to the holes
+        # instead: their entry face is ~ center - depth/2.
+        c = np.asarray(centers, dtype=float)
+        half = float(depth) / 2.0 if depth and depth > 0 else 5.0
+        plane_pos = float(c[:, ax].min()) - half - 2.0
         want_positive = True
         end_bound, depth = "THROUGH_ALL", None
     else:
@@ -582,20 +849,31 @@ def build_onshape_plan(feature_tree: FeatureTree,
     queries. Without as_built, blends are skipped and tree holes are
     used as-is.
 
-    The whole model is TRANSLATED so its bbox-min corner lands on the
-    origin — mesh coordinates are wherever the scanner/exporter put
-    them, and a part floating 100 mm from the origin reads as broken
-    in CAD (user request).
+    The model is TRANSLATED so the BASE plate's own sketch plane lands
+    on the origin (user request: "build ON origin, not offset from it").
+    Anchoring the base — not the bbox-min corner — is what puts the part
+    on a default plane: the side plates hang BELOW the base, so the
+    bbox-min is their bottom, and anchoring there floated the base plate
+    ~76 mm up. With the base axis anchored at its own lo, the base
+    sketch sits exactly on a default origin plane (see _profile_extrusion).
     """
     plan = OnshapePlan()
     features = list(feature_tree.features)
-    off = -np.asarray(bbox_mm[0], dtype=float)
-    size = np.asarray(bbox_mm[1], dtype=float) + off
-    bbox_shifted = (np.zeros(3), size)
+    bmin = np.asarray(bbox_mm[0], dtype=float)
+    off = -bmin.copy()  # other axes: bbox-min -> 0 (positive octant)
 
     base = next(
         (f for f in features if f.type == FeatureType.BASE_EXTRUSION), None,
     )
+    if base is not None:
+        bsg = base.sketch_geometry or {}
+        ax_b, _ = _axis_of(base.direction)
+        bspan = bsg.get("span")
+        if bspan is not None:
+            # base axis: anchor the base's lo at the origin plane
+            off[ax_b] = -float(bspan[0])
+    bbox_shifted = (bmin + off, np.asarray(bbox_mm[1], dtype=float) + off)
+
     if base is not None:
         _profile_extrusion(plan, base, "Extrude Base", "NEW", off)
     else:
@@ -640,26 +918,36 @@ def build_onshape_plan(feature_tree: FeatureTree,
         n_f = n_c2 = 0
         for b in as_built["blends"]:
             kind = b.get("kind", "fillet")
+            r = float(b["radius"])
             if kind == "chamfer":
                 n_c2 += 1
                 label = f"Chamfer {n_c2}"
             else:
                 n_f += 1
-                label = f"Fillet {n_f} (r={b['radius']:.0f}mm)"
+                label = f"Fillet {n_f} (r={r:.0f}mm)"
             mids = (np.asarray(b.get("edge_midpoints") or [], dtype=float)
                     + off).tolist()
-            retries = []
             if len(mids) > 1:
-                retries.append(_blend_feature(
-                    label, kind, float(b["radius"]), mids[:1],
-                    tangent_propagation=True,
-                ))
+                # Outline ring: seed EVERY recorded edge AND propagate
+                # tangentially. The outer edge of a plate is a loop of
+                # straight sides and tangent corner arcs broken only at
+                # the (few) sharp corners; seeding every side + tangent
+                # propagation rolls the whole loop, where a single seed
+                # stopped at the first sharp corner (user: "only the
+                # long edge filleted"). Fallbacks: explicit set only,
+                # then single-seed propagation.
+                primary = _blend_feature(label, kind, r, mids,
+                                         tangent_propagation=True)
+                retries = [
+                    _blend_feature(label, kind, r, mids),
+                    _blend_feature(label, kind, r, mids[:1],
+                                   tangent_propagation=True),
+                ]
+            else:
+                primary = _blend_feature(label, kind, r, mids)
+                retries = []
             plan.add(PlannedFeature(
-                name=label,
-                btm=_blend_feature(
-                    label, kind, float(b["radius"]), mids,
-                ),
-                retry_btms=retries,
+                name=label, btm=primary, retry_btms=retries,
             ))
     else:
         for f in features:

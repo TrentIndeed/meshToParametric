@@ -116,14 +116,42 @@
   rim fillets. cPlanes get an explicit small "size" so they stop
   swamping the view. RackMount v4: 22/24 features OK — all 4 tab
   holes, 10/12 fillets, volume matches the CadQuery rebuild.
-- [ ] **2 ring fillets still ERROR in Onshape** (the side plates' big
-  outline ring chains): CadQuery profiles carry EXACT tangent corner
-  arcs (MakeFillet2d) while the Onshape sketch draws the sharp
-  polygon, so the chain edges near corners differ and Parasolid
-  refuses the same selection. Fix = profile-arc parity: capture the
-  as-built profile geometry (line/arc runs from
-  _draw_exact_corner_arcs) and emit sketch ARC entities
-  (BTMSketchCurveSegment-155 with circle geometry + start/endParam).
+- [x] **Round 3 (2026-06-12): clean corners, full-ring fillets, build
+  ON origin, hole sketches at the part.** All five user reports fixed;
+  RackMount v7 = 23/23 features OK.
+    - **Profile regularizer** (`_regularize_profile`): mesh sampling
+      renders each corner as short 10-deg facets; the Onshape sketch
+      drew them as a raw polyline ("slight angle ~1/10 from each
+      corner"). Now: separate axis-aligned straight runs from corner
+      arc-runs, SNAP straights to the sketch axes, intersect for exact
+      90-deg sharp corners + circle-fit the rounding radius, then build
+      EXACTLY tangent arcs. Verified offline: base 20 corners all 90
+      deg, side plate 4 corners all 90 deg, areas within ~1%. Two
+      fallbacks (fitted-arc walk, then raw polyline) for outlines it
+      can't regularize.
+    - **Full outer-edge fillet**: the outer edge is now a
+      tangent-continuous loop (clean arcs), so a fillet seeded on EVERY
+      recorded edge + tangentPropagation=true rolls the whole loop;
+      single-seed stopped at the first sharp corner ("only the long
+      edge filleted"). Sketch ARC serialization: BTCurveGeometryCircle
+      with startParam/endParam CCW angles, clockwise=true REJECTED by
+      the extrude (express CW by swapping the angles — probe6).
+    - **Build ON origin** (not translated-near-it): anchor the BASE
+      plate's own span-lo to 0 so its sketch sits on the Top default
+      plane (deterministic JDC, no construction plane) — the side
+      plates hang below into -Z. bbox-min anchoring had floated the
+      base ~76mm up because the side plates are the bbox minimum.
+    - **Through-hole sketches at the holes**: placed at
+      min(center)-depth/2-2 on the hole axis instead of the global
+      bbox extreme (which sat ~80mm 'in front' on the far side-plate
+      edge).
+- [ ] **Sketch visibility is not REST-settable.** Consumed sketches
+  auto-hide; show/hide is client view-state, not in the feature model.
+  No API path — UI only: select the sketches in the tree, right-click,
+  Show. (Revisit if Onshape exposes a display-state endpoint.)
+- [ ] **Relief counterbores under the tabs (~9% volume) unmodeled** in
+  both exports — the residual that keeps the volume gate at FAIL.
+  Recognize them as pocket/counterbore features.
 - [ ] **Web UI hookup** (Pro tier "Onshape" feature): an "Export to
   Onshape" button on /app that runs the live path for the job's tree
   and links the created document. Needs per-user credentials

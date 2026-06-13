@@ -91,25 +91,28 @@ def _tree() -> FeatureTree:
 def test_plan_structure_and_order():
     plan = build_onshape_plan(_tree(), BBOX)
     names = [pf.name for pf in plan.features]
-    # base triplet, join triplet, two hole triplets = 12 features
-    assert len(plan.features) == 12, names
-    assert names[0:3] == ["Extrude Base plane", "Extrude Base sketch",
-                          "Extrude Base"]
-    assert names[3] == "Extrude Join 1 plane"
+    # base on a DEFAULT origin plane (no cPlane) => sketch+extrude only;
+    # join triplet; two hole triplets = 11 features
+    assert len(plan.features) == 11, names
+    assert names[0:2] == ["Extrude Base sketch", "Extrude Base"]
+    assert names[2] == "Extrude Join 1 plane"
     assert any("Through Hole Pattern" in n and "(2x)" in n for n in names)
     assert any(n.startswith("Blind Hole") for n in names)
     # fillet deferred, reported
     assert any("FILLET" in s for s in plan.skipped)
 
 
-def test_base_btm_conventions():
+def test_base_on_default_origin_plane():
     plan = build_onshape_plan(_tree(), BBOX)
-    cp, sk, ex = plan.features[0:3]
-    # base axis is Z -> Top plane (JDC), extrude +Z needs no flip
-    det = cp.btm["parameters"][0]["queries"][0]["deterministicIds"]
-    assert det == [PLANE_FOR_AXIS[2][0]]
-    # sketch is mm -> meters: outer ring first point at origin, second
-    # segment param length 0.040 m
+    sk, ex = plan.features[0:2]
+    # base axis Z, span lo 0 -> sketched directly on the Top plane (JDC),
+    # NOT a construction plane; no plane dependency to patch
+    assert sk.name == "Extrude Base sketch"
+    assert sk.plane_dep is None
+    plane_q = next(p for p in sk.btm["parameters"]
+                   if p["parameterId"] == "sketchPlane")["queries"][0]
+    assert plane_q["deterministicIds"] == [PLANE_FOR_AXIS[2][0]]
+    # sketch is mm -> meters: first outer segment param length 0.040 m
     line0 = sk.btm["entities"][0]
     assert line0["geometry"]["btType"] == "BTCurveGeometryLine-117"
     assert abs(line0["endParam"] - 0.040) < 1e-9
@@ -223,10 +226,15 @@ def test_ring_circle_recognition():
 
 def test_resolve_pending_patches_references():
     plan = build_onshape_plan(_tree(), BBOX)
-    cp, sk, ex = plan.features[0:3]
+    # the JOIN keeps a construction plane (it's away from the origin) —
+    # use its plane->sketch->extrude chain to exercise the patching
+    cp = next(pf for pf in plan.features if pf.name == "Extrude Join 1 plane")
+    sk = next(pf for pf in plan.features if pf.name == "Extrude Join 1 sketch")
+    ex = next(pf for pf in plan.features if pf.name == "Extrude Join 1")
     cp.feature_id = "FCPLANE"
     btm = resolve_pending(plan, sk)
-    qs = btm["parameters"][0]["queries"][0]["queryString"]
+    qs = next(p for p in btm["parameters"]
+              if p["parameterId"] == "sketchPlane")["queries"][0]["queryString"]
     assert 'makeId("FCPLANE")' in qs
     sk.feature_id = "FSKETCH"
     btm = resolve_pending(plan, ex)

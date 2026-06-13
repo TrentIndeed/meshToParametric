@@ -168,6 +168,19 @@
   holes (Mesh1's tangent blind pair) before trusting depth direction.
 
 ## Scans
+- [ ] **Scan cleaning + design-intent + geometry recovery — full plan in
+  `docs/SCAN_RECOVERY_PLAN.md` (2026-06-13).** The clean-CAD path is
+  solid; scans need a front-end the pipeline lacks: feature-preserving
+  denoise (Poisson rounds edges), CANONICAL-FRAME ALIGNMENT (fit.py
+  `_snap_params` snaps to WORLD axes — meaningless until the part is
+  box-aligned; this is the root of the wrench over-extrude), and GLOBAL
+  constraint inference (parallel/perp/coaxial/equal/symmetry/dimension
+  — current snapping is per-primitive). Plus promoting the Onshape
+  `_regularize_profile` (axis-snapped straights + tangent arcs) into a
+  shared sketch-regularization stage. Sequencing: alignment + denoise
+  first (biggest lever), then the regularizer, then constraint
+  inference, then confidence/gating. Prismatic target (Scan2); organic
+  (spanner) → /clean only. The items below are subsumed by that plan.
 - [x] Decimation speedup: 2.5M-face scans spent ~60s in quadric edge-collapse.
   A cheap vertex-clustering pre-pass (when faces > 5x the cap) cuts the input
   ~10x in ~2s, so the quality quadric runs on a small mesh. Scan2 ingest

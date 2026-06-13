@@ -58,6 +58,12 @@ def ingest_mesh(
         mesh = _merge_vertices(mesh, config.merge_tolerance)
         mesh = _decimate(mesh, config.max_faces)
         mesh = _fix_normals(mesh)
+        # Scan front-end: feature-preserving denoise flattens scanner
+        # noise on the surfaces while keeping sharp edges, BEFORE
+        # hole-fill / Poisson fit a cleaner surface.
+        if config.denoise_scan:
+            mesh = _denoise_scan(mesh, config)
+            mesh = _fix_normals(mesh)
         mesh = _fill_holes(mesh, config.max_hole_edges)
         # Ragged scans still have large open boundaries small-hole filling
         # can't close. Screened-Poisson reconstruction (scan input only)
@@ -77,11 +83,22 @@ def ingest_mesh(
     # Re-fix normals after remeshing since it can introduce inconsistencies
     mesh = _fix_normals(mesh)
 
+    # Scan front-end: rotate the part onto its own orthogonal frame so
+    # downstream axis snapping / extrusion-engine silhouettes / prismatic
+    # reasoning (all world-axis-relative) become meaningful.
+    align_transform = None
+    if config.align_canonical:
+        from mesh2param.pipeline.align import align_to_canonical_frame
+        mesh, align_transform, _method = align_to_canonical_frame(mesh)
+        mesh = _fix_normals(mesh)
+
     mesh, unit_scale = _normalize_scale(mesh, config)
 
     result = _build_cleaned_mesh(mesh, path)
     if unit_scale != 1.0:
         result.metadata["unit_scale"] = unit_scale
+    if align_transform is not None:
+        result.metadata["align_transform"] = align_transform.tolist()
     logger.debug(
         "ingest_mesh completed: verts=%d, faces=%d, watertight=%s",
         len(result.vertices), len(result.faces), result.is_watertight,
@@ -293,6 +310,66 @@ def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:
         return mesh
     except Exception as e:
         logger.warning("Decimation failed (%s) — using original mesh", e)
+        return mesh
+
+
+def _denoise_scan(mesh: trimesh.Trimesh, config: IngestConfig) -> trimesh.Trimesh:
+    """Feature-preserving denoise for scans.
+
+    Smooths scanner noise off the surfaces while KEEPING sharp edges —
+    naive Laplacian smoothing would round every corner (the same reason
+    Poisson is gated). Prefers two-step smoothing (smooth face normals
+    over a neighbourhood, then refit vertices to them — feature
+    preserving), falling back to surface-preserving Laplacian, then
+    Taubin. Returns the input unchanged on any failure.
+    """
+    try:
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=np.asarray(mesh.vertices),
+            face_matrix=np.asarray(mesh.faces),
+        ))
+        it = int(max(1, config.denoise_iterations))
+        applied = None
+        for fname, kw in (
+            ("apply_coord_two_steps_smoothing", {"stepsmoothnum": it}),
+            ("apply_coord_laplacian_smoothing_surface_preserving", {}),
+            ("apply_coord_taubin_smoothing", {"stepsmoothnum": it}),
+        ):
+            fn = getattr(ms, fname, None)
+            if fn is None:
+                continue
+            try:
+                fn(**kw)
+                applied = fname
+                break
+            except Exception:
+                try:
+                    fn()
+                    applied = fname
+                    break
+                except Exception:
+                    continue
+        if applied is None:
+            logger.warning("No usable pymeshlab denoise filter found")
+            return mesh
+        out = ms.current_mesh()
+        den = trimesh.Trimesh(
+            vertices=np.asarray(out.vertex_matrix()),
+            faces=np.asarray(out.face_matrix()),
+            process=False,
+        )
+        if len(den.faces) == 0:
+            return mesh
+        logger.info("Feature-preserving denoise via %s (%d its): %d verts",
+                    applied, it, len(den.vertices))
+        return den
+    except ImportError:
+        logger.warning("pymeshlab not installed — skipping scan denoise")
+        return mesh
+    except Exception as e:
+        logger.warning("Scan denoise failed (%s) — keeping original", e)
         return mesh
 
 

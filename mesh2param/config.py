@@ -26,6 +26,11 @@ class IngestConfig(BaseModel):
     # both need. Uses pymeshlab's built-in filter (already a dependency).
     poisson_reconstruct: bool = True
     poisson_depth: int = 8
+    # Scan recovery front-end (off for clean CAD meshes; the scan
+    # classifier turns these on). See docs/SCAN_RECOVERY_PLAN.md.
+    denoise_scan: bool = False          # feature-preserving surface denoise
+    denoise_iterations: int = 3
+    align_canonical: bool = False       # rotate onto the part's own frame
     # Scale normalization: the pipeline's absolute thresholds (snap
     # tolerances, fillet radii, plate-thickness checks) are tuned for
     # mm-scale parts with a bbox diagonal around 100-500. Parts far

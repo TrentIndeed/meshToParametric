@@ -80,7 +80,17 @@ Ordered; each imposes more structure than the last.
   possible.
 - Output: a clean, watertight, uniform, edge-preserved manifold.
 
-### B. Canonical-frame alignment (THE missing front-end)
+### B. Canonical-frame alignment (THE missing front-end) — IMPLEMENTED 2026-06-13
+`pipeline/align.py::align_to_canonical_frame` (dominant orthogonal
+normal triple, OBB fallback, axis-reorder so length→X/thickness→Z) +
+feature-preserving denoise (`ingest._denoise_scan`, two-step
+smoothing), both gated by `IngestConfig.align_canonical` /
+`denoise_scan`. Validated on Scan1: the wrench went from engine
+coverage **0% → 92%**, dominant face normal **19.6° → 0.6°** off-axis,
+bbox resolved to a flat **165×27×9.3 mm** part. The engine still
+over-segments the thickness (stage 5 / the engine span-honesty work) —
+but the part is now in a readable, axis-aligned pose. Original design
+below:
 - Find the part's natural orthogonal frame and rotate it onto the world
   axes, so every downstream "snap to axis" / "prismatic" assumption
   holds and the extrusion engine reads the right directions.
@@ -216,6 +226,16 @@ symmetry, dimension grids) layers on top of this pragmatic spine — same
 stages, deeper solvers.
 
 ---
+
+## 7b. Locked decisions (2026-06-13)
+- **First target: Scan1 (wrench/spanner)** — the part with the visible
+  failure; alignment + denoise attack it directly. (Semi-organic, so
+  it's also a stress test of the prismatic/organic gate.)
+- **Ambition: full constraint solver** — build toward the least-squares
+  constraint graph (E), not just greedy per-primitive snaps.
+- **Start with: canonical-frame alignment + feature-preserving denoise**
+  (stages B + A). Biggest lever, the wrench fix, and the foundation
+  everything else stands on.
 
 ## 8. Open decisions
 - First target part + ambition for v1 (pragmatic snapping spine vs.

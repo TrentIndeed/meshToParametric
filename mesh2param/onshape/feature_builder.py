@@ -851,16 +851,18 @@ def build_onshape_plan(feature_tree: FeatureTree,
 
     The model is TRANSLATED so the BASE plate's own sketch plane lands
     on the origin (user request: "build ON origin, not offset from it").
-    Anchoring the base — not the bbox-min corner — is what puts the part
-    on a default plane: the side plates hang BELOW the base, so the
-    bbox-min is their bottom, and anchoring there floated the base plate
-    ~76 mm up. With the base axis anchored at its own lo, the base
-    sketch sits exactly on a default origin plane (see _profile_extrusion).
+    The base plate is CENTERED on the origin: its sketch-plane axis is
+    anchored at its own span-lo (so the sketch sits on a default plane,
+    not floated ~76 mm up by the side plates that form the bbox minimum)
+    AND its in-plane center is moved to (0,0) (so the origin sits at the
+    middle of the base plate, not off to one side by the full-part
+    bbox-min — which is dominated by the wider side plates). Every other
+    feature rides the same translation, so the assembly stays intact.
     """
     plan = OnshapePlan()
     features = list(feature_tree.features)
     bmin = np.asarray(bbox_mm[0], dtype=float)
-    off = -bmin.copy()  # other axes: bbox-min -> 0 (positive octant)
+    off = -bmin.copy()  # fallback: bbox-min -> origin
 
     base = next(
         (f for f in features if f.type == FeatureType.BASE_EXTRUSION), None,
@@ -869,9 +871,16 @@ def build_onshape_plan(feature_tree: FeatureTree,
         bsg = base.sketch_geometry or {}
         ax_b, _ = _axis_of(base.direction)
         bspan = bsg.get("span")
+        bpts = bsg.get("points")
         if bspan is not None:
-            # base axis: anchor the base's lo at the origin plane
+            # base sketch-plane axis -> origin plane
             off[ax_b] = -float(bspan[0])
+        if bpts:
+            # base in-plane center -> origin
+            u_ax, v_ax = UV_AXES[ax_b]
+            BP = np.asarray(bpts, dtype=float)
+            off[u_ax] = -0.5 * (float(BP[:, 0].min()) + float(BP[:, 0].max()))
+            off[v_ax] = -0.5 * (float(BP[:, 1].min()) + float(BP[:, 1].max()))
     bbox_shifted = (bmin + off, np.asarray(bbox_mm[1], dtype=float) + off)
 
     if base is not None:

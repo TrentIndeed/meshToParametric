@@ -132,11 +132,11 @@ def test_join_y_axis_sign_conventions():
     cp = next(pf for pf in plan.features if pf.name == "Extrude Join 1 plane")
     ex = next(pf for pf in plan.features if pf.name == "Extrude Join 1")
     pcp = {x["parameterId"]: x for x in cp.btm["parameters"]}
-    # span lo 40 + origin shift (+20 on Y, from bbox lo -20) = world
-    # y=+60 on the Front plane (normal -Y): positive offset with
-    # oppositeDirection=True (negative offset expressions are rejected
-    # by the feature spec)
-    assert pcp["offset"]["expression"].startswith("60.")
+    # base is centered on origin: base (u,v) center is (20,15) so the Y
+    # shift is -15. Join span lo 40 -> world y=25 on the Front plane
+    # (normal -Y): positive offset with oppositeDirection=True (negative
+    # offset expressions are rejected by the feature spec)
+    assert pcp["offset"]["expression"].startswith("25.")
     assert pcp["oppositeDirection"]["value"] is True
     pex = {x["parameterId"]: x for x in ex.btm["parameters"]}
     # extruding toward +Y from a Front-derived plane needs the flip
@@ -198,8 +198,9 @@ def test_as_built_overrides_tree_holes_and_adds_blends():
         if p["parameterId"] == "entities"
     )["queries"][0]["queryString"]
     assert qs.count("qClosestTo") == 2
-    # midpoints carry the origin shift (+10, +20, 0 from bbox lo)
-    assert "vector(11.0000, 22.0000, 3.0000)" in qs
+    # midpoints carry the base-centering shift: base (u,v) center (20,15)
+    # -> off (-20,-15,0); midpoint (1,2,3) -> (-19,-13,3)
+    assert "vector(-19.0000, -13.0000, 3.0000)" in qs
     cham_pf = next(pf for pf in plan.features if "Chamfer" in pf.name)
     assert cham_pf.btm["featureType"] == "chamfer"
     assert not any("FILLET" in s for s in plan.skipped)

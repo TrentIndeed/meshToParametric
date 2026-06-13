@@ -612,6 +612,7 @@ body {
   <div class="divider"></div>
   <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
   <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
+  <div id="onshape-menu-item" onclick="onshapeConnectClick(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-link"></i> Connect Onshape</div>
   <div class="divider"></div>
   <div class="divider"></div>
   <div onclick="toggleGrid()"><i class="ri-grid-line"></i> Toggle Grid</div>
@@ -840,7 +841,7 @@ body {
     </button>
     <div id="export-menu">
       <div onclick="downloadSTEP(); document.getElementById('export-menu').classList.remove('show')"><i class="ri-file-3-line"></i> Download STEP</div>
-      <div onclick="alert('Onshape export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-cloud-line"></i> Push to Onshape</div>
+      <div onclick="exportToOnshape(); document.getElementById('export-menu').classList.remove('show')"><i class="ri-cloud-line"></i> Push to Onshape</div>
       <div onclick="alert('IGES export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-file-code-line"></i> Download IGES</div>
       <div onclick="alert('STL export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-box-3-line"></i> Download STL</div>
     </div>
@@ -1059,7 +1060,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260610b" type="module"></script>
+<script src="/static/app.js?v=20260613a" type="module"></script>
 </body>
 </html>
 

@@ -62,24 +62,43 @@ def _redirect_uri(request: Request) -> str:
     return f"{proto}://{host}/api/onshape/callback"
 
 
-def _make_state(username: str) -> str:
-    expiry = int(time.time()) + _STATE_TTL
-    nonce = secrets.token_hex(8)
-    payload = f"{_b64url(username.encode())}.{expiry}.{nonce}"
-    return f"{payload}.{_sign(payload)}"
+def _safe_next(n: str | None) -> str:
+    """Only allow same-site path redirects (block //evil.com and absolute
+    URLs)."""
+    if not n or not n.startswith("/") or n.startswith("//"):
+        return "/home"
+    return n
+
+
+def _make_state(username: str, next_path: str = "/home") -> str:
+    import json
+    obj = {
+        "u": username,
+        "n": _safe_next(next_path),
+        "e": int(time.time()) + _STATE_TTL,
+        "x": secrets.token_hex(6),
+    }
+    raw = _b64url(json.dumps(obj, separators=(",", ":")).encode())
+    return f"{raw}.{_sign(raw)}"
+
+
+def _parse_state(state: str) -> dict | None:
+    import json
+    try:
+        raw, sig = state.rsplit(".", 1)
+        if not hmac.compare_digest(_sign(raw), sig):
+            return None
+        obj = json.loads(_b64url_decode(raw))
+        if int(obj["e"]) < time.time():
+            return None
+        return obj
+    except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+        return None
 
 
 def _state_username(state: str) -> str | None:
-    try:
-        user_b64, expiry, nonce, sig = state.split(".")
-        payload = f"{user_b64}.{expiry}.{nonce}"
-        if not hmac.compare_digest(_sign(payload), sig):
-            return None
-        if int(expiry) < time.time():
-            return None
-        return _b64url_decode(user_b64).decode()
-    except (ValueError, TypeError, UnicodeDecodeError):
-        return None
+    obj = _parse_state(state)
+    return obj["u"] if obj else None
 
 
 @router.get("/status")
@@ -94,16 +113,23 @@ def status(request: Request, db: Session = Depends(get_db)):
     }
 
 
+def _bounce(next_path: str, flag: str) -> RedirectResponse:
+    sep = "&" if "?" in next_path else "?"
+    return RedirectResponse(f"{next_path}{sep}onshape={flag}", status_code=302)
+
+
 @router.get("/connect")
-def connect(request: Request, db: Session = Depends(get_db)):
+def connect(request: Request, next: str = "/home",
+            db: Session = Depends(get_db)):
     user = _current_user(request, db)
+    next_path = _safe_next(next)
     if user is None:
-        return RedirectResponse("/login?next=/home", status_code=302)
+        return RedirectResponse(f"/login?next={next_path}", status_code=302)
     if not os_oauth.is_configured():
-        return RedirectResponse("/home?onshape=unconfigured", status_code=302)
+        return _bounce(next_path, "unconfigured")
     if not _can_use_onshape(user):
-        return RedirectResponse("/home?onshape=upgrade", status_code=302)
-    state = _make_state(user.username)
+        return _bounce(next_path, "upgrade")
+    state = _make_state(user.username, next_path)
     url = os_oauth.build_authorize_url(state, _redirect_uri(request))
     return RedirectResponse(url, status_code=302)
 
@@ -111,21 +137,23 @@ def connect(request: Request, db: Session = Depends(get_db)):
 @router.get("/callback")
 def callback(request: Request, db: Session = Depends(get_db),
              code: str = "", state: str = "", error: str = ""):
+    obj = _parse_state(state)
+    next_path = _safe_next(obj.get("n") if obj else None)
     if error:
         logger.info("Onshape OAuth denied/aborted: %s", error)
-        return RedirectResponse("/home?onshape=denied", status_code=302)
-    username = _state_username(state)
-    if not username or not code:
-        return RedirectResponse("/home?onshape=badstate", status_code=302)
+        return _bounce(next_path, "denied")
+    if obj is None or not code:
+        return _bounce(next_path, "badstate")
+    username = obj["u"]
     from mesh2param.db.database import User
     user = db.query(User).filter(User.username == username).first()
     if user is None:
-        return RedirectResponse("/home?onshape=badstate", status_code=302)
+        return _bounce(next_path, "badstate")
     try:
         bundle = os_oauth.exchange_code(code, _redirect_uri(request))
     except os_oauth.OnshapeOAuthError:
         logger.exception("Onshape code exchange failed")
-        return RedirectResponse("/home?onshape=error", status_code=302)
+        return _bounce(next_path, "error")
     # identity for "Connected as <name>"
     identity = None
     access = bundle.get("access_token")
@@ -136,7 +164,7 @@ def callback(request: Request, db: Session = Depends(get_db),
     os_oauth.store_tokens_on_user(user, bundle, db, identity)
     logger.info("Onshape connected for user %s (%s)", username,
                 (identity or {}).get("name"))
-    return RedirectResponse("/home?onshape=connected", status_code=302)
+    return _bounce(next_path, "connected")
 
 
 @router.post("/disconnect")

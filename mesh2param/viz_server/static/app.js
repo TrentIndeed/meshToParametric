@@ -2723,3 +2723,96 @@ function animate() {
   axisRenderer.render(axisScene, axisCamera);
 }
 animate();
+
+
+// ──────────────────────────────────────────────────────────────────
+// Onshape integration (per-user OAuth export). Backend:
+// api/onshape_oauth.py. Exposed on window for the inline menu onclicks.
+// ──────────────────────────────────────────────────────────────────
+let _onshapeStatus = null;
+
+async function refreshOnshapeStatus() {
+  try {
+    const r = await fetch('/api/onshape/status');
+    _onshapeStatus = await r.json();
+  } catch (e) { _onshapeStatus = null; }
+  const item = document.getElementById('onshape-menu-item');
+  if (item) {
+    if (_onshapeStatus && _onshapeStatus.connected) {
+      const who = _onshapeStatus.onshape_user_name || 'Connected';
+      item.innerHTML = '<i class="ri-link"></i> Onshape: ' + who + ' · Disconnect';
+    } else {
+      item.innerHTML = '<i class="ri-link-unlink"></i> Connect Onshape';
+    }
+  }
+}
+window.refreshOnshapeStatus = refreshOnshapeStatus;
+
+window.onshapeConnectClick = function () {
+  if (_onshapeStatus && _onshapeStatus.connected) {
+    if (confirm('Disconnect your Onshape account from Paramesh?')) {
+      fetch('/api/onshape/disconnect', { method: 'POST' })
+        .then(() => { addChatMessage('ai', 'Onshape account disconnected.'); refreshOnshapeStatus(); })
+        .catch(() => addChatMessage('ai', 'Could not disconnect Onshape.'));
+    }
+  } else {
+    window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
+  }
+};
+
+window.exportToOnshape = async function () {
+  if (!currentJobId) { alert('Run a conversion first, then push it to Onshape.'); return; }
+  // Open the tab synchronously so the popup blocker allows it; fill it
+  // with the document URL once the export returns (or close it on error).
+  const win = window.open('', '_blank');
+  addChatMessage('ai', 'Exporting to your Onshape account…');
+  let r;
+  try {
+    r = await fetch('/api/onshape/export/' + currentJobId, { method: 'POST' });
+  } catch (e) {
+    if (win) win.close();
+    addChatMessage('ai', 'Onshape export failed: network error.');
+    return;
+  }
+  if (r.status === 409) {            // not connected -> start OAuth, return here
+    if (win) win.close();
+    addChatMessage('ai', 'Connecting your Onshape account…');
+    window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
+    return;
+  }
+  if (r.status === 403) {
+    if (win) win.close();
+    addChatMessage('ai', 'Pushing to Onshape is a Pro feature — upgrade to enable it.');
+    return;
+  }
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) {
+    if (win) win.close();
+    addChatMessage('ai', 'Onshape export failed: ' + (data.detail || data.error || ('HTTP ' + r.status)));
+    return;
+  }
+  const feat = data.features ? (' (' + data.features + ' features)') : '';
+  addChatMessage('ai', (data.already ? 'Already in your Onshape. ' : 'Exported to Onshape' + feat + '. ') + 'Opening it now…');
+  if (win) { win.location = data.url; } else { window.open(data.url, '_blank', 'noopener'); }
+  refreshOnshapeStatus();
+};
+
+// Handle the ?onshape=... flag the OAuth round-trip lands back on, and
+// prime the connection status for the menu label.
+(function () {
+  const flag = new URLSearchParams(location.search).get('onshape');
+  const msgs = {
+    connected: 'Onshape account connected. Use Export → Push to Onshape.',
+    denied: 'Onshape connection was cancelled.',
+    upgrade: 'Onshape is a Pro feature — upgrade to connect.',
+    unconfigured: 'Onshape integration is not configured on the server.',
+    error: 'Onshape connection failed. Please try again.',
+    badstate: 'Onshape connection expired. Please try again.',
+  };
+  if (flag && msgs[flag]) {
+    setTimeout(() => { try { addChatMessage('ai', msgs[flag]); } catch (e) {} }, 1000);
+    history.replaceState({}, '', location.pathname);
+  }
+  refreshOnshapeStatus();
+})();

@@ -1228,7 +1228,7 @@ async def support_chat(body: dict):
         elif "format" in msg_lower or "stl" in msg_lower or "file" in msg_lower:
             return {"reply": "We support STL, OBJ, PLY, and 3MF files. The pipeline repairs topology and fixes normals automatically."}
         elif "onshape" in msg_lower:
-            return {"reply": "Onshape live export is planned. At launch you'll be able to export STEP files and push feature trees to Onshape via the REST API."}
+            return {"reply": "Pro users can connect their Onshape account and push a converted part straight into their own Onshape document — use Export → Push to Onshape after a conversion (the menu's Connect Onshape links your account)."}
         elif "waitlist" in msg_lower or "launch" in msg_lower or "when" in msg_lower or "beta" in msg_lower:
             return {"reply": "Paramesh AI is in private beta. Join the waitlist on our homepage and we'll notify you when access opens up."}
         else:

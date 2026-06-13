@@ -152,11 +152,17 @@
 - [ ] **Relief counterbores under the tabs (~9% volume) unmodeled** in
   both exports — the residual that keeps the volume gate at FAIL.
   Recognize them as pocket/counterbore features.
-- [ ] **Web UI hookup** (Pro tier "Onshape" feature): an "Export to
-  Onshape" button on /app that runs the live path for the job's tree
-  and links the created document. Needs per-user credentials
-  eventually; today the server's .env key exports to the OWNER's
-  account, fine for single-user testing.
+- [ ] **Multi-user Onshape integration — see `docs/ONSHAPE_INTEGRATION_PLAN.md`.**
+  Decisions locked 2026-06-13: per-user OAuth 2.0; full round-trip loop
+  (export → re-sync → import from Onshape); design for the Onshape App
+  Store (launch Paramesh from inside Onshape) from the start; Pro-tier,
+  billing stays in Stripe. The live export engine is built and proven;
+  what remains is per-user account plumbing (OAuth tokens on the User,
+  job↔document link on MeshJob) and the round-trip UX. Phased: (1)
+  connect + one-click export to the user's own account, (2) linked
+  docs + re-sync + embed, (3) import + App Store extensions. Today the
+  server .env key exports to the OWNER's account — fine only for
+  single-user testing.
 - [ ] Blind-hole opening derivation assumes the recognized center sits
   at the bore's axial midpoint — verify against a part with deep blind
   holes (Mesh1's tangent blind pair) before trusting depth direction.

@@ -31,6 +31,8 @@ class IngestConfig(BaseModel):
     denoise_scan: bool = False          # feature-preserving surface denoise
     denoise_iterations: int = 3
     align_canonical: bool = False       # rotate onto the part's own frame
+    scan_auto: bool = False             # auto-enable the front-end for scans
+    scan_face_threshold: int = 100_000  # raw faces above this => scan
     # Scale normalization: the pipeline's absolute thresholds (snap
     # tolerances, fillet radii, plate-thickness checks) are tuned for
     # mm-scale parts with a bbox diagonal around 100-500. Parts far

@@ -53,6 +53,19 @@ def ingest_mesh(
         logger.exception("Stage 1 failed during mesh loading: file=%s", path)
         raise
 
+    # Scan detection: dense triangle soup (>> the decimation cap) is a
+    # scan, not clean CAD. Clean test meshes are 1.6k-9.5k faces; scans
+    # are 300k-2.5M. Watertightness does NOT separate them (the wrench
+    # scan is watertight). With scan_auto on, this turns on the scan
+    # front-end (denoise + canonical-frame alignment) automatically.
+    raw_faces = len(mesh.faces)
+    is_scan = bool(config.scan_auto and raw_faces > config.scan_face_threshold)
+    do_denoise = config.denoise_scan or is_scan
+    do_align = config.align_canonical or is_scan
+    if is_scan:
+        logger.info("Scan detected (%d raw faces > %d) — scan front-end on",
+                    raw_faces, config.scan_face_threshold)
+
     try:
         mesh = _remove_degenerate_faces(mesh, config.min_face_area)
         mesh = _merge_vertices(mesh, config.merge_tolerance)
@@ -61,7 +74,7 @@ def ingest_mesh(
         # Scan front-end: feature-preserving denoise flattens scanner
         # noise on the surfaces while keeping sharp edges, BEFORE
         # hole-fill / Poisson fit a cleaner surface.
-        if config.denoise_scan:
+        if do_denoise:
             mesh = _denoise_scan(mesh, config)
             mesh = _fix_normals(mesh)
         mesh = _fill_holes(mesh, config.max_hole_edges)
@@ -87,9 +100,10 @@ def ingest_mesh(
     # downstream axis snapping / extrusion-engine silhouettes / prismatic
     # reasoning (all world-axis-relative) become meaningful.
     align_transform = None
-    if config.align_canonical:
+    align_method = None
+    if do_align:
         from mesh2param.pipeline.align import align_to_canonical_frame
-        mesh, align_transform, _method = align_to_canonical_frame(mesh)
+        mesh, align_transform, align_method = align_to_canonical_frame(mesh)
         mesh = _fix_normals(mesh)
 
     mesh, unit_scale = _normalize_scale(mesh, config)
@@ -99,6 +113,11 @@ def ingest_mesh(
         result.metadata["unit_scale"] = unit_scale
     if align_transform is not None:
         result.metadata["align_transform"] = align_transform.tolist()
+        result.metadata["align_method"] = align_method
+    if is_scan:
+        result.metadata["scan_mode"] = True
+        result.metadata["raw_faces"] = raw_faces
+        result.metadata["denoised"] = bool(do_denoise)
     logger.debug(
         "ingest_mesh completed: verts=%d, faces=%d, watertight=%s",
         len(result.vertices), len(result.faces), result.is_watertight,

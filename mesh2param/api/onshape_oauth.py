@@ -53,7 +53,8 @@ def _can_use_onshape(user) -> bool:
         return False
     if user.username in DEVELOPER_USERNAMES:
         return True
-    return (user.plan or "free") == "pro"
+    # Pro and up — plus the developer tier, which must have full access.
+    return (user.plan or "free") in ("pro", "unlimited", "developer")
 
 
 def _redirect_uri(request: Request) -> str:

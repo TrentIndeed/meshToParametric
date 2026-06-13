@@ -288,6 +288,7 @@ def _color_regions_no_adjacent_match(regions, sub_cleaned, palette):
 # stage_key is what gets stored in Job.pause_at_stage and matched in
 # _pause_for_review.
 PAUSE_STAGES: list[tuple[str, str]] = [
+    ("scan_cleanup", "Scan cleanup (denoise + align)"),
     ("decompose", "Decompose bodies"),
     ("segment", "Segmentation"),
     ("fit", "Primitive fitting"),
@@ -654,7 +655,11 @@ class JobQueue:
         job.progress = 5
         job.progress_stage = "Ingesting mesh..."
         logger.debug("Job %s: stage=ingest file=%s", job.id, job.file_path)
-        cleaned = ingest_mesh(job.file_path, IngestConfig(remesh=False))
+        # scan_auto: dense scans (>>30k faces) auto-get the scan
+        # front-end (feature-preserving denoise + canonical-frame
+        # alignment); clean CAD passes through untouched.
+        cleaned = ingest_mesh(
+            job.file_path, IngestConfig(remesh=False, scan_auto=True))
 
         # Resize mesh if target dimensions were specified
         target_dims = getattr(job, '_target_dims', None)
@@ -676,6 +681,28 @@ class JobQueue:
                             scale_xyz.tolist(), (cleaned.bbox[1] - cleaned.bbox[0]).tolist())
 
         _set_mesh_viz(cleaned)
+
+        # Stage 1b: Scan cleanup — the first visual after decimation for
+        # SCAN inputs. The mesh shown is feature-preserving-denoised and
+        # rotated onto its own orthogonal frame (so the wrench reads as a
+        # flat axis-aligned part instead of an arbitrary pose). Clean CAD
+        # skips this (no front-end ran).
+        if cleaned.metadata.get("scan_mode"):
+            rf = int(cleaned.metadata.get("raw_faces", 0))
+            am = cleaned.metadata.get("align_method", "?")
+            ext = np.round(cleaned.bbox[1] - cleaned.bbox[0], 1).tolist()
+            job.progress = 5
+            job.progress_stage = (
+                f"Scan cleanup: denoised + aligned ({am} frame, "
+                f"{rf:,} raw faces) — extents {ext} mm"
+            )
+            job.debug_summary.append(
+                f"Scan cleanup: {rf:,} raw faces -> denoised + {am}-aligned, "
+                f"extents {ext} mm"
+            )
+            job.progress_version += 1
+            _dwell_if_not_step_through("scan_cleanup")
+            _pause_for_review("scan_cleanup")
 
         # Whole-mesh segment + peel was REMOVED. It modified `cleaned`
         # in-place before decomposition, so per-body segmentation saw

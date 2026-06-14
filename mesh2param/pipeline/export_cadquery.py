@@ -264,6 +264,23 @@ def export_cadquery(
     blend_surface_patches_out: list = []
     fillet_match_diag_out: list = []
     as_built_record: dict = {"holes": [], "blends": []}
+    # Record the AS-BUILT base profile (outer boundary + interior cutouts)
+    # so the Onshape export replays the exact frame CadQuery extruded. The
+    # recognizer's engine profile carries only the OUTER outline; large
+    # through-openings (Mesh3's frame windows) are found by the slice path
+    # here as profiles[1:]. Without this the Onshape base extrudes a solid
+    # plate (~2x volume). Same philosophy as the holes/blends records.
+    try:
+        _bax = int(np.argmax(np.abs(extrude_dir)))
+        as_built_record["base"] = {
+            "axis_idx": _bax,
+            "span": [float(extrude_start), float(extrude_start + depth)],
+            "outer": [[float(p[0]), float(p[1])] for p in profiles[0]],
+            "inner": [[[float(p[0]), float(p[1])] for p in ring]
+                      for ring in profiles[1:] if ring is not None and len(ring) >= 3],
+        }
+    except Exception:
+        logger.debug("Could not record as-built base profile", exc_info=True)
     try:
         # Multi-body: skip per-body fillet application so the union doesn't
         # freeze fillets at body boundaries. Fillets get applied once to the

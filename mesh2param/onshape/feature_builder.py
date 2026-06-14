@@ -922,6 +922,23 @@ def build_onshape_plan(feature_tree: FeatureTree,
     base = next(
         (f for f in features if f.type == FeatureType.BASE_EXTRUSION), None,
     )
+    # Prefer the AS-BUILT base profile: CadQuery's slice path captures the
+    # interior cutouts (frame windows/pockets) the recognizer's engine
+    # profile misses (outer outline only). Replaying it keeps the Onshape
+    # base identical to the CadQuery solid — same outer, same holes — so a
+    # frame no longer extrudes as a solid plate (Mesh3 ~2x volume).
+    ab_base = (as_built or {}).get("base") if as_built else None
+    if base is not None and ab_base and ab_base.get("outer"):
+        import dataclasses
+        try:
+            base = dataclasses.replace(base, sketch_geometry={
+                "points": ab_base["outer"],
+                "inner": ab_base.get("inner") or [],
+                "span": ab_base.get("span") or (base.sketch_geometry or {}).get("span"),
+                "axis_idx": ab_base.get("axis_idx", _axis_of(base.direction)[0]),
+            })
+        except Exception:
+            logger.debug("Could not apply as-built base profile", exc_info=True)
     if base is not None:
         bsg = base.sketch_geometry or {}
         ax_b, _ = _axis_of(base.direction)

@@ -483,6 +483,50 @@ def _walk_outline_with_arcs(prefix: str, pts_mm: list):
     return ents if len(ents) >= 3 else None
 
 
+def _entity_endpoints(e: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    """(start, end) of a line/arc sketch segment in METERS, or None for a
+    full circle / unrecognized geometry."""
+    g = e.get("geometry") or {}
+    bt = g.get("btType", "")
+    if "Line" in bt:
+        px, py = g["pntX"], g["pntY"]
+        dx, dy = g["dirX"], g["dirY"]
+        p0, p1 = e.get("startParam", 0.0), e.get("endParam", 0.0)
+        return (np.array([px + dx * p0, py + dy * p0]),
+                np.array([px + dx * p1, py + dy * p1]))
+    if "Circle" in bt:
+        if "startParam" not in e or "endParam" not in e:
+            return None  # full circle, not an arc segment
+        cx, cy, r = g["xCenter"], g["yCenter"], g["radius"]
+        a0, a1 = e["startParam"], e["endParam"]
+        return (np.array([cx + r * np.cos(a0), cy + r * np.sin(a0)]),
+                np.array([cx + r * np.cos(a1), cy + r * np.sin(a1)]))
+    return None
+
+
+def _chain_closes(ents: list[dict], tol_mm: float = 0.05) -> bool:
+    """True when the ordered entities form a closed loop — each segment's
+    end meets the next segment's start (and last meets first) within
+    tol_mm. Onshape only forms a sketch REGION from a closed loop, so an
+    arc whose endpoint misses the adjacent line by more than the merge
+    tolerance yields an OK sketch with no region and the extrude ERRORs
+    (Mesh3's corner arcs missed by ~4.7 mm). Sub-tolerance: reject and
+    fall back to the polyline, which closes by construction."""
+    eps = tol_mm / 1000.0
+    n = len(ents)
+    if n < 3:
+        return False
+    pts = [_entity_endpoints(e) for e in ents]
+    if any(p is None for p in pts):
+        return False
+    for i in range(n):
+        end = pts[i][1]
+        start_next = pts[(i + 1) % n][0]
+        if float(np.linalg.norm(end - start_next)) > eps:
+            return False
+    return True
+
+
 def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
     """Outer-profile entities. Three paths, best first:
 
@@ -492,6 +536,11 @@ def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
       B. Fit one arc per sampled corner run -> smooth but only
          approximately tangent (complex outlines the regularizer rejects).
       C. Raw polyline (last resort).
+
+    Every arc-based path is verified to form a CLOSED loop before use; a
+    chain that doesn't close (Onshape would build the sketch but fail the
+    extrude with no region) is discarded in favor of the next path. The
+    polyline always closes, so the base extrude never silently fails.
     """
     pts = _clean_polygon(pts_mm)
     sharp, fillets = _regularize_profile(pts_mm)
@@ -505,11 +554,17 @@ def _outline_entities(prefix: str, pts_mm: list) -> list[dict]:
             sharp = fillets = None
     if sharp and fillets:
         ents = _analytic_tangent_arcs(prefix, sharp, fillets)
-        if ents:
+        if ents and _chain_closes(ents):
             return ents
+        if ents:
+            logger.info("Outline %s: analytic-arc chain open (gap > tol); "
+                        "trying next path", prefix)
     ents = _walk_outline_with_arcs(prefix, pts)
-    if ents:
+    if ents and _chain_closes(ents):
         return ents
+    if ents:
+        logger.info("Outline %s: fitted-arc chain open; using polyline",
+                    prefix)
     return _polygon_entities(prefix, pts)
 
 

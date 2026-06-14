@@ -30,11 +30,20 @@ from mesh2param.pipeline.ingest import ingest_mesh
 import match_fillets_to_edges as mfe
 
 
+MESHES = {
+    "Mesh1": "models/Mesh1/Body1Mesh.3mf",
+    "Mesh2": "models/Mesh2/BottomMount.3mf",
+    "Mesh3": "models/Mesh3/Front Plate.3mf",
+    "Mesh4": "models/Mesh4/tube.3mf",
+    "Mesh5": "models/Mesh5/RackMount.3mf",
+}
+
+
 def main() -> int:
-    name = sys.argv[1] if len(sys.argv) > 1 else "mesh2param BottomMount DIAG"
-    cleaned = ingest_mesh(
-        str(ROOT / "models/Mesh2/BottomMount.3mf"), IngestConfig(remesh=False),
-    )
+    which = sys.argv[1] if len(sys.argv) > 1 else "Mesh2"
+    rel = MESHES.get(which, MESHES["Mesh2"])
+    name = sys.argv[2] if len(sys.argv) > 2 else f"mesh2param {which} DIAG"
+    cleaned = ingest_mesh(str(ROOT / rel), IngestConfig(remesh=False))
     raw, body_results, decomp = mfe.build_clusters(cleaned)
     clusters = [{
         "group_id": cl["gid"], "vertices": cl["verts"],

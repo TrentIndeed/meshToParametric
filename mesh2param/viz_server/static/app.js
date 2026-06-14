@@ -2877,19 +2877,25 @@ window.unbindOnshapeDocument = function () {
   addChatMessage('ai', 'Stopped building to Onshape. The document stays in your account.');
 };
 
-// Live SYNCED build. With a bound target it re-syncs into that already-
-// open document (no new tab); otherwise it creates + opens a new one.
+// Live SYNCED build. Always opens (or re-opens) a tab on the Onshape
+// document so the user can SEE the build — pointing straight at the bound
+// doc's URL when we already know it (collaborative sync rebuilds it live),
+// or a blank tab navigated once the new document is created.
 // Drives Paramesh's own build animation in step with the Onshape build.
 window.exportToOnshape = async function () {
   console.log('[onshape] build; jobId =', currentJobId, 'target =', _onshapeTarget && _onshapeTarget.document_id);
   if (!currentJobId) { alert('Run a conversion first, then build it in Onshape.'); return; }
   const target = _onshapeTarget;
-  const win = target ? null : window.open('', '_blank');   // new-doc case opens a tab (popup-safe)
+  // Open a tab from THIS click (popup-safe). If the bound doc URL is known,
+  // open it directly so the user lands on the file immediately; otherwise
+  // open blank and point it at the new doc on the 'document' event.
+  const win = window.open((target && target.url) ? target.url : '', '_blank');
+  let winNavigated = !!(target && target.url);
   let qs = '';
   if (target) qs = '?document_id=' + encodeURIComponent(target.document_id) +
     '&workspace_id=' + encodeURIComponent(target.workspace_id) +
     '&element_id=' + encodeURIComponent(target.element_id);
-  addChatMessage('ai', target ? 'Rebuilding in your bound Onshape document…' : 'Building in your Onshape account…');
+  addChatMessage('ai', target ? 'Opening your Onshape document and rebuilding it — watch it update in that tab…' : 'Building in your Onshape account…');
   let resp;
   try {
     resp = await fetch('/api/onshape/export/' + currentJobId + '/live' + qs, { method: 'POST' });
@@ -2921,7 +2927,7 @@ window.exportToOnshape = async function () {
       let ev; try { ev = JSON.parse(dline.slice(5).trim()); } catch (e) { continue; }
       if (ev.type === 'document') {
         docUrl = ev.url; total = ev.total || 0;
-        if (win) win.location = ev.url;        // new doc: open it
+        if (win && !winNavigated) { win.location = ev.url; winNavigated = true; }
         // Bind this document so a later Play or Reanalyze re-syncs into
         // it — not only the "New Onshape Document" button. Every export
         // becomes sticky: the toggle flips on and the target is saved, so

@@ -1329,6 +1329,16 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   if (!file) return;
   console.debug('[upload] file selected:', file.name, 'size:', (file.size / 1024).toFixed(1), 'KB');
 
+  // If a bound Onshape doc already holds a DIFFERENT built part, rotate to a
+  // fresh document so the new file doesn't overlap it. The blank window must
+  // be opened here, synchronously inside the click gesture, or the popup is
+  // blocked. Same-file re-upload (or an unused bound doc) keeps the doc.
+  if (_onshapeTarget && _onshapeTarget.filename && _onshapeTarget.filename !== file.name) {
+    const rotateWin = window.open('', '_blank');
+    try { await rotateOnshapeDocument(rotateWin, file.name); }
+    catch (err) { console.warn('[onshape] doc rotation failed', err); if (rotateWin) rotateWin.close(); }
+  }
+
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
   const progressBar = document.getElementById('progress-bar');
@@ -2838,6 +2848,27 @@ window.newOnshapeDocument = async function () {
   addChatMessage('ai', 'New Onshape document opened and bound. Run (or re-run) the pipeline — it will build into this document. Keep that tab visible to watch.');
 };
 
+// When a bound document already holds a built part and the user uploads a
+// DIFFERENT file, give that new file its own fresh document so the build
+// doesn't overlap the previous part (and break its features). The `win`
+// must be opened synchronously from the upload click for the popup to
+// survive — we just point it at the new document here.
+async function rotateOnshapeDocument(win, filename) {
+  let r;
+  try { r = await fetch('/api/onshape/document/new', { method: 'POST' }); }
+  catch (e) { if (win) win.close(); return false; }
+  if (!r.ok) { if (win) win.close(); return false; }
+  let d = {}; try { d = await r.json(); } catch (e) {}
+  if (!d.url) { if (win) win.close(); return false; }
+  _onshapeTarget = { document_id: d.document_id, workspace_id: d.workspace_id,
+                     element_id: d.element_id, url: d.url, filename: null };
+  try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
+  if (win) win.location = d.url;
+  updateOnshapeBindUI();
+  addChatMessage('ai', 'New file detected — opened a fresh Onshape document so it won’t overlap the previous part. The pipeline will build into this new document.');
+  return true;
+}
+
 window.unbindOnshapeDocument = function () {
   _onshapeTarget = null;
   try { localStorage.removeItem('onshape_target'); } catch (e) {}
@@ -2905,6 +2936,15 @@ window.exportToOnshape = async function () {
         if (!progEl) progEl = _onshapeProgressEl();
         progEl.textContent = txt;
       } else if (ev.type === 'done') {
+        // Record which file this bound document now holds, so uploading a
+        // DIFFERENT part later rotates to a fresh document instead of
+        // overlapping this one.
+        if (_onshapeTarget && !ev.already) {
+          const fnEl = document.getElementById('viewer-filename');
+          _onshapeTarget.filename = (fnEl && fnEl.textContent)
+            || (pendingFile && pendingFile.name) || _onshapeTarget.filename || '';
+          try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
+        }
         addChatMessage('ai', ev.already
           ? 'Opened your existing Onshape document.'
           : 'Done — built ' + ev.n_ok + '/' + ev.total + ' features in Onshape.');

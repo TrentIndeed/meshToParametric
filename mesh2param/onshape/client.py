@@ -197,23 +197,41 @@ class OnshapeClient:
             f"/partstudios/d/{did}/w/{wid}/e/{eid}/features/featureid/{fid}",
         )
 
-    def clear_features(self, did: str, wid: str, eid: str) -> int:
+    def clear_features(self, did: str, wid: str, eid: str,
+                       max_rounds: int = 12) -> int:
         """Delete all USER features from the part studio (keeps the
         default origin + planes), so a re-analyze rebuilds into the same
         document cleanly. Deletes in reverse so dependents go first.
-        Returns the count removed."""
-        feats = self.features(did, wid, eid).get("features", [])
-        n = 0
-        for f in reversed(feats):
-            fid = f.get("featureId")
-            if not fid:
-                continue
-            try:
-                self.delete_feature(did, wid, eid, fid)
-                n += 1
-            except OnshapeApiError:
-                pass
-        return n
+
+        A single pass can leave features behind: a delete may fail because
+        a feature still has dependents that haven't been removed yet, and
+        that failure is swallowed. A partial clear is the root cause of the
+        overlap bug (the new part builds on top of leftover features), so
+        we loop — re-fetching and re-deleting — until the studio is empty
+        or no further progress is made. Returns the total count removed."""
+        total = 0
+        for _ in range(max_rounds):
+            feats = self.features(did, wid, eid).get("features", [])
+            if not feats:
+                break
+            removed_this_round = 0
+            for f in reversed(feats):
+                fid = f.get("featureId")
+                if not fid:
+                    continue
+                try:
+                    self.delete_feature(did, wid, eid, fid)
+                    total += 1
+                    removed_this_round += 1
+                except OnshapeApiError:
+                    # Likely a dependency ordering issue; a later round
+                    # (after its dependents are gone) should succeed.
+                    pass
+            if removed_this_round == 0:
+                # No progress — anything left is undeletable (default
+                # origin/planes or a permission limit). Stop looping.
+                break
+        return total
 
     def volume_mm3(self, did: str, wid: str, eid: str) -> float | None:
         """Combined solid volume in mm^3 (None if no parts yet)."""

@@ -2864,14 +2864,14 @@ function _boundForCurrentMesh() {
 }
 
 // "Open in Onshape" until the current document has been opened, then
-// "Reopen in Onshape". Shown once Onshape is connected (so you can open an
-// empty document BEFORE analyzing) or once a mesh has been analyzed.
+// "Reopen in Onshape". Shown ONLY when the Onshape account is connected
+// (otherwise the button is hidden — connect via the menu first).
 function updateOnshapeOpenButton() {
   const btn = document.getElementById('onshape-open-btn');
   if (!btn) return;
   const analyzed = !!currentJobId && !!(typeof steps !== 'undefined' && steps && steps.length);
   const connected = !!(_onshapeStatus && _onshapeStatus.connected);
-  btn.style.display = (connected || analyzed) ? 'flex' : 'none';
+  btn.style.display = connected ? 'flex' : 'none';
   const opened = _boundForCurrentMesh() && _onshapeTarget.opened;
   const lbl = btn.querySelector('.os-label');
   if (lbl) lbl.textContent = opened ? 'Reopen in Onshape' : 'Open in Onshape';

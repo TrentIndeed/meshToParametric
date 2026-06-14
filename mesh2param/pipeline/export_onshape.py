@@ -74,19 +74,27 @@ class ExportResult:
 def apply_planned_feature(client, did, wid, eid, plan, pf):
     """Add ONE planned feature to the part studio, walking its fallback
     ladder (blends retry as a single seed edge + tangent propagation —
-    Parasolid rolls whole chains OCC couldn't). Returns (ok, feature_id).
-    Shared by the batch export and the live/streamed build."""
+    Parasolid rolls whole chains OCC couldn't). Returns
+    (ok, feature_id, detail) where detail is a short human string —
+    "OK", an add-time non-OK status, or the Onshape error message (the
+    only real clue to WHY a feature was rejected). Shared by the batch
+    export and the live/streamed build; the detail feeds the saved build
+    log so failures can be debugged WITHOUT re-running a live export."""
     from mesh2param.onshape.client import OnshapeApiError
     from mesh2param.onshape.feature_builder import resolve_pending
 
     btm = resolve_pending(plan, pf)
+    detail = "OK"
     try:
         fid, status = client.add_feature(did, wid, eid, btm)
         pf.feature_id = fid
         ok = status == "OK"
+        if not ok:
+            detail = f"status={status}"
     except OnshapeApiError as exc:
         logger.warning("Feature %r rejected: %s", pf.name, exc)
         fid, ok = "", False
+        detail = str(exc)[:400]
     if not ok and pf.retry_btms:
         for ri, retry in enumerate(pf.retry_btms, 1):
             if fid:
@@ -98,14 +106,41 @@ def apply_planned_feature(client, did, wid, eid, plan, pf):
                 fid, status = client.add_feature(did, wid, eid, retry)
                 pf.feature_id = fid
                 ok = status == "OK"
+                detail = "OK" if ok else f"retry{ri} status={status}"
             except OnshapeApiError as exc:
                 logger.warning("Feature %r retry %d rejected: %s",
                                pf.name, ri, exc)
                 fid, ok = "", False
+                detail = f"retry{ri}: {str(exc)[:400]}"
             if ok:
                 logger.info("Feature %r applied via fallback %d", pf.name, ri)
+                detail = f"OK via fallback {ri}"
                 break
-    return ok, fid
+    return ok, fid, detail
+
+
+def write_build_log(log: dict, label: str = "build") -> str | None:
+    """Persist an Onshape build record to data/onshape_builds/ so a failed
+    export can be debugged from disk instead of re-running a live build
+    (which spends API calls). Returns the path written, or None."""
+    import json
+    from pathlib import Path
+
+    try:
+        d = Path("data") / "onshape_builds"
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = log.get("timestamp") or "build"
+        safe = "".join(c if c.isalnum() or c in "-_." else "_"
+                       for c in f"{label}_{stamp}")[:80]
+        path = d / f"{safe}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2)
+        logger.info("Onshape build log saved: %s (%d/%d features ok)",
+                    path, log.get("n_ok", 0), log.get("total", 0))
+        return str(path)
+    except Exception:
+        logger.debug("Could not write Onshape build log", exc_info=True)
+        return None
 
 
 def create_empty_document(client, doc_name: str) -> dict:
@@ -534,16 +569,20 @@ def _live_export(
 
     n_ok = 0
     n_err = 0
-    for pf in plan.features:
+    feat_log: list[dict] = []
+    for i, pf in enumerate(plan.features):
         t = _time.time()
-        ok, fid = apply_planned_feature(client, did, wid, eid, plan, pf)
+        ok, fid, detail = apply_planned_feature(client, did, wid, eid, plan, pf)
         _log_call(pf.name, t, ok)
+        feat_log.append({"index": i, "name": pf.name, "ok": ok,
+                         "detail": detail})
         if ok:
             n_ok += 1
         else:
             n_err += 1
             logger.warning(
-                "Feature %r created with errors (id=%s)", pf.name, fid,
+                "Feature %r created with errors (id=%s): %s",
+                pf.name, fid, detail,
             )
         if config.rate_limit_delay > 0:
             _time.sleep(min(config.rate_limit_delay, 0.2))
@@ -551,6 +590,19 @@ def _live_export(
     t = _time.time()
     cad_volume = client.volume_mm3(did, wid, eid) or 0.0
     _log_call("Mass Properties (validate)", t, cad_volume > 0)
+
+    write_build_log({
+        "timestamp": str(int(_time.time())),
+        "document_name": config.document_name,
+        "url": url, "document_id": did, "workspace_id": wid,
+        "element_id": eid,
+        "n_ok": n_ok, "n_err": n_err, "total": len(plan.features),
+        "skipped": plan.skipped,
+        "cad_volume": round(cad_volume, 1), "mesh_volume": round(mesh_volume, 1),
+        "volume_error_pct": round(
+            abs(cad_volume - mesh_volume) / (mesh_volume + 1e-15) * 100, 2),
+        "features": feat_log,
+    }, label="cli")
 
     volume_error = (
         abs(cad_volume - mesh_volume) / (mesh_volume + 1e-15) * 100

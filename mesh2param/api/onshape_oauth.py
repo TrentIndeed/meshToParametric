@@ -405,15 +405,20 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
         if not target:
             _t.sleep(1.8)
         n_ok = 0
+        feat_log: list[dict] = []
         for i, pf in enumerate(plan.features):
+            detail = "OK"
             try:
-                ok, _fid = apply_planned_feature(client, did, wid, eid,
-                                                 plan, pf)
-            except Exception:
+                ok, _fid, detail = apply_planned_feature(client, did, wid, eid,
+                                                         plan, pf)
+            except Exception as exc:
                 logger.exception("Live feature %s failed", pf.name)
                 ok = False
+                detail = f"exception: {str(exc)[:300]}"
             if ok:
                 n_ok += 1
+            feat_log.append({"index": i, "name": pf.name, "ok": ok,
+                             "detail": detail})
             yield _sse({"type": "feature", "index": i, "name": pf.name,
                         "ok": ok, "n_ok": n_ok, "total": total})
             _t.sleep(_LIVE_PACE)
@@ -421,6 +426,40 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
                   "ok" if n_ok == total else "partial")
         logger.info("Live build %s done: %d/%d features", job_uuid,
                     n_ok, total)
+        # Persist a per-build log (incl. final feature states) so a failed
+        # export can be debugged from disk — no need to re-run a live build
+        # (which spends Onshape API calls).
+        try:
+            from mesh2param.pipeline.export_onshape import write_build_log
+            final_states = []
+            try:
+                fdata = client.features(did, wid, eid)
+                fstates = fdata.get("featureStates", {}) or {}
+                for f in fdata.get("features", []):
+                    fid = f.get("featureId", "")
+                    final_states.append({
+                        "name": f.get("name", "?"),
+                        "status": (fstates.get(fid) or {}).get(
+                            "featureStatus", "?"),
+                    })
+            except Exception:
+                logger.debug("Could not fetch final feature states",
+                             exc_info=True)
+            cad_vol = client.volume_mm3(did, wid, eid)
+            write_build_log({
+                "timestamp": str(int(_t.time())),
+                "job_uuid": job_uuid,
+                "user": getattr(ctx.get("user"), "username", "?"),
+                "url": url, "document_id": did, "workspace_id": wid,
+                "element_id": eid,
+                "n_ok": n_ok, "total": total,
+                "skipped": plan.skipped,
+                "cad_volume": round(cad_vol, 1) if cad_vol else None,
+                "features": feat_log,
+                "final_states": final_states,
+            }, label=f"job_{job_uuid}")
+        except Exception:
+            logger.debug("Build-log persistence failed", exc_info=True)
         yield _sse({"type": "done", "url": url, "n_ok": n_ok,
                     "total": total})
 

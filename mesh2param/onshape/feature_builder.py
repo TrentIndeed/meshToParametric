@@ -966,6 +966,33 @@ def build_onshape_plan(feature_tree: FeatureTree,
             n_join += 1
             _profile_extrusion(plan, f, f"Extrude Join {n_join}", "ADD", off)
 
+    # Additional decomposed bodies (RackMount's side plates). Each is its own
+    # prismatic chunk in the SAME coordinate frame as the base, so it rides
+    # the same origin offset. Built with ADD (union) — like the joins — so the
+    # whole part becomes one solid before the holes/fillets, letting blends
+    # roll across body junctions and the perimeter of every plate.
+    n_body = 0
+    for eb in (as_built or {}).get("extra_bodies") or []:
+        if not eb.get("outer"):
+            continue
+        n_body += 1
+        ax_e = int(eb.get("axis_idx", 0))
+        d_e = np.zeros(3, dtype=float)
+        d_e[ax_e] = 1.0
+        eb_feat = Feature(
+            type=FeatureType.BASE_EXTRUSION,
+            face_indices=np.asarray([], dtype=int),
+            sketch_geometry={
+                "points": eb["outer"], "inner": eb.get("inner") or [],
+                "span": eb["span"], "axis_idx": ax_e,
+            },
+            direction=d_e,
+            depth=abs(float(eb["span"][1]) - float(eb["span"][0])),
+            operation="ADD",
+        )
+        _profile_extrusion(plan, eb_feat, f"Extrude Side Body {n_body}",
+                           "ADD", off)
+
     n_hole = 0
     if as_built and as_built.get("holes"):
         for h in as_built["holes"]:

@@ -281,6 +281,29 @@ def export_cadquery(
         }
     except Exception:
         logger.debug("Could not record as-built base profile", exc_info=True)
+    # Multi-body: record each ADDITIONAL body's base profile too, so the
+    # Onshape export extrudes every body (not just body 0). Without this the
+    # side plates (RackMount bodies 1-2) never get built — their volume is
+    # missing (~72% short) and the fillets/holes that ride them ERROR with no
+    # geometry to select. Same coordinate frame as body 0, so they share the
+    # single origin offset and the assembly stays intact.
+    as_built_record["extra_bodies"] = []
+    for abd in additional_bodies_data:
+        try:
+            _ap = abd.get("profiles") or []
+            if not _ap:
+                continue
+            _bax2 = int(np.argmax(np.abs(np.asarray(abd["extrude_dir"]))))
+            _bs = float(abd["extrude_start"])
+            as_built_record["extra_bodies"].append({
+                "axis_idx": _bax2,
+                "span": [_bs, _bs + float(abd["depth"])],
+                "outer": [[float(p[0]), float(p[1])] for p in _ap[0]],
+                "inner": [[[float(p[0]), float(p[1])] for p in ring]
+                          for ring in _ap[1:] if ring is not None and len(ring) >= 3],
+            })
+        except Exception:
+            logger.debug("Could not record as-built extra body", exc_info=True)
     try:
         # Multi-body: skip per-body fillet application so the union doesn't
         # freeze fillets at body boundaries. Fillets get applied once to the

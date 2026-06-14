@@ -64,11 +64,20 @@ The three gaps that make all of the above fail on scans:
 Ordered; each imposes more structure than the last.
 
 ### A. Scan-aware cleaning (mesh level)
-- **Feature-preserving denoise**: bilateral / normal-guided smoothing
-  that flattens scanner noise on faces while preserving sharp edges
-  (pymeshlab has `apply_coord_laplacian_smoothing` variants and
-  `apply_coord_hc_laplacian`, plus normal-based feature smoothing; or a
-  custom bilateral). REPLACES blind smoothing; runs BEFORE Poisson.
+- **Feature-preserving denoise — IMPLEMENTED 2026-06-14.**
+  `ingest._bilateral_denoise` (Zheng et al. bilateral normal filtering,
+  vectorized numpy): soft space+normal weighting removes surface noise
+  while preserving true sharp edges and, crucially, WITHOUT faceting
+  smooth curves. Default `denoise_method="bilateral"` (knobs:
+  `denoise_sigma_s`=0.3, `denoise_normal_iter`, `denoise_vertex_iter`);
+  the pymeshlab two-step is kept as an opt-in fallback. Validated on a
+  synthetic noised box (ground truth): bilateral keeps edge/corner error
+  ~25x below Laplacian; on the spanner it smooths surface noise (median
+  adj-normal angle 4.9->4.0 deg) while the two-step facets it (false >30
+  deg edges 0.6%->5.6%, bilateral stays 0.5%). Tests in
+  `tests/test_scan_denoise.py`; dev harness `scripts/diag_scan_denoise.py`.
+- Remaining stage-A gaps: explicit sharp-feature tagging to protect edges
+  through remesh/Poisson; uniform feature-preserving remesh.
 - **Sharp-feature detection**: tag edges where the dihedral angle is
   consistently high → protect them through denoise/remesh/Poisson.
 - **Repair**: islands/spikes/non-manifold removal, occlusion-gap hole

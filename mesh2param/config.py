@@ -30,6 +30,13 @@ class IngestConfig(BaseModel):
     # classifier turns these on). See docs/SCAN_RECOVERY_PLAN.md.
     denoise_scan: bool = False          # feature-preserving surface denoise
     denoise_iterations: int = 3
+    # Denoise method: "bilateral" = normal-filtering denoise that removes
+    # surface noise WITHOUT faceting smooth curves (preserves true sharp
+    # edges); "twostep" = pymeshlab two-step (more aggressive, can facet).
+    denoise_method: str = "bilateral"
+    denoise_sigma_s: float = 0.3        # bilateral edge-preservation knob
+    denoise_normal_iter: int = 6        # bilateral normal-smoothing passes
+    denoise_vertex_iter: int = 12       # bilateral vertex-refit passes
     align_canonical: bool = False       # rotate onto the part's own frame
     scan_auto: bool = False             # auto-enable the front-end for scans
     scan_face_threshold: int = 100_000  # raw faces above this => scan

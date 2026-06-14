@@ -1326,9 +1326,6 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   console.debug('[upload] file selected:', file.name, 'size:', (file.size / 1024).toFixed(1), 'KB');
-  // A new mesh: the "Open in Onshape" button resets to "Open" (the bound doc
-  // no longer matches this mesh) and the next press makes a fresh document.
-  try { updateOnshapeOpenButton && updateOnshapeOpenButton(); } catch (e) {}
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
@@ -1374,6 +1371,10 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     // Show filename under the viewer
     const fnLabel = document.getElementById('viewer-filename');
     if (fnLabel) fnLabel.textContent = previewRes.filename || pendingFile?.name || '';
+    // Now that the current mesh name has changed, relabel the Onshape button:
+    // a new (un-analyzed) mesh no longer matches the bound doc, so it shows
+    // "Open in Onshape" (not "Reopen"). Must run AFTER viewer-filename updates.
+    try { updateOnshapeOpenButton && updateOnshapeOpenButton(); } catch (e) {}
 
     // AI thinking messages about the uploaded mesh
     addChatMessage('ai', `Loaded ${previewRes.filename || 'mesh'}: ${previewRes.faces.toLocaleString()} faces, ${previewRes.vertices.toLocaleString()} vertices`, true);
@@ -2011,6 +2012,10 @@ function finishLoad(statusData) {
     try { sessionStorage.setItem('paramesh_mesh_compare', JSON.stringify(savedMeshPreview)); } catch (e) { /* too large */ }
   }
   populateUI(statusData);
+
+  // Mark which mesh this job built, so the Onshape button knows the job is
+  // valid for the loaded mesh (vs a stale job after a new upload).
+  _analyzedMeshName = (statusData && statusData.filename) || currentMeshName() || '';
 
   // Reveal the "Open in Onshape" button now that this mesh has steps
   // (covers restored sessions and the demo, not just a fresh analysis).
@@ -2825,6 +2830,15 @@ function _onshapeProgressEl() {
 let _onshapeTarget = null;
 try { _onshapeTarget = JSON.parse(localStorage.getItem('onshape_target') || 'null'); } catch (e) {}
 
+// Filename the CURRENT job was analyzed for. After uploading a new mesh the
+// old job is stale — building it would push the wrong (old) part — so the
+// Open button opens an empty doc until the new mesh is analyzed.
+let _analyzedMeshName = '';
+function _jobMatchesCurrentMesh() {
+  return !!currentJobId && !!_analyzedMeshName
+    && _analyzedMeshName === currentMeshName();
+}
+
 function _saveOnshapeTarget() {
   try {
     if (_onshapeTarget) localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget));
@@ -2909,9 +2923,10 @@ window.openInOnshape = async function () {
   const win = window.open('', '_blank');
   if (!_boundForCurrentMesh()) { _onshapeTarget = null; _saveOnshapeTarget(); }
 
-  // No analyzed mesh yet → open an EMPTY document and bind it. When you run
-  // the pipeline it builds into this document live (the synced animation).
-  if (!currentJobId) { await _openEmptyOnshapeDoc(win); return; }
+  // No analyzed mesh for what's loaded (nothing analyzed, or a new upload not
+  // yet analyzed) → open an EMPTY document and bind it. Running the pipeline
+  // then builds into this document live (the synced animation).
+  if (!_jobMatchesCurrentMesh()) { await _openEmptyOnshapeDoc(win); return; }
 
   // Analyzed mesh → build it into a (new or unclaimed) document and open it.
   const url = await _runOnshapeBuild(win);

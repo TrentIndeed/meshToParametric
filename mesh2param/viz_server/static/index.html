@@ -384,6 +384,17 @@ body {
 #play-btn:hover { background: #79C0FF; transform: scale(1.1); }
 #play-btn.playing { background: var(--text-muted); }
 #play-btn i { font-size: 18px; margin-left: 2px; }
+#onshape-open-btn {
+  position: fixed; right: 74px; bottom: 18px; z-index: 51;
+  height: 44px; padding: 0 16px; border-radius: 22px;
+  background: var(--bg-tertiary); color: var(--text-primary);
+  border: 1px solid var(--border); cursor: pointer;
+  display: none; align-items: center; gap: 8px;
+  font-family: 'OpenAI Sans', sans-serif; font-size: 13px; font-weight: 500;
+  transition: all 0.15s; white-space: nowrap;
+}
+#onshape-open-btn:hover { background: var(--accent); color: #000; border-color: var(--accent); }
+#onshape-open-btn i { font-size: 16px; }
 #timeline::-webkit-scrollbar { height: 6px; }
 #timeline::-webkit-scrollbar-track { background: transparent; }
 #timeline::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -613,7 +624,6 @@ body {
   <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
   <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
   <div id="onshape-menu-item" onclick="onshapeConnectClick(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-link"></i> Connect Onshape</div>
-  <div id="onshape-newdoc-item" onclick="newOnshapeDocument(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-file-add-line"></i> New Onshape Document</div>
   <div id="onshape-unbind-item" style="display:none" onclick="unbindOnshapeDocument(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-close-circle-line"></i> Stop building to Onshape</div>
   <div class="divider"></div>
   <div class="divider"></div>
@@ -843,7 +853,7 @@ body {
     </button>
     <div id="export-menu">
       <div onclick="downloadSTEP(); document.getElementById('export-menu').classList.remove('show')"><i class="ri-file-3-line"></i> Download STEP</div>
-      <div onclick="exportToOnshape(); document.getElementById('export-menu').classList.remove('show')"><i class="ri-cloud-line"></i> Push to Onshape</div>
+      <div onclick="openInOnshape(); document.getElementById('export-menu').classList.remove('show')"><i class="ri-cloud-line"></i> Open in Onshape</div>
       <div onclick="alert('IGES export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-file-code-line"></i> Download IGES</div>
       <div onclick="alert('STL export coming soon'); document.getElementById('export-menu').classList.remove('show')"><i class="ri-box-3-line"></i> Download STL</div>
     </div>
@@ -948,25 +958,6 @@ body {
     </span>
     Debug
   </label>
-  <label id="onshape-toggle" title="Mirror the build into your Onshape account live — the model builds in Onshape in step with the animation (requires Connect Onshape)" style="
-    display:flex; align-items:center; gap:6px; cursor:pointer;
-    font-size:11px; color:var(--text-secondary); font-family:'OpenAI Sans',sans-serif;
-    user-select:none; background:var(--bg-tertiary); padding:4px 10px; border-radius:12px;
-    border:1px solid var(--border);
-  ">
-    <span style="position:relative;display:inline-block;width:28px;height:16px;">
-      <input type="checkbox" id="onshape-mirror-cb" style="opacity:0;width:0;height:0;">
-      <span style="
-        position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px;
-        background:var(--border);transition:background 0.2s;
-      "></span>
-      <span style="
-        position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;
-        background:var(--text-muted);transition:transform 0.2s,background 0.2s;
-      "></span>
-    </span>
-    Onshape
-  </label>
   <!-- Breakpoint dropdown: only meaningful when Debug is on and Step is off.
        Pauses the (otherwise non-step) pipeline at exactly the chosen stage. -->
   <label id="pause-at-wrap" title="Pause the pipeline once at this stage, then continue without further pauses" style="
@@ -995,9 +986,10 @@ body {
   #step-through-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
   #debug-cb:checked + span { background: var(--accent) !important; }
   #debug-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
-  #onshape-mirror-cb:checked + span { background: var(--accent) !important; }
-  #onshape-mirror-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
 </style>
+<button id="onshape-open-btn" onclick="window.openInOnshape()">
+  <i class="ri-cloud-line"></i><span class="os-label">Open in Onshape</span>
+</button>
 <button id="play-btn" title="Play build animation" style="display:none;" onclick="window.playBuildAnimation()">
   <i class="ri-play-fill"></i>
 </button>
@@ -1083,7 +1075,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260613g" type="module"></script>
+<script src="/static/app.js?v=20260613h" type="module"></script>
 </body>
 </html>
 

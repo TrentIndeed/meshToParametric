@@ -812,18 +812,16 @@ window.playBuildAnimation = async function() {
 
   if (!steps || steps.length === 0) return;
 
-  // "Build in Onshape" toggle: the live Onshape build DRIVES this
-  // animation (exportToOnshape advances loadStep as each Onshape
-  // feature lands), so the model builds in Paramesh and in your Onshape
-  // account at the same time. Called from this Play click, so the
-  // new-tab open is popup-safe.
-  const _mirror = document.getElementById('onshape-mirror-cb');
-  if (_mirror && _mirror.checked) {
-    if (_onshapeStatus && _onshapeStatus.connected) {
-      window.exportToOnshape();
-      return;
-    }
-    addChatMessage('ai', 'Connect your Onshape account (menu → Connect Onshape) to mirror the build live — playing locally for now.');
+  // If this mesh's Onshape document is already open, the live Onshape build
+  // DRIVES this animation (it advances loadStep as each feature lands) so
+  // the model rebuilds in Paramesh and in the already-open Onshape tab at
+  // once. No NEW tab is opened here — that's what "Open in Onshape" is for;
+  // Play just re-syncs the document the user already opened.
+  if (_boundForCurrentMesh && _boundForCurrentMesh()
+      && _onshapeTarget && _onshapeTarget.opened
+      && _onshapeStatus && _onshapeStatus.connected) {
+    _runOnshapeBuild(null);
+    return;
   }
 
   _animPlaying = true;
@@ -1328,16 +1326,9 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   console.debug('[upload] file selected:', file.name, 'size:', (file.size / 1024).toFixed(1), 'KB');
-
-  // If a bound Onshape doc already holds a DIFFERENT built part, rotate to a
-  // fresh document so the new file doesn't overlap it. The blank window must
-  // be opened here, synchronously inside the click gesture, or the popup is
-  // blocked. Same-file re-upload (or an unused bound doc) keeps the doc.
-  if (_onshapeTarget && _onshapeTarget.filename && _onshapeTarget.filename !== file.name) {
-    const rotateWin = window.open('', '_blank');
-    try { await rotateOnshapeDocument(rotateWin, file.name); }
-    catch (err) { console.warn('[onshape] doc rotation failed', err); if (rotateWin) rotateWin.close(); }
-  }
+  // A new mesh: the "Open in Onshape" button resets to "Open" (the bound doc
+  // no longer matches this mesh) and the next press makes a fresh document.
+  try { updateOnshapeOpenButton && updateOnshapeOpenButton(); } catch (e) {}
 
   const loading = document.getElementById('loading');
   const loadingText = document.getElementById('loading-text');
@@ -1862,9 +1853,9 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
       // finishLoad will dismiss the loading overlay after the 3D model renders
       finishLoad(statusData);
 
-      // If an Onshape document is bound, automatically (re)build this
-      // run into it — the model builds in Onshape in step with the
-      // Paramesh animation, and a re-analyze re-syncs the same file.
+      // Reveal / relabel the "Open in Onshape" button now that this mesh has
+      // steps, then — if its document is already open — silently re-sync it.
+      try { updateOnshapeOpenButton && updateOnshapeOpenButton(); } catch (e) {}
       try { window.maybeAutoBuildOnshape && window.maybeAutoBuildOnshape(); } catch (e) {}
     } else {
       alert('Pipeline error: ' + (data.error || 'unknown'));
@@ -2020,6 +2011,10 @@ function finishLoad(statusData) {
     try { sessionStorage.setItem('paramesh_mesh_compare', JSON.stringify(savedMeshPreview)); } catch (e) { /* too large */ }
   }
   populateUI(statusData);
+
+  // Reveal the "Open in Onshape" button now that this mesh has steps
+  // (covers restored sessions and the demo, not just a fresh analysis).
+  try { updateOnshapeOpenButton && updateOnshapeOpenButton(); } catch (e) {}
 
   // Show dimension panel from bbox (AI analysis will upgrade it if available)
   if (statusData.bbox_min && statusData.bbox_max) {
@@ -2813,102 +2808,142 @@ function _onshapeProgressEl() {
   return d;
 }
 
-// ── Bound Onshape document (the "New Onshape Document" target) ──
-// When set, every build re-syncs into THIS document instead of making a
-// new one — so re-analyzing the same mesh updates the same Onshape file.
+// ── Onshape document binding + the unified "Open in Onshape" button ──
+// ONE button drives everything. First press for a mesh creates a fresh
+// Onshape document, builds the part into it, and opens the tab; after that
+// it reads "Reopen in Onshape" and just re-opens that same document's tab.
+// Uploading a different mesh resets it to "Open" and the next press makes a
+// NEW document for that mesh (so parts never overlap). Pressing Play (or a
+// Reanalyze) syncs into the already-open document WITHOUT opening a tab.
+//
+// _onshapeTarget = {document_id, workspace_id, element_id, url, filename,
+// opened}. `filename` is which mesh the doc holds; `opened` is whether the
+// user has opened its tab.
 let _onshapeTarget = null;
 try { _onshapeTarget = JSON.parse(localStorage.getItem('onshape_target') || 'null'); } catch (e) {}
 
-function updateOnshapeBindUI() {
-  const unbind = document.getElementById('onshape-unbind-item');
-  const newdoc = document.getElementById('onshape-newdoc-item');
-  if (unbind) unbind.style.display = _onshapeTarget ? '' : 'none';
-  if (newdoc) newdoc.innerHTML = _onshapeTarget
-    ? '<i class="ri-file-add-line"></i> New Onshape Document (replace current)'
-    : '<i class="ri-file-add-line"></i> New Onshape Document';
+function _saveOnshapeTarget() {
+  try {
+    if (_onshapeTarget) localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget));
+    else localStorage.removeItem('onshape_target');
+  } catch (e) {}
 }
 
-window.newOnshapeDocument = async function () {
-  // popup-safe: opens the empty doc tab from this click
-  const win = window.open('', '_blank');
-  let r;
-  try { r = await fetch('/api/onshape/document/new', { method: 'POST' }); }
-  catch (e) { if (win) win.close(); addChatMessage('ai', 'Could not reach the server.'); return; }
-  if (r.status === 409) { if (win) win.close(); addChatMessage('ai', 'Connect your Onshape account first (menu → Connect Onshape).'); window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname); return; }
-  if (r.status === 403) { if (win) win.close(); addChatMessage('ai', 'Onshape is a Pro feature.'); return; }
-  if (r.status === 401) { if (win) win.close(); window.location = '/login?next=' + encodeURIComponent(location.pathname); return; }
-  let d = {}; try { d = await r.json(); } catch (e) {}
-  if (!r.ok || !d.url) { if (win) win.close(); addChatMessage('ai', 'Could not create the document: ' + (d.detail || d.error || r.status)); return; }
-  _onshapeTarget = { document_id: d.document_id, workspace_id: d.workspace_id, element_id: d.element_id, url: d.url };
-  try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
-  // also flip the "build in Onshape" toggle on
-  const mirror = document.getElementById('onshape-mirror-cb'); if (mirror) mirror.checked = true;
-  if (win) win.location = d.url;
-  updateOnshapeBindUI();
-  addChatMessage('ai', 'New Onshape document opened and bound. Run (or re-run) the pipeline — it will build into this document. Keep that tab visible to watch.');
-};
+function currentMeshName() {
+  const el = document.getElementById('viewer-filename');
+  return (el && el.textContent)
+    || (typeof pendingFile !== 'undefined' && pendingFile && pendingFile.name) || '';
+}
 
-// When a bound document already holds a built part and the user uploads a
-// DIFFERENT file, give that new file its own fresh document so the build
-// doesn't overlap the previous part (and break its features). The `win`
-// must be opened synchronously from the upload click for the popup to
-// survive — we just point it at the new document here.
-async function rotateOnshapeDocument(win, filename) {
-  let r;
-  try { r = await fetch('/api/onshape/document/new', { method: 'POST' }); }
-  catch (e) { if (win) win.close(); return false; }
-  if (!r.ok) { if (win) win.close(); return false; }
-  let d = {}; try { d = await r.json(); } catch (e) {}
-  if (!d.url) { if (win) win.close(); return false; }
-  _onshapeTarget = { document_id: d.document_id, workspace_id: d.workspace_id,
-                     element_id: d.element_id, url: d.url, filename: null };
-  try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
-  if (win) win.location = d.url;
-  updateOnshapeBindUI();
-  addChatMessage('ai', 'New file detected — opened a fresh Onshape document so it won’t overlap the previous part. The pipeline will build into this new document.');
-  return true;
+// The bound document "belongs to" the current mesh when its filename matches.
+function _boundForCurrentMesh() {
+  const cur = currentMeshName();
+  return !!(_onshapeTarget && _onshapeTarget.document_id && cur
+            && _onshapeTarget.filename === cur);
+}
+
+// "Open in Onshape" until this mesh's document has been opened, then
+// "Reopen in Onshape". Hidden until a mesh has been analyzed (steps exist).
+function updateOnshapeOpenButton() {
+  const btn = document.getElementById('onshape-open-btn');
+  if (!btn) return;
+  const ready = !!currentJobId && !!(typeof steps !== 'undefined' && steps && steps.length);
+  btn.style.display = ready ? 'flex' : 'none';
+  const opened = _boundForCurrentMesh() && _onshapeTarget.opened;
+  const lbl = btn.querySelector('.os-label');
+  if (lbl) lbl.textContent = opened ? 'Reopen in Onshape' : 'Open in Onshape';
+  btn.title = opened
+    ? 'Reopen this part in your Onshape tab'
+    : 'Build this part into a new Onshape document and open it';
+}
+window.updateOnshapeOpenButton = updateOnshapeOpenButton;
+
+// Kept for the menu's "Stop building" item and other callers.
+function updateOnshapeBindUI() {
+  const unbind = document.getElementById('onshape-unbind-item');
+  if (unbind) unbind.style.display = _onshapeTarget ? '' : 'none';
+  updateOnshapeOpenButton();
 }
 
 window.unbindOnshapeDocument = function () {
-  _onshapeTarget = null;
-  try { localStorage.removeItem('onshape_target'); } catch (e) {}
-  const mirror = document.getElementById('onshape-mirror-cb'); if (mirror) mirror.checked = false;
+  _onshapeTarget = null; _saveOnshapeTarget();
   updateOnshapeBindUI();
   addChatMessage('ai', 'Stopped building to Onshape. The document stays in your account.');
 };
 
-// Live SYNCED build. Always opens (or re-opens) a tab on the Onshape
-// document so the user can SEE the build — pointing straight at the bound
-// doc's URL when we already know it (collaborative sync rebuilds it live),
-// or a blank tab navigated once the new document is created.
-// Drives Paramesh's own build animation in step with the Onshape build.
-window.exportToOnshape = async function () {
-  console.log('[onshape] build; jobId =', currentJobId, 'target =', _onshapeTarget && _onshapeTarget.document_id);
-  if (!currentJobId) { alert('Run a conversion first, then build it in Onshape.'); return; }
-  const target = _onshapeTarget;
-  // Open a tab from THIS click (popup-safe). If the bound doc URL is known,
-  // open it directly so the user lands on the file immediately; otherwise
-  // open blank and point it at the new doc on the 'document' event.
-  const win = window.open((target && target.url) ? target.url : '', '_blank');
-  let winNavigated = !!(target && target.url);
+// THE button. Popup-safe — the tab is opened synchronously inside this click.
+window.openInOnshape = async function () {
+  if (!currentJobId) { alert('Analyze a mesh first, then open it in Onshape.'); return; }
+  // Connection gate. We must NOT await before opening the tab (a popup only
+  // survives a synchronous user gesture), so only take the async refresh
+  // path when we don't already know we're connected. If a stale status was
+  // hiding a live connection, ask for one more click rather than a popup.
+  if (!(_onshapeStatus && _onshapeStatus.connected)) {
+    try { await refreshOnshapeStatus(); } catch (e) {}
+    if (_onshapeStatus && _onshapeStatus.connected) {
+      addChatMessage('ai', 'Onshape connected — click "Open in Onshape" again to build.');
+      updateOnshapeOpenButton();
+      return;
+    }
+    addChatMessage('ai', 'Connect your Onshape account to open this part…');
+    window.onshapeConnectClick();
+    return;
+  }
+  const cur = currentMeshName();
+  // Reopen: this mesh already has its own opened document → just show it.
+  if (_boundForCurrentMesh() && _onshapeTarget.opened && _onshapeTarget.url) {
+    window.open(_onshapeTarget.url, '_blank');
+    return;
+  }
+  // New mesh (or never opened): make a fresh document for it and build.
+  // Open the tab now (popup-safe); _runOnshapeBuild navigates it once the
+  // document is created. Clear any binding that belongs to another mesh so
+  // a brand-new document is created instead of overwriting that one.
+  const win = window.open('', '_blank');
+  if (!_boundForCurrentMesh()) { _onshapeTarget = null; _saveOnshapeTarget(); }
+  const url = await _runOnshapeBuild(win);
+  if (url && _onshapeTarget) {
+    _onshapeTarget.filename = cur;
+    _onshapeTarget.opened = true;
+    _saveOnshapeTarget();
+  } else if (win) { try { win.close(); } catch (e) {} }
+  updateOnshapeOpenButton();
+};
+
+// Silent sync used by Play and Reanalyze: rebuild the current mesh into the
+// already-open bound document. NO new tab — collaborative sync updates the
+// tab the user already opened via "Open in Onshape".
+window.exportToOnshape = function () { return _runOnshapeBuild(null); };
+
+// Core streamed build. `win` is a pre-opened tab to navigate to the NEW
+// document (from openInOnshape), or null for a silent sync. Drives the
+// build animation (advances loadStep as each Onshape feature lands) and
+// returns the document URL (or null on failure).
+async function _runOnshapeBuild(win) {
+  console.log('[onshape] build; jobId =', currentJobId, 'target =', _onshapeTarget && _onshapeTarget.document_id, 'tab =', !!win);
+  if (!currentJobId) { if (win) { try { win.close(); } catch (e) {} } return null; }
+  // Sync into the bound doc only when it belongs to the current mesh;
+  // otherwise build a fresh document (no target query string).
+  const target = _boundForCurrentMesh() ? _onshapeTarget : null;
+  let winNavigated = false;
   let qs = '';
   if (target) qs = '?document_id=' + encodeURIComponent(target.document_id) +
     '&workspace_id=' + encodeURIComponent(target.workspace_id) +
     '&element_id=' + encodeURIComponent(target.element_id);
-  addChatMessage('ai', target ? 'Opening your Onshape document and rebuilding it — watch it update in that tab…' : 'Building in your Onshape account…');
+  addChatMessage('ai', target ? 'Rebuilding in your Onshape document…' : 'Building in your Onshape account…');
   let resp;
   try {
     resp = await fetch('/api/onshape/export/' + currentJobId + '/live' + qs, { method: 'POST' });
-  } catch (e) { if (win) win.close(); addChatMessage('ai', 'Onshape build failed: network error.'); return; }
+  } catch (e) { if (win) win.close(); addChatMessage('ai', 'Onshape build failed: network error.'); return null; }
   console.log('[onshape] /live responded', resp.status);
-  if (resp.status === 401) { if (win) win.close(); addChatMessage('ai', 'Log in to build in Onshape.'); window.location = '/login?next=' + encodeURIComponent(location.pathname); return; }
-  if (resp.status === 409) { if (win) win.close(); addChatMessage('ai', 'Connecting your Onshape account…'); window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname); return; }
-  if (resp.status === 403) { if (win) win.close(); addChatMessage('ai', 'Building in Onshape needs a Pro account.'); return; }
+  if (resp.status === 401) { if (win) win.close(); addChatMessage('ai', 'Log in to build in Onshape.'); window.location = '/login?next=' + encodeURIComponent(location.pathname); return null; }
+  if (resp.status === 409) { if (win) win.close(); addChatMessage('ai', 'Connecting your Onshape account…'); window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname); return null; }
+  if (resp.status === 403) { if (win) win.close(); addChatMessage('ai', 'Building in Onshape needs a Pro account.'); return null; }
   if (!resp.ok || !resp.body) {
     let d = {}; try { d = await resp.json(); } catch (e) {}
     if (win) win.close();
     addChatMessage('ai', 'Onshape build failed: ' + (d.detail || d.error || ('HTTP ' + resp.status)));
-    return;
+    return null;
   }
 
   const reader = resp.body.getReader();
@@ -2928,24 +2963,15 @@ window.exportToOnshape = async function () {
       if (ev.type === 'document') {
         docUrl = ev.url; total = ev.total || 0;
         if (win && !winNavigated) { win.location = ev.url; winNavigated = true; }
-        // Bind this document so a later Play or Reanalyze re-syncs into
-        // it — not only the "New Onshape Document" button. Every export
-        // becomes sticky: the toggle flips on and the target is saved, so
-        // the next build (same file) updates this same Onshape file.
+        // Capture the document ids so Play / Reanalyze re-sync into it.
         if (ev.document_id && ev.workspace_id && ev.element_id) {
-          _onshapeTarget = {
+          _onshapeTarget = Object.assign({}, _onshapeTarget, {
             document_id: ev.document_id, workspace_id: ev.workspace_id,
             element_id: ev.element_id, url: ev.url,
-            filename: (_onshapeTarget && _onshapeTarget.filename) || null,
-          };
-          try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
-          const _mc = document.getElementById('onshape-mirror-cb'); if (_mc) _mc.checked = true;
+          });
+          _saveOnshapeTarget();
           updateOnshapeBindUI();
         }
-        addChatMessage('ai', ev.target
-          ? 'Rebuilding into your bound document — watch it update in that tab.'
-          : (ev.already ? 'Opening your existing Onshape document…'
-                        : 'Document ready — keep that Onshape tab visible to watch it build. Future builds will update this same file.'));
       } else if (ev.type === 'feature') {
         if (steps && steps.length && total) {
           const si = Math.min(steps.length - 1, Math.max(0,
@@ -2956,39 +2982,32 @@ window.exportToOnshape = async function () {
         if (!progEl) progEl = _onshapeProgressEl();
         progEl.textContent = txt;
       } else if (ev.type === 'done') {
-        // Record which file this bound document now holds, so uploading a
-        // DIFFERENT part later rotates to a fresh document instead of
-        // overlapping this one.
+        // Tag the doc with the mesh it now holds, so uploading a DIFFERENT
+        // mesh resets the button to "Open" and the next open makes a new doc.
         if (_onshapeTarget && !ev.already) {
-          const fnEl = document.getElementById('viewer-filename');
-          _onshapeTarget.filename = (fnEl && fnEl.textContent)
-            || (pendingFile && pendingFile.name) || _onshapeTarget.filename || '';
-          try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
+          _onshapeTarget.filename = currentMeshName() || _onshapeTarget.filename || '';
+          _saveOnshapeTarget();
         }
         addChatMessage('ai', ev.already
-          ? 'Opened your existing Onshape document.'
+          ? 'Opened your Onshape document.'
           : 'Done — built ' + ev.n_ok + '/' + ev.total + ' features in Onshape.');
         refreshOnshapeStatus();
+        updateOnshapeOpenButton();
       } else if (ev.type === 'error') {
         if (win && !docUrl) win.close();
         addChatMessage('ai', 'Onshape build error: ' + (ev.detail || 'unknown'));
       }
     }
   }
-};
+  return docUrl;
+}
 
-// Auto-build into the bound document when a pipeline run completes.
-// No popup: the bound doc tab is already open, so this can fire without
-// a fresh user click. Called from the done-handler.
+// Pipeline-complete / Reanalyze: silently re-sync into the opened doc.
+// No tab — the document tab is already open from "Open in Onshape".
 window.maybeAutoBuildOnshape = function () {
-  const mirror = document.getElementById('onshape-mirror-cb');
-  if (!_onshapeTarget) return;                 // only auto-build when bound
-  if (!(mirror && mirror.checked)) return;
-  if (!(_onshapeStatus && _onshapeStatus.connected)) {
-    addChatMessage('ai', 'Onshape build is on but the account is disconnected — reconnect to mirror the build.');
-    return;
-  }
-  setTimeout(() => { try { window.exportToOnshape(); } catch (e) {} }, 600);
+  if (!_boundForCurrentMesh() || !_onshapeTarget.opened) return;
+  if (!(_onshapeStatus && _onshapeStatus.connected)) return;
+  setTimeout(() => { try { _runOnshapeBuild(null); } catch (e) {} }, 600);
 };
 
 // Handle the ?onshape=... flag the OAuth round-trip lands back on, and
@@ -2996,7 +3015,7 @@ window.maybeAutoBuildOnshape = function () {
 (function () {
   const flag = new URLSearchParams(location.search).get('onshape');
   const msgs = {
-    connected: 'Onshape account connected. Use Export → Push to Onshape.',
+    connected: 'Onshape account connected. Use the "Open in Onshape" button to build your part.',
     denied: 'Onshape connection was cancelled.',
     upgrade: 'Onshape is a Pro feature — upgrade to connect.',
     unconfigured: 'Onshape integration is not configured on the server.',

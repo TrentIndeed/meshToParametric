@@ -196,10 +196,25 @@
 - [x] **Cleanup viz stages** — Denoise / Align / Regularize each a separate
   pause-stage (gated to dirty inputs).
 
+**Real AI-mesh validation (2026-06-14, `scripts/diag_ai_parts.py`, 15 parts
+in `models/AI*/`):** Meshy meshes are DENSE (72k–1.14M faces), not low-poly —
+14/15 are caught by the >100k face-count detector (NOT the wobble detector;
+their wobble is low, 0.0–1.5). They DO fragment (seg 46→7341 regions), and
+`noise_robust` cuts that 50–70% on real data (HexStandoff 46→21, PerforatedPlate
+98→26, EnclosureLid 3110→1077) — it works here because real meshes keep big
+regions + slivers (my earlier SIMULATED coarse-CAD shattered with no big
+regions, which is why it didn't help there). So the merge is validated; the
+remaining work is to push the counts further down on the dense/complex parts.
+
 **Still TODO:**
-- [ ] **Tune stage C (segmentation) on REAL AI meshes** (`models/AI*/`) —
-  decide whether real Meshy parts fragment at all; if they do, fix
-  region-GROWING robustness, not just the post-merge.
+- [ ] **Region-growing robustness for dense AI meshes** — the post-merge helps
+  50–70% but complex parts (EnclosureLid 1077, TaperedHousing 2667) are still
+  over-fragmented. Fix the GROWING/curvature-split that shatters them, not just
+  the post-merge.
+- [ ] **Detection gap: AI8 (72k faces, low wobble) slips through** — between
+  the 30k decimation floor and the 100k scan threshold AND too smooth for the
+  wobble detector. Consider lowering `scan_face_threshold` or detecting "dense
+  relative to the decimation cap."
 - [ ] **Stage E global constraint inference (beyond orientation):** equal-
   radius, symmetry (hole patterns / mirror planes), and the dimension
   network. Orientation (parallel/perp) is done in `regularize_planes`.

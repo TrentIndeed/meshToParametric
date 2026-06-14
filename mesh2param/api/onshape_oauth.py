@@ -371,7 +371,10 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
         # Already built and not forced → just point the UI at it.
         if already_url and not force:
             yield _sse({"type": "document", "url": already_url,
-                        "total": 0, "already": True})
+                        "total": 0, "already": True,
+                        "document_id": job_row.onshape_document_id or "",
+                        "workspace_id": job_row.onshape_workspace_id or "",
+                        "element_id": job_row.onshape_element_id or ""})
             yield _sse({"type": "done", "url": already_url, "already": True,
                         "n_ok": 0, "total": 0})
             return
@@ -393,7 +396,9 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
         logger.info("Live build %s -> %s (%d features, target=%s)",
                     job_uuid, url, total, bool(target))
         yield _sse({"type": "document", "url": url, "total": total,
-                    "target": bool(target)})
+                    "target": bool(target),
+                    "document_id": did, "workspace_id": wid,
+                    "element_id": eid})
         # New doc: give the browser a moment to load the empty part
         # studio so the user sees it build from the start. A bound
         # target is already open, so build immediately.

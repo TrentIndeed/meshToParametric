@@ -2922,10 +2922,24 @@ window.exportToOnshape = async function () {
       if (ev.type === 'document') {
         docUrl = ev.url; total = ev.total || 0;
         if (win) win.location = ev.url;        // new doc: open it
+        // Bind this document so a later Play or Reanalyze re-syncs into
+        // it — not only the "New Onshape Document" button. Every export
+        // becomes sticky: the toggle flips on and the target is saved, so
+        // the next build (same file) updates this same Onshape file.
+        if (ev.document_id && ev.workspace_id && ev.element_id) {
+          _onshapeTarget = {
+            document_id: ev.document_id, workspace_id: ev.workspace_id,
+            element_id: ev.element_id, url: ev.url,
+            filename: (_onshapeTarget && _onshapeTarget.filename) || null,
+          };
+          try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
+          const _mc = document.getElementById('onshape-mirror-cb'); if (_mc) _mc.checked = true;
+          updateOnshapeBindUI();
+        }
         addChatMessage('ai', ev.target
           ? 'Rebuilding into your bound document — watch it update in that tab.'
           : (ev.already ? 'Opening your existing Onshape document…'
-                        : 'Document ready — keep that Onshape tab visible to watch it build.'));
+                        : 'Document ready — keep that Onshape tab visible to watch it build. Future builds will update this same file.'));
       } else if (ev.type === 'feature') {
         if (steps && steps.length && total) {
           const si = Math.min(steps.length - 1, Math.max(0,

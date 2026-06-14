@@ -12,7 +12,7 @@ import numpy as np
 import trimesh
 
 from mesh2param.config import IngestConfig
-from mesh2param.pipeline.ingest import _bilateral_denoise
+from mesh2param.pipeline.ingest import _bilateral_denoise, _surface_wobble
 
 
 def _det_noise(n_vertices: int, sigma: float) -> np.ndarray:
@@ -81,6 +81,19 @@ def test_bilateral_beats_laplacian_on_edges():
     # large margin (Laplacian edge error was ~25x bilateral in validation).
     assert _err(bil, clean, edge) < _err(lap, clean, edge) * 0.5
     assert _err(bil, clean, corner) < _err(lap, clean, corner) * 0.5
+
+
+def test_surface_wobble_separates_clean_from_dirty():
+    """The face-count-independent 'needs cleaning' signal: an exactly-flat
+    mesh wobbles ~0 deg; a noised (AI/scan-like) one wobbles several deg.
+    Catches dirty LOW-POLY meshes the scan_face_threshold misses."""
+    clean, flat, edge, corner = _box()
+    cfg = IngestConfig()
+    assert _surface_wobble(clean) < cfg.dirty_wobble_deg          # clean CAD
+    dirty = trimesh.Trimesh(clean.vertices + _det_noise(len(clean.vertices), 0.15),
+                            clean.faces, process=False)
+    assert _surface_wobble(dirty) > cfg.dirty_wobble_deg          # AI/dirty
+    assert len(dirty.faces) < 100_000                            # low-poly: size test misses it
 
 
 def test_bilateral_does_not_facet_curves():

@@ -181,6 +181,19 @@ A pass over the fitted primitives that infers and ENFORCES relations:
 
 ---
 
+## 3b. "Needs cleaning" detection — IMPLEMENTED 2026-06-14
+A scan isn't the only dirty input: **AI-generated meshes** (Meshy, Tripo)
+are LOW-poly but have wobbly near-flat faces and approximate angles, so the
+`scan_face_threshold` (raw faces > 100k) misses them. `ingest._surface_wobble`
+adds a face-count-INDEPENDENT trigger: median dihedral among near-flat
+adjacent faces — clean CAD ~0 deg, AI/scan ~5 deg. With `scan_auto`, a mesh
+above `dirty_wobble_deg` (1.5) gets the cleanup front-end too
+(`cleanup_source="dirty_mesh"` in metadata). Validated: clean Mesh1-5 stay
+at 0.0-0.4 deg (untouched); a 0.3%-noised low-poly mesh reads 4.9 deg and is
+cleaned. NOTE: the front-end currently does denoise + align; actually
+SNAPPING near-flat -> flat and near-90 -> 90 (what makes AI meshes crisp) is
+stage E/F regularization, still to build.
+
 ## 4. Prismatic vs organic
 A classifier up front (planarity ratio, how much of the surface is
 explained by a few primitives, symmetry): prismatic → full recovery;

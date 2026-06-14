@@ -60,8 +60,22 @@ def ingest_mesh(
     # front-end (denoise + canonical-frame alignment) automatically.
     raw_faces = len(mesh.faces)
     is_scan = bool(config.scan_auto and raw_faces > config.scan_face_threshold)
-    do_denoise = config.denoise_scan or is_scan
-    do_align = config.align_canonical or is_scan
+    # AI-generated / dirty low-poly meshes (Meshy, Tripo) are NOT big enough
+    # to trip the face-count test, but their near-flat faces are wobbly and
+    # angles approximate — so they still need the cleanup front-end. Detect
+    # them by SURFACE EXACTNESS (clean CAD ~0 deg wobble, dirty ~5 deg);
+    # cheap on the low-poly meshes this targets (huge scans already tripped).
+    is_dirty = False
+    if config.scan_auto and not is_scan:
+        wobble = _surface_wobble(mesh)
+        is_dirty = wobble > config.dirty_wobble_deg
+        if is_dirty:
+            logger.info("Dirty mesh detected (flat-face wobble %.2f deg > "
+                        "%.2f) — cleanup front-end on", wobble,
+                        config.dirty_wobble_deg)
+    needs_frontend = is_scan or is_dirty
+    do_denoise = config.denoise_scan or needs_frontend
+    do_align = config.align_canonical or needs_frontend
     if is_scan:
         logger.info("Scan detected (%d raw faces > %d) — scan front-end on",
                     raw_faces, config.scan_face_threshold)
@@ -114,8 +128,11 @@ def ingest_mesh(
     if align_transform is not None:
         result.metadata["align_transform"] = align_transform.tolist()
         result.metadata["align_method"] = align_method
-    if is_scan:
+    if needs_frontend:
+        # scan_mode drives the "Scan cleanup" pipeline-viz stage + UI copy;
+        # source distinguishes a true scan from an AI/dirty low-poly mesh.
         result.metadata["scan_mode"] = True
+        result.metadata["cleanup_source"] = "scan" if is_scan else "dirty_mesh"
         result.metadata["raw_faces"] = raw_faces
         result.metadata["denoised"] = bool(do_denoise)
     logger.debug(
@@ -330,6 +347,26 @@ def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:
     except Exception as e:
         logger.warning("Decimation failed (%s) — using original mesh", e)
         return mesh
+
+
+def _surface_wobble(mesh: trimesh.Trimesh) -> float:
+    """Median dihedral (deg) among 'same-surface' adjacent face pairs — how
+    far near-flat faces deviate from EXACTLY flat. Clean CAD is ~0 (flat
+    faces tessellate into exactly coplanar triangles); AI-generated / scanned
+    meshes sit a few degrees off. A face-count-INDEPENDENT 'needs cleaning'
+    signal, so a dirty low-poly mesh is caught where the size test misses it.
+    """
+    try:
+        adj = mesh.face_adjacency
+        if len(adj) == 0:
+            return 0.0
+        n = mesh.face_normals
+        d = np.clip((n[adj[:, 0]] * n[adj[:, 1]]).sum(1), -1.0, 1.0)
+        ang = np.degrees(np.arccos(d))
+        same = ang < 10.0   # candidate 'same flat surface' pairs
+        return float(np.median(ang[same])) if same.any() else 0.0
+    except Exception:
+        return 0.0
 
 
 def _bilateral_denoise(mesh: trimesh.Trimesh,

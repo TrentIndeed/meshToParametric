@@ -40,6 +40,11 @@ class IngestConfig(BaseModel):
     align_canonical: bool = False       # rotate onto the part's own frame
     scan_auto: bool = False             # auto-enable the front-end for scans
     scan_face_threshold: int = 100_000  # raw faces above this => scan
+    # AI-generated / "dirty low-poly" meshes (Meshy, Tripo, etc.) have FEW
+    # triangles but wobbly near-flat faces — the face-count test misses them.
+    # Trigger the cleanup front-end by SURFACE EXACTNESS instead: median
+    # dihedral within near-flat faces. Clean CAD ~0 deg; dirty meshes ~5 deg.
+    dirty_wobble_deg: float = 1.5       # flat-face wobble above this => dirty
     # Scale normalization: the pipeline's absolute thresholds (snap
     # tolerances, fillet radii, plate-thickness checks) are tuned for
     # mm-scale parts with a bbox diagonal around 100-500. Parts far

@@ -108,14 +108,31 @@ def apply_planned_feature(client, did, wid, eid, plan, pf):
     return ok, fid
 
 
+def create_empty_document(client, doc_name: str) -> dict:
+    """Create a fresh, EMPTY Onshape document + part studio (no
+    features). Used by the 'New Onshape Document' button so the user can
+    open it and have subsequent pipeline runs build into it.
+    Returns {document_id, workspace_id, element_id, url}."""
+    did, wid = client.create_document(doc_name)
+    eid = client.partstudio_id(did, wid)
+    return {
+        "document_id": did, "workspace_id": wid, "element_id": eid,
+        "url": client.document_url(did, wid, eid),
+    }
+
+
 def prepare_live_export(client, feature_tree: FeatureTree,
                         cleaned: CleanedMesh, as_built: dict | None,
-                        doc_name: str) -> dict | None:
-    """Build the plan and create an EMPTY document/part studio for a
-    streamed live build. The caller then adds the plan's features one at
-    a time (apply_planned_feature) with pacing while the user watches
-    the document. Returns {plan, did, wid, eid, url} or None if the plan
-    is empty."""
+                        doc_name: str,
+                        target: tuple | None = None) -> dict | None:
+    """Build the plan and ready a document for a streamed live build.
+
+    With `target` = (did, wid, eid), build into that EXISTING document
+    (clearing its features first, so a re-analyze of the same mesh
+    rebuilds into the same file the user already has open). Without a
+    target, create a fresh empty document. The caller then adds the
+    plan's features one at a time (apply_planned_feature) with pacing.
+    Returns {plan, did, wid, eid, url} or None if the plan is empty."""
     from mesh2param.onshape.feature_builder import build_onshape_plan
 
     plan = build_onshape_plan(
@@ -123,8 +140,18 @@ def prepare_live_export(client, feature_tree: FeatureTree,
     )
     if not plan.features:
         return None
-    did, wid = client.create_document(doc_name)
-    eid = client.partstudio_id(did, wid)
+    if target:
+        did, wid, eid = target
+        try:
+            n = client.clear_features(did, wid, eid)
+            logger.info("Re-sync: cleared %d existing feature(s) in %s",
+                        n, did)
+        except Exception:
+            logger.warning("Could not clear features in %s; building over",
+                           did, exc_info=True)
+    else:
+        did, wid = client.create_document(doc_name)
+        eid = client.partstudio_id(did, wid)
     return {
         "plan": plan, "did": did, "wid": wid, "eid": eid,
         "url": client.document_url(did, wid, eid),

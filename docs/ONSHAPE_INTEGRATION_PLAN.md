@@ -153,12 +153,17 @@ model in their own Onshape in one click.
 
 All of this works on track 1 (no Store listing needed).
 
-- **Idempotent re-export**: if the job already has a linked doc and it
-  still exists in the user's account, UPDATE it rather than create a
-  new one. Options, simplest first: (a) delete the Part Studio's
-  features and rebuild (clean, loses user edits); (b) create a new
-  VERSION then rebuild on a branch (preserves history); (c) diff and
-  patch (hard). Start with (a) + a warning, move to (b).
+- **Idempotent re-export / bound document (IMPLEMENTED 2026-06-13).**
+  "New Onshape Document" (`POST /api/onshape/document/new`) creates an
+  empty doc, opens it, and the UI BINDS it (localStorage). Every
+  pipeline run then auto-builds into the bound doc, and a re-analyze of
+  the same mesh RE-SYNCS it: `OnshapeClient.clear_features` deletes the
+  user features (reverse order) and the build re-runs into the same
+  file (option (a) — clear + rebuild). The live endpoint takes a
+  target did/wid/eid; binding the doc also means the auto-build needs
+  no popup (the tab is already open). Option (b) versioning is the
+  later upgrade. NOTE: feature-clear uses Write scope; whole-document
+  delete would need OAuth2Delete (currently off).
 - **Live incremental build the user can watch in Onshape (IMPLEMENTED
   2026-06-13, pre-Store form).** `POST /api/onshape/export/{job}/live`
   is an SSE stream: it creates the doc, emits a `document` event with

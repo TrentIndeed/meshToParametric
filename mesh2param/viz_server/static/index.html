@@ -613,6 +613,8 @@ body {
   <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
   <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
   <div id="onshape-menu-item" onclick="onshapeConnectClick(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-link"></i> Connect Onshape</div>
+  <div id="onshape-newdoc-item" onclick="newOnshapeDocument(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-file-add-line"></i> New Onshape Document</div>
+  <div id="onshape-unbind-item" style="display:none" onclick="unbindOnshapeDocument(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-close-circle-line"></i> Stop building to Onshape</div>
   <div class="divider"></div>
   <div class="divider"></div>
   <div onclick="toggleGrid()"><i class="ri-grid-line"></i> Toggle Grid</div>
@@ -946,6 +948,25 @@ body {
     </span>
     Debug
   </label>
+  <label id="onshape-toggle" title="Mirror the build into your Onshape account live — the model builds in Onshape in step with the animation (requires Connect Onshape)" style="
+    display:flex; align-items:center; gap:6px; cursor:pointer;
+    font-size:11px; color:var(--text-secondary); font-family:'OpenAI Sans',sans-serif;
+    user-select:none; background:var(--bg-tertiary); padding:4px 10px; border-radius:12px;
+    border:1px solid var(--border);
+  ">
+    <span style="position:relative;display:inline-block;width:28px;height:16px;">
+      <input type="checkbox" id="onshape-mirror-cb" style="opacity:0;width:0;height:0;">
+      <span style="
+        position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px;
+        background:var(--border);transition:background 0.2s;
+      "></span>
+      <span style="
+        position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;
+        background:var(--text-muted);transition:transform 0.2s,background 0.2s;
+      "></span>
+    </span>
+    Onshape
+  </label>
   <!-- Breakpoint dropdown: only meaningful when Debug is on and Step is off.
        Pauses the (otherwise non-step) pipeline at exactly the chosen stage. -->
   <label id="pause-at-wrap" title="Pause the pipeline once at this stage, then continue without further pauses" style="
@@ -974,6 +995,8 @@ body {
   #step-through-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
   #debug-cb:checked + span { background: var(--accent) !important; }
   #debug-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
+  #onshape-mirror-cb:checked + span { background: var(--accent) !important; }
+  #onshape-mirror-cb:checked + span + span { transform: translateX(12px); background: #fff !important; }
 </style>
 <button id="play-btn" title="Play build animation" style="display:none;" onclick="window.playBuildAnimation()">
   <i class="ri-play-fill"></i>
@@ -1060,7 +1083,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260613c" type="module"></script>
+<script src="/static/app.js?v=20260613d" type="module"></script>
 </body>
 </html>
 

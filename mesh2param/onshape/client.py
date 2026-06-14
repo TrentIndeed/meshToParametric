@@ -197,6 +197,24 @@ class OnshapeClient:
             f"/partstudios/d/{did}/w/{wid}/e/{eid}/features/featureid/{fid}",
         )
 
+    def clear_features(self, did: str, wid: str, eid: str) -> int:
+        """Delete all USER features from the part studio (keeps the
+        default origin + planes), so a re-analyze rebuilds into the same
+        document cleanly. Deletes in reverse so dependents go first.
+        Returns the count removed."""
+        feats = self.features(did, wid, eid).get("features", [])
+        n = 0
+        for f in reversed(feats):
+            fid = f.get("featureId")
+            if not fid:
+                continue
+            try:
+                self.delete_feature(did, wid, eid, fid)
+                n += 1
+            except OnshapeApiError:
+                pass
+        return n
+
     def volume_mm3(self, did: str, wid: str, eid: str) -> float | None:
         """Combined solid volume in mm^3 (None if no parts yet)."""
         try:

@@ -811,6 +811,21 @@ window.playBuildAnimation = async function() {
   }
 
   if (!steps || steps.length === 0) return;
+
+  // "Build in Onshape" toggle: the live Onshape build DRIVES this
+  // animation (exportToOnshape advances loadStep as each Onshape
+  // feature lands), so the model builds in Paramesh and in your Onshape
+  // account at the same time. Called from this Play click, so the
+  // new-tab open is popup-safe.
+  const _mirror = document.getElementById('onshape-mirror-cb');
+  if (_mirror && _mirror.checked) {
+    if (_onshapeStatus && _onshapeStatus.connected) {
+      window.exportToOnshape();
+      return;
+    }
+    addChatMessage('ai', 'Connect your Onshape account (menu → Connect Onshape) to mirror the build live — playing locally for now.');
+  }
+
   _animPlaying = true;
   window._pipelineRotate = true;
   btn.classList.add('playing');
@@ -1836,6 +1851,11 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
 
       // finishLoad will dismiss the loading overlay after the 3D model renders
       finishLoad(statusData);
+
+      // If an Onshape document is bound, automatically (re)build this
+      // run into it — the model builds in Onshape in step with the
+      // Paramesh animation, and a re-analyze re-syncs the same file.
+      try { window.maybeAutoBuildOnshape && window.maybeAutoBuildOnshape(); } catch (e) {}
     } else {
       alert('Pipeline error: ' + (data.error || 'unknown'));
       document.getElementById('status-dot').className = 'status-dot';
@@ -2783,36 +2803,70 @@ function _onshapeProgressEl() {
   return d;
 }
 
-// Live SYNCED build: create the doc, open it in a tab, then watch the
-// features stream in (Onshape's collaborative sync updates the viewport)
-// while Paramesh's own build animation advances in step.
+// ── Bound Onshape document (the "New Onshape Document" target) ──
+// When set, every build re-syncs into THIS document instead of making a
+// new one — so re-analyzing the same mesh updates the same Onshape file.
+let _onshapeTarget = null;
+try { _onshapeTarget = JSON.parse(localStorage.getItem('onshape_target') || 'null'); } catch (e) {}
+
+function updateOnshapeBindUI() {
+  const unbind = document.getElementById('onshape-unbind-item');
+  const newdoc = document.getElementById('onshape-newdoc-item');
+  if (unbind) unbind.style.display = _onshapeTarget ? '' : 'none';
+  if (newdoc) newdoc.innerHTML = _onshapeTarget
+    ? '<i class="ri-file-add-line"></i> New Onshape Document (replace current)'
+    : '<i class="ri-file-add-line"></i> New Onshape Document';
+}
+
+window.newOnshapeDocument = async function () {
+  // popup-safe: opens the empty doc tab from this click
+  const win = window.open('', '_blank');
+  let r;
+  try { r = await fetch('/api/onshape/document/new', { method: 'POST' }); }
+  catch (e) { if (win) win.close(); addChatMessage('ai', 'Could not reach the server.'); return; }
+  if (r.status === 409) { if (win) win.close(); addChatMessage('ai', 'Connect your Onshape account first (menu → Connect Onshape).'); window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname); return; }
+  if (r.status === 403) { if (win) win.close(); addChatMessage('ai', 'Onshape is a Pro feature.'); return; }
+  if (r.status === 401) { if (win) win.close(); window.location = '/login?next=' + encodeURIComponent(location.pathname); return; }
+  let d = {}; try { d = await r.json(); } catch (e) {}
+  if (!r.ok || !d.url) { if (win) win.close(); addChatMessage('ai', 'Could not create the document: ' + (d.detail || d.error || r.status)); return; }
+  _onshapeTarget = { document_id: d.document_id, workspace_id: d.workspace_id, element_id: d.element_id, url: d.url };
+  try { localStorage.setItem('onshape_target', JSON.stringify(_onshapeTarget)); } catch (e) {}
+  // also flip the "build in Onshape" toggle on
+  const mirror = document.getElementById('onshape-mirror-cb'); if (mirror) mirror.checked = true;
+  if (win) win.location = d.url;
+  updateOnshapeBindUI();
+  addChatMessage('ai', 'New Onshape document opened and bound. Run (or re-run) the pipeline — it will build into this document. Keep that tab visible to watch.');
+};
+
+window.unbindOnshapeDocument = function () {
+  _onshapeTarget = null;
+  try { localStorage.removeItem('onshape_target'); } catch (e) {}
+  const mirror = document.getElementById('onshape-mirror-cb'); if (mirror) mirror.checked = false;
+  updateOnshapeBindUI();
+  addChatMessage('ai', 'Stopped building to Onshape. The document stays in your account.');
+};
+
+// Live SYNCED build. With a bound target it re-syncs into that already-
+// open document (no new tab); otherwise it creates + opens a new one.
+// Drives Paramesh's own build animation in step with the Onshape build.
 window.exportToOnshape = async function () {
-  console.log('[onshape] Push clicked; jobId =', currentJobId);
-  if (!currentJobId) { alert('Run a conversion first, then push it to Onshape.'); return; }
-  const win = window.open('', '_blank');   // popup-safe; filled on 'document'
-  addChatMessage('ai', 'Building in your Onshape account…');
+  console.log('[onshape] build; jobId =', currentJobId, 'target =', _onshapeTarget && _onshapeTarget.document_id);
+  if (!currentJobId) { alert('Run a conversion first, then build it in Onshape.'); return; }
+  const target = _onshapeTarget;
+  const win = target ? null : window.open('', '_blank');   // new-doc case opens a tab (popup-safe)
+  let qs = '';
+  if (target) qs = '?document_id=' + encodeURIComponent(target.document_id) +
+    '&workspace_id=' + encodeURIComponent(target.workspace_id) +
+    '&element_id=' + encodeURIComponent(target.element_id);
+  addChatMessage('ai', target ? 'Rebuilding in your bound Onshape document…' : 'Building in your Onshape account…');
   let resp;
   try {
-    resp = await fetch('/api/onshape/export/' + currentJobId + '/live', { method: 'POST' });
+    resp = await fetch('/api/onshape/export/' + currentJobId + '/live' + qs, { method: 'POST' });
   } catch (e) { if (win) win.close(); addChatMessage('ai', 'Onshape build failed: network error.'); return; }
   console.log('[onshape] /live responded', resp.status);
-  if (resp.status === 401) {
-    if (win) win.close();
-    addChatMessage('ai', 'You need to be logged in to push to Onshape. Taking you to sign in…');
-    window.location = '/login?next=' + encodeURIComponent(location.pathname);
-    return;
-  }
-  if (resp.status === 409) {           // not connected -> start OAuth, return here
-    if (win) win.close();
-    addChatMessage('ai', 'Connecting your Onshape account…');
-    window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname);
-    return;
-  }
-  if (resp.status === 403) {
-    if (win) win.close();
-    addChatMessage('ai', 'Pushing to Onshape needs a Pro account (and you must be logged in).');
-    return;
-  }
+  if (resp.status === 401) { if (win) win.close(); addChatMessage('ai', 'Log in to build in Onshape.'); window.location = '/login?next=' + encodeURIComponent(location.pathname); return; }
+  if (resp.status === 409) { if (win) win.close(); addChatMessage('ai', 'Connecting your Onshape account…'); window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname); return; }
+  if (resp.status === 403) { if (win) win.close(); addChatMessage('ai', 'Building in Onshape needs a Pro account.'); return; }
   if (!resp.ok || !resp.body) {
     let d = {}; try { d = await resp.json(); } catch (e) {}
     if (win) win.close();
@@ -2836,12 +2890,12 @@ window.exportToOnshape = async function () {
       let ev; try { ev = JSON.parse(dline.slice(5).trim()); } catch (e) { continue; }
       if (ev.type === 'document') {
         docUrl = ev.url; total = ev.total || 0;
-        if (win) win.location = ev.url;        // open the doc; watch it build
-        addChatMessage('ai', ev.already
-          ? 'Opening your existing Onshape document…'
-          : 'Document ready — keep that Onshape tab visible to watch it build.');
+        if (win) win.location = ev.url;        // new doc: open it
+        addChatMessage('ai', ev.target
+          ? 'Rebuilding into your bound document — watch it update in that tab.'
+          : (ev.already ? 'Opening your existing Onshape document…'
+                        : 'Document ready — keep that Onshape tab visible to watch it build.'));
       } else if (ev.type === 'feature') {
-        // drive Paramesh's own build animation in step with Onshape
         if (steps && steps.length && total) {
           const si = Math.min(steps.length - 1, Math.max(0,
             Math.round((ev.index + 1) / total * steps.length) - 1));
@@ -2863,6 +2917,20 @@ window.exportToOnshape = async function () {
   }
 };
 
+// Auto-build into the bound document when a pipeline run completes.
+// No popup: the bound doc tab is already open, so this can fire without
+// a fresh user click. Called from the done-handler.
+window.maybeAutoBuildOnshape = function () {
+  const mirror = document.getElementById('onshape-mirror-cb');
+  if (!_onshapeTarget) return;                 // only auto-build when bound
+  if (!(mirror && mirror.checked)) return;
+  if (!(_onshapeStatus && _onshapeStatus.connected)) {
+    addChatMessage('ai', 'Onshape build is on but the account is disconnected — reconnect to mirror the build.');
+    return;
+  }
+  setTimeout(() => { try { window.exportToOnshape(); } catch (e) {} }, 600);
+};
+
 // Handle the ?onshape=... flag the OAuth round-trip lands back on, and
 // prime the connection status for the menu label.
 (function () {
@@ -2880,4 +2948,5 @@ window.exportToOnshape = async function () {
     history.replaceState({}, '', location.pathname);
   }
   refreshOnshapeStatus();
+  try { updateOnshapeBindUI(); } catch (e) {}
 })();

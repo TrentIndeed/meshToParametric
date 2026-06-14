@@ -300,14 +300,45 @@ def export_job(job_uuid: str, request: Request, force: int = 0,
     }
 
 
+@router.post("/document/new")
+def new_document(request: Request, db: Session = Depends(get_db)):
+    """Create a fresh EMPTY Onshape document in the user's account and
+    return its ids + url. The UI opens it and binds it as the build
+    target; subsequent pipeline runs build into it."""
+    from mesh2param.pipeline.export_onshape import create_empty_document
+
+    user = _current_user(request, db)
+    if user is None:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    if not _can_use_onshape(user):
+        return JSONResponse({"error": "upgrade", "detail":
+                             "Onshape is a Pro feature."}, status_code=403)
+    client = os_oauth.get_onshape_client_for_user(user, db)
+    if client is None:
+        return JSONResponse(
+            {"error": "not_connected",
+             "detail": "Connect your Onshape account first."},
+            status_code=409)
+    try:
+        info = create_empty_document(client, "Paramesh part")
+    except Exception:
+        logger.exception("Failed to create empty Onshape document")
+        return JSONResponse({"error": "create_failed"}, status_code=502)
+    logger.info("New empty Onshape document %s for user %s",
+                info["document_id"], user.username)
+    return {"status": "ok", **info}
+
+
 @router.post("/export/{job_uuid}/live")
 def export_job_live(job_uuid: str, request: Request, force: int = 0,
+                    document_id: str = "", workspace_id: str = "",
+                    element_id: str = "",
                     db: Session = Depends(get_db)):
-    """Streamed LIVE build: create the document, hand the URL back
-    immediately (so the UI can open it), then add features one at a time
-    with pacing. The user watches the model build up in their Onshape
-    viewport (Onshape's collaborative microversion sync), in step with
-    Paramesh's animation. Server-Sent Events:
+    """Streamed LIVE build. With document_id/workspace_id/element_id,
+    build into that EXISTING document (clearing it first) — this is how
+    a run targets the doc opened by 'New Onshape Document', and how a
+    re-analyze of the same mesh rebuilds into the same file. Without a
+    target, a fresh document is created. Server-Sent Events:
       {type: document, url, total} | {type: feature, index, name, ok,
       n_ok, total} | {type: done, url, n_ok, total} | {type: error, ...}
     Non-2xx (not authed / upgrade / not connected / expired) come back as
@@ -326,7 +357,11 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
     job_row = ctx["job_row"]
     client = ctx["client"]
     data = ctx["data"]
-    already_url = job_row.onshape_url
+    target = ((document_id, workspace_id, element_id)
+              if document_id and workspace_id and element_id else None)
+    # When targeting a bound document, ignore the job's old link — always
+    # (re)build into the bound doc.
+    already_url = None if target else job_row.onshape_url
     doc_name = f"{Path(job_row.filename or 'part').stem} (Paramesh)"
 
     def _sse(obj: dict) -> str:
@@ -343,7 +378,7 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
         try:
             prep = prepare_live_export(
                 client, data["tree"], data["cleaned"],
-                data.get("as_built"), doc_name)
+                data.get("as_built"), doc_name, target=target)
         except Exception as exc:
             logger.exception("Live export prep failed for %s", job_uuid)
             yield _sse({"type": "error", "detail": str(exc)[:200]})
@@ -355,13 +390,15 @@ def export_job_live(job_uuid: str, request: Request, force: int = 0,
         did, wid, eid, url = (prep["did"], prep["wid"],
                               prep["eid"], prep["url"])
         total = len(plan.features)
-        logger.info("Live build %s -> %s (%d features)",
-                    job_uuid, url, total)
-        yield _sse({"type": "document", "url": url, "total": total})
-        # Give the user's browser a moment to load the (empty) part
-        # studio before features start streaming in, so they see it
-        # build from the start rather than catching up mid-way.
-        _t.sleep(1.8)
+        logger.info("Live build %s -> %s (%d features, target=%s)",
+                    job_uuid, url, total, bool(target))
+        yield _sse({"type": "document", "url": url, "total": total,
+                    "target": bool(target)})
+        # New doc: give the browser a moment to load the empty part
+        # studio so the user sees it build from the start. A bound
+        # target is already open, so build immediately.
+        if not target:
+            _t.sleep(1.8)
         n_ok = 0
         for i, pf in enumerate(plan.features):
             try:

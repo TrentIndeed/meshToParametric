@@ -76,6 +76,17 @@ class SegmentConfig(BaseModel):
     min_region_faces: int = 10
     curvature_variance_threshold: float = 0.1
     max_kmeans_clusters: int = 5
+    # Noise-robust mode (scan / AI meshes): after normal segmentation, absorb
+    # the noise-sliver fragments into the dominant coplanar face they belong
+    # to. Clean CAD leaves this off (it doesn't fragment). See stage C in
+    # docs/SCAN_RECOVERY_PLAN.md.
+    noise_robust: bool = False
+    fragment_max_faces_frac: float = 0.01   # regions below this frac of total = fragments
+    # A fragment merges into a big neighbour that owns >= this share of its
+    # boundary edges (boundary dominance — robust to the slivers' wild
+    # normals, yet an edge-straddling sliver's split boundary blocks a merge
+    # across a true right-angle edge).
+    fragment_dominance_frac: float = 0.6
 
     def model_post_init(self, __context) -> None:
         logger.debug(

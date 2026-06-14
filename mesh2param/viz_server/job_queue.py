@@ -867,7 +867,12 @@ class JobQueue:
         def _process_single_body(bi, body):
             sub_cleaned = extract_sub_mesh(cleaned, body.face_indices, body=body)
             _check_cancelled()
-            regions = segment_mesh(sub_cleaned, SegmentConfig())
+            # Scan / AI inputs: noise-robust segmentation absorbs the noise
+            # slivers so each flat face is one region (not hundreds), which is
+            # what lets regularization recover a clean consensus frame.
+            _seg = SegmentConfig(
+                noise_robust=bool(cleaned.metadata.get("scan_mode")))
+            regions = segment_mesh(sub_cleaned, _seg)
             _check_cancelled()
             fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
             _check_cancelled()
@@ -889,7 +894,7 @@ class JobQueue:
                     n_snap = sum(1 for r in reg_report if r.get("snapped"))
                     logger.info("Body %d regularized: %d/%d planes snapped",
                                 bi, n_snap, len(reg_report))
-                    regions = segment_mesh(sub_cleaned, SegmentConfig())
+                    regions = segment_mesh(sub_cleaned, _seg)
                     _check_cancelled()
                     fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
                     _check_cancelled()

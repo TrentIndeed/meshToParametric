@@ -169,6 +169,12 @@ def segment_mesh(
         labels = _merge_small_regions(
             labels, adjacency, cleaned.normals, 15,
         )
+        # Noise-robust mode (scans / AI meshes): absorb the leftover
+        # noise-sliver fragments into the dominant coplanar face. Clean CAD
+        # doesn't fragment, so it leaves this off.
+        if config.noise_robust:
+            labels = _merge_coplanar_fragments(labels, cleaned.normals,
+                                               adjacency, config)
     except Exception:
         logger.exception(
             "Stage 2 failed during segmentation passes: faces=%d, labels_shape=%s",
@@ -179,6 +185,66 @@ def segment_mesh(
     regions = _build_regions(labels, cleaned, adjacency)
     logger.info("Segmented mesh into %d regions", len(regions))
     return regions
+
+
+def _merge_coplanar_fragments(
+    labels: np.ndarray,
+    normals: np.ndarray,
+    adjacency: dict[int, set[int]],
+    config: SegmentConfig,
+) -> np.ndarray:
+    """Absorb noise-sliver fragments into the dominant face they belong to.
+
+    A noisy scan / AI mesh shatters each flat face into one big region plus
+    hundreds of tiny slivers whose normals are too noisy to match the face
+    they came from (often >60 deg off). So instead of normal similarity, a
+    fragment (region below `fragment_max_faces_frac` of the mesh) is absorbed
+    by BOUNDARY DOMINANCE: if a BIG neighbour (>= min_region_faces) accounts
+    for at least `fragment_dominance_frac` of the fragment's shared edges, the
+    fragment is part of that face and merges into it — wild normal or not. A
+    sliver embedded in one face has nearly all its boundary on that face
+    (merges); a sliver straddling a true 90 deg edge has its boundary split
+    between two faces (no dominance -> left alone), so it can't cross the
+    edge. Iterated to convergence (a face absorbs its boundary slivers, then
+    the next ring). Gated to noise_robust (scans/AI); clean CAD is untouched.
+    """
+    labels = labels.copy()
+    total = len(labels)
+    frag_max = max(config.min_region_faces,
+                   int(total * config.fragment_max_faces_frac))
+    dom = float(config.fragment_dominance_frac)
+
+    changed = True
+    rounds = 0
+    while changed and rounds < 50:
+        changed = False
+        rounds += 1
+        uniq, counts = np.unique(labels, return_counts=True)
+        size = {int(label): int(count) for label, count in zip(uniq, counts)}
+        for label, count in zip(uniq, counts):
+            if label < 0 or count >= frag_max:
+                continue
+            face_mask = labels == label
+            # count shared edges to each neighbouring region
+            link: dict[int, int] = {}
+            for fi in np.where(face_mask)[0]:
+                for ni in adjacency.get(fi, set()):
+                    nl = int(labels[ni])
+                    if nl != label and nl >= 0:
+                        link[nl] = link.get(nl, 0) + 1
+            if not link:
+                continue
+            total_links = sum(link.values())
+            best = max(link, key=link.get)
+            if (size.get(best, 0) >= config.min_region_faces
+                    and link[best] >= dom * total_links):
+                labels[face_mask] = best
+                changed = True
+
+    labels = _renumber_labels(labels)
+    logger.info("Noise-robust merge: -> %d regions",
+                len(np.unique(labels[labels >= 0])))
+    return labels
 
 
 def _build_face_adjacency(faces: np.ndarray) -> dict[int, set[int]]:

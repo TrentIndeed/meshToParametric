@@ -123,6 +123,22 @@ below:
   each plane normal to an axis.
 
 ### E. Global constraint inference (the heart of intent recovery)
+**Orientation regularization IMPLEMENTED 2026-06-14** — `pipeline/regularize.py`.
+`regularize_planes` builds the part's OWN orthogonal frame from its dominant
+plane normals (area-weighted), snaps it to the world axes when close (post-
+alignment), and snaps every plane onto it AS A SET → exact mutual parallel/
+perpendicular (recovers 90 deg corners), plus optional coplanar-offset merge.
+`regularize_mesh` then PROJECTS the mesh vertices onto the recovered consensus
+planes (interior verts flatten onto their plane, shared-edge verts onto the
+exact edge, corners onto the corner) — because recognition reads the raw mesh
+geometry, snapping the primitives alone is inert. Validated end-to-end: a
+noisy box's faces go from ~2 deg off-axis to <0.01 deg, exactly axis-aligned,
+without touching curved/un-snapped regions. Tests in tests/test_regularize.py.
+STILL TODO: wire into the live pipeline (re-segment/fit on the regularized
+mesh, gated by scan_mode) + the Denoise/Align/Regularize viz stages; then
+equal-radius, symmetry, and the dimension network below.
+
+Original design:
 A pass over the fitted primitives that infers and ENFORCES relations:
 - **Parallel / perpendicular**: near-parallel plane normals → exactly
   parallel; near-perpendicular → exactly perpendicular (snap as a set,

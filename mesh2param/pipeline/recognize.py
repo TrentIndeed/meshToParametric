@@ -424,12 +424,15 @@ def _find_base_extrusion(
                 len(plan.segments), 100 * primary.gain_frac,
             )
         direction = engine_dir.copy()
-        if len(plan.segments) >= 2:
-            # Multi-extrude part: the base covers only its own segment's
-            # span (RackMount's base plate is 9mm of an 85mm Z extent) —
-            # joins fill the rest. Single-segment parts keep the full
-            # extent (the depth computation below).
-            base_span = [float(primary.start), float(primary.end)]
+        # Capture the engine's measured cross-section as the base profile so
+        # the Onshape export can sketch+extrude it (CadQuery slices its own,
+        # but the Onshape path has no fallback and silently skips a base with
+        # no engine profile — see feature_builder._profile_extrusion). This
+        # applies to single-segment parts too: on a multi-extrude part the
+        # base covers only its own segment's span (RackMount's base plate is
+        # 9mm of an 85mm Z extent) and joins fill the rest; a single-segment
+        # part (BottomMount) spans the full extent.
+        base_span = [float(primary.start), float(primary.end)]
     elif plan is not None:
         logger.info(
             "Extrusion engine inconclusive (%d segments); keeping "

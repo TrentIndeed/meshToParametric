@@ -2770,6 +2770,9 @@ async function refreshOnshapeStatus() {
       item.innerHTML = '<i class="ri-link-unlink"></i> Connect Onshape';
     }
   }
+  // Reveal the "Open in Onshape" button once we know the account is connected
+  // (so an empty document can be opened before analyzing a mesh).
+  try { updateOnshapeOpenButton(); } catch (e) {}
 }
 window.refreshOnshapeStatus = refreshOnshapeStatus;
 
@@ -2835,26 +2838,33 @@ function currentMeshName() {
     || (typeof pendingFile !== 'undefined' && pendingFile && pendingFile.name) || '';
 }
 
-// The bound document "belongs to" the current mesh when its filename matches.
+// The bound document "belongs to" the current mesh when its filename matches
+// — OR when it's an UNCLAIMED empty document (filename not set yet, e.g. one
+// opened before analyzing). An unclaimed doc accepts the next mesh built, so
+// "Open in Onshape" before analysis works: the pipeline builds into it.
 function _boundForCurrentMesh() {
+  if (!(_onshapeTarget && _onshapeTarget.document_id)) return false;
+  if (!_onshapeTarget.filename) return true;          // unclaimed empty doc
   const cur = currentMeshName();
-  return !!(_onshapeTarget && _onshapeTarget.document_id && cur
-            && _onshapeTarget.filename === cur);
+  return !!cur && _onshapeTarget.filename === cur;
 }
 
-// "Open in Onshape" until this mesh's document has been opened, then
-// "Reopen in Onshape". Hidden until a mesh has been analyzed (steps exist).
+// "Open in Onshape" until the current document has been opened, then
+// "Reopen in Onshape". Shown once Onshape is connected (so you can open an
+// empty document BEFORE analyzing) or once a mesh has been analyzed.
 function updateOnshapeOpenButton() {
   const btn = document.getElementById('onshape-open-btn');
   if (!btn) return;
-  const ready = !!currentJobId && !!(typeof steps !== 'undefined' && steps && steps.length);
-  btn.style.display = ready ? 'flex' : 'none';
+  const analyzed = !!currentJobId && !!(typeof steps !== 'undefined' && steps && steps.length);
+  const connected = !!(_onshapeStatus && _onshapeStatus.connected);
+  btn.style.display = (connected || analyzed) ? 'flex' : 'none';
   const opened = _boundForCurrentMesh() && _onshapeTarget.opened;
   const lbl = btn.querySelector('.os-label');
   if (lbl) lbl.textContent = opened ? 'Reopen in Onshape' : 'Open in Onshape';
   btn.title = opened
-    ? 'Reopen this part in your Onshape tab'
-    : 'Build this part into a new Onshape document and open it';
+    ? 'Reopen this document in your Onshape tab'
+    : (analyzed ? 'Build this part into a new Onshape document and open it'
+                : 'Open an empty Onshape document — the pipeline will build into it');
 }
 window.updateOnshapeOpenButton = updateOnshapeOpenButton;
 
@@ -2873,7 +2883,6 @@ window.unbindOnshapeDocument = function () {
 
 // THE button. Popup-safe — the tab is opened synchronously inside this click.
 window.openInOnshape = async function () {
-  if (!currentJobId) { alert('Analyze a mesh first, then open it in Onshape.'); return; }
   // Connection gate. We must NOT await before opening the tab (a popup only
   // survives a synchronous user gesture), so only take the async refresh
   // path when we don't already know we're connected. If a stale status was
@@ -2881,26 +2890,30 @@ window.openInOnshape = async function () {
   if (!(_onshapeStatus && _onshapeStatus.connected)) {
     try { await refreshOnshapeStatus(); } catch (e) {}
     if (_onshapeStatus && _onshapeStatus.connected) {
-      addChatMessage('ai', 'Onshape connected — click "Open in Onshape" again to build.');
+      addChatMessage('ai', 'Onshape connected — click "Open in Onshape" again.');
       updateOnshapeOpenButton();
       return;
     }
-    addChatMessage('ai', 'Connect your Onshape account to open this part…');
+    addChatMessage('ai', 'Connect your Onshape account to open it in Onshape…');
     window.onshapeConnectClick();
     return;
   }
   const cur = currentMeshName();
-  // Reopen: this mesh already has its own opened document → just show it.
+  // Reopen: the current document is already open → just show its tab.
   if (_boundForCurrentMesh() && _onshapeTarget.opened && _onshapeTarget.url) {
     window.open(_onshapeTarget.url, '_blank');
     return;
   }
-  // New mesh (or never opened): make a fresh document for it and build.
-  // Open the tab now (popup-safe); _runOnshapeBuild navigates it once the
-  // document is created. Clear any binding that belongs to another mesh so
-  // a brand-new document is created instead of overwriting that one.
+  // Open the tab now (popup-safe). Clear any binding for a DIFFERENT mesh so
+  // we make a fresh document instead of overwriting that one.
   const win = window.open('', '_blank');
   if (!_boundForCurrentMesh()) { _onshapeTarget = null; _saveOnshapeTarget(); }
+
+  // No analyzed mesh yet → open an EMPTY document and bind it. When you run
+  // the pipeline it builds into this document live (the synced animation).
+  if (!currentJobId) { await _openEmptyOnshapeDoc(win); return; }
+
+  // Analyzed mesh → build it into a (new or unclaimed) document and open it.
   const url = await _runOnshapeBuild(win);
   if (url && _onshapeTarget) {
     _onshapeTarget.filename = cur;
@@ -2909,6 +2922,28 @@ window.openInOnshape = async function () {
   } else if (win) { try { win.close(); } catch (e) {} }
   updateOnshapeOpenButton();
 };
+
+// Create + open an EMPTY Onshape document and bind it (filename unset, so the
+// first mesh built claims it). `win` is the pre-opened tab from the click.
+async function _openEmptyOnshapeDoc(win) {
+  let r;
+  try { r = await fetch('/api/onshape/document/new', { method: 'POST' }); }
+  catch (e) { if (win) win.close(); addChatMessage('ai', 'Could not reach the server.'); return false; }
+  if (r.status === 409) { if (win) win.close(); addChatMessage('ai', 'Connect your Onshape account first.'); window.location = '/api/onshape/connect?next=' + encodeURIComponent(location.pathname); return false; }
+  if (r.status === 403) { if (win) win.close(); addChatMessage('ai', 'Onshape is a Pro feature.'); return false; }
+  if (r.status === 401) { if (win) win.close(); window.location = '/login?next=' + encodeURIComponent(location.pathname); return false; }
+  let d = {}; try { d = await r.json(); } catch (e) {}
+  if (!r.ok || !d.url) { if (win) win.close(); addChatMessage('ai', 'Could not create the document: ' + (d.detail || d.error || r.status)); return false; }
+  _onshapeTarget = {
+    document_id: d.document_id, workspace_id: d.workspace_id,
+    element_id: d.element_id, url: d.url, filename: null, opened: true,
+  };
+  _saveOnshapeTarget();
+  if (win) win.location = d.url;
+  updateOnshapeBindUI();
+  addChatMessage('ai', 'Empty Onshape document opened. Run the pipeline and it will build here live — keep that tab visible to watch.');
+  return true;
+}
 
 // Silent sync used by Play and Reanalyze: rebuild the current mesh into the
 // already-open bound document. NO new tab — collaborative sync updates the

@@ -3,3 +3,6 @@
 *.3mf filter=lfs diff=lfs merge=lfs -text
 *.step filter=lfs diff=lfs merge=lfs -text
 *.stp filter=lfs diff=lfs merge=lfs -text
+models/**/*.3mf filter=lfs diff=lfs merge=lfs -text
+models/**/*.stl filter=lfs diff=lfs merge=lfs -text
+models/**/*.obj filter=lfs diff=lfs merge=lfs -text

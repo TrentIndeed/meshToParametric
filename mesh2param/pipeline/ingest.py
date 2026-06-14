@@ -23,12 +23,18 @@ SUPPORTED_EXTENSIONS = {".stl", ".obj", ".ply", ".3mf"}
 def ingest_mesh(
     file_path: str | Path,
     config: IngestConfig | None = None,
+    on_stage=None,
 ) -> CleanedMesh:
     """Load a mesh file and return a cleaned, validated CleanedMesh.
 
     Args:
         file_path: Path to an STL, OBJ, or PLY mesh file.
         config: Ingestion configuration. Uses defaults if None.
+        on_stage: optional callback(name, trimesh) fired after the
+            cleanup front-end's distinct steps ("denoise", "align") with a
+            copy of the intermediate mesh — lets the UI show each cleaning
+            step as its own visual stage. No-op for clean CAD (the front-end
+            never runs).
 
     Returns:
         A CleanedMesh with consistent winding, no degenerate triangles,
@@ -91,6 +97,11 @@ def ingest_mesh(
         if do_denoise:
             mesh = _denoise_scan(mesh, config)
             mesh = _fix_normals(mesh)
+            if on_stage is not None:
+                try:
+                    on_stage("denoise", mesh.copy())
+                except Exception:
+                    logger.debug("on_stage(denoise) failed", exc_info=True)
         mesh = _fill_holes(mesh, config.max_hole_edges)
         # Ragged scans still have large open boundaries small-hole filling
         # can't close. Screened-Poisson reconstruction (scan input only)
@@ -119,6 +130,11 @@ def ingest_mesh(
         from mesh2param.pipeline.align import align_to_canonical_frame
         mesh, align_transform, align_method = align_to_canonical_frame(mesh)
         mesh = _fix_normals(mesh)
+        if on_stage is not None:
+            try:
+                on_stage("align", mesh.copy())
+            except Exception:
+                logger.debug("on_stage(align) failed", exc_info=True)
 
     mesh, unit_scale = _normalize_scale(mesh, config)
 

@@ -289,6 +289,9 @@ def _color_regions_no_adjacent_match(regions, sub_cleaned, palette):
 # _pause_for_review.
 PAUSE_STAGES: list[tuple[str, str]] = [
     ("scan_cleanup", "Scan cleanup (denoise + align)"),
+    ("denoise", "Denoise (feature-preserving)"),
+    ("align", "Align to canonical frame"),
+    ("regularize", "Regularize (flatten faces, snap 90°)"),
     ("decompose", "Decompose bodies"),
     ("segment", "Segmentation"),
     ("fit", "Primitive fitting"),
@@ -658,8 +661,12 @@ class JobQueue:
         # scan_auto: dense scans (>>30k faces) auto-get the scan
         # front-end (feature-preserving denoise + canonical-frame
         # alignment); clean CAD passes through untouched.
+        # Capture the cleanup front-end's intermediate meshes (post-denoise,
+        # post-align) so each becomes its own visual stage below.
+        _cleanup_inter: dict = {}
         cleaned = ingest_mesh(
-            job.file_path, IngestConfig(remesh=False, scan_auto=True))
+            job.file_path, IngestConfig(remesh=False, scan_auto=True),
+            on_stage=lambda name, m: _cleanup_inter.__setitem__(name, m))
 
         # Resize mesh if target dimensions were specified
         target_dims = getattr(job, '_target_dims', None)
@@ -682,27 +689,39 @@ class JobQueue:
 
         _set_mesh_viz(cleaned)
 
-        # Stage 1b: Scan cleanup — the first visual after decimation for
-        # SCAN inputs. The mesh shown is feature-preserving-denoised and
-        # rotated onto its own orthogonal frame (so the wrench reads as a
-        # flat axis-aligned part instead of an arbitrary pose). Clean CAD
-        # skips this (no front-end ran).
+        # Stage 1b: cleanup front-end visuals for SCAN / AI ("dirty") inputs —
+        # one verifiable stage per distinct transformation (Denoise, Align;
+        # Regularize comes after fitting). Clean CAD skips all of these (the
+        # front-end never ran).
         if cleaned.metadata.get("scan_mode"):
             rf = int(cleaned.metadata.get("raw_faces", 0))
             am = cleaned.metadata.get("align_method", "?")
-            ext = np.round(cleaned.bbox[1] - cleaned.bbox[0], 1).tolist()
+            src = cleaned.metadata.get("cleanup_source", "scan")
+            kind = "AI/dirty mesh" if src == "dirty_mesh" else "scan"
             job.progress = 5
-            job.progress_stage = (
-                f"Scan cleanup: denoised + aligned ({am} frame, "
-                f"{rf:,} raw faces) — extents {ext} mm"
-            )
-            job.debug_summary.append(
-                f"Scan cleanup: {rf:,} raw faces -> denoised + {am}-aligned, "
-                f"extents {ext} mm"
-            )
-            job.progress_version += 1
-            _dwell_if_not_step_through("scan_cleanup")
-            _pause_for_review("scan_cleanup")
+            # Denoise: feature-preserving surface smoothing (no faceting).
+            if "denoise" in _cleanup_inter:
+                _set_mesh_viz(_cleanup_inter["denoise"])
+                job.progress_stage = (
+                    f"Denoise ({kind}): feature-preserving surface smoothing")
+                job.debug_summary.append(
+                    f"Denoise: {rf:,} raw faces, surface noise smoothed "
+                    f"(edges preserved)")
+                job.progress_version += 1
+                _dwell_if_not_step_through("denoise")
+                _pause_for_review("denoise")
+            # Align: rotate onto the part's own orthogonal frame.
+            ext = np.round(cleaned.bbox[1] - cleaned.bbox[0], 1).tolist()
+            if "align" in _cleanup_inter:
+                _set_mesh_viz(_cleanup_inter["align"])
+                job.progress_stage = (
+                    f"Align: canonical {am} frame — extents {ext} mm")
+                job.debug_summary.append(
+                    f"Align: rotated onto {am} frame, extents {ext} mm")
+                job.progress_version += 1
+                _dwell_if_not_step_through("align")
+                _pause_for_review("align")
+            _set_mesh_viz(cleaned)
 
         # Whole-mesh segment + peel was REMOVED. It modified `cleaned`
         # in-place before decomposition, so per-body segmentation saw
@@ -924,6 +943,24 @@ class JobQueue:
 
         all_body_results = [(body, sub_cleaned, body_tree)
                             for body, sub_cleaned, _, _, _, _, body_tree, _ in body_stage_data]
+
+        # Stage 1c: Regularize — for SCAN / AI inputs the per-body processing
+        # projected the wobbly vertices onto the recovered consensus planes
+        # (flat faces, exact 90° corners). Show the crisped geometry of the
+        # primary body as its own verifiable stage.
+        if cleaned.metadata.get("scan_mode") and body_stage_data:
+            reg_mesh = body_stage_data[0][1]   # regularized sub_cleaned (body 0)
+            _set_mesh_viz(reg_mesh)
+            ext = np.round(reg_mesh.bbox[1] - reg_mesh.bbox[0], 1).tolist()
+            job.progress_stage = (
+                "Regularize: faces flattened, corners snapped to 90° — "
+                f"extents {ext} mm")
+            job.debug_summary.append(
+                "Regularize: vertices projected onto consensus planes "
+                "(flat faces, exact right angles)")
+            job.progress_version += 1
+            _dwell_if_not_step_through("regularize")
+            _pause_for_review("regularize")
 
         # ── Show per-stage visualizations ──
         # Each body's sub_cleaned is the mesh used for that body's pipeline.

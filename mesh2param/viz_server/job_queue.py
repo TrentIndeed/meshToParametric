@@ -852,6 +852,31 @@ class JobQueue:
             _check_cancelled()
             fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
             _check_cancelled()
+            # Scan / AI-mesh regularization (Stage E): the denoised+aligned
+            # mesh still has wobbly near-flat faces and off-90deg corners.
+            # Project its vertices onto the recovered consensus planes so the
+            # flats are actually flat and corners exactly 90, then re-segment
+            # /fit the CRISP mesh so the rest of the pipeline sees clean
+            # geometry. Gated to dirty inputs (scans + AI meshes); clean CAD
+            # is already exact and never enters this branch.
+            if cleaned.metadata.get("scan_mode"):
+                try:
+                    from mesh2param.pipeline.regularize import regularize_mesh
+                    # Conservative 12 deg snap: a few-degree wobble (noise)
+                    # snaps to flat, but an intentional chamfer/draft (>=12
+                    # deg off-axis) is preserved, not flattened.
+                    _, reg_report = regularize_mesh(
+                        sub_cleaned, regions, fitted, snap_angle_deg=12.0)
+                    n_snap = sum(1 for r in reg_report if r.get("snapped"))
+                    logger.info("Body %d regularized: %d/%d planes snapped",
+                                bi, n_snap, len(reg_report))
+                    regions = segment_mesh(sub_cleaned, SegmentConfig())
+                    _check_cancelled()
+                    fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
+                    _check_cancelled()
+                except Exception:
+                    logger.exception(
+                        "Regularization failed for body %d — using raw fit", bi)
             graph, edges_list = build_topology(regions, fitted, sub_cleaned, TopologyConfig())
             _check_cancelled()
             # Stage 4.5: topology-based blend identification. Walks the

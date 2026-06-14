@@ -167,20 +167,49 @@
   at the bore's axial midpoint — verify against a part with deep blind
   holes (Mesh1's tangent blind pair) before trusting depth direction.
 
-## Scans
-- [ ] **Scan cleaning + design-intent + geometry recovery — full plan in
-  `docs/SCAN_RECOVERY_PLAN.md` (2026-06-13).** The clean-CAD path is
-  solid; scans need a front-end the pipeline lacks: feature-preserving
-  denoise (Poisson rounds edges), CANONICAL-FRAME ALIGNMENT (fit.py
-  `_snap_params` snaps to WORLD axes — meaningless until the part is
-  box-aligned; this is the root of the wrench over-extrude), and GLOBAL
-  constraint inference (parallel/perp/coaxial/equal/symmetry/dimension
-  — current snapping is per-primitive). Plus promoting the Onshape
-  `_regularize_profile` (axis-snapped straights + tangent arcs) into a
-  shared sketch-regularization stage. Sequencing: alignment + denoise
-  first (biggest lever), then the regularizer, then constraint
-  inference, then confidence/gating. Prismatic target (Scan2); organic
-  (spanner) → /clean only. The items below are subsumed by that plan.
+## Scans + AI-generated ("dirty") meshes
+> Market note: scans AND AI-generated meshes (Meshy/Tripo) are the SAME
+> dirty-mesh problem and the same target market — see `docs/ROADMAP.md`.
+
+**Front-end BUILT so far (2026-06-13/14) — `docs/SCAN_RECOVERY_PLAN.md`:**
+- [x] Feature-preserving **denoise** — `ingest._bilateral_denoise` (Zheng
+  bilateral normal filtering, default `denoise_method="bilateral"`):
+  removes surface noise WITHOUT faceting curves (the pymeshlab two-step
+  faceted: 0.6%→5.6% false edges; bilateral stays ~0.5%).
+- [x] **Canonical-frame alignment** — `pipeline/align.py` (dominant normal
+  triple + OBB fallback). Wrench 0%→92% engine coverage.
+- [x] **Dirty-mesh detection by surface exactness** — `ingest._surface_wobble`
+  (median dihedral within near-flat faces). Catches low-poly AI meshes the
+  100k face-count threshold misses (clean CAD ~0°, dirty ~5°). Sets
+  `cleanup_source="dirty_mesh"`.
+- [x] **Regularize stage** — `pipeline/regularize.py`. Builds the part's own
+  orthogonal frame, snaps planes to it (exact parallel/perp), and PROJECTS
+  mesh vertices onto the consensus planes (flat faces, 90° corners). Noisy
+  box → exactly axis-aligned. Wired into the live pipeline gated to
+  scan_mode (12° conservative snap preserves real drafts/chamfers).
+- [x] **Noise-robust segmentation** — `SegmentConfig.noise_robust` +
+  `_merge_coplanar_fragments` (boundary dominance, cascade-safe). Absorbs
+  noise slivers into the dominant face. NOTE: validated correct on
+  embedded-sliver cases, but SIMULATED noise on coarse CAD shatters at
+  region-GROWING (no big regions to merge into) — needs a REAL AI/scan mesh
+  to tune (15 in `models/AI*/`).
+- [x] **Cleanup viz stages** — Denoise / Align / Regularize each a separate
+  pause-stage (gated to dirty inputs).
+
+**Still TODO:**
+- [ ] **Tune stage C (segmentation) on REAL AI meshes** (`models/AI*/`) —
+  decide whether real Meshy parts fragment at all; if they do, fix
+  region-GROWING robustness, not just the post-merge.
+- [ ] **Stage E global constraint inference (beyond orientation):** equal-
+  radius, symmetry (hole patterns / mirror planes), and the dimension
+  network. Orientation (parallel/perp) is done in `regularize_planes`.
+- [ ] **Stage F:** promote the Onshape `_regularize_profile` (axis-snapped
+  straights + tangent arcs + circle recovery) into a shared sketch-
+  regularization stage consumed by both exporters.
+- [ ] **Prismatic/organic classifier (stage H)** — HARD: simple geometry
+  metrics don't separate (the smooth spanner reads as MORE developable than
+  the detailed industrial/gear scans). Needs noise-robust primitive-fitting
+  coverage, not a one-shot threshold. Organic → /clean only.
 - [x] Decimation speedup: 2.5M-face scans spent ~60s in quadric edge-collapse.
   A cheap vertex-clustering pre-pass (when faces > 5x the cap) cuts the input
   ~10x in ~2s, so the quality quadric runs on a small mesh. Scan2 ingest
@@ -199,23 +228,16 @@
   prismatic scan (Scan2 Industrial Part) is the best candidate for further
   work; truly organic shapes (spanner) belong on /clean. No reference STEPs
   for scans, so accuracy is volume-only.
-- [ ] **Scan intent recovery (user direction, 2026-06-12).** "We need to
-  do very heavy work on smoothing out surfaces, recovering intent such
-  as circles, 90 degree angles, etc. There is extreme distortion causing
-  horrible results." Concrete observed failure on the wrench (Scan1):
-  the extrusion engine takes the SIDE profile — extremely jagged — and
-  extrudes it far past the wrench's true width. Two separate problems:
-  (a) profile selection trusting a noisy silhouette's bbox span instead
-  of the measured cross-section run (the run-tracking IoU should break
-  on scan noise but apparently doesn't), and (b) no
-  smoothing/regularization stage that snaps near-circles to circles,
-  near-90° corners to 90°, and near-parallel runs to parallel before
-  fitting. ORDER (user-corrected 2026-06-12): the scan CLEANER +
-  REGULARIZER come FIRST — the wrench IS a scan (Scan1 spanner), so
-  fixing its profile/span reading without de-noising the input is
-  working on garbage. Sequence: surface smoothing / scan cleanup, then
-  the 2D outline regularizer (RANSAC lines/arcs with angle snapping),
-  then revisit the engine's profile/span honesty on the cleaned data.
+- [~] **Scan intent recovery (user direction, 2026-06-12)** — LARGELY
+  ADDRESSED by the front-end above. "Smoothing out surfaces, recovering
+  intent such as circles, 90 degree angles" → denoise (smoothing) +
+  regularize (90° / flat faces via consensus-frame snapping + vertex
+  projection) are built and gated to dirty inputs, in the user-corrected
+  order (clean/regularize FIRST, then recognition). REMAINING: near-circle
+  → exact-circle recovery (part of stage F), and revisiting the extrusion
+  engine's profile/span honesty on the now-cleaned wrench (the over-extrude
+  is a symptom of an organic part — the spanner belongs on /clean per the
+  prismatic/organic gate).
 - [ ] Scan failures currently visible in tests: Scan3 fit drops 2/105
   regions, Scan1 recognizes only a BASE feature (no holes) — both
   pre-existing (confirmed on 4b51b30, 2026-06-12), xfail candidates

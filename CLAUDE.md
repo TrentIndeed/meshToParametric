@@ -5,6 +5,8 @@ Python pipeline that converts triangulated mesh files (STL/OBJ/PLY/3MF) of prism
 
 Target parts: brackets, mounts, plates — prismatic components with planar faces, cylindrical holes, pockets, bosses, fillets, chamfers. Not freeform/organic geometry.
 
+Target inflows (all the same "dirty mesh" problem): clean CAD STLs, **physical-part scans**, and **AI-generated meshes** (Meshy/Tripo). Market & roadmap (user base, the AI-gen→CAD difficulty ladder, why scans + AI meshes are one market): **`docs/ROADMAP.md`**. Scan/AI front-end technical plan + status: `docs/SCAN_RECOVERY_PLAN.md`.
+
 ## Active handoffs (read before changing the corresponding stage)
 - **`docs/FILLET_AND_HOLE_HANDOFF.md`** — historical notes on Stages 4.5–6. The collinear-merge / reconciliation path it documents has been replaced by the stitched-fillets stage and the per-edge measured-radius matcher in `export_cadquery.py`. Read for background; current code is in `viz_server/job_queue.py` (stitched stage block) and `pipeline/export_cadquery.py` (`_apply_recognized_fillets_to_solid`).
 - **`docs/SEGMENTATION_HANDOFF.md`** — open issue with corner-triangle classification at fillet-fillet junctions in Stage 2.

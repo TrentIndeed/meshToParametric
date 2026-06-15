@@ -96,11 +96,20 @@ def group_extrusion_segments(
 ) -> list[ExtrusionGroup]:
     """Collapse identical extrusions into one feature each.
 
-    Key = (axis, profile area, depth). Members with the SAME span are co-planar
-    (one sketch, many loops); members with the same profile/depth but mirrored
-    spans are a symmetric pattern. Both become a single ExtrusionGroup so the
-    feature tree shows one "Sketch + Extrude" per set, like symmetric holes.
+    Two-stage, matching how a CAD operator sketches:
+    1. CO-PLANAR sets — same axis + profile + depth AND the same start plane
+       become one sketch with several loops (AI1's four TOP screws share a
+       slice; its four BOTTOM screws share a different slice -> two features,
+       not eight).
+    2. MIRROR pairs — two SINGLE walls with the same profile/depth on parallel
+       planes are a symmetric pair modelled as one feature (RackMount's two
+       side plates). Restricting this to singletons keeps the four-loop screw
+       sketches on their own planes as separate features.
     """
+    def _akey(s):
+        return (s.axis_idx, round(s.area, 1), round(s.length, 1))
+
+    # Stage 1: co-planar grouping (start plane included in the key).
     groups: list[ExtrusionGroup] = []
     for seg in sorted(plan.segments, key=lambda s: -s.area):
         placed = False
@@ -112,6 +121,8 @@ def group_extrusion_segments(
             gl = g.members[0].length
             if abs(gl - seg.length) / max(gl, seg.length, 1e-9) > len_tol:
                 continue
+            if abs(g.members[0].start - seg.start) > len_tol * max(gl, 1e-9):
+                continue  # different sketch slice -> different feature
             g.members.append(seg)
             placed = True
             break
@@ -120,10 +131,32 @@ def group_extrusion_segments(
                 axis_idx=seg.axis_idx, direction=seg.direction,
                 profile=seg.profile, area=seg.area, members=[seg],
             ))
-    for g in groups:
+
+    # Stage 2: merge SINGLETON mirror pairs (identical lone walls on parallel
+    # planes). Multi-loop co-planar sets (the 4-screw sketches) are left alone.
+    merged: list[ExtrusionGroup] = []
+    used = [False] * len(groups)
+    for i, g in enumerate(groups):
+        if used[i]:
+            continue
+        if len(g.members) == 1:
+            for j in range(i + 1, len(groups)):
+                if used[j] or len(groups[j].members) != 1:
+                    continue
+                h = groups[j]
+                if (h.axis_idx == g.axis_idx
+                        and abs(h.area - g.area) / max(h.area, g.area, 1e-9) <= area_tol
+                        and abs(h.members[0].length - g.members[0].length)
+                        / max(g.members[0].length, 1e-9) <= len_tol):
+                    g.members.append(h.members[0])
+                    used[j] = True
+        used[i] = True
+        merged.append(g)
+
+    for g in merged:
         starts = [m.start for m in g.members]
         g.same_plane = (max(starts) - min(starts)) <= len_tol * g.members[0].length
-    return groups
+    return merged
 
 
 def plan_extrusions(

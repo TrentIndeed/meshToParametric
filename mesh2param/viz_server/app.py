@@ -655,6 +655,23 @@ async def job_status(job_id: str):
     return result
 
 
+@app.get("/api/job/{job_id}/mesh")
+async def job_mesh(job_id: str):
+    """The pipeline's FINAL (decimated + aligned) mesh — the exact frame the CAD
+    was built in. The Compare view uses this instead of the raw upload so the
+    mesh and the model show in the same orientation (no flip)."""
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    cm = getattr(job, "cleaned", None)
+    if cm is None:
+        return JSONResponse({"error": "No cleaned mesh yet"}, status_code=404)
+    return {
+        "vertices": cm.vertices.flatten().tolist(),
+        "faces": cm.faces.flatten().tolist(),
+    }
+
+
 @app.post("/api/queue/reset")
 async def queue_reset():
     """Last-resort recovery: kill the in-flight CadQuery subprocess,

@@ -979,7 +979,7 @@ function populateUI(statusData) {
   compareBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">Compare</span>';
   compareBtn.title = 'Split view: Mesh vs CAD';
   compareBtn.onclick = () => {
-    if (!savedMeshPreview) return;
+    if (!currentJobId) { console.warn('[compare] no job to compare'); return; }
     // Clear and show both mesh + CAD side by side
     while (modelGroup.children.length) {
       const child = modelGroup.children[0];
@@ -988,28 +988,33 @@ function populateUI(statusData) {
       modelGroup.remove(child);
     }
 
-    // Mesh on the left (offset -X)
-    const meshVerts = new Float32Array(savedMeshPreview.mesh_vertices);
-    const meshGeo = new THREE.BufferGeometry();
-    meshGeo.setAttribute('position', new THREE.BufferAttribute(meshVerts, 3));
-    meshGeo.setIndex(savedMeshPreview.mesh_faces);
-    meshGeo.computeVertexNormals();
-    const meshMat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
-    const meshObj = new THREE.Mesh(meshGeo, meshMat);
-
-    // CAD on the right (offset +X) — load last step
     const lastIdx = statusData.steps.length - 1;
-    const cadUrl = currentJobId ? `/api/job/${currentJobId}/step/${lastIdx}` : `/api/step/${lastIdx}`;
-    console.debug('[compare] fetching CAD step', lastIdx, 'from', cadUrl);
-    fetch(cadUrl).then(r => {
-      if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + cadUrl);
-      return r.json();
-    }).then(cadData => {
-      if (!cadData.vertices) { console.warn('[compare] CAD step has no vertices'); return; }
+    // Use the PIPELINE mesh (decimated + aligned) — the exact frame the CAD was
+    // built in — so the mesh and the model compare in ONE orientation. No
+    // canonical-orient / flip hacks needed; they're already the same frame.
+    Promise.all([
+      fetch(`/api/job/${currentJobId}/mesh`).then(r => {
+        if (!r.ok) throw new Error('mesh HTTP ' + r.status); return r.json();
+      }),
+      fetch(`/api/job/${currentJobId}/step/${lastIdx}`).then(r => {
+        if (!r.ok) throw new Error('step HTTP ' + r.status); return r.json();
+      }),
+    ]).then(([meshData, cadData]) => {
+      if (!meshData.vertices || !cadData.vertices) {
+        console.warn('[compare] missing geometry'); return;
+      }
       try {
-        const cadVerts = new Float32Array(cadData.vertices);
+        // Mesh (left)
+        const meshGeo = new THREE.BufferGeometry();
+        meshGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(meshData.vertices), 3));
+        meshGeo.setIndex(meshData.faces);
+        meshGeo.computeVertexNormals();
+        const meshMat = new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 });
+        const meshObj = new THREE.Mesh(meshGeo, meshMat);
+
+        // CAD (right)
         const cadGeo = new THREE.BufferGeometry();
-        cadGeo.setAttribute('position', new THREE.BufferAttribute(cadVerts, 3));
+        cadGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cadData.vertices), 3));
         cadGeo.setIndex(cadData.faces);
         cadGeo.computeVertexNormals();
         const cadMat = new THREE.MeshPhysicalMaterial({
@@ -1017,46 +1022,6 @@ function populateUI(statusData) {
           clearcoat: 0.15, reflectivity: 0.6,
         });
         const cadObj = new THREE.Mesh(cadGeo, cadMat);
-
-        // The preview mesh (raw ingest frame) and the CAD model (pipeline
-        // frame, after scan-align/regularize snap the part to world axes) can
-        // sit in DIFFERENT orientations — the mesh lies flat while the model
-        // stands upright. Canonically orient BOTH the same way (thinnest axis
-        // up, longest axis along X) so the split view compares like with like.
-        const _canonicalOrient = (geo) => {
-          geo.computeBoundingBox();
-          let s = geo.boundingBox.getSize(new THREE.Vector3());
-          const dims = [s.x, s.y, s.z];
-          const thin = dims.indexOf(Math.min(...dims));
-          if (thin === 0) geo.rotateZ(Math.PI / 2);        // X-thin -> Y-thin
-          else if (thin === 2) geo.rotateX(Math.PI / 2);   // Z-thin -> Y-thin
-          geo.computeBoundingBox();
-          s = geo.boundingBox.getSize(new THREE.Vector3());
-          if (s.z > s.x) geo.rotateY(Math.PI / 2);          // longest -> X
-          geo.computeBoundingBox();
-        };
-        // Canonical orient leaves a 180-deg ambiguity (which face is up). The
-        // mesh frame and the regularized CAD frame can disagree on it, so one
-        // ends up flipped. Resolve by the vertex centroid: flip so the heavier
-        // half is consistently on the same side for both.
-        const _flipConsistent = (geo) => {
-          geo.computeBoundingBox();
-          const c = geo.boundingBox.getCenter(new THREE.Vector3());
-          const pos = geo.attributes.position;
-          let cy = 0, cx = 0;
-          for (let i = 0; i < pos.count; i++) { cy += pos.getY(i); cx += pos.getX(i); }
-          cy /= pos.count; cx /= pos.count;
-          if (cy - c.y < 0) { geo.rotateX(Math.PI); }      // heavy side up
-          geo.computeBoundingBox();
-          const c2 = geo.boundingBox.getCenter(new THREE.Vector3());
-          let cx2 = 0; for (let i = 0; i < pos.count; i++) cx2 += pos.getX(i); cx2 /= pos.count;
-          if (cx2 - c2.x < 0) { geo.rotateY(Math.PI); }     // heavy side +X
-          geo.computeBoundingBox();
-        };
-        _canonicalOrient(meshGeo);
-        _canonicalOrient(cadGeo);
-        _flipConsistent(meshGeo);
-        _flipConsistent(cadGeo);
 
         // Center both, then place side by side with small gap
         const meshBox = new THREE.Box3().setFromBufferAttribute(meshGeo.attributes.position);

@@ -251,6 +251,51 @@ def regularize_mesh(cleaned, regions, fitted, snap_angle_deg: float = 25.0,
             V[v] = V[v] + delta
             moved += 1
 
+    # Fillet pass: project pure-fillet (cylinder-interior) vertices onto their
+    # clean fitted cylinder, so a rolled edge becomes a consistent constant-
+    # radius roll instead of a bumpy strip. GUARDED: only GENUINE small fillets
+    # (0.3mm < r < 25% of bbox, good fit) — a flat side mis-fit as a huge-radius
+    # cylinder is skipped, so it can't bend a flat face. Only interior vertices
+    # (all incident faces in the one cylinder) move; the tangent edges to the
+    # plates are left to the plane pass / left alone.
+    reg_cyl: dict[int, tuple] = {}
+    for r in regions:
+        if r.surface_type != SurfaceType.CYLINDER:
+            continue
+        fp = fit_by_region.get(r.region_id)
+        if fp is None:
+            continue
+        rad = float((fp.params or {}).get("radius", 0.0) or 0.0)
+        if not (0.3 < rad < 0.25 * bbox_diag):
+            continue
+        a = _unit((fp.params or {}).get("axis_dir", [0, 0, 1.0]))
+        c = np.asarray((fp.params or {}).get("axis_point", [0, 0, 0.0]),
+                       dtype=float)
+        reg_cyl[r.region_id] = (a, c, rad)
+
+    cyl_moved = 0
+    for v in range(len(V)):
+        rids = {int(face_region[fi]) for fi in vfaces[v]}
+        if len(rids) != 1:
+            continue
+        rid = next(iter(rids))
+        if rid not in reg_cyl:
+            continue
+        a, c, rad = reg_cyl[rid]
+        vr = V[v] - c
+        axial = (vr @ a) * a
+        radial = vr - axial
+        rn = float(np.linalg.norm(radial))
+        if rn < 1e-6:
+            continue
+        target = c + axial + (radial / rn) * rad
+        if float(np.linalg.norm(target - V[v])) <= max_move_frac * bbox_diag:
+            V[v] = target
+            cyl_moved += 1
+    for rid in reg_cyl:
+        report.append({"region_id": rid, "type": "fillet",
+                       "radius": round(reg_cyl[rid][2], 2), "snapped": True})
+
     cleaned.vertices = V
     try:
         cleaned.normals = np.asarray(
@@ -258,9 +303,9 @@ def regularize_mesh(cleaned, regions, fitted, snap_angle_deg: float = 25.0,
         cleaned.bbox = np.array([V.min(0), V.max(0)], dtype=float)
     except Exception:
         pass
-    logger.info("Mesh regularization: %d/%d plane regions snapped, %d "
-                "vertices projected onto consensus planes",
-                len(reg_plane), len(plane_regs), moved)
+    logger.info("Mesh regularization: %d/%d planes snapped (%d verts), "
+                "%d fillet cylinders (%d verts)",
+                len(reg_plane), len(plane_regs), moved, len(reg_cyl), cyl_moved)
     return cleaned, report
 
 

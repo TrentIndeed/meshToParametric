@@ -80,6 +80,19 @@ front-end stops short:
 
 ---
 
+## CONCLUSION (2026-06-14): the bottleneck is UPSTREAM (segmentation + fit)
+Built three downstream cleanup passes — mesh-plane regularization, 2D sketch-
+profile regularization (Stage F), and fillet-cylinder regularization — and ALL
+THREE no-op on the real AI parts for the same reason: segmentation/fit don't
+hand them clean regions to work on. The profile was already cleaned by the mesh
+pass (or not cleanly detectable); the fillets are never isolated as cylinder
+regions (so the fillet pass finds nothing); flats get mis-fit as cylinders
+(#5). The downstream regularizers are correct and SAFE (self-gated, guarded,
+no-op when input is bad), but they're starved. So the #1 lever is unambiguously
+**segmentation + primitive-fit robustness on rough/dense AI meshes** — once that
+produces clean plane + fillet regions, the (already-built) regularizers fire.
+Stop adding downstream passes; fix the input.
+
 ## How these map to the roadmap
 - #3, #4 → extend Stage E (regularization) to outer boundary + fillets.
 - #5 → Stage D fit robustness on noisy regions.

@@ -916,6 +916,27 @@ def plan_extrusions_components(
     # nothing else covers it — so it survives no matter how little of the part
     # it is). Volume is consulted ONLY for this redundancy test, never to
     # match shapes or to gate on a part-fraction threshold.
+    # DOMINATION by a more-prismatic twin: a slab is extrudable on every axis,
+    # but a drafted plate's biggest face DRIFTS along its thickness
+    # (BottomMount grows 16% face-to-face) and is the WORST of the equivalent
+    # axes. Mark a candidate dominated if ANOTHER candidate with strictly
+    # lower drift describes the SAME material on a constant-section axis. The
+    # test is MUTUAL coverage (each prism covers >=80% of the other) — that is
+    # what makes them the same plate seen differently. Mutuality is essential:
+    # a thin phantom slab covers a screw's column but the screw is a tiny part
+    # of the slab, so it is NOT mutual and the screw is spared; RackMount's
+    # bodies cover DIFFERENT material so none dominates another.
+    counts = [int(np.count_nonzero(c["_mem"])) or 1 for c in candidates]
+    for i, c in enumerate(candidates):
+        c["_dominated"] = False
+        for j, c2 in enumerate(candidates):
+            if c2 is c or c2.get("drift", 0.0) >= c.get("drift", 0.0) - 0.03:
+                continue
+            inter = int(np.count_nonzero(c["_mem"] & c2["_mem"]))
+            if inter / counts[i] >= 0.8 and inter / counts[j] >= 0.8:
+                c["_dominated"] = True
+                break
+
     # Cross-axis dedup by SELF-COVERAGE, largest profile first (sketch the
     # biggest face, extrude the short way — the base, then bosses, then
     # screws). A candidate is KEPT iff most of ITS OWN prism is still
@@ -925,9 +946,18 @@ def plan_extrusions_components(
     # nothing else covers it — so it survives no matter how little of the part
     # it is). Volume is consulted ONLY for this redundancy test, never to
     # match shapes or to gate on a part-fraction threshold.
+    # Order by how much of the part each candidate explains AS A SINGLE
+    # OBJECT (its own prism's voxel count), not raw profile area: a part that
+    # is cleanly prismatic along ONE axis (BottomMount along its 213mm length)
+    # then wins as one extrude over a fragmented near-constant axis whose
+    # biggest single face happens to be larger. Plates still precede screws
+    # (they explain far more), so AI1/RackMount are unchanged.
     unclaimed = np.ones(total, dtype=bool)
     chosen: list[dict] = []
-    for c in sorted(candidates, key=lambda c: -c["area"]):
+    order = sorted(candidates, key=lambda c: -int(np.count_nonzero(c["_mem"])))
+    for c in order:
+        if c["_dominated"]:
+            continue  # a more-prismatic axis describes this same material
         own = int(np.count_nonzero(c["_mem"]))
         if own == 0:
             continue

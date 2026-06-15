@@ -20,6 +20,22 @@ Gates to clear before releasing the software (do NOT ship until these exist):
   processing time, feature-tree complexity. (We already compute volume error +
   bbox; ADD: max + mean surface deviation, validity flag, timing,
   feature-count — surface this in the UI and the report.)
+- [ ] **Point-cloud input handling.** A point cloud is NOT a mesh (no faces /
+  connectivity) — the pipeline requires a mesh (it segments faces, fits
+  surfaces, slices cross-sections). Decide: either reject point clouds up front
+  with a clear message, or add a surfacing step (Poisson / ball-pivoting) that
+  meshes the cloud before ingest. State it in the support envelope either way.
+- [ ] **Decimate AI/dirty meshes to the reference triangle regime.** Mesh1-5
+  are 800-9,500 faces (Mesh5 ~9.5K), the density segmentation was tuned on; AI
+  meshes decimate to the 30K cap = 15-37x denser, which is why flat surfaces
+  fragment (noise has far more triangles to shatter). Lower IngestConfig
+  max_faces toward ~10-12K for the dirty path.
+- [ ] **Hole/boss feature ordering for standoffs.** A standoff = a through-hole
+  in the base plate with a boss (screw) extruded over it. Order should be:
+  extrude plate -> drill plate hole -> extrude standoff (covering the hole), so
+  the hole stays in the plate rather than being dropped or drilled through the
+  boss. (Currently the export vetoes holes coaxial with a boss to stop the
+  standoff being cut away — correct short-term, but the plate hole is lost.)
 - [ ] **Tightly defined support envelope**, stated up front: single solid,
   watertight mesh, primarily mechanical/prismatic geometry, no organic
   surfaces, limited/no assembly support, and an explicit list of supported

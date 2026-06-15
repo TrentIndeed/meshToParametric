@@ -96,7 +96,19 @@ def ingest_mesh(
     try:
         mesh = _remove_degenerate_faces(mesh, config.min_face_area)
         mesh = _merge_vertices(mesh, config.merge_tolerance)
-        mesh = _decimate(mesh, config.max_faces)
+        # Dirty/AI meshes decimate to a target density that SCALES WITH SIZE
+        # (faces per cm^2), so segmentation gets consistent quality regardless
+        # of part size and noisy flats stay one region; clean CAD keeps
+        # max_faces.
+        _cap = config.max_faces
+        if needs_frontend:
+            _area_cm2 = float(mesh.area) / 100.0
+            _cap = int(np.clip(
+                config.dirty_faces_per_cm2 * _area_cm2,
+                config.dirty_min_faces, config.max_faces))
+            logger.info("Dirty decimation target: %d faces (%.0f cm^2 @ %.0f/cm^2)",
+                        _cap, _area_cm2, config.dirty_faces_per_cm2)
+        mesh = _decimate(mesh, _cap)
         mesh = _fix_normals(mesh)
         # Scan front-end: feature-preserving denoise flattens scanner
         # noise on the surfaces while keeping sharp edges, BEFORE
@@ -118,6 +130,20 @@ def ingest_mesh(
         # Last resort: a non-manifold "soup" Poisson can't close (AI meshes).
         if config.voxel_repair and not mesh.is_watertight:
             mesh = _voxel_remesh_repair(mesh, config)
+        # Voxel-remesh / Poisson re-mesh to their OWN resolution, undoing the
+        # earlier density decimation. Decimate AGAIN to the density target so
+        # the watertight result lands at the reference triangle regime (this is
+        # what segmentation actually sees).
+        if needs_frontend:
+            _a2 = float(mesh.area) / 100.0
+            _cap2 = int(np.clip(
+                config.dirty_faces_per_cm2 * _a2,
+                config.dirty_min_faces, config.max_faces))
+            if len(mesh.faces) > _cap2 * 1.1:
+                mesh = _decimate(mesh, _cap2)
+                mesh = _fix_normals(mesh)
+                logger.info("Post-watertight re-decimation: -> %d faces",
+                            len(mesh.faces))
     except Exception:
         logger.exception(
             "Stage 1 failed during mesh cleanup: file=%s, verts=%d, faces=%d",

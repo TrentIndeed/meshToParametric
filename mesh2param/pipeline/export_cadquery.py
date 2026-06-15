@@ -1443,12 +1443,43 @@ def _extract_profile_and_holes(
                 if not jsg.get("points") or not jsg.get("span"):
                     continue
                 jax = int(jsg.get("axis_idx", 0))
-                _join_lookup.append((
-                    jax,
-                    [a for a in range(3) if a != jax],
-                    _JoinPath(np.asarray(jsg["points"], dtype=float)),
-                    jsg["span"],
-                ))
+                # Include EVERY loop of a pattern boss (AI1's four-screw sketch
+                # carries the other three in extra_loops); otherwise only the
+                # first screw of each pattern is known and the rest get drilled.
+                for loop in [jsg["points"], *(jsg.get("extra_loops") or [])]:
+                    if loop and len(loop) >= 3:
+                        _join_lookup.append((
+                            jax,
+                            [a for a in range(3) if a != jax],
+                            _JoinPath(np.asarray(loop, dtype=float)),
+                            jsg["span"],
+                        ))
+
+            # A boss the planner already built (a screw/standoff) must NOT then
+            # be drilled: the flat plate face reads a RING where the standoff
+            # pokes through, and the 2D pass would cut the whole standoff out.
+            # Drop detected holes whose centre sits inside a coaxial boss.
+            def _on_join_boss(h) -> bool:
+                hd = np.asarray(h.direction, dtype=float)
+                hd = hd / (np.linalg.norm(hd) + 1e-15)
+                hsg = h.sketch_geometry or {}
+                centers = hsg.get("centers") or [hsg.get("center")]
+                for cc in centers:
+                    if cc is None:
+                        continue
+                    c3 = np.asarray(cc, dtype=float)
+                    for jax, (ju, jv), jpath, jspan in _join_lookup:
+                        if abs(hd[jax]) < 0.9:
+                            continue
+                        if jpath.contains_point((c3[ju], c3[jv]), radius=0.5):
+                            return True
+                return False
+
+            _kept = [h for h in detected_holes if not _on_join_boss(h)]
+            if len(_kept) != len(detected_holes):
+                logger.info("Dropped %d detected hole(s) coaxial with a boss",
+                            len(detected_holes) - len(_kept))
+            detected_holes = _kept
 
             def _trustworthy(rh) -> bool:
                 rdir = np.asarray(rh.direction, dtype=float)

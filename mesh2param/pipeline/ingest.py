@@ -108,6 +108,9 @@ def ingest_mesh(
         # closes them so the part has a real volume downstream.
         if config.poisson_reconstruct and not mesh.is_watertight:
             mesh = _poisson_reconstruct(mesh, config)
+        # Last resort: a non-manifold "soup" Poisson can't close (AI meshes).
+        if config.voxel_repair and not mesh.is_watertight:
+            mesh = _voxel_remesh_repair(mesh, config)
     except Exception:
         logger.exception(
             "Stage 1 failed during mesh cleanup: file=%s, verts=%d, faces=%d",
@@ -583,6 +586,40 @@ def _poisson_reconstruct(mesh: trimesh.Trimesh, config: IngestConfig) -> trimesh
     except Exception as e:
         logger.warning("Poisson reconstruction failed (%s) — keeping original", e)
         return mesh
+
+
+def _voxel_remesh_repair(mesh: trimesh.Trimesh,
+                         config: IngestConfig) -> trimesh.Trimesh:
+    """Last-resort watertighting for a BADLY-BROKEN mesh — non-manifold "soup"
+    (overlapping/self-intersecting surfaces, thousands of components) that
+    Poisson can't close. Common in AI-generated meshes (e.g. AI13: 0 open
+    edges but 23k non-manifold edges, ~18k components). Voxelizes the mesh and
+    extracts a marching-cubes isosurface = a GUARANTEED watertight manifold, at
+    the cost of sharp detail (the denoise/align/regularize front-end recovers
+    flats/angles). Coarser resolutions are MORE robustly closed (thin features
+    stay connected), so it tries finer first and falls back coarser. Returns
+    the repaired mesh, or the original if nothing closes it. Needs
+    scikit-image (trimesh's marching_cubes backend)."""
+    try:
+        diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) or 1.0
+    except Exception:
+        return mesh
+    for res in (96, 72, 56, 44):
+        try:
+            rm = mesh.voxelized(diag / res).fill().marching_cubes
+            rm.fix_normals()
+            if rm.is_watertight and len(rm.faces) > 0:
+                logger.info("Voxel-remesh repair: non-manifold soup -> "
+                            "watertight manifold (res=%d, %d faces)",
+                            res, len(rm.faces))
+                return rm
+        except ImportError:
+            logger.warning("scikit-image not installed — cannot voxel-remesh")
+            return mesh
+        except Exception:
+            continue
+    logger.warning("Voxel-remesh repair could not close the mesh")
+    return mesh
 
 
 def _subdivide_long_edges(mesh: trimesh.Trimesh) -> trimesh.Trimesh:

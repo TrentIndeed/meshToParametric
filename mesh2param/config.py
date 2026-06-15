@@ -26,6 +26,12 @@ class IngestConfig(BaseModel):
     # both need. Uses pymeshlab's built-in filter (already a dependency).
     poisson_reconstruct: bool = True
     poisson_depth: int = 8
+    # Last-resort watertighting for BADLY-BROKEN meshes (non-manifold "soup"
+    # that Poisson can't close — common in AI-generated meshes). Voxel-remeshes
+    # to a guaranteed watertight manifold (coarsens detail; the denoise/align/
+    # regularize front-end then recovers it). Only fires when still non-
+    # watertight after Poisson, so clean meshes and ragged scans are untouched.
+    voxel_repair: bool = True
     # Scan recovery front-end (off for clean CAD meshes; the scan
     # classifier turns these on). See docs/SCAN_RECOVERY_PLAN.md.
     denoise_scan: bool = False          # feature-preserving surface denoise

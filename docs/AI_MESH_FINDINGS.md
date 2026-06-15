@@ -64,19 +64,20 @@ front-end stops short:
 
 ## AI13 / TaperedHousing (upload)
 
-7. **[UX + repair] Non-watertight mesh rejected on upload, and auto-repair
-   FAILS on it.** The preview (`app.py /api/preview`) hard-rejects a
-   non-watertight mesh > 5000 faces with "Repair the mesh first using the free
-   cleaner at /clean". User wants the **cleaner to run automatically on upload**
-   instead. BUT — confirmed 2026-06-14 — AI13 stays **non-watertight even after
-   `ingest_mesh` with Poisson on** (76,099 faces, watertight=False): Poisson's
-   result wasn't watertight so `_poisson_reconstruct` correctly bailed (won't
-   trade a valid open mesh for a broken closed one). So this is TWO problems:
-   (a) the repair isn't strong enough for AI13 (need stronger watertighting —
-   higher Poisson depth, voxel/manifold remesh, or pymeshlab close-holes +
-   `meshing_repair_non_manifold`), and (b) once repair succeeds, the preview
-   should auto-run it and not bounce the user to /clean. Fix (a) first; (b) is
-   the UX wrapper.
+7. **[UX + repair] Non-watertight mesh rejected on upload; the mesh is badly
+   broken (not just open).** DIAGNOSED 2026-06-14: AI13 has **0 open boundary
+   edges but 23,217 NON-MANIFOLD edges and ~18,000 components** — it's
+   degenerate "soup" (overlapping/self-intersecting surfaces, T-junctions), not
+   a mesh with holes. So hole-closing is irrelevant, and Poisson does NOT close
+   it either (poisson-only result still non-watertight; quadric decimation
+   after it also breaks watertightness). trimesh voxel-remesh needs `skimage`
+   (not installed). **Robustly repairing arbitrary broken soup needs a manifold
+   library** (`manifold3d`, or pymeshlab alpha-wrap whose plugin DLL is missing
+   here) — a dependency decision. TWO problems: (a) repair this class of mesh
+   (needs the lib); (b) the preview HARD-rejects (`can_process=False`,
+   app.py:436-441) and bounces the user to /clean — should instead either auto-
+   repair or let the build attempt it with a warning. (b) is the quick UX win;
+   (a) is the real repair work and needs a dep.
 
 ---
 

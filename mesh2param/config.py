@@ -17,16 +17,6 @@ class IngestConfig(BaseModel):
     # collapse). Scans arrive at 300K-2.5M faces; segmentation cost is
     # superlinear in faces, so cap before Stage 2. 0 disables.
     max_faces: int = 30_000
-    # Scan / AI ("dirty") inputs decimate to a target TRIANGLE DENSITY that
-    # SCALES WITH MESH SIZE (faces per cm^2 of surface area), not a fixed cap —
-    # a fixed count is dense on a small part and sparse on a big one, giving
-    # inconsistent segmentation quality. The reference CAD meshes sit at
-    # ~2-13 faces/cm^2; AI meshes carry surface noise so they need somewhat
-    # more, but at the 30K cap they are 15-37x too dense and flats shatter into
-    # many regions. target_faces = clip(density * area_cm2, min, max_faces).
-    # Only the scan/dirty front-end path; clean CAD keeps max_faces.
-    dirty_faces_per_cm2: float = 120.0
-    dirty_min_faces: int = 4_000
     # Screened-Poisson surface reconstruction for ragged scan input. Only
     # runs when the cleaned mesh is NOT watertight after normal repair —
     # clean CAD meshes are left untouched, because Poisson SMOOTHS the

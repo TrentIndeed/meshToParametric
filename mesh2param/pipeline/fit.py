@@ -110,6 +110,31 @@ def fit_surfaces(
                         params=plane_params, rms_error=plane_rms,
                     )
 
+            # Dirty-mesh fit robustness: noise creates APPARENT curvature, so a
+            # flat patch mis-fits as a cylinder / cone / sphere (user-observed:
+            # "fitting did some cylindric shape instead of flat sides"). Prefer
+            # the plane whenever it fits COMPARABLY — the curved primitive then
+            # didn't earn its complexity (Occam). A GENUINE curved surface
+            # (bore, real fillet) fits a plane MUCH worse, so the ratio guard
+            # preserves it. Gated to dirty inputs; clean CAD keeps the strict
+            # logic above.
+            if (cleaned.metadata.get("scan_mode")
+                    and fitted.surface_type in (
+                        SurfaceType.CYLINDER, SurfaceType.CONE,
+                        SurfaceType.SPHERE)):
+                plane_params, plane_rms = _fit_plane(
+                    points, normals, config, inlier_thresh)
+                if plane_rms <= fitted.rms_error * 1.25 + 1e-6:
+                    logger.info(
+                        "Region %d: %s fits no better than a plane (rms %.4f "
+                        "vs %.4f) -> plane", region.region_id,
+                        fitted.surface_type.value, fitted.rms_error, plane_rms)
+                    fitted = FittedSurface(
+                        region_id=region.region_id,
+                        surface_type=SurfaceType.PLANE,
+                        params=plane_params, rms_error=plane_rms,
+                    )
+
             # Disambiguate sphere vs cylinder: both can fit hole surfaces with
             # near-zero RMS, but cylinder is the correct type for holes.
             if config.try_alternative_types and fitted.surface_type in (SurfaceType.SPHERE, SurfaceType.CYLINDER):

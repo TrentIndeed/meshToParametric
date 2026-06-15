@@ -124,11 +124,27 @@ def fit_surfaces(
                         SurfaceType.SPHERE)):
                 plane_params, plane_rms = _fit_plane(
                     points, normals, config, inlier_thresh)
-                if plane_rms <= fitted.rms_error * 1.25 + 1e-6:
+                # (a) the plane fits COMPARABLY (curved didn't earn complexity)
+                prefer = plane_rms <= fitted.rms_error * 1.25 + 1e-6
+                # (b) GEOMETRIC flatness (the real discriminator for cylinders):
+                # a cylinder whose radius exceeds its own patch extent is
+                # effectively flat (the box face the user expects), whereas a
+                # GENUINE bore/fillet has radius <= its region extent. This
+                # cleanly flattens AI15's huge-radius mis-fits while preserving
+                # AI3's tiny bore (radius << its region). Generous rms guard:
+                # a truly-flat region's plane fits fine, so 3x is safe here.
+                if (not prefer and fitted.surface_type == SurfaceType.CYLINDER):
+                    rad = float(fitted.params.get("radius", 0.0) or 0.0)
+                    ext = points.max(axis=0) - points.min(axis=0)
+                    region_diag = float(np.linalg.norm(ext)) or 1.0
+                    if (rad > 1.0 * region_diag
+                            and plane_rms <= fitted.rms_error * 3.0 + 1e-6):
+                        prefer = True
+                if prefer:
                     logger.info(
-                        "Region %d: %s fits no better than a plane (rms %.4f "
-                        "vs %.4f) -> plane", region.region_id,
-                        fitted.surface_type.value, fitted.rms_error, plane_rms)
+                        "Region %d: %s -> plane (rms %.4f vs %.4f)",
+                        region.region_id, fitted.surface_type.value,
+                        fitted.rms_error, plane_rms)
                     fitted = FittedSurface(
                         region_id=region.region_id,
                         surface_type=SurfaceType.PLANE,

@@ -71,6 +71,61 @@ class ExtrusionPlan:
         return len(self.segments) == 1
 
 
+@dataclass
+class ExtrusionGroup:
+    """A set of identical extrusions modelled as ONE feature.
+
+    Two extrudes belong together when they share an axis, profile, and depth:
+    either co-planar on the SAME span (RackMount's two side plates, AI1's four
+    top screws — one sketch, several profile loops) or a mirror/pattern of the
+    same wall. The group carries the representative profile once and the per-
+    instance (start, end) span + in-plane centre, so the export emits a single
+    sketch+extrude feature instead of N copies.
+    """
+
+    axis_idx: int
+    direction: np.ndarray
+    profile: list[tuple[float, float]]
+    area: float
+    members: list[ExtrusionSegment] = field(default_factory=list)
+    same_plane: bool = False      # all members share the start plane
+
+
+def group_extrusion_segments(
+    plan: ExtrusionPlan, area_tol: float = 0.06, len_tol: float = 0.2,
+) -> list[ExtrusionGroup]:
+    """Collapse identical extrusions into one feature each.
+
+    Key = (axis, profile area, depth). Members with the SAME span are co-planar
+    (one sketch, many loops); members with the same profile/depth but mirrored
+    spans are a symmetric pattern. Both become a single ExtrusionGroup so the
+    feature tree shows one "Sketch + Extrude" per set, like symmetric holes.
+    """
+    groups: list[ExtrusionGroup] = []
+    for seg in sorted(plan.segments, key=lambda s: -s.area):
+        placed = False
+        for g in groups:
+            if g.axis_idx != seg.axis_idx:
+                continue
+            if abs(g.area - seg.area) / max(g.area, seg.area, 1e-9) > area_tol:
+                continue
+            gl = g.members[0].length
+            if abs(gl - seg.length) / max(gl, seg.length, 1e-9) > len_tol:
+                continue
+            g.members.append(seg)
+            placed = True
+            break
+        if not placed:
+            groups.append(ExtrusionGroup(
+                axis_idx=seg.axis_idx, direction=seg.direction,
+                profile=seg.profile, area=seg.area, members=[seg],
+            ))
+    for g in groups:
+        starts = [m.start for m in g.members]
+        g.same_plane = (max(starts) - min(starts)) <= len_tol * g.members[0].length
+    return groups
+
+
 def plan_extrusions(
     cleaned: CleanedMesh,
     n_slices: int = 24,
@@ -855,14 +910,13 @@ def plan_extrusions_components(
     cross-axis dedup. Separate from `plan_extrusions` (the default); switch
     over only once validated against the reference meshes.
 
-    Validated: AI1 -> 10 objects (2 plates + 8 screws, no volume used to match
-    shapes); Mesh1/3/4 -> 1, Mesh5 -> 3 — all matching the default engine's
-    counts. KNOWN LIMITATION: a DRAFTED plate (BottomMount) is decomposed as 1
-    extrude of its biggest face, but that face is the DRAFTED one (sketch on
-    the constant-section axis would be geometrically exact). The end-to-end
-    `drift` field is recorded on each candidate for a future draft-aware axis
-    choice; a naive low-drift-first pass was tried and rejected because it
-    mis-classified RackMount's bodies and over-decomposed it."""
+    Validated against every reference mesh, matching the default engine's
+    decomposition while finding AI1's stack (no volume used to match shapes):
+    AI1 -> 10 (2 plates + 8 screws), Mesh1/3/4 -> 1, Mesh5 -> 3, and
+    BottomMount (a DRAFTED plate) -> 1 on its constant-section long axis (the
+    full-prism rule below picks the clean trapezoid axis over the drifting big
+    face). Identical extrudes can be collapsed into one feature each with
+    `group_extrusion_segments` (RackMount's two side plates, AI1's screws)."""
     mesh = trimesh.Trimesh(
         vertices=cleaned.vertices, faces=cleaned.faces, process=False,
     )
@@ -907,35 +961,36 @@ def plan_extrusions_components(
         c["_mem"] = _voxels_in_prism(
             occupied, c, pitch, tol_cells=0.5, axial_tol_cells=0.1,
         )
-    # Cross-axis dedup by SELF-COVERAGE, processing the largest profile first
-    # (sketch the biggest face, extrude the short way — the base, then bosses,
-    # then screws). A candidate is KEPT iff most of ITS OWN prism is still
-    # unclaimed: that drops the REDUNDANT phantom slices (a slab is extrudable
-    # on all three axes; its edge-on views are already claimed by the chosen
-    # face) WITHOUT dropping SMALL real objects (a screw owns its own column —
-    # nothing else covers it — so it survives no matter how little of the part
-    # it is). Volume is consulted ONLY for this redundancy test, never to
-    # match shapes or to gate on a part-fraction threshold.
-    # DOMINATION by a more-prismatic twin: a slab is extrudable on every axis,
-    # but a drafted plate's biggest face DRIFTS along its thickness
-    # (BottomMount grows 16% face-to-face) and is the WORST of the equivalent
-    # axes. Mark a candidate dominated if ANOTHER candidate with strictly
-    # lower drift describes the SAME material on a constant-section axis. The
-    # test is MUTUAL coverage (each prism covers >=80% of the other) — that is
-    # what makes them the same plate seen differently. Mutuality is essential:
-    # a thin phantom slab covers a screw's column but the screw is a tiny part
-    # of the slab, so it is NOT mutual and the screw is spared; RackMount's
-    # bodies cover DIFFERENT material so none dominates another.
     counts = [int(np.count_nonzero(c["_mem"])) or 1 for c in candidates]
-    for i, c in enumerate(candidates):
-        c["_dominated"] = False
-        for j, c2 in enumerate(candidates):
-            if c2 is c or c2.get("drift", 0.0) >= c.get("drift", 0.0) - 0.03:
+    cover_frac = [n / total for n in counts]
+
+    # FULL-PRISM preference (drafted/single-block parts). When ONE candidate
+    # explains nearly the whole part by itself, it is the single correct
+    # extrude and every other candidate is a redundant view of the same
+    # material. A drafted plate (BottomMount) is cleanly prismatic only along
+    # its constant-section axis (the trapezoid swept the 213mm length covers
+    # ~100% as one object); its drifting big face FRAGMENTS, so no single
+    # candidate there reaches the bar — the clean axis wins for free, lowest
+    # drift breaking ties. This is INERT for genuinely multi-body parts (AI1's
+    # stack, RackMount's base+plates) where NO single prism covers the part,
+    # so they fall through to the per-object pass below unchanged.
+    FULL = 0.92
+    full = [i for i, f in enumerate(cover_frac) if f >= FULL]
+    if full:
+        best = min(full, key=lambda i: (candidates[i].get("drift", 0.0),
+                                        -cover_frac[i]))
+        bc = candidates[best]
+        kept = [bc]
+        for i, c in enumerate(candidates):
+            if i == best:
                 continue
-            inter = int(np.count_nonzero(c["_mem"] & c2["_mem"]))
-            if inter / counts[i] >= 0.8 and inter / counts[j] >= 0.8:
-                c["_dominated"] = True
-                break
+            inter = int(np.count_nonzero(c["_mem"] & bc["_mem"]))
+            if inter / counts[i] < 0.8:   # material the full prism doesn't own
+                kept.append(c)
+        chosen = [(c, cover_frac[candidates.index(c)], 0.0) for c in kept]
+        segments = [_to_segment(c, gf, 1.0) for c, gf, _ in chosen]
+        return ExtrusionPlan(segments=segments, coverage_frac=1.0,
+                             voxel_pitch=pitch)
 
     # Cross-axis dedup by SELF-COVERAGE, largest profile first (sketch the
     # biggest face, extrude the short way — the base, then bosses, then
@@ -946,18 +1001,9 @@ def plan_extrusions_components(
     # nothing else covers it — so it survives no matter how little of the part
     # it is). Volume is consulted ONLY for this redundancy test, never to
     # match shapes or to gate on a part-fraction threshold.
-    # Order by how much of the part each candidate explains AS A SINGLE
-    # OBJECT (its own prism's voxel count), not raw profile area: a part that
-    # is cleanly prismatic along ONE axis (BottomMount along its 213mm length)
-    # then wins as one extrude over a fragmented near-constant axis whose
-    # biggest single face happens to be larger. Plates still precede screws
-    # (they explain far more), so AI1/RackMount are unchanged.
     unclaimed = np.ones(total, dtype=bool)
-    chosen: list[dict] = []
-    order = sorted(candidates, key=lambda c: -int(np.count_nonzero(c["_mem"])))
-    for c in order:
-        if c["_dominated"]:
-            continue  # a more-prismatic axis describes this same material
+    chosen = []
+    for c in sorted(candidates, key=lambda c: -c["area"]):
         own = int(np.count_nonzero(c["_mem"]))
         if own == 0:
             continue

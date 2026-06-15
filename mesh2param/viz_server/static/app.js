@@ -1035,8 +1035,28 @@ function populateUI(statusData) {
           if (s.z > s.x) geo.rotateY(Math.PI / 2);          // longest -> X
           geo.computeBoundingBox();
         };
+        // Canonical orient leaves a 180-deg ambiguity (which face is up). The
+        // mesh frame and the regularized CAD frame can disagree on it, so one
+        // ends up flipped. Resolve by the vertex centroid: flip so the heavier
+        // half is consistently on the same side for both.
+        const _flipConsistent = (geo) => {
+          geo.computeBoundingBox();
+          const c = geo.boundingBox.getCenter(new THREE.Vector3());
+          const pos = geo.attributes.position;
+          let cy = 0, cx = 0;
+          for (let i = 0; i < pos.count; i++) { cy += pos.getY(i); cx += pos.getX(i); }
+          cy /= pos.count; cx /= pos.count;
+          if (cy - c.y < 0) { geo.rotateX(Math.PI); }      // heavy side up
+          geo.computeBoundingBox();
+          const c2 = geo.boundingBox.getCenter(new THREE.Vector3());
+          let cx2 = 0; for (let i = 0; i < pos.count; i++) cx2 += pos.getX(i); cx2 /= pos.count;
+          if (cx2 - c2.x < 0) { geo.rotateY(Math.PI); }     // heavy side +X
+          geo.computeBoundingBox();
+        };
         _canonicalOrient(meshGeo);
         _canonicalOrient(cadGeo);
+        _flipConsistent(meshGeo);
+        _flipConsistent(cadGeo);
 
         // Center both, then place side by side with small gap
         const meshBox = new THREE.Box3().setFromBufferAttribute(meshGeo.attributes.position);

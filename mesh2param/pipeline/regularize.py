@@ -267,3 +267,217 @@ def regularize_mesh(cleaned, regions, fitted, snap_angle_deg: float = 25.0,
 def _normal_of_fit(fp) -> np.ndarray:
     return _unit((fp.snapped_params or {}).get("normal")
                  or fp.params.get("normal", [0, 0, 1.0]))
+
+
+def _line_intersect_2d(p1, d1, p2, d2):
+    """Intersection of lines p1+t·d1 and p2+s·d2 (2D), or None if parallel."""
+    cross = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(cross) < 1e-9:
+        return None
+    diff = p2 - p1
+    t = (diff[0] * d2[1] - diff[1] * d2[0]) / cross
+    return p1 + t * d1
+
+
+def _fit_circle_2d_local(pts):
+    arr = np.asarray(pts, dtype=float)
+    A = np.c_[2 * arr[:, 0], 2 * arr[:, 1], np.ones(len(arr))]
+    sol, *_ = np.linalg.lstsq(A, (arr ** 2).sum(1), rcond=None)
+    cx, cy = float(sol[0]), float(sol[1])
+    r = float(np.sqrt(max(sol[2] + cx * cx + cy * cy, 0.0)))
+    return cx, cy, r
+
+
+def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0):
+    """Reduce a (possibly dense, noisy) 2D outline to axis-aligned straight
+    runs + their corner intersections + per-corner fillet radii.
+
+    Like feature_builder._regularize_profile but FILLET-OPTIONAL (sharp 90°
+    corners are fine) and tolerant of dense sampling (Douglas-Peucker first, a
+    generous axis tolerance). Returns (sharp_corner_pts, {idx: radius}) or
+    (None, None) if it isn't an axis-aligned prismatic outline.
+    """
+    from shapely.geometry import Polygon
+    P = np.asarray(pts_mm, dtype=float)
+    try:
+        s = Polygon(P).buffer(0).simplify(0.4, preserve_topology=True)
+        if s.geom_type == "Polygon" and len(s.exterior.coords) >= 5:
+            P = np.asarray(s.exterior.coords[:-1], dtype=float)
+    except Exception:
+        pass
+    n = len(P)
+    if n < 4:
+        return None, None
+    seg = np.roll(P, -1, axis=0) - P
+    L = np.linalg.norm(seg, axis=1)
+    d = seg / (L[:, None] + 1e-12)
+    ct = np.cos(np.radians(axis_tol_deg))
+    ax = []
+    for i in range(n):
+        if abs(d[i, 0]) > ct:
+            ax.append((0, 1.0 if d[i, 0] >= 0 else -1.0))
+        elif abs(d[i, 1]) > ct:
+            ax.append((1, 1.0 if d[i, 1] >= 0 else -1.0))
+        else:
+            ax.append(None)
+    straight = [ax[i] is not None and L[i] >= min_run for i in range(n)]
+    if sum(straight) < 3:
+        return None, None
+
+    def _same(a, b):
+        return a is not None and b is not None and a[0] == b[0] and a[1] == b[1]
+
+    start = next((i for i in range(n) if straight[i]
+                  and not (straight[(i - 1) % n] and _same(ax[(i - 1) % n], ax[i]))),
+                 None)
+    if start is None:
+        return None, None
+    runs, i, guard = [], start, 0
+    while guard < 4 * n:
+        guard += 1
+        if straight[i]:
+            a = ax[i]
+            mem = [i]
+            j = (i + 1) % n
+            while guard < 4 * n and straight[j] and _same(ax[j], a):
+                mem.append(j)
+                j = (j + 1) % n
+                guard += 1
+            runs.append((a, mem))
+            i = j
+        else:
+            i = (i + 1) % n
+        if i == start:
+            break
+    # Merge consecutive runs on the SAME axis (one side split by a short
+    # non-straight bit) so adjacent runs are always perpendicular — otherwise
+    # two parallel runs have no corner intersection and the whole thing bails.
+    merged = []
+    for a, mem in runs:
+        if merged and merged[-1][0][0] == a[0]:
+            merged[-1] = (merged[-1][0], merged[-1][1] + mem)
+        else:
+            merged.append((a, mem))
+    if len(merged) > 1 and merged[0][0][0] == merged[-1][0][0]:
+        merged[0] = (merged[0][0], merged[-1][1] + merged[0][1])
+        merged.pop()
+    runs = merged
+    if len(runs) < 3:
+        return None, None
+    run_lines = []
+    for (axis, _sign), mem in runs:
+        vidx = mem + [(mem[-1] + 1) % n]
+        ctr = P[vidx].mean(axis=0)
+        dvec = np.zeros(2)
+        dvec[axis] = 1.0
+        run_lines.append((ctr, dvec, mem))
+    m = len(runs)
+    sharp, fillets = [], {}
+    for k in range(m):
+        c1, d1, m1 = run_lines[k]
+        c2, d2, m2 = run_lines[(k + 1) % m]
+        X = _line_intersect_2d(c1, d1, c2, d2)
+        if X is None:
+            return None, None
+        bend, j, g = [], (m1[-1] + 1) % n, 0
+        while j != m2[0] and g < n:
+            bend.append(j)
+            j = (j + 1) % n
+            g += 1
+        if len(bend) >= 2:
+            try:
+                _, _, rr = _fit_circle_2d_local(P[bend])
+                if 0.3 < rr < 60.0:
+                    fillets[len(sharp)] = rr
+            except np.linalg.LinAlgError:
+                pass
+        sharp.append((float(X[0]), float(X[1])))
+    return (sharp, fillets) if len(sharp) >= 3 else (None, None)
+
+
+def regularize_profile_2d(pts_mm: list, arc_samples: int = 8) -> list | None:
+    """Stage F (sketch): clean a bumpy 2D outline into axis-aligned straight
+    sides meeting at exact corners, with tangent arcs at the rounded ones.
+
+    A scan / AI mesh's extruded base profile comes out wavy with corners that
+    aren't quite 90 deg (user's "bumpy sketch / lines not 90 from a filleted
+    corner"). This reuses `feature_builder._regularize_profile` (which snaps
+    straight runs to their axis and finds the sharp corners + per-corner
+    radii), then RECONSTRUCTS a point polygon: straight axis-aligned sides and,
+    at each rounded corner, a tangent circular arc sampled to points. Returns
+    the clean polygon, or None when the outline isn't a prismatic axis-aligned
+    shape (caller keeps the original). Gate on scan/dirty meshes — clean CAD
+    profiles are already exact.
+    """
+    # Reject genuinely ROUND / organic outlines: a circle (flange) sampled as
+    # a polygon has near-axis segments only near its 4 cardinal points, so most
+    # of the perimeter is NOT axis-aligned — regularizing it would turn a
+    # circle into a polygon. Only proceed when axis-aligned sides dominate.
+    P0 = np.asarray(pts_mm, dtype=float)
+    if len(P0) >= 4:
+        seg0 = np.roll(P0, -1, axis=0) - P0
+        L0 = np.linalg.norm(seg0, axis=1)
+        d0 = seg0 / (L0[:, None] + 1e-12)
+        near_axis = np.abs(d0).max(1) > np.cos(np.radians(10.0))
+        if L0.sum() > 0 and float(L0[near_axis].sum() / L0.sum()) < 0.6:
+            return None
+
+    sharp, fillets = _regularize_outline(pts_mm)
+    if not sharp or len(sharp) < 3:
+        return None
+    S = np.asarray(sharp, dtype=float)
+    n = len(S)
+    side_len = np.linalg.norm(np.roll(S, -1, axis=0) - S, axis=1)
+    out: list[list[float]] = []
+    for i in range(n):
+        cur = S[i]
+        r = float((fillets or {}).get(i, 0.0))
+        din = _unit(S[(i - 1) % n] - cur)     # toward previous side
+        dout = _unit(S[(i + 1) % n] - cur)    # toward next side
+        cosang = float(np.clip(din @ dout, -1.0, 1.0))
+        half = np.arccos(cosang) / 2.0
+        # tangent distance from the corner; cap so the arc fits both sides
+        tdist = r / np.tan(half) if half > 1e-3 else 0.0
+        max_t = 0.45 * min(side_len[(i - 1) % n], side_len[i])
+        if r <= 0 or half <= 1e-3 or half >= np.pi / 2 - 1e-3 or tdist > max_t:
+            out.append([float(cur[0]), float(cur[1])])
+            continue
+        t_in = cur + din * tdist
+        t_out = cur + dout * tdist
+        center = cur + _unit(din + dout) * (r / np.sin(half))
+        a0 = np.arctan2(t_in[1] - center[1], t_in[0] - center[0])
+        a1 = np.arctan2(t_out[1] - center[1], t_out[0] - center[0])
+        da = (a1 - a0 + np.pi) % (2 * np.pi) - np.pi   # short way
+        for s in range(arc_samples + 1):
+            a = a0 + da * s / arc_samples
+            out.append([float(center[0] + r * np.cos(a)),
+                        float(center[1] + r * np.sin(a))])
+    if len(out) < 3:
+        return None
+
+    # SELF-GATE: only return the regularized outline when it is STRICTLY
+    # cleaner than the input AND preserves the shape. The mesh-level
+    # regularization already flattens many base outlines (AI15's was 0.4 deg);
+    # forcing a run/arc rebuild on an already-clean outline can make it WORSE.
+    # So measure straight-side deviation from axis before/after and the area;
+    # if it doesn't clearly improve, return None and the caller keeps the
+    # original.
+    def _straight_dev(p):
+        Q = np.asarray(p, dtype=float)
+        s = np.roll(Q, -1, axis=0) - Q
+        ln = np.linalg.norm(s, axis=1)
+        di = s / (ln[:, None] + 1e-12)
+        ang = np.degrees(np.arccos(np.clip(np.abs(di).max(1), -1.0, 1.0)))
+        lg = ln > 3.0
+        return float(np.median(ang[lg])) if lg.any() else 0.0
+    try:
+        from shapely.geometry import Polygon
+        a_in = abs(Polygon(pts_mm).buffer(0).area)
+        a_out = abs(Polygon(out).buffer(0).area)
+        if a_in > 0 and abs(a_out - a_in) / a_in > 0.03:
+            return None
+    except Exception:
+        return None
+    if _straight_dev(out) >= _straight_dev(pts_mm) - 0.05:
+        return None
+    return out

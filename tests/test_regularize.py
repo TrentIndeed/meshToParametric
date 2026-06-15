@@ -146,3 +146,53 @@ def test_regularize_mesh_flattens_noisy_box():
     assert all(r["snapped"] for r in report)     # all 6 box faces snapped
     assert after < 0.01                          # faces now exactly axis-aligned
     assert after < before / 10.0                 # and a big improvement
+
+
+# --------------------------------------------------------------------------
+# Stage F: 2D sketch-profile regularization (axis-snap sides + tangent arcs)
+# --------------------------------------------------------------------------
+def _rounded_rect(W, H, r, ns=10):
+    pts, hw, hh = [], W / 2, H / 2
+    corners = [(hw - r, -hh + r, -np.pi / 2, 0), (hw - r, hh - r, 0, np.pi / 2),
+               (-hw + r, hh - r, np.pi / 2, np.pi),
+               (-hw + r, -hh + r, np.pi, 3 * np.pi / 2)]
+    for cx, cy, a0, a1 in corners:
+        for k in range(ns + 1):
+            a = a0 + (a1 - a0) * k / ns
+            pts.append((cx + r * np.cos(a), cy + r * np.sin(a)))
+    return pts
+
+
+def _straight_dev_deg(pts):
+    from mesh2param.pipeline.regularize import regularize_profile_2d  # noqa
+    Q = np.asarray(pts, float)
+    seg = np.roll(Q, -1, 0) - Q
+    L = np.linalg.norm(seg, axis=1)
+    d = seg / (L[:, None] + 1e-9)
+    ang = np.degrees(np.arccos(np.clip(np.abs(d).max(1), -1, 1)))
+    long = L > 3.0
+    return float(np.median(ang[long])) if long.any() else 0.0
+
+
+def test_profile_regularizer_snaps_sides_and_keeps_area():
+    from shapely.geometry import Polygon
+    from mesh2param.pipeline.regularize import regularize_profile_2d
+    clean = _rounded_rect(100, 60, 8)
+    P = np.asarray(clean)
+    t = np.arange(len(P) * 2) * 0.37
+    g = (np.sin(t) + np.sin(2.7 * t + 1)) / np.sqrt(2)
+    noisy = (P + g.reshape(-1, 2) * 0.4).tolist()
+    reg = regularize_profile_2d(noisy)
+    assert reg is not None and len(reg) >= 3
+    assert _straight_dev_deg(reg) < 0.05          # sides exactly axis-aligned
+    assert _straight_dev_deg(reg) < _straight_dev_deg(noisy)
+    a_clean, a_reg = Polygon(clean).area, Polygon(reg).area
+    assert abs(a_reg - a_clean) / a_clean < 0.02  # shape preserved
+
+
+def test_profile_regularizer_rejects_non_prismatic():
+    from mesh2param.pipeline.regularize import regularize_profile_2d
+    # a circle is not an axis-aligned prismatic outline -> None
+    circ = [(20 * np.cos(a), 20 * np.sin(a))
+            for a in np.linspace(0, 2 * np.pi, 40, endpoint=False)]
+    assert regularize_profile_2d(circ) is None

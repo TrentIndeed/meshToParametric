@@ -1621,6 +1621,24 @@ def _extract_profile_and_holes(
             )
         best_profiles = kept_profiles
 
+    # Stage F (scan/AI only): regularize the OUTER profile — snap its straight
+    # sides to axis-aligned and its corners to exact 90 deg with tangent arcs.
+    # A scan/AI base profile comes out wavy with non-90 corners (user's "bumpy
+    # sketch"); clean CAD profiles are already exact, so this is gated off for
+    # them. Inner cutouts are left as-is.
+    if (best_profiles and cleaned.metadata.get("scan_mode")
+            and len(best_profiles[0]) >= 6):
+        try:
+            from mesh2param.pipeline.regularize import regularize_profile_2d
+            reg = regularize_profile_2d(best_profiles[0])
+            if reg and len(reg) >= 3:
+                logger.info("Regularized base profile: %d -> %d pts "
+                            "(axis-snapped straights + tangent corners)",
+                            len(best_profiles[0]), len(reg))
+                best_profiles = [reg] + best_profiles[1:]
+        except Exception:
+            logger.debug("Profile regularization failed", exc_info=True)
+
     return best_profiles, extrude_start, holes, chamfers, fillets
 
 

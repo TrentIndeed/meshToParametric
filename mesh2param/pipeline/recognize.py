@@ -82,8 +82,12 @@ def recognize_features(
     # segments as JOIN extrude features below.
     extrusion_plan = None
     try:
-        from mesh2param.pipeline.extrusion import plan_extrusions
-        extrusion_plan = plan_extrusions(cleaned)
+        if config.use_component_planner:
+            from mesh2param.pipeline.extrusion import plan_extrusions_components
+            extrusion_plan = plan_extrusions_components(cleaned)
+        else:
+            from mesh2param.pipeline.extrusion import plan_extrusions
+            extrusion_plan = plan_extrusions(cleaned)
     except Exception:
         logger.exception("Extrusion engine failed; using legacy base logic")
 
@@ -107,10 +111,16 @@ def recognize_features(
     # timeline: Extrude Base -> Extrude Join x N -> holes -> blends.
     if extrusion_plan is not None and len(extrusion_plan.segments) >= 2:
         primary = extrusion_plan.segments[0]
-        if primary.gain_frac >= 0.4:
+        # The component planner's segments ARE the validated decomposition —
+        # every one is a real body (AI1's eight screws each explain <0.3% of
+        # the volume), so emit them all. The volume-greedy plan still uses the
+        # 40%/3% noise gates it was tuned with.
+        primary_gate = 0.0 if config.use_component_planner else 0.4
+        seg_gate = 0.0 if config.use_component_planner else 0.03
+        if primary.gain_frac >= primary_gate:
             from mesh2param.pipeline.extrusion import segment_inner_rings
             for seg in extrusion_plan.segments[1:]:
-                if seg.gain_frac < 0.03:
+                if seg.gain_frac < seg_gate:
                     continue
                 try:
                     inner = segment_inner_rings(cleaned, seg)

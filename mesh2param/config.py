@@ -156,6 +156,13 @@ class RecognizeConfig(BaseModel):
     slot_max_width_ratio: float = 0.3  # max slot width as fraction of bbox diagonal
     chamfer_width_ratio: float = 0.05  # max chamfer extent as fraction of bbox diagonal
     min_feature_faces: int = 3  # minimum faces for a feature
+    # Use the component-tracking extrusion planner (plan_extrusions_components)
+    # instead of the default volume-greedy plan_extrusions. It decomposes a
+    # part into every prismatic body by tracking cross-section SHAPE — so a
+    # stacked part (AI1: a plate, a smaller plate, eight corner screws) yields
+    # all its extrudes instead of one over-merged slab. Off by default until
+    # the build path is fully validated; see pipeline/extrusion.py.
+    use_component_planner: bool = False
 
     def model_post_init(self, __context) -> None:
         logger.debug(

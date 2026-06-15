@@ -907,18 +907,22 @@ def _track_axis_components(
             if (end - start) < min_span:
                 continue
             widest = max(sub, key=lambda e: e["sig"]["area"])["sig"]
-            # Drift: the END-TO-END change in cross-section across the span.
-            # ~0 for a true prism (and for a part with an INTERIOR window/cut,
-            # whose two faces are both full — so a window is NOT read as
-            # drift); high for a monotonic draft/taper (BottomMount's big face
-            # grows 16% face-to-face — not a valid prismatic axis) or a domed
-            # screw head. Used to reject big drifting faces in favour of the
-            # constant-section axis. Robust ends = median of the first/last few.
+            # Drift: the change in cross-section across the span's INTERIOR
+            # (the 25% and 75% stations), NOT its end faces. ~0 for a true
+            # prism; high only for a monotonic draft/taper that changes through
+            # the whole body (BottomMount's big face). Sampling the interior
+            # makes it immune to FILLETS, which only round the cross-section
+            # over a short ramp at an END (a bottom-edge fillet, or the seam
+            # between two stacked plates) — those ramps are absorbed into the
+            # plateau and must NOT read as a draft that flips the axis. A real
+            # draft still shows between the quartiles; a fillet does not.
             sub_areas = [e["sig"]["area"] for e in sub]
-            k = max(1, len(sub_areas) // 5)
-            a_start = float(np.median(sub_areas[:k]))
-            a_end = float(np.median(sub_areas[-k:]))
-            drift = abs(a_end - a_start) / max(a_end, a_start, 1e-9)
+            n_sa = len(sub_areas)
+            w = max(1, n_sa // 10)
+            lo_i, hi_i = n_sa // 4, (3 * n_sa) // 4
+            a_lo = float(np.median(sub_areas[max(0, lo_i - w):lo_i + w + 1]))
+            a_hi = float(np.median(sub_areas[max(0, hi_i - w):hi_i + w + 1]))
+            drift = abs(a_hi - a_lo) / max(a_hi, a_lo, 1e-9)
             # Extend the span to the part face at the ends (the slice inset
             # and plateau-centre assignment leave it a half-step short).
             s0 = lo if start <= stations[0] + 1e-9 else start - half
@@ -927,12 +931,32 @@ def _track_axis_components(
                 "axis": axis,
                 "start": float(s0),
                 "end": float(e0),
-                "profile": widest["coords"],
+                "profile": _simplify_profile(widest["coords"], diag),
                 "area": float(widest["area"]),
                 "centroid": widest["centroid"],
                 "drift": float(drift),
             })
     return out
+
+
+def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
+    """Clean a raw slice outline into a sketchable profile.
+
+    The widest-slice polygon of a dirty AI/scan mesh carries hundreds of jagged
+    vertices and can self-intersect — extruding it produces an invalid face and
+    a near-empty solid. buffer(0) heals self-intersections; simplify drops the
+    noise while preserving corners and curve sampling (a screw circle keeps
+    enough points to stay round)."""
+    from shapely.geometry import Polygon
+    p = Polygon(coords)
+    if not p.is_valid:
+        p = p.buffer(0)
+        if p.geom_type == "MultiPolygon":
+            p = max(p.geoms, key=lambda g: g.area)
+    p = p.simplify(max(0.003 * diag, 0.15), preserve_topology=True)
+    if p.is_empty or p.geom_type != "Polygon":
+        return [(float(x), float(y)) for x, y in coords]
+    return [(float(x), float(y)) for x, y in p.exterior.coords[:-1]]
 
 
 def plan_extrusions_components(
@@ -1010,8 +1034,13 @@ def plan_extrusions_components(
     FULL = 0.92
     full = [i for i, f in enumerate(cover_frac) if f >= FULL]
     if full:
-        best = min(full, key=lambda i: (candidates[i].get("drift", 0.0),
-                                        -cover_frac[i]))
+        # Lowest drift wins (the constant-section axis over a drafted face);
+        # ties go to the LARGEST profile (sketch the biggest face, extrude the
+        # short way), then highest coverage. So an edge-filleted plate — zero
+        # interior drift on every axis — picks its big flat face, the fillet
+        # handled downstream.
+        best = min(full, key=lambda i: (round(candidates[i].get("drift", 0.0), 3),
+                                        -candidates[i]["area"], -cover_frac[i]))
         bc = candidates[best]
         kept = [bc]
         for i, c in enumerate(candidates):

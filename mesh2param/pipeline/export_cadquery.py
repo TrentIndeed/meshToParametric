@@ -2248,21 +2248,27 @@ def _build_stepwise(
         script_lines.append(f"result = result.polyline(hole_profile_{_ci}).close()")
 
     # --- Step 1: Extrude base profile ---
-    # Try both directions, keep the one that overlaps with the actual part bbox.
-    part_min = float(cleaned.bbox[0][primary_axis])
-    part_max = float(cleaned.bbox[1][primary_axis])
+    # Try both directions, keep the one landing in the base's INTENDED SPAN
+    # [extrude_start, extrude_start + extrude_dir*depth]. Anchoring on the part
+    # bbox fails for a STACKED part (a base plate in the MIDDLE — AI1): the
+    # part extends both ways from the base plane, so both directions overlap it
+    # equally and the tie sends the base the wrong way (into the bottom plate's
+    # region). The base span has a definite direction, so use it.
+    _ed = 1.0 if float(extrude_dir[primary_axis]) >= 0 else -1.0
+    tgt_lo = min(extrude_start, extrude_start + _ed * depth)
+    tgt_hi = max(extrude_start, extrude_start + _ed * depth)
 
     wp_pos = cq.Workplane(plane_name, origin=tuple(origin_3d))
     wp_pos = _draw_profile_with_holes(wp_pos, profiles[0], base_inner_cutouts).extrude(depth)
     bb_pos = wp_pos.val().BoundingBox()
     pos_vals = [(bb_pos.xmin, bb_pos.xmax), (bb_pos.ymin, bb_pos.ymax), (bb_pos.zmin, bb_pos.zmax)]
-    pos_overlap = min(pos_vals[primary_axis][1], part_max) - max(pos_vals[primary_axis][0], part_min)
+    pos_overlap = min(pos_vals[primary_axis][1], tgt_hi) - max(pos_vals[primary_axis][0], tgt_lo)
 
     wp_neg = cq.Workplane(plane_name, origin=tuple(origin_3d))
     wp_neg = _draw_profile_with_holes(wp_neg, profiles[0], base_inner_cutouts).extrude(-depth)
     bb_neg = wp_neg.val().BoundingBox()
     neg_vals = [(bb_neg.xmin, bb_neg.xmax), (bb_neg.ymin, bb_neg.ymax), (bb_neg.zmin, bb_neg.zmax)]
-    neg_overlap = min(neg_vals[primary_axis][1], part_max) - max(neg_vals[primary_axis][0], part_min)
+    neg_overlap = min(neg_vals[primary_axis][1], tgt_hi) - max(neg_vals[primary_axis][0], tgt_lo)
 
     if neg_overlap > pos_overlap:
         wp = wp_neg

@@ -969,7 +969,19 @@ def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
     p = p.simplify(max(0.003 * diag, 0.15), preserve_topology=True)
     if p.is_empty or p.geom_type != "Polygon":
         return [(float(x), float(y)) for x, y in coords]
-    return [(float(x), float(y)) for x, y in p.exterior.coords[:-1]]
+    simplified = [(float(x), float(y)) for x, y in p.exterior.coords[:-1]]
+    # Regularize into a true CAD sketch: axis-aligned straight sides meeting at
+    # exact 90-deg corners, with a tangent arc at each rounded corner. Self-
+    # gating — returns None for a round/organic outline, so a screw circle
+    # stays a circle while a wavy plate outline becomes a clean rectangle.
+    try:
+        from mesh2param.pipeline.regularize import regularize_profile_2d
+        reg = regularize_profile_2d(simplified)
+        if reg and len(reg) >= 3:
+            return [(float(x), float(y)) for x, y in reg]
+    except Exception:
+        pass
+    return simplified
 
 
 def plan_extrusions_components(

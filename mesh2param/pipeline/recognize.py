@@ -176,6 +176,17 @@ def recognize_features(
     # same face — they share a sketch in CAD intent, not N separate
     # operations.
     hole_features = _group_symmetric_holes(hole_features)
+    if config.use_component_planner:
+        # The component planner builds solid prismatic BODIES (a screw/standoff
+        # is a JOIN boss). A cylinder it already added must NOT then be drilled
+        # as a hole — that destroys the boss (AI1's four corner screws were
+        # being cut through). Drop holes that are coaxial with, and centred
+        # inside, a boss the planner emitted.
+        boss_feats = [f for f in features if f.type == FeatureType.BOSS]
+        hole_features = [
+            (hf, rids) for hf, rids in hole_features
+            if not _hole_coaxial_with_boss(hf, boss_feats)
+        ]
     for hf, rids in hole_features:
         hf.dependencies = [base_idx]
         features.append(hf)
@@ -322,6 +333,48 @@ def _thin_axis_tapered(verts: np.ndarray, bbox: np.ndarray, axis: int,
     if max(a_min, a_max) < 1e-9:
         return False
     return (min(a_min, a_max) / max(a_min, a_max)) < ratio_thresh
+
+
+def _hole_coaxial_with_boss(hole: Feature, bosses: list[Feature]) -> bool:
+    """True if EVERY position of this hole sits inside a coaxial boss.
+
+    A cylinder the component planner already built as a solid boss (a screw /
+    standoff) must not also be drilled as a hole. Compares the hole's axis to
+    each boss's axis_idx and its centre(s) to the boss footprint in that plane.
+    Requires ALL positions to coincide so a mixed pattern (some real holes)
+    is kept.
+    """
+    from shapely.geometry import Point, Polygon
+
+    sg = hole.sketch_geometry or {}
+    centers = []
+    if sg.get("center") is not None:
+        centers.append(np.asarray(sg["center"], dtype=float))
+    for p in sg.get("positions") or []:
+        centers.append(np.asarray(p, dtype=float))
+    if not centers:
+        return False
+    hax = int(np.argmax(np.abs(np.asarray(hole.direction, dtype=float))))
+    u, v = (a for a in range(3) if a != hax)
+    boss_polys = []
+    for b in bosses:
+        bsg = b.sketch_geometry or {}
+        if int(bsg.get("axis_idx", -1)) != hax:
+            continue
+        pts = bsg.get("points")
+        if pts and len(pts) >= 3:
+            try:
+                boss_polys.append(Polygon(pts).buffer(0.5))
+            except Exception:
+                continue
+    if not boss_polys:
+        return False
+    on = 0
+    for c in centers:
+        pt = Point(float(c[u]), float(c[v]))
+        if any(poly.contains(pt) for poly in boss_polys):
+            on += 1
+    return on == len(centers)
 
 
 def _find_base_extrusion(

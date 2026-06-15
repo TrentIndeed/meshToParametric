@@ -170,6 +170,9 @@
 ## Scans + AI-generated ("dirty") meshes
 > Market note: scans AND AI-generated meshes (Meshy/Tripo) are the SAME
 > dirty-mesh problem and the same target market — see `docs/ROADMAP.md`.
+> EYES-ON findings from real AI parts (regularize stops at interior flats,
+> bumpy extruded profile, flat-fit-as-cylinder, AI13 non-watertight repair
+> fails, Mesh5 cosmetic corner triangles) → `docs/AI_MESH_FINDINGS.md`.
 
 **Front-end BUILT so far (2026-06-13/14) — `docs/SCAN_RECOVERY_PLAN.md`:**
 - [x] Feature-preserving **denoise** — `ingest._bilateral_denoise` (Zheng

@@ -1018,6 +1018,26 @@ function populateUI(statusData) {
         });
         const cadObj = new THREE.Mesh(cadGeo, cadMat);
 
+        // The preview mesh (raw ingest frame) and the CAD model (pipeline
+        // frame, after scan-align/regularize snap the part to world axes) can
+        // sit in DIFFERENT orientations — the mesh lies flat while the model
+        // stands upright. Canonically orient BOTH the same way (thinnest axis
+        // up, longest axis along X) so the split view compares like with like.
+        const _canonicalOrient = (geo) => {
+          geo.computeBoundingBox();
+          let s = geo.boundingBox.getSize(new THREE.Vector3());
+          const dims = [s.x, s.y, s.z];
+          const thin = dims.indexOf(Math.min(...dims));
+          if (thin === 0) geo.rotateZ(Math.PI / 2);        // X-thin -> Y-thin
+          else if (thin === 2) geo.rotateX(Math.PI / 2);   // Z-thin -> Y-thin
+          geo.computeBoundingBox();
+          s = geo.boundingBox.getSize(new THREE.Vector3());
+          if (s.z > s.x) geo.rotateY(Math.PI / 2);          // longest -> X
+          geo.computeBoundingBox();
+        };
+        _canonicalOrient(meshGeo);
+        _canonicalOrient(cadGeo);
+
         // Center both, then place side by side with small gap
         const meshBox = new THREE.Box3().setFromBufferAttribute(meshGeo.attributes.position);
         const cadBox = new THREE.Box3().setFromBufferAttribute(cadGeo.attributes.position);

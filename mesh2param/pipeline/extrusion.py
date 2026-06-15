@@ -715,11 +715,42 @@ def _segment_track_plateaus(
         i = j + 1 if j > i else i + 1
     if not plateaus:
         return [track]
+    # Merge an interior-CUT plateau: a strict local minimum in area bracketed
+    # by larger plateaus of similar area is removed material (Front Plate's
+    # window — full / reduced-middle / full), not a stacked level. Absorb it
+    # into one object with the larger profile (the window becomes a downstream
+    # cut). A terminal step (AI1's bottom plate -> bigger main plate) is NOT
+    # bracketed, so it still splits.
+    pa = [float(np.median([areas[i] for i in range(a, b + 1)])) for a, b in plateaus]
+    parent = list(range(len(plateaus)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x, y):
+        parent[_find(x)] = _find(y)
+
+    for k in range(1, len(plateaus) - 1):
+        sim = abs(pa[k - 1] - pa[k + 1]) / max(pa[k - 1], pa[k + 1], 1e-9) < 0.1
+        if pa[k] < pa[k - 1] and pa[k] < pa[k + 1] and sim:
+            _union(k - 1, k)
+            _union(k, k + 1)
+    # Group plateaus by merged root, then assign every slice to its nearest
+    # plateau and bucket by that plateau's group.
     centers = [0.5 * (pos[a] + pos[b]) for a, b in plateaus]
-    groups = [[] for _ in plateaus]
+    roots = [_find(k) for k in range(len(plateaus))]
+    order, seen = [], {}
+    for r in roots:
+        if r not in seen:
+            seen[r] = len(order)
+            order.append(r)
+    groups = [[] for _ in order]
     for k in range(n):
-        g = int(np.argmin([abs(pos[k] - cc) for cc in centers]))
-        groups[g].append(track[k])
+        p = int(np.argmin([abs(pos[k] - cc) for cc in centers]))
+        groups[seen[roots[p]]].append(track[k])
     return [g for g in groups if g]
 
 
@@ -788,6 +819,18 @@ def _track_axis_components(
             if (end - start) < min_span:
                 continue
             widest = max(sub, key=lambda e: e["sig"]["area"])["sig"]
+            # Drift: the END-TO-END change in cross-section across the span.
+            # ~0 for a true prism (and for a part with an INTERIOR window/cut,
+            # whose two faces are both full — so a window is NOT read as
+            # drift); high for a monotonic draft/taper (BottomMount's big face
+            # grows 16% face-to-face — not a valid prismatic axis) or a domed
+            # screw head. Used to reject big drifting faces in favour of the
+            # constant-section axis. Robust ends = median of the first/last few.
+            sub_areas = [e["sig"]["area"] for e in sub]
+            k = max(1, len(sub_areas) // 5)
+            a_start = float(np.median(sub_areas[:k]))
+            a_end = float(np.median(sub_areas[-k:]))
+            drift = abs(a_end - a_start) / max(a_end, a_start, 1e-9)
             # Extend the span to the part face at the ends (the slice inset
             # and plateau-centre assignment leave it a half-step short).
             s0 = lo if start <= stations[0] + 1e-9 else start - half
@@ -799,6 +842,7 @@ def _track_axis_components(
                 "profile": widest["coords"],
                 "area": float(widest["area"]),
                 "centroid": widest["centroid"],
+                "drift": float(drift),
             })
     return out
 
@@ -809,7 +853,16 @@ def plan_extrusions_components(
 ) -> ExtrusionPlan:
     """Component-tracking + plateau decomposition with coverage-based
     cross-axis dedup. Separate from `plan_extrusions` (the default); switch
-    over only once validated against the reference meshes."""
+    over only once validated against the reference meshes.
+
+    Validated: AI1 -> 10 objects (2 plates + 8 screws, no volume used to match
+    shapes); Mesh1/3/4 -> 1, Mesh5 -> 3 — all matching the default engine's
+    counts. KNOWN LIMITATION: a DRAFTED plate (BottomMount) is decomposed as 1
+    extrude of its biggest face, but that face is the DRAFTED one (sketch on
+    the constant-section axis would be geometrically exact). The end-to-end
+    `drift` field is recorded on each candidate for a future draft-aware axis
+    choice; a naive low-drift-first pass was tried and rejected because it
+    mis-classified RackMount's bodies and over-decomposed it."""
     mesh = trimesh.Trimesh(
         vertices=cleaned.vertices, faces=cleaned.faces, process=False,
     )
@@ -863,6 +916,15 @@ def plan_extrusions_components(
     # nothing else covers it — so it survives no matter how little of the part
     # it is). Volume is consulted ONLY for this redundancy test, never to
     # match shapes or to gate on a part-fraction threshold.
+    # Cross-axis dedup by SELF-COVERAGE, largest profile first (sketch the
+    # biggest face, extrude the short way — the base, then bosses, then
+    # screws). A candidate is KEPT iff most of ITS OWN prism is still
+    # unclaimed: that drops the REDUNDANT phantom slices (a slab is extrudable
+    # on all three axes; its edge-on views are already claimed by the chosen
+    # face) WITHOUT dropping SMALL real objects (a screw owns its own column —
+    # nothing else covers it — so it survives no matter how little of the part
+    # it is). Volume is consulted ONLY for this redundancy test, never to
+    # match shapes or to gate on a part-fraction threshold.
     unclaimed = np.ones(total, dtype=bool)
     chosen: list[dict] = []
     for c in sorted(candidates, key=lambda c: -c["area"]):
@@ -874,8 +936,7 @@ def plan_extrusions_components(
             continue  # redundant — its material already belongs to another
         # Claim PRECISELY the material this object explains: tight axial band
         # so a plate's claim does NOT bleed up into the fat domed bases of the
-        # screws abutting its top face (which would deflate their
-        # self-coverage and drop them). In-plane stays at the scoring band.
+        # screws abutting its top face.
         unclaimed &= ~_voxels_in_prism(
             occupied, c, pitch, tol_cells=0.5, axial_tol_cells=0.1,
         )

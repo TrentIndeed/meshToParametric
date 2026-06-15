@@ -65,7 +65,14 @@ def ingest_mesh(
     # scan is watertight). With scan_auto on, this turns on the scan
     # front-end (denoise + canonical-frame alignment) automatically.
     raw_faces = len(mesh.faces)
-    is_scan = bool(config.scan_auto and raw_faces > config.scan_face_threshold)
+    # Scan OR just much denser than the decimation cap: a clean CAD part of a
+    # simple bracket is a few thousand faces; a mesh several times the cap is a
+    # scan/AI export (e.g. AI8 RackmountEar at 72k faces slips under the 100k
+    # scan threshold AND is too smooth-dense for the wobble test, but it IS
+    # dirty). Clean test meshes (<=9.5k) stay well under 2x the cap.
+    dense = config.scan_auto and raw_faces > 2 * config.max_faces
+    is_scan = bool(config.scan_auto
+                   and (raw_faces > config.scan_face_threshold or dense))
     # AI-generated / dirty low-poly meshes (Meshy, Tripo) are NOT big enough
     # to trip the face-count test, but their near-flat faces are wobbly and
     # angles approximate — so they still need the cleanup front-end. Detect

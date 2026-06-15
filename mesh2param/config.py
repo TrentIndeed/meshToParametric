@@ -87,6 +87,14 @@ class SegmentConfig(BaseModel):
     # to. Clean CAD leaves this off (it doesn't fragment). See stage C in
     # docs/SCAN_RECOVERY_PLAN.md.
     noise_robust: bool = False
+    # In noise_robust mode, region-growing uses this (higher) angle tolerance.
+    # The default 30 deg sharp-edge test mis-fires on noisy meshes — a flat AI
+    # face's noise creates thousands of false sharp edges that shatter region
+    # growing (AI1: 4988 sharp edges -> 188 regions). 45 deg keeps genuine ~90
+    # deg corners as edges while tolerating noise (AI1 -> 22 regions). Shallow
+    # (<45 deg) chamfers merge into their plane — an acceptable trade on dirty
+    # meshes, where not fragmenting matters far more.
+    noise_robust_angle_deg: float = 45.0
     fragment_max_faces_frac: float = 0.01   # regions below this frac of total = fragments
     # A fragment merges into a big neighbour that owns >= this share of its
     # boundary edges (boundary dominance — robust to the slivers' wild

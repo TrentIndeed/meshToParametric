@@ -57,6 +57,13 @@ def segment_mesh(
     if config is None:
         config = SegmentConfig()
 
+    # Noise-robust mode: raise the angle tolerance so a noisy flat face's false
+    # sharp edges don't shatter region growing (the dominant fragmentation
+    # source on dirty/AI meshes). Clean CAD keeps the strict default.
+    if config.noise_robust and config.curved_angle_threshold_deg < config.noise_robust_angle_deg:
+        config = config.model_copy(update={
+            "curved_angle_threshold_deg": config.noise_robust_angle_deg})
+
     logger.debug(
         "segment_mesh called: faces=%d, normals_shape=%s",
         len(cleaned.faces), cleaned.normals.shape,

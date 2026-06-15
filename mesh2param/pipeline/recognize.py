@@ -1124,7 +1124,8 @@ def _split_tangent_bores(
     n = n / (np.linalg.norm(n) + 1e-15)
     # Orthonormal in-plane basis
     ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
+    u = np.cross(n, ref)
+    u /= np.linalg.norm(u) + 1e-15
     w = np.cross(n, u)
     pts = np.c_[verts @ u, verts @ w]
     if len(pts) < 24:
@@ -1356,7 +1357,8 @@ def _inplane_circle_fit(
     n = np.asarray(axis, dtype=float)
     n = n / (np.linalg.norm(n) + 1e-15)
     ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
+    u = np.cross(n, ref)
+    u /= np.linalg.norm(u) + 1e-15
     w = np.cross(n, u)
     x, y = verts @ u, verts @ w
 
@@ -1400,7 +1402,8 @@ def _inplane_angular_coverage(
     rel = verts - center_in_plane
     rel = rel - np.outer(rel @ n, n)
     ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    u = np.cross(n, ref); u /= np.linalg.norm(u) + 1e-15
+    u = np.cross(n, ref)
+    u /= np.linalg.norm(u) + 1e-15
     w = np.cross(n, u)
     ang = np.degrees(np.arctan2(rel @ w, rel @ u)) % 360.0
     # Coverage via occupied 10° bins — robust to uneven tessellation.
@@ -1416,8 +1419,10 @@ def _section_material(mesh, axis_idx: int, pos: float):
     from shapely.geometry import Polygon as _SMPoly
     from shapely.ops import unary_union as _sm_union
 
-    n = np.zeros(3); n[axis_idx] = 1.0
-    o = np.zeros(3); o[axis_idx] = pos
+    n = np.zeros(3)
+    n[axis_idx] = 1.0
+    o = np.zeros(3)
+    o[axis_idx] = pos
     section = mesh.section(plane_origin=o, plane_normal=n)
     if section is None:
         return None

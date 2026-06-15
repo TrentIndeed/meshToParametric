@@ -1434,12 +1434,6 @@ def _extract_profile_and_holes(
         if detected_holes:
             ext_axis = ext_norm
 
-            join_axes = {
-                int(np.argmax(np.abs(np.asarray(jf.direction, dtype=float))))
-                for jf in feature_tree.features
-                if jf.type == FeatureType.BOSS and jf.operation == "JOIN"
-            }
-
             from matplotlib.path import Path as _JoinPath
             _join_lookup = []
             for jf in feature_tree.features:
@@ -2729,7 +2723,6 @@ def _build_stepwise(
             solid_shape = wp.val().wrapped
             for c_each in centers_all:
                 c_arr = np.asarray(c_each, dtype=float)
-                c_ax = float(c_arr @ h_dir)
                 half = max(float(h_depth) / 2.0 - 1.0, 0.5)
                 # Probe SEVERAL stations along the bore: a stepped tab
                 # hole's midpoint sits in its relief counterbore (already

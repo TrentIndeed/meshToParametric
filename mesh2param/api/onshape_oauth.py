@@ -260,7 +260,6 @@ def export_job(job_uuid: str, request: Request, force: int = 0,
     """Export a finished job to the current user's own Onshape account
     (all features at once) and link the document. Idempotent: an already
     linked job returns its url unless force=1."""
-    from datetime import datetime
     from pathlib import Path
 
     from mesh2param.config import ExportConfig

@@ -20,7 +20,8 @@ from mesh2param.pipeline.regularize import regularize_mesh, regularize_planes
 
 def _rot(v, axis, ang):
     """Rodrigues rotation of v about unit axis by ang radians."""
-    v = np.asarray(v, float); axis = np.asarray(axis, float)
+    v = np.asarray(v, float)
+    axis = np.asarray(axis, float)
     axis = axis / np.linalg.norm(axis)
     c, s = np.cos(ang), np.sin(ang)
     return (v * c + np.cross(axis, v) * s + axis * (axis @ v) * (1 - c))

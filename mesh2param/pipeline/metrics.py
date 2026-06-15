@@ -229,8 +229,10 @@ def cross_section_fidelity(
     hi = np.maximum(ma.bounds[1], mb.bounds[1])
 
     def _section_geom(mesh, axis, pos):
-        n = np.zeros(3); n[axis] = 1.0
-        o = np.zeros(3); o[axis] = pos
+        n = np.zeros(3)
+        n[axis] = 1.0
+        o = np.zeros(3)
+        o[axis] = pos
         s = mesh.section(plane_origin=o, plane_normal=n)
         if s is None:
             return None

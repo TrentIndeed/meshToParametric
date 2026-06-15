@@ -158,9 +158,13 @@ def plan_extrusions(
         best_idx = max(survivors, key=lambda ci: candidates[ci]["area"])
         best_gain = int(gains[best_idx])
         cand = candidates[best_idx]
-        # Claim removal uses a GENEROUS band so half-cell boundary crumbs
-        # don't surface as phantom follow-up segments.
-        unclaimed &= ~_voxels_in_prism(occupied, cand, pitch, tol_cells=1.5)
+        # Claim removal uses a GENEROUS in-plane band so lateral wall
+        # crumbs don't surface as phantom follow-up segments, but a TIGHT
+        # axial band so a thin level's claim doesn't reach into the stacked
+        # neighbour above/below it (see _voxels_in_prism).
+        unclaimed &= ~_voxels_in_prism(
+            occupied, cand, pitch, tol_cells=1.5, axial_tol_cells=0.5,
+        )
         covered = 1.0 - float(np.count_nonzero(unclaimed)) / total
         segments.append(_to_segment(cand, best_gain / total, covered))
         logger.info(
@@ -201,8 +205,10 @@ def _slice_components(mesh: trimesh.Trimesh, axis: int, pos: float):
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
 
-    normal = np.zeros(3); normal[axis] = 1.0
-    origin = np.zeros(3); origin[axis] = pos
+    normal = np.zeros(3)
+    normal[axis] = 1.0
+    origin = np.zeros(3)
+    origin[axis] = pos
     section = mesh.section(plane_origin=origin, plane_normal=normal)
     if section is None:
         return []
@@ -372,8 +378,10 @@ def segment_inner_rings(
 
     def _station_rings(frac: float) -> list:
         pos = segment.start + frac * (segment.end - segment.start)
-        n = np.zeros(3); n[segment.axis_idx] = 1.0
-        o = np.zeros(3); o[segment.axis_idx] = pos
+        n = np.zeros(3)
+        n[segment.axis_idx] = 1.0
+        o = np.zeros(3)
+        o[segment.axis_idx] = pos
         section = mesh.section(plane_origin=o, plane_normal=n)
         if section is None:
             return []
@@ -448,6 +456,20 @@ def _merge_step_runs(cands: list[dict]) -> list[dict]:
     material is the downstream cut features' job, exactly like Mesh2's
     baked corner cuts.
     """
+    # Per-axis part extent, taken from the runs themselves: a run reaching
+    # a part FACE was snapped to the mesh bound in _candidate_runs, so the
+    # min start / max end per axis is the true extent. Used to tell a
+    # terminal STEP (an exposed thinner top/bottom face = added material,
+    # a boss) from an interior CUT (the reduced section is bracketed by the
+    # full profile on both sides — a window/pocket). Computed once: merges
+    # only ever UNION spans, so the extent never grows.
+    axis_lo: dict[int, float] = {}
+    axis_hi: dict[int, float] = {}
+    for c in cands:
+        ax = c["axis"]
+        axis_lo[ax] = min(axis_lo.get(ax, c["start"]), c["start"])
+        axis_hi[ax] = max(axis_hi.get(ax, c["end"]), c["end"])
+
     changed = True
     while changed:
         changed = False
@@ -487,10 +509,30 @@ def _merge_step_runs(cands: list[dict]) -> list[dict]:
                 # model the side plates as a 60mm base extrude with 90%
                 # carved away.
                 area_ratio = min(a["area"], b["area"]) / max(a["area"], b["area"])
+                # Terminal-step guard: a is below b (adjacent, a.end~b.start).
+                # If the SMALLER run's outer face (the one away from the
+                # larger run) is an exposed part boundary, the reduction is
+                # added material — a thinner second plate / boss — not a cut.
+                # CAD intent is base extrude + boss extrude, so keep them
+                # separate (the smaller run survives to become a JOIN). Only
+                # an INTERIOR reduction (Front Plate's window, bracketed by
+                # full profile on both axial sides) is a true step-cut.
+                ax = a["axis"]
+                ext = max(axis_hi[ax] - axis_lo[ax], 1e-9)
+                term_tol = 0.02 * ext
+                smaller = a if a["area"] < b["area"] else b
+                larger = b if smaller is a else a
+                if smaller["start"] >= larger["end"] - term_tol:
+                    terminal_step = abs(smaller["end"] - axis_hi[ax]) <= term_tol
+                elif smaller["end"] <= larger["start"] + term_tol:
+                    terminal_step = abs(smaller["start"] - axis_lo[ax]) <= term_tol
+                else:
+                    terminal_step = False
                 step_cut = (
                     containment > 0.85
                     and boundary_iou < 0.85
                     and area_ratio > 0.25
+                    and not terminal_step
                 )
                 same_profile = boundary_iou > 0.93
                 if step_cut or same_profile:
@@ -526,6 +568,11 @@ def _voxel_occupancy(mesh: trimesh.Trimesh) -> tuple[np.ndarray | None, float]:
     except Exception:
         pass
     pitch = float(np.clip(pitch, 0.8, 3.0))
+    return _occupancy_at_pitch(mesh, pitch), pitch
+
+
+def _occupancy_at_pitch(mesh: trimesh.Trimesh, pitch: float) -> np.ndarray | None:
+    """Filled-interior voxel centers at an explicit pitch (shell removed)."""
     try:
         vox = mesh.voxelized(pitch).fill()
         points = np.asarray(vox.points, dtype=float)
@@ -544,23 +591,33 @@ def _voxel_occupancy(mesh: trimesh.Trimesh) -> tuple[np.ndarray | None, float]:
                 points = vox.indices_to_points(idx).astype(float)
         except Exception:
             pass
-        return points, pitch
+        return points
     except Exception as exc:
         logger.warning("Voxelization failed (%s); falling back", exc)
-        return None, pitch
+        return None
 
 
 def _voxels_in_prism(
     points: np.ndarray, cand: dict, pitch: float, tol_cells: float = 0.5,
+    axial_tol_cells: float | None = None,
 ) -> np.ndarray:
     """Boolean mask of voxel centers inside the candidate's swept prism.
 
-    tol_cells scales the boundary tolerance in cell units. Gains are
-    SCORED with the conservative half-cell band (a center within pitch/2
-    of the wall genuinely intersects material; a full-pitch band let
-    wrong candidates claim entire thin features). Claims are REMOVED
-    with a generous band (1.5 cells) so the boundary crumbs a strict
-    score can't reach don't surface as phantom follow-up segments.
+    tol_cells scales the IN-PLANE boundary tolerance in cell units. Gains
+    are SCORED with the conservative half-cell band (a center within
+    pitch/2 of the wall genuinely intersects material; a full-pitch band
+    let wrong candidates claim entire thin features). Claims are REMOVED
+    with a generous in-plane band (1.5 cells) so the lateral wall crumbs a
+    strict score can't reach don't surface as phantom follow-up segments.
+
+    axial_tol_cells overrides the band ALONG THE EXTRUSION AXIS (defaults
+    to tol_cells). The claim path keeps this TIGHT even while the in-plane
+    band is generous: a generous AXIAL band reaches past a thin level into
+    the stacked neighbour above/below it (AI1's three ~2mm Y-levels — a
+    base plate, a second plate, four screws — collapsed to one segment
+    when claiming the middle plate erased both neighbours). The lateral
+    crumb-clearing that motivated 1.5 cells is purely in-plane, so
+    tightening only the axial band keeps it without the bleed.
     """
     from matplotlib.path import Path
 
@@ -568,10 +625,8 @@ def _voxels_in_prism(
     ax_u, ax_v = (i for i in range(3) if i != axis)
     axial = points[:, axis]
     tol = tol_cells * pitch
-    # Symmetric tolerance axially and in-plane — an asymmetric band
-    # systematically favored short-axial candidates with big profiles
-    # over long-axial candidates with thin profiles.
-    mask = (axial >= cand["start"] - tol) & (axial <= cand["end"] + tol)
+    axial_tol = (tol_cells if axial_tol_cells is None else axial_tol_cells) * pitch
+    mask = (axial >= cand["start"] - axial_tol) & (axial <= cand["end"] + axial_tol)
     if not mask.any():
         return mask
     path = Path(np.asarray(cand["profile"], dtype=float))
@@ -585,3 +640,250 @@ def _voxels_in_prism(
     inside = np.zeros(len(points), dtype=bool)
     inside[mask] = near
     return inside
+
+
+# ---------------------------------------------------------------------------
+# Component-tracking planner (v2)
+# ---------------------------------------------------------------------------
+# A different decomposition that finds the extrusion COUNT from cross-section
+# SHAPE, never from volume-similarity. It tracks each connected component of
+# the cross-section across densely-spaced slices and segments each track at
+# AREA PLATEAUS — so a part like AI1 (a plate, a smaller plate, and eight
+# corner screw heads) resolves into its 10 real extrusions instead of one
+# over-extruded slab. Volume is used ONLY at the end, to dedup objects that
+# the same material produces on different axes (a slab is "extrudable" on all
+# three; coverage picks the one that owns the material). See the module
+# docstring for the original volume-greedy engine, still the default.
+
+
+def _comp_sig(poly) -> dict:
+    """Translation-invariant component descriptor (NO volume): centroid,
+    area, in-plane extents, and the outline coords (the candidate profile)."""
+    c = np.array(poly.centroid.coords[0], dtype=float)
+    xy = np.array(poly.exterior.coords)[:-1]
+    ext = xy.max(0) - xy.min(0) if len(xy) else np.zeros(2)
+    return {
+        "centroid": c,
+        "area": float(poly.area),
+        "ext": ext.astype(float),
+        "coords": [(float(x), float(y)) for x, y in poly.exterior.coords[:-1]],
+    }
+
+
+def _same_track(a: dict, b: dict, scale: float) -> bool:
+    """Is component b the continuation of track a, one slice on? Purely
+    SPATIAL — a component's centroid barely moves along its extrusion axis
+    (a corner screw stays in its corner), so the lock tolerates a domed
+    screw whose area triples without ever binding it to the centre plate.
+    Area discontinuities are handled by the plateau segmentation, not here."""
+    rad = 0.5 * (float(np.mean(a["ext"])) + float(np.mean(b["ext"])))
+    cen_tol = max(0.6 * rad, 0.03 * scale)
+    return bool(np.linalg.norm(a["centroid"] - b["centroid"]) <= cen_tol)
+
+
+def _segment_track_plateaus(
+    track: list, tol: float = 0.15, min_plateau: float = 0.6,
+) -> list:
+    """Segment one raw track into objects by AREA PLATEAUS.
+
+    An extrusion has a sustained near-constant cross-section. A screw HEAD
+    tapers continuously (no clean step to cut on) but still has ONE sustained
+    plateau then a taper; two STACKED plates show TWO plateaus separated by a
+    jump. So: find maximal plateaus (area within +/-tol of the running median
+    for at least min_plateau of axial length), one object per plateau, and a
+    track with NO plateau (a pure cone) stays one object. The ramps (tapered
+    tip, the step between plateaus) are absorbed by assigning every slice to
+    its nearest plateau centre. Returns a list of sub-tracks.
+    """
+    if len(track) < 2:
+        return [track]
+    areas = [e["sig"]["area"] for e in track]
+    pos = [e["pos"] for e in track]
+    plateaus = []  # (start_idx, end_idx) inclusive
+    i, n = 0, len(track)
+    while i < n:
+        j = i
+        ref = areas[i]
+        while j + 1 < n:
+            a2 = areas[j + 1]
+            if abs(a2 - ref) / max(ref, a2, 1e-9) > tol:
+                break
+            j += 1
+            ref = float(np.median(areas[i:j + 1]))
+        if pos[j] - pos[i] >= min_plateau:
+            plateaus.append((i, j))
+        i = j + 1 if j > i else i + 1
+    if not plateaus:
+        return [track]
+    centers = [0.5 * (pos[a] + pos[b]) for a, b in plateaus]
+    groups = [[] for _ in plateaus]
+    for k in range(n):
+        g = int(np.argmin([abs(pos[k] - cc) for cc in centers]))
+        groups[g].append(track[k])
+    return [g for g in groups if g]
+
+
+def _track_axis_components(
+    mesh: trimesh.Trimesh, axis: int, max_slices: int = 400,
+    min_step: float = 0.1, min_span_frac: float = 0.02,
+) -> list[dict]:
+    """All candidate extrusion objects along one axis, by component tracking.
+
+    Slices at sub-millimetre resolution (capped at max_slices stations),
+    tracks each connected component into a raw track, then plateau-segments
+    each track. Returns candidate dicts: {axis, start, end, profile, area,
+    centroid}. Volume is NOT consulted here.
+    """
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    extent = hi - lo
+    if extent <= 0:
+        return []
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    # Sub-mm slicing so small features (AI1's ~1.5mm screws, ~0.6mm plateaus)
+    # are resolved; capped so a long axis stays tractable.
+    n = int(np.clip(extent / min_step, 30, max_slices))
+    real_step = extent / n
+    min_span = max(min_span_frac * extent, 2.0 * real_step)
+    min_plateau = max(min_span, 0.5)
+    # Bridge a one-slice section dropout (a hole band) but break the big
+    # empty middle between a bottom screw and the top screw above it.
+    max_gap = max(2.5 * real_step, 0.4)
+    stations = np.linspace(lo + 0.01 * extent, hi - 0.01 * extent, n)
+
+    tracks: list[list] = []
+    active: list[dict] = []
+    for pos in stations:
+        comps = [_comp_sig(p) for p in _slice_components(mesh, axis, float(pos))]
+        used = [False] * len(comps)
+        nxt = []
+        for tr in active:
+            last = tr["seq"][-1]["sig"]
+            m = -1
+            for k, s in enumerate(comps):
+                if not used[k] and _same_track(last, s, diag):
+                    m = k
+                    break
+            if m >= 0:
+                used[m] = True
+                tr["seq"].append({"pos": float(pos), "sig": comps[m]})
+                tr["gap"] = 0.0
+                nxt.append(tr)
+            else:
+                tr["gap"] += real_step
+                if tr["gap"] <= max_gap:
+                    nxt.append(tr)
+                else:
+                    tracks.append(tr["seq"])
+        for k, s in enumerate(comps):
+            if not used[k]:
+                nxt.append({"seq": [{"pos": float(pos), "sig": s}], "gap": 0.0})
+        active = nxt
+    tracks.extend(tr["seq"] for tr in active)
+
+    out = []
+    half = 0.5 * real_step
+    for tr in tracks:
+        for sub in _segment_track_plateaus(tr, min_plateau=min_plateau):
+            start, end = sub[0]["pos"], sub[-1]["pos"]
+            if (end - start) < min_span:
+                continue
+            widest = max(sub, key=lambda e: e["sig"]["area"])["sig"]
+            # Extend the span to the part face at the ends (the slice inset
+            # and plateau-centre assignment leave it a half-step short).
+            s0 = lo if start <= stations[0] + 1e-9 else start - half
+            e0 = hi if end >= stations[-1] - 1e-9 else end + half
+            out.append({
+                "axis": axis,
+                "start": float(s0),
+                "end": float(e0),
+                "profile": widest["coords"],
+                "area": float(widest["area"]),
+                "centroid": widest["centroid"],
+            })
+    return out
+
+
+def plan_extrusions_components(
+    cleaned: CleanedMesh, max_slices: int = 400, min_step: float = 0.1,
+    keep_self_frac: float = 0.5,
+) -> ExtrusionPlan:
+    """Component-tracking + plateau decomposition with coverage-based
+    cross-axis dedup. Separate from `plan_extrusions` (the default); switch
+    over only once validated against the reference meshes."""
+    mesh = trimesh.Trimesh(
+        vertices=cleaned.vertices, faces=cleaned.faces, process=False,
+    )
+    if not mesh.is_watertight:
+        logger.info("Component planner: mesh not watertight, declining")
+        return ExtrusionPlan()
+
+    candidates: list[dict] = []
+    for axis in range(3):
+        candidates.extend(
+            _track_axis_components(mesh, axis, max_slices, min_step)
+        )
+    if not candidates:
+        return ExtrusionPlan()
+
+    # Cross-axis dedup needs voxels FINE enough to separate a thin boss/screw
+    # from the plate it sits on (the default diag/90 pitch shares one voxel
+    # layer between them). Resolve the THINNEST candidate object with ~3
+    # voxels, but cap the grid by a memory budget so a big part — whose
+    # features are correspondingly bigger — uses a coarser-but-adequate pitch.
+    spans = [c["end"] - c["start"] for c in candidates if c["end"] > c["start"]]
+    thin = min(spans) if spans else float(np.min(mesh.extents))
+    bbox_vol = float(np.prod(mesh.extents)) or 1.0
+    budget_pitch = (bbox_vol / 3_000_000.0) ** (1.0 / 3.0)
+    dedup_pitch = float(np.clip(max(thin / 3.0, budget_pitch), 0.2, 3.0))
+    occupied = _occupancy_at_pitch(mesh, dedup_pitch)
+    pitch = dedup_pitch
+    if occupied is None or len(occupied) == 0:
+        # No volume to dedup against — return the candidates as-is, biggest
+        # profile first (degenerate fallback; coverage is the normal path).
+        candidates.sort(key=lambda c: -c["area"])
+        segs = [_to_segment(c, 0.0, 0.0) for c in candidates]
+        return ExtrusionPlan(segments=segs)
+
+    total = len(occupied)
+    # Precompute each candidate's own prism membership once. The axial band is
+    # TIGHT: a screw abutting a plate's top face must not have its prism bleed
+    # DOWN into the plate (those plate voxels are claimed and would deflate the
+    # screw's self-coverage below the keep threshold). In-plane stays at the
+    # half-cell scoring band so the thin circle is captured.
+    for c in candidates:
+        c["_mem"] = _voxels_in_prism(
+            occupied, c, pitch, tol_cells=0.5, axial_tol_cells=0.1,
+        )
+    # Cross-axis dedup by SELF-COVERAGE, processing the largest profile first
+    # (sketch the biggest face, extrude the short way — the base, then bosses,
+    # then screws). A candidate is KEPT iff most of ITS OWN prism is still
+    # unclaimed: that drops the REDUNDANT phantom slices (a slab is extrudable
+    # on all three axes; its edge-on views are already claimed by the chosen
+    # face) WITHOUT dropping SMALL real objects (a screw owns its own column —
+    # nothing else covers it — so it survives no matter how little of the part
+    # it is). Volume is consulted ONLY for this redundancy test, never to
+    # match shapes or to gate on a part-fraction threshold.
+    unclaimed = np.ones(total, dtype=bool)
+    chosen: list[dict] = []
+    for c in sorted(candidates, key=lambda c: -c["area"]):
+        own = int(np.count_nonzero(c["_mem"]))
+        if own == 0:
+            continue
+        new = int(np.count_nonzero(c["_mem"] & unclaimed))
+        if new / own < keep_self_frac:
+            continue  # redundant — its material already belongs to another
+        # Claim PRECISELY the material this object explains: tight axial band
+        # so a plate's claim does NOT bleed up into the fat domed bases of the
+        # screws abutting its top face (which would deflate their
+        # self-coverage and drop them). In-plane stays at the scoring band.
+        unclaimed &= ~_voxels_in_prism(
+            occupied, c, pitch, tol_cells=0.5, axial_tol_cells=0.1,
+        )
+        coverage = 1.0 - float(np.count_nonzero(unclaimed)) / total
+        chosen.append((c, new / total, coverage))
+
+    segments = [_to_segment(c, gf, cov) for c, gf, cov in chosen]
+    coverage = 1.0 - float(np.count_nonzero(unclaimed)) / total
+    return ExtrusionPlan(
+        segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
+    )

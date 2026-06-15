@@ -28,6 +28,45 @@ quality framework in `ROADMAP.md`.
 
 ---
 
+## AI1 / MountingPlate (multi-level extrusion)
+
+The part: a **main plate**, a **smaller plate stacked on top**, and **8 screw
+heads** — 4 at the corners on the TOP face and 4 at the corners on the BOTTOM
+face. All features are thin (bbox 81.5 × 6 × 50mm; each level ~2mm).
+
+1. **[structural] FIXED 2026-06-15 — over-extrusion of stacked levels.** The
+   extrusion engine collapsed the whole part to ONE full-footprint segment
+   spanning the entire 6mm thickness (`-2.96..1.01`, the user's "extruded the
+   whole main plate through the full screw-top-to-bottom thickness"). Two
+   root causes in `pipeline/extrusion.py`:
+   - `_merge_step_runs` merged the upper (smaller) plate run into the base run
+     via the `step_cut` rule. That rule is for INTERIOR cuts (Front Plate's
+     window, bracketed by full profile above AND below). Added a
+     **terminal-step guard**: a reduced profile whose exposed face is at the
+     part's end (a thinner top plate / boss) is added material, not a cut —
+     keep it a separate run. Front Plate's window (non-terminal) still merges.
+   - The greedy claim band was 1.5 cells (~1.6mm) applied ALONG the extrusion
+     axis, so claiming one ~2mm level erased its stacked neighbours. Decoupled
+     the band: in-plane stays generous (1.5, clears lateral wall crumbs), axial
+     tightened to 0.5 cells. AI1: 1 over-extruded segment → 2 plate levels.
+   - Result: AI1 build **15.6% FAIL → 3.6% PASS**. No regression (Mesh1-5 all
+     pass, extrusion unit tests 9/9, AI3/AI15 still PASS, AI11/14/8 unchanged).
+
+2. **[structural] OPEN — top plate + 8 screws not yet distinct extrusions.**
+   The over-extrusion is gone and the VOLUME is now correct (3.6%), but the
+   feature tree does NOT yet emit what the user wants: main-plate extrude +
+   top-plate extrude + 8 corner-screw extrudes. Currently the screws (~0.75mm
+   tall, sitting within a claimed plate's footprint) are still swallowed by the
+   plate's claim, and the second plate is absorbed into the base/chamfer
+   approximations rather than surfacing as a JOIN/boss. Target geometry =
+   **2 plate extrudes + 8 screw-head extrudes (4 top, 4 bottom)**. Next step:
+   protect thin terminal bosses from the preceding level's claim (axial band
+   ~0 toward a neighbouring run) and/or recover them in `_find_bosses`, then
+   emit non-primary segments as JOIN bosses (the machinery exists in
+   `recognize.py` step 1b, gated on `gain_frac >= 0.03`).
+
+---
+
 ## AI15 / RibbedBlock (full pipeline, ends "pretty good")
 
 The overall result is decent, but the intermediate stages show where the

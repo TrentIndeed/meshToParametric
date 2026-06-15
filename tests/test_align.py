@@ -6,7 +6,7 @@ import pytest
 
 trimesh = pytest.importorskip("trimesh")
 
-from mesh2param.pipeline.align import align_to_canonical_frame
+from mesh2param.pipeline.align import align_to_canonical_frame  # noqa: E402
 
 
 def test_aligns_arbitrarily_rotated_box():

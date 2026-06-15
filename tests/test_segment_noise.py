@@ -25,14 +25,19 @@ def test_embedded_slivers_absorbed_despite_wild_normals():
     labels = np.array([0] * z + [1, 2, 3] + [100] * 20)
     adj = {i: set() for i in range(len(labels))}
     for i in range(z - 1):
-        adj[i].add(i + 1); adj[i + 1].add(i)
+        adj[i].add(i + 1)
+        adj[i + 1].add(i)
     for k, sl in enumerate((z, z + 1, z + 2)):       # each sliver embedded in +Z
         a, b = k * 2, k * 2 + 1
-        adj[sl].update({a, b}); adj[a].add(sl); adj[b].add(sl)
+        adj[sl].update({a, b})
+        adj[a].add(sl)
+        adj[b].add(sl)
     base = z + 3
     for i in range(base, base + 19):
-        adj[i].add(i + 1); adj[i + 1].add(i)
-    adj[0].add(base); adj[base].add(0)               # one cross edge at the 90° join
+        adj[i].add(i + 1)
+        adj[i + 1].add(i)
+    adj[0].add(base)
+    adj[base].add(0)               # one cross edge at the 90° join
 
     out = _merge_coplanar_fragments(
         labels.copy(), normals, adj,
@@ -48,12 +53,15 @@ def test_edge_sliver_does_not_cross_right_angle():
     labels = np.array([0] * 15 + [1] + [100] * 15)
     adj = {i: set() for i in range(31)}
     for i in range(14):
-        adj[i].add(i + 1); adj[i + 1].add(i)
+        adj[i].add(i + 1)
+        adj[i + 1].add(i)
     for i in range(16, 30):
-        adj[i].add(i + 1); adj[i + 1].add(i)
+        adj[i].add(i + 1)
+        adj[i + 1].add(i)
     # sliger (15) borders equally: two +Z faces and two +X faces
     for nb in (0, 1, 16, 17):
-        adj[15].add(nb); adj[nb].add(15)
+        adj[15].add(nb)
+        adj[nb].add(15)
 
     out = _merge_coplanar_fragments(
         labels.copy(), normals, adj,

@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from mesh2param.config import IngestConfig
 from mesh2param.pipeline.extrusion import plan_extrusions

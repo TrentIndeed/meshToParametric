@@ -2309,6 +2309,21 @@ def _build_stepwise(
                 ring_pts = _clean_engine_polygon(ring)
                 if len(ring_pts) >= 3:
                     j_inner.append(ring_pts)
+            # Pattern: a co-planar group (AI1's four corner screws) carries its
+            # extra profile loops here, drawn on the SAME sketch plane so the
+            # join is one sketch + one extrude with N loops.
+            j_extra = []
+            _ei = sg.get("extra_inner") or []
+            for li, loop in enumerate(sg.get("extra_loops") or []):
+                lp = _clean_engine_polygon(loop)
+                if len(lp) < 3:
+                    continue
+                lin = []
+                for ring in (_ei[li] if li < len(_ei) else []) or []:
+                    rp = _clean_engine_polygon(ring)
+                    if len(rp) >= 3:
+                        lin.append(rp)
+                j_extra.append((lp, lin))
             j_len = float(span[1]) - float(span[0])
             plane_j = plane_map[ax_j]
             origin_j = [0.0, 0.0, 0.0]
@@ -2341,6 +2356,8 @@ def _build_stepwise(
                 try:
                     wpj = cq.Workplane(plane_j, origin=tuple(origin_j))
                     wpj = _draw_profile_with_holes(wpj, j_pts, j_inner)
+                    for lp, lin in j_extra:
+                        wpj = _draw_profile_with_holes(wpj, lp, lin)
                     wpj = wpj.extrude(sign * j_len)
                     bbj = wpj.val().BoundingBox()
                     j_vals = [

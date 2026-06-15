@@ -1,5 +1,45 @@
 # TODO
 
+## Product vision & release gates
+
+**Target statement (the bar to hit before release):**
+> Paramesh converts clean mechanical meshes into editable parametric CAD, shows
+> you the recovered feature tree, measures the reconstruction error, and lets
+> you correct the model.
+
+Gates to clear before releasing the software (do NOT ship until these exist):
+
+- [ ] **Demonstration videos (20–50, uncut).** Real screen captures, not
+  cinematic animation: file selection → processing → generated feature tree →
+  parameter editing → regeneration → mesh deviation overlay. Uncut = credible.
+- [ ] **Public benchmark set** with easy / moderate / difficult / **failed**
+  examples. Publishing the failures reads as more credible than competitors
+  who only show ideal parts.
+- [ ] **Numeric verification** reported per conversion: max deviation, mean
+  surface deviation, volume difference, validity (watertight/manifold),
+  processing time, feature-tree complexity. (We already compute volume error +
+  bbox; ADD: max + mean surface deviation, validity flag, timing,
+  feature-count — surface this in the UI and the report.)
+- [ ] **Tightly defined support envelope**, stated up front: single solid,
+  watertight mesh, primarily mechanical/prismatic geometry, no organic
+  surfaces, limited/no assembly support, and an explicit list of supported
+  feature types (extrude, hole, pocket, boss, slot, fillet, chamfer).
+- [ ] **Immediate access** — even a paid alpha with usage limits beats another
+  waitlist. (We have a waitlist + token tiers; flip on a gated alpha.)
+- [ ] **Human correction loop** — let the user mark an axis, identify a hole,
+  replace a feature, or pick among candidate strategies. Reducing a 2-hour
+  rebuild to 5 minutes matters more than full autonomy. (Today's AI chat +
+  dimension review is a start; ADD direct feature-tree edits + axis/hole
+  picking + candidate-strategy selection.)
+- [ ] **Failure-safe behavior** — "Unsupported geometry" is far better than a
+  model that looks right but has dimensional/topological errors. Gate on the
+  numeric verification: if max deviation or volume error exceeds a threshold,
+  REFUSE with a reason instead of returning a wrong-but-plausible model.
+
+Principle: **fully autonomous reconstruction is secondary.** The product wins
+by reducing a 2-hour manual rebuild to ~5 minutes WITH a correction loop, and
+by refusing rather than silently shipping wrong geometry.
+
 ## Test coverage
 - [x] Reference STEPs for Mesh3 (Front Plate) and Mesh5 (RackMount) — found in
   `Documents/CAD_3MF/march2026/stp/`, geometrically verified (0.4% / 0.0%

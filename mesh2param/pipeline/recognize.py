@@ -118,36 +118,96 @@ def recognize_features(
         primary_gate = 0.0 if config.use_component_planner else 0.4
         seg_gate = 0.0 if config.use_component_planner else 0.03
         if primary.gain_frac >= primary_gate:
-            from mesh2param.pipeline.extrusion import segment_inner_rings
-            for seg in extrusion_plan.segments[1:]:
-                if seg.gain_frac < seg_gate:
-                    continue
+            from mesh2param.pipeline.extrusion import (
+                group_extrusion_segments, segment_inner_rings,
+            )
+
+            def _seg_inner(seg):
                 try:
-                    inner = segment_inner_rings(cleaned, seg)
+                    return [[list(p) for p in ring]
+                            for ring in segment_inner_rings(cleaned, seg)]
                 except Exception:
-                    inner = []
-                features.append(Feature(
-                    type=FeatureType.BOSS,
-                    face_indices=np.array([], dtype=np.int64),
-                    sketch_geometry={
-                        "type": "polygon",
-                        "points": [list(p) for p in seg.profile],
-                        "span": [float(seg.start), float(seg.end)],
-                        "axis_idx": int(seg.axis_idx),
-                        # Interior windows the outer outline would fill
-                        "inner": [[list(p) for p in ring] for ring in inner],
-                    },
-                    depth=float(seg.length),
-                    direction=seg.direction.copy(),
-                    operation="JOIN",
-                    dependencies=[base_idx],
-                ))
-                logger.info(
-                    "Join extrusion: axis %d span %.1f..%.1f area=%.0f "
-                    "(%.0f%% of part)",
-                    seg.axis_idx, seg.start, seg.end, seg.area,
-                    100 * seg.gain_frac,
-                )
+                    return []
+
+            if config.use_component_planner:
+                # Group identical extrudes into one FEATURE each (AI1's four
+                # TOP screws and four BOTTOM screws each become one co-planar
+                # multi-loop sketch + extrude, not eight bosses). The base is
+                # the largest group; the rest are joins.
+                groups = group_extrusion_segments(extrusion_plan)
+                base_group = max(groups, key=lambda g: g.area)
+                for g in groups:
+                    if g is base_group:
+                        continue
+                    if g.members[0].gain_frac < seg_gate and len(g.members) == 1:
+                        continue
+                    if g.same_plane and len(g.members) > 1:
+                        # One sketch on the shared plane, N profile loops.
+                        rep = g.members[0]
+                        loops = [[list(p) for p in m.profile] for m in g.members]
+                        inners = [_seg_inner(m) for m in g.members]
+                        features.append(Feature(
+                            type=FeatureType.BOSS,
+                            face_indices=np.array([], dtype=np.int64),
+                            sketch_geometry={
+                                "type": "polygon",
+                                "points": loops[0],
+                                "span": [float(rep.start), float(rep.end)],
+                                "axis_idx": int(g.axis_idx),
+                                "inner": inners[0],
+                                "extra_loops": loops[1:],
+                                "extra_inner": inners[1:],
+                            },
+                            depth=float(rep.length),
+                            direction=rep.direction.copy(),
+                            operation="JOIN",
+                            dependencies=[base_idx],
+                        ))
+                        logger.info("Join pattern: axis %d x%d (one sketch)",
+                                    g.axis_idx, len(g.members))
+                    else:
+                        # Singletons / mirror pairs -> a boss per instance.
+                        for m in g.members:
+                            features.append(Feature(
+                                type=FeatureType.BOSS,
+                                face_indices=np.array([], dtype=np.int64),
+                                sketch_geometry={
+                                    "type": "polygon",
+                                    "points": [list(p) for p in m.profile],
+                                    "span": [float(m.start), float(m.end)],
+                                    "axis_idx": int(m.axis_idx),
+                                    "inner": _seg_inner(m),
+                                },
+                                depth=float(m.length),
+                                direction=m.direction.copy(),
+                                operation="JOIN",
+                                dependencies=[base_idx],
+                            ))
+            else:
+                for seg in extrusion_plan.segments[1:]:
+                    if seg.gain_frac < seg_gate:
+                        continue
+                    features.append(Feature(
+                        type=FeatureType.BOSS,
+                        face_indices=np.array([], dtype=np.int64),
+                        sketch_geometry={
+                            "type": "polygon",
+                            "points": [list(p) for p in seg.profile],
+                            "span": [float(seg.start), float(seg.end)],
+                            "axis_idx": int(seg.axis_idx),
+                            "inner": _seg_inner(seg),
+                        },
+                        depth=float(seg.length),
+                        direction=seg.direction.copy(),
+                        operation="JOIN",
+                        dependencies=[base_idx],
+                    ))
+                    logger.info(
+                        "Join extrusion: axis %d span %.1f..%.1f area=%.0f "
+                        "(%.0f%% of part)",
+                        seg.axis_idx, seg.start, seg.end, seg.area,
+                        100 * seg.gain_frac,
+                    )
 
     # --- 2. Holes: full cylinders ---
     try:
@@ -361,12 +421,12 @@ def _hole_coaxial_with_boss(hole: Feature, bosses: list[Feature]) -> bool:
         bsg = b.sketch_geometry or {}
         if int(bsg.get("axis_idx", -1)) != hax:
             continue
-        pts = bsg.get("points")
-        if pts and len(pts) >= 3:
-            try:
-                boss_polys.append(Polygon(pts).buffer(0.5))
-            except Exception:
-                continue
+        for pts in [bsg.get("points"), *(bsg.get("extra_loops") or [])]:
+            if pts and len(pts) >= 3:
+                try:
+                    boss_polys.append(Polygon(pts).buffer(0.5))
+                except Exception:
+                    continue
     if not boss_polys:
         return False
     on = 0

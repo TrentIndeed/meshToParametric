@@ -540,13 +540,9 @@ class JobQueue:
         """Run the full mesh-to-CAD pipeline for a job."""
         import pickle
         from mesh2param.config import (
-            FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig,
+            IngestConfig,
         )
         from mesh2param.pipeline.ingest import ingest_mesh
-        from mesh2param.pipeline.segment import segment_mesh
-        from mesh2param.pipeline.fit import fit_surfaces
-        from mesh2param.pipeline.topology import build_topology
-        from mesh2param.pipeline.recognize import recognize_features
 
         job.status = "processing"
         logger.info("Pipeline started for job %s (file=%r)", job.id, job.filename)
@@ -862,65 +858,20 @@ class JobQueue:
 
         # ── Process each body through the single-body pipeline ──
         # Run all bodies in parallel, then show visualizations per stage.
-        from mesh2param.pipeline.peel_via_topology import identify_blends_from_topology
 
         def _process_single_body(bi, body):
+            # SHARED CORE: recognize_body() is the single source of truth for
+            # segment -> fit -> (regularize -> re-seg/fit) -> topology -> blends
+            # -> recognize. Standalone scripts/tests call the SAME function, so
+            # a reproduction always matches what the app produces (no drift).
+            from mesh2param.pipeline.convert import recognize_body
             sub_cleaned = extract_sub_mesh(cleaned, body.face_indices, body=body)
             _check_cancelled()
-            # Scan / AI inputs: noise-robust segmentation absorbs the noise
-            # slivers so each flat face is one region (not hundreds), which is
-            # what lets regularization recover a clean consensus frame.
-            _seg = SegmentConfig(
-                noise_robust=bool(cleaned.metadata.get("scan_mode")))
-            regions = segment_mesh(sub_cleaned, _seg)
+            br = recognize_body(
+                sub_cleaned, bool(cleaned.metadata.get("scan_mode")))
             _check_cancelled()
-            fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
-            _check_cancelled()
-            # Scan / AI-mesh regularization (Stage E): the denoised+aligned
-            # mesh still has wobbly near-flat faces and off-90deg corners.
-            # Project its vertices onto the recovered consensus planes so the
-            # flats are actually flat and corners exactly 90, then re-segment
-            # /fit the CRISP mesh so the rest of the pipeline sees clean
-            # geometry. Gated to dirty inputs (scans + AI meshes); clean CAD
-            # is already exact and never enters this branch.
-            if cleaned.metadata.get("scan_mode"):
-                try:
-                    from mesh2param.pipeline.regularize import regularize_mesh
-                    # Conservative 12 deg snap: a few-degree wobble (noise)
-                    # snaps to flat, but an intentional chamfer/draft (>=12
-                    # deg off-axis) is preserved, not flattened.
-                    _, reg_report = regularize_mesh(
-                        sub_cleaned, regions, fitted, snap_angle_deg=12.0)
-                    n_snap = sum(1 for r in reg_report if r.get("snapped"))
-                    logger.info("Body %d regularized: %d/%d planes snapped",
-                                bi, n_snap, len(reg_report))
-                    regions = segment_mesh(sub_cleaned, _seg)
-                    _check_cancelled()
-                    fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
-                    _check_cancelled()
-                except Exception:
-                    logger.exception(
-                        "Regularization failed for body %d — using raw fit", bi)
-            graph, edges_list = build_topology(regions, fitted, sub_cleaned, TopologyConfig())
-            _check_cancelled()
-            # Stage 4.5: topology-based blend identification. Walks the
-            # surface adjacency graph (cleaner & faster than the triangle-
-            # by-triangle peel), finding cylinder regions classified as
-            # FILLET and narrow plane regions classified as CHAMFER.
-            try:
-                topology_blends = identify_blends_from_topology(
-                    regions, fitted, edges_list, sub_cleaned,
-                )
-            except Exception:
-                logger.exception("identify_blends_from_topology failed for body %d", bi)
-                topology_blends = []
-            _check_cancelled()
-            body_tree = recognize_features(
-                regions, fitted, graph, edges_list, sub_cleaned,
-                RecognizeConfig(), topo_blends=topology_blends,
-            )
-            return (body, sub_cleaned, regions, fitted, graph, edges_list,
-                    body_tree, topology_blends)
+            return (body, sub_cleaned, br.regions, br.fitted, br.graph,
+                    br.edges, br.tree, br.blends)
 
         job.progress = 8
         job.progress_stage = "Analyzing surfaces..."

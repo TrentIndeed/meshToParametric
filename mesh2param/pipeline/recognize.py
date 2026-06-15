@@ -269,14 +269,20 @@ def recognize_features(
     logger.debug("Found %d pockets", len(pocket_features))
 
     # --- 4. Bosses: outward-facing plane groups above the base ---
-    try:
-        boss_features = _find_bosses(
-            regions, fitted, graph, region_lookup, fitted_lookup,
-            cleaned, config, assigned, base_rids,
-        )
-    except Exception:
-        logger.exception("Stage 5 failed finding bosses")
-        raise
+    # The component planner ALREADY emits every additive body as a JOIN boss
+    # (step 1b), so the legacy region-based boss finder only duplicates them
+    # (AI1 got two spurious axis-None bosses on top of the real screw
+    # patterns). Skip it under the component planner.
+    boss_features = []
+    if not config.use_component_planner:
+        try:
+            boss_features = _find_bosses(
+                regions, fitted, graph, region_lookup, fitted_lookup,
+                cleaned, config, assigned, base_rids,
+            )
+        except Exception:
+            logger.exception("Stage 5 failed finding bosses")
+            raise
     for bf, rids in boss_features:
         bf.dependencies = [base_idx]
         features.append(bf)

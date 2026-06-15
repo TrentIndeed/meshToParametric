@@ -903,10 +903,23 @@ def _track_axis_components(
     half = 0.5 * real_step
     for tr in tracks:
         for sub in _segment_track_plateaus(tr, min_plateau=min_plateau):
-            start, end = sub[0]["pos"], sub[-1]["pos"]
+            widest = max(sub, key=lambda e: e["sig"]["area"])["sig"]
+            # Span = the PLATEAU CORE (slices within half the plateau area),
+            # not every assigned slice. A wall's X-section drops SHARPLY to the
+            # base-only strip past its faces; with no competing plateau there
+            # those base slices get assigned to the wall and over-extend its
+            # extrude into the base (RackMount: 7.2mm vs 6mm -> 17% over-build).
+            # Clipping to the core stops the wall at the junction. It only
+            # trims a screw's thin tapering TIP (tiny, and the cylinder
+            # approximation of a dome is actually closer without it). A window
+            # dip sits in the MIDDLE, so the full-area end slices still bound
+            # the span.
+            wa = float(widest["area"])
+            core = [e["pos"] for e in sub if e["sig"]["area"] >= 0.5 * wa]
+            start, end = (min(core), max(core)) if core else (
+                sub[0]["pos"], sub[-1]["pos"])
             if (end - start) < min_span:
                 continue
-            widest = max(sub, key=lambda e: e["sig"]["area"])["sig"]
             # Drift: the change in cross-section across the span's INTERIOR
             # (the 25% and 75% stations), NOT its end faces. ~0 for a true
             # prism; high only for a monotonic draft/taper that changes through

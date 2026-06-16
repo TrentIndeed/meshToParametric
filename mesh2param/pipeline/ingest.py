@@ -96,7 +96,12 @@ def ingest_mesh(
     try:
         mesh = _remove_degenerate_faces(mesh, config.min_face_area)
         mesh = _merge_vertices(mesh, config.merge_tolerance)
-        mesh = _decimate(mesh, config.max_faces)
+        # Dirty/scan inputs decimate to the lower cap so flat faces stop
+        # over-fragmenting in segmentation (the thresholds were tuned on the
+        # clean-CAD triangle regime). Clean CAD is below max_faces anyway.
+        _cap = (config.dirty_max_faces or config.max_faces) \
+            if needs_frontend else config.max_faces
+        mesh = _decimate(mesh, _cap)
         mesh = _fix_normals(mesh)
         # Scan front-end: feature-preserving denoise flattens scanner
         # noise on the surfaces while keeping sharp edges, BEFORE

@@ -795,7 +795,20 @@ def _profile_extrusion(plan: OnshapePlan, feat: Feature, label: str,
         ))
         plane_param = _plane_param_created_by("PENDING")
         plane_dep = cp_idx
-    entities = _outline_entities("outer", pts)
+    # Prefer the PARAMETRIC arc representation (sharp corners + per-corner
+    # radii): emit true line + tangent-arc sketch entities — the way Onshape
+    # models a rounded outline, and identical to what the CadQuery build draws
+    # from the same data. Fall back to point-based arc detection if absent.
+    entities = None
+    _corners = sg.get("corners")
+    _fillets = sg.get("fillets")
+    if _corners and len(_corners) >= 3 and _fillets:
+        _fdict = {i: float(r) for i, r in enumerate(_fillets) if r and r > 0.05}
+        if _fdict:
+            _corners_off = (np.asarray(_corners, dtype=float) + off_uv).tolist()
+            entities = _analytic_tangent_arcs("outer", _corners_off, _fdict)
+    if entities is None:
+        entities = _outline_entities("outer", pts)
     for ri, ring in enumerate(sg.get("inner") or []):
         if len(ring) >= 3:
             ring_s = (np.asarray(ring, dtype=float) + off_uv).tolist()

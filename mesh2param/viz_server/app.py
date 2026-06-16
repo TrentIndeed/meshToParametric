@@ -621,6 +621,11 @@ async def job_status(job_id: str):
         "error": job.error,
         "num_steps": len(job.steps),
         "steps": steps_info,
+        # Live CAD-build streaming: the right pane refetches the newest step
+        # whenever steps_version changes; building_live is True while the CAD
+        # subprocess is still emitting steps.
+        "steps_version": getattr(job, 'steps_version', 0),
+        "building_live": getattr(job, 'building_live', False),
         "mesh_volume": round(job.mesh_volume, 1),
         "cad_volume": round(job.cad_volume, 1),
         "bbox_min": job.bbox_min,
@@ -811,6 +816,8 @@ async def job_step(job_id: str, index: int):
     }
     if step.sketch_overlay is not None:
         result["sketch_overlay"] = step.sketch_overlay.flatten().tolist()
+    if getattr(step, "overlay_arcs", None):
+        result["overlay_arcs"] = step.overlay_arcs
     return result
 
 
@@ -932,6 +939,8 @@ async def step_legacy(index: int):
     }
     if getattr(step, "sketch_overlay", None) is not None:
         legacy_result["sketch_overlay"] = step.sketch_overlay.flatten().tolist()
+    if getattr(step, "overlay_arcs", None):
+        legacy_result["overlay_arcs"] = step.overlay_arcs
     return legacy_result
 
 

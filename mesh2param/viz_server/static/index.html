@@ -176,6 +176,74 @@ body {
   position: fixed; top: 48px; left: 240px; right: 300px; bottom: 80px;
 }
 
+/* ── Live dual-pane build view ──
+   During processing the viewer splits at the viewport midline: the left
+   half (#viewer) keeps showing the analysis stages running on the original
+   mesh, the right half (#live-build-pane) shows the CAD model accreting
+   feature-by-feature as steps stream in from the build subprocess. */
+#live-build-pane {
+  position: fixed; top: 48px; left: 50%; right: 300px; bottom: 80px;
+  display: none; z-index: 45; background: var(--bg-primary);
+  border-left: 1px solid var(--border);
+}
+body.live-split #viewer { right: 50% !important; }
+body.live-split #live-build-pane { display: block; }
+/* Build complete: the live pane expands to fill the whole viewer area and the
+   main viewer hides behind it — the finished model just recenters in place,
+   no reload. Clicking a timeline step / feature dismisses it (reveals main). */
+body.live-full #live-build-pane {
+  display: block; left: 240px; right: 300px; z-index: 46; border-left: none;
+}
+body.live-full #viewer { visibility: hidden; }
+/* The LEFT SIDEBAR (with its feature tree) stays visible in BOTH live modes —
+   the build pane sits to the RIGHT of it (left: 240px), never on top. The
+   in-pane floating tree is hidden (below) so there's exactly ONE feature tree,
+   in the sidebar, where it belongs. */
+.pane-label {
+  position: absolute; top: 10px; left: 0; right: 0; text-align: center;
+  z-index: 2; pointer-events: none;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.6px;
+  color: var(--text-secondary); text-transform: uppercase;
+}
+#viewer-analysis-label { display: none; }
+body.live-split #viewer-analysis-label { display: block; }
+/* Sits just under the pane title at the TOP — the bottom-center is occupied by
+   the floating Upload/Export actions bar (z-index 60), which used to cover it. */
+#live-build-pane .lbp-sub {
+  position: absolute; top: 30px; left: 0; right: 0; text-align: center;
+  z-index: 2; pointer-events: none; font-size: 12px; color: var(--accent);
+  font-weight: 600;
+}
+/* The in-pane floating tree is HIDDEN — the real left sidebar shows the one
+   feature tree now (kept visible in live modes). */
+#live-build-pane .lbp-tree { display: none !important; }
+#live-build-pane .lbp-tree-unused {
+  position: absolute; top: 36px; left: 12px; bottom: 40px; width: 180px;
+  z-index: 3; pointer-events: none;
+  display: flex; flex-direction: column;
+}
+#live-build-pane .lbp-tree-title {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.6px;
+  text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px;
+}
+#live-build-pane .lbp-tree-list { overflow: hidden; display: flex; flex-direction: column; gap: 2px; }
+#live-build-pane .lbp-tree-row {
+  display: flex; align-items: center; gap: 7px; font-size: 12px;
+  color: var(--text-secondary); padding: 3px 8px; border-radius: 6px;
+  background: rgba(127,127,127,0.06); animation: lbpRowIn 0.25s ease;
+}
+#live-build-pane .lbp-tree-row.cur {
+  color: var(--text-primary); background: rgba(88,166,255,0.16);
+}
+#live-build-pane .lbp-tree-ic { color: var(--accent); width: 14px; text-align: center; }
+#live-build-pane .lbp-tree-nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@keyframes lbpRowIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+
+/* Smooth transition when the viewer splits (mesh glides from center to the
+   left half) and when the build pane expands to full — no abrupt jump. */
+#viewer { transition: right 0.45s ease; }
+#live-build-pane { transition: left 0.45s ease, right 0.45s ease; }
+
 /* â”€â”€ AI Chat Panel (right sidebar) â€” resizable â”€â”€ */
 #chat-panel {
   position: fixed; top: 48px; right: 0; bottom: 80px; width: 300px;
@@ -697,6 +765,7 @@ body {
 
 <!-- 3D Viewer -->
 <div id="viewer">
+  <div id="viewer-analysis-label" class="pane-label">Analyzing mesh</div>
   <div id="empty-state">
     <i class="ri-box-3-line"></i>
     <p>Drop a mesh file or click Upload</p>
@@ -1075,7 +1144,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260615c" type="module"></script>
+<script src="/static/app.js?v=20260616j" type="module"></script>
 </body>
 </html>
 

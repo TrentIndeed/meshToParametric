@@ -30,6 +30,53 @@ logger = logging.getLogger(__name__)
 MAX_JOBS = 50  # max completed jobs to keep in memory
 
 
+def _ingest_streamed_steps(job, stream_dir, already: int) -> int:
+    """Read construction-step files the CAD subprocess has streamed since the
+    last poll and append them to `job.steps`, bumping `job.steps_version`.
+
+    Files are written atomically by export_cadquery as `{NNNN}.pkl` in build
+    order. We only read contiguous indices starting at `already`, so a file
+    mid-write (its index not yet present) just defers to the next poll tick.
+    Returns the new count of ingested steps. Best-effort: never raises into
+    the build loop.
+    """
+    import pickle
+    try:
+        from mesh2param.pipeline.export_cadquery import ConstructionStep
+    except Exception:
+        return already
+    n = already
+    while True:
+        f = stream_dir / f"{n:04d}.pkl"
+        if not f.exists():
+            break
+        try:
+            with open(f, "rb") as fh:
+                payload = pickle.load(fh)
+        except Exception:
+            # Possibly caught mid-rename; retry on the next tick.
+            break
+        try:
+            job.steps.append(ConstructionStep(
+                name=payload.get("name", f"Step {n + 1}"),
+                tess_vertices=payload.get("tess_vertices"),
+                tess_faces=payload.get("tess_faces"),
+                volume=float(payload.get("volume", 0.0) or 0.0),
+                sketch_overlay=payload.get("sketch_overlay"),
+                overlay_arcs=payload.get("overlay_arcs"),
+            ))
+            n += 1
+        except Exception:
+            logger.debug("Failed to ingest streamed step %d", n, exc_info=True)
+            break
+    if n != already:
+        job.steps_version += 1
+        job.last_activity_at = time.time()
+        logger.info("Live CAD build: %d step(s) streamed for job %s",
+                    n, job.id)
+    return n
+
+
 def _project_vertex_to_primitive(vert: np.ndarray, fitted) -> np.ndarray:
     """Snap a vertex onto its region's fitted analytic surface.
 
@@ -299,9 +346,9 @@ PAUSE_STAGES: list[tuple[str, str]] = [
     ("blend_graph", "Blend graph"),
     ("stitched", "Stitched fillets (debug)"),
     ("features", "Feature recognition"),
-    ("build", "Build 3D model"),
-    ("intent", "Fillet & chamfer intent"),
-    ("apply", "Apply fillets & chamfers"),
+    # build / intent / apply checkpoints removed — the two-phase right-pane
+    # build now shows the model accreting and fillets applying live, so these
+    # left-pane re-shows were redundant. Reconcile stays (a real diagnostic).
     ("reconcile", "Blend reconciliation (debug)"),
 ]
 PAUSE_STAGE_KEYS = {k for k, _ in PAUSE_STAGES}
@@ -345,6 +392,11 @@ class Job:
     progress_edges: list | None = None     # flat float list (line segment pairs)
     progress_edge_colors: list | None = None  # flat float list (per-edge-vertex RGB)
     progress_version: int = 0  # incremented on each viz update
+    # Live CAD construction streaming — bumped each time a new construction
+    # step is ingested from the CAD subprocess while it's still building, so
+    # the dual-pane UI's right pane accretes features in real time.
+    steps_version: int = 0
+    building_live: bool = False  # True while CAD steps are streaming in
     bbox_min: list = field(default_factory=lambda: [0, 0, 0])
     bbox_max: list = field(default_factory=lambda: [0, 0, 0])
     token_cost: int = 0
@@ -536,6 +588,130 @@ class JobQueue:
                 if not keep:
                     Path(job.file_path).unlink(missing_ok=True)
 
+    def _launch_cad_subprocess(self, job, num_variants):
+        """Pre-warm + Popen the CadQuery build subprocess; return its handle
+        bundle. Input is provided LATER via `_write_cad_input`.
+
+        Launched EARLY (at ingest) so the slow `import cadquery` (OCC load,
+        ~15 s) overlaps the analysis stages instead of blocking the build. The
+        subprocess imports CadQuery, then POLLS for its input pickle, which the
+        parent drops once recognition has produced the feature tree — so the
+        build starts the instant the data is ready, with CadQuery already
+        loaded, and its steps stream during the remaining analysis viz. It then
+        waits at `clusters_path` for the stitched fillets (phase two).
+        """
+        import tempfile
+        cad_input_path = Path("data") / f"cad_input_{job.id}.pkl"
+        try:
+            cad_input_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        tmp_out = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+        tmp_out.close()
+
+        clusters_path = Path("data") / f"cad_clusters_{job.id}.pkl"
+        try:
+            clusters_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        job._cad_clusters_path = str(clusters_path)
+
+        cad_stream_dir = Path("data") / f"cad_stream_{job.id}"
+        try:
+            if cad_stream_dir.exists():
+                import shutil as _sh
+                _sh.rmtree(cad_stream_dir, ignore_errors=True)
+            cad_stream_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.debug("Could not prepare CAD stream dir", exc_info=True)
+        job.steps = []
+        job.steps_version = 0
+        # NOT building_live yet — the subprocess is only PRE-WARMING (loading
+        # CadQuery) and has no input. Showing the right pane now would leave it
+        # blank for the whole analysis. _write_cad_input flips it on when the
+        # build actually starts.
+        job.building_live = False
+        job._cad_stream_ingested = 0
+
+        script = f"""
+import pickle, sys, os, time, logging, traceback, faulthandler
+faulthandler.enable()
+logging.basicConfig(
+    level=logging.INFO, stream=sys.stdout,
+    format='%(levelname)s %(name)s: %(message)s',
+)
+sys.path.insert(0, '.')
+try:
+    # Pre-warm: pay the slow OCC import NOW, while the parent is still
+    # analysing, so the build starts instantly once the input arrives.
+    import cadquery  # noqa: F401
+    print('CAD engine ready; waiting for feature tree...', flush=True)
+    _in = r'{cad_input_path}'
+    _dl = time.time() + 300
+    while time.time() < _dl:
+        if os.path.exists(_in) and os.path.getsize(_in) > 0:
+            time.sleep(0.15)   # let the parent's atomic rename settle
+            break
+        time.sleep(0.1)
+    with open(_in, 'rb') as f:
+        tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
+    from mesh2param.pipeline.export_cadquery import export_cadquery
+    result = export_cadquery(tree, cleaned, use_llm=False, num_variants={num_variants},
+                             body_results=all_body_results if decomposition.is_multi_body else None,
+                             stitched_clusters=stitched_clusters,
+                             stream_dir=r'{cad_stream_dir}',
+                             stitched_clusters_path=r'{clusters_path}')
+    result.solid = None
+    with open(r'{tmp_out.name}', 'wb') as f:
+        pickle.dump(result, f)
+except BaseException as _exc:
+    print('=== SUBPROCESS EXCEPTION ===', flush=True)
+    traceback.print_exc(file=sys.stdout)
+    sys.stdout.flush()
+    sys.exit(2)
+"""
+        cad_log_path = Path("data") / f"cad_subproc_{job.id}.log"
+        cad_log_path.parent.mkdir(parents=True, exist_ok=True)
+        cad_err_path = Path("data") / f"cad_subproc_{job.id}.err.log"
+        cad_log_fh = open(cad_log_path, "w", encoding="utf-8")
+        cad_err_fh = open(cad_err_path, "w", encoding="utf-8")
+        proc_handle = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=cad_log_fh, stderr=cad_err_fh, text=True,
+        )
+        job._cad_subprocess = proc_handle
+        logger.info("CAD build subprocess pre-warmed (pid=%s) for job %s",
+                    proc_handle.pid, job.id)
+        return {
+            'proc_handle': proc_handle, 'cad_input_path': cad_input_path,
+            'tmp_out': tmp_out, 'cad_log_path': cad_log_path,
+            'cad_err_path': cad_err_path, 'cad_log_fh': cad_log_fh,
+            'cad_err_fh': cad_err_fh, 'cad_stream_dir': cad_stream_dir,
+            'deadline': time.time() + 600.0, 'clusters_path': clusters_path,
+            'input_written': False, 'job': job,
+        }
+
+    def _write_cad_input(self, bundle, tree, cleaned, all_body_results,
+                         decomposition):
+        """Hand the pre-warmed CAD subprocess its inputs (atomic write), so it
+        unblocks and starts building. Returns True on success."""
+        import os
+        import pickle
+        if bundle is None or bundle.get('input_written'):
+            return False
+        p = str(bundle['cad_input_path'])
+        try:
+            with open(p + ".tmp", "wb") as f:
+                pickle.dump(
+                    (tree, cleaned, all_body_results, decomposition, []), f)
+            os.replace(p + ".tmp", p)
+            bundle['input_written'] = True
+            bundle['job'].building_live = True  # build is starting -> show pane
+            return True
+        except Exception:
+            logger.exception("Failed to hand input to CAD subprocess")
+            return False
+
     def _run_pipeline(self, job: Job):
         """Run the full mesh-to-CAD pipeline for a job."""
         import pickle
@@ -597,6 +773,18 @@ class JobQueue:
             while elapsed < seconds:
                 if job.status == "error":
                     break
+                # If the CAD build was launched early and is building
+                # concurrently, ingest its streamed steps during this dwell so
+                # the right pane accretes features while the left still shows
+                # analysis stages.
+                _ln = getattr(job, "_cad_launch", None)
+                if _ln is not None:
+                    try:
+                        job._cad_stream_ingested = _ingest_streamed_steps(
+                            job, _ln["cad_stream_dir"],
+                            getattr(job, "_cad_stream_ingested", 0))
+                    except Exception:
+                        pass
                 time.sleep(0.25)
                 elapsed += 0.25
 
@@ -684,6 +872,19 @@ class JobQueue:
                             scale_xyz.tolist(), (cleaned.bbox[1] - cleaned.bbox[0]).tolist())
 
         _set_mesh_viz(cleaned)
+
+        # PRE-WARM the CAD build subprocess NOW (right after ingest) so its slow
+        # `import cadquery` overlaps decompose + recognition + the viz stages.
+        # It blocks waiting for the feature tree, which we hand it the instant
+        # recognition finishes — so the right pane starts building during the
+        # analysis stages instead of sitting blank until the CAD stage.
+        job._cad_launch = None
+        try:
+            job._cad_launch = self._launch_cad_subprocess(
+                job, getattr(job, '_num_variants', 1))
+        except Exception:
+            logger.exception("CAD pre-warm failed; will build synchronously")
+            job._cad_launch = None
 
         # Stage 1b: cleanup front-end visuals for SCAN / AI ("dirty") inputs —
         # one verifiable stage per distinct transformation (Denoise, Align;
@@ -870,7 +1071,13 @@ class JobQueue:
             br = recognize_body(
                 sub_cleaned, bool(cleaned.metadata.get("scan_mode")))
             _check_cancelled()
-            return (body, sub_cleaned, br.regions, br.fitted, br.graph,
+            # Element [1] is the VIZ mesh: the mesh the regions/fitted/edges/
+            # blends actually live on. For dirty AI/scan parts that's a
+            # DECIMATED copy (br.seg_mesh) — drawing the regions on it shows
+            # clean flats instead of the shattered full-mesh segmentation, and
+            # it matches the ~10K-triangle regime segmentation was tuned for.
+            # The full-density mesh is rebuilt where the CAD export needs it.
+            return (body, br.seg_mesh, br.regions, br.fitted, br.graph,
                     br.edges, br.tree, br.blends)
 
         job.progress = 8
@@ -897,8 +1104,28 @@ class JobQueue:
         # apply stage measures the radius per CAD edge from the same
         # vertex set. The per-body record radii are never read.
 
-        all_body_results = [(body, sub_cleaned, body_tree)
-                            for body, sub_cleaned, _, _, _, _, body_tree, _ in body_stage_data]
+        # The CAD build needs the FULL-density per-body mesh (decimation hurts
+        # the build — blocky screws, bad profiles). body_stage_data[*][1] is
+        # now the decimated viz mesh, so rebuild the full sub-mesh here.
+        all_body_results = [
+            (body, extract_sub_mesh(cleaned, body.face_indices, body=body),
+             body_tree)
+            for body, _viz_mesh, _, _, _, _, body_tree, _ in body_stage_data]
+
+        # ── Phase one: hand the pre-warmed build its inputs NOW ──
+        # The CAD subprocess was pre-warmed at ingest (CadQuery already loaded)
+        # and is blocking for the feature tree. Drop it in so the prismatic
+        # build starts immediately and streams CONCURRENTLY with every analysis
+        # viz stage that follows (regularize, segment, fit, topology, blend,
+        # stitched, features). It then waits for the fillet clusters (phase two,
+        # dropped at clusters_path). The dwell loop ingests its streamed steps.
+        if all_body_results and job._cad_launch is not None:
+            try:
+                self._write_cad_input(
+                    job._cad_launch, all_body_results[0][2], cleaned,
+                    all_body_results, decomposition)
+            except Exception:
+                logger.exception("Handing input to CAD subprocess failed")
 
         # Stage 1c: Regularize — for SCAN / AI inputs the per-body processing
         # projected the wobbly vertices onto the recovered consensus planes
@@ -2126,6 +2353,27 @@ class JobQueue:
             # diag entry for its group.
             job._uid_to_group = dict(uid_to_group)
 
+            # ── Phase two unlock ──
+            # The build subprocess (launched right after recognition) has
+            # already built the prismatic model and is now blocked waiting for
+            # these fillet clusters. Drop them atomically so it applies
+            # fillets/chamfers as the second phase.
+            _cp = getattr(job, '_cad_clusters_path', None)
+            if _cp:
+                try:
+                    import os as _os
+                    import pickle as _pk
+                    _tmp = _cp + ".tmp"
+                    with open(_tmp, "wb") as _f:
+                        _pk.dump(stitched_clusters_payload, _f)
+                    _os.replace(_tmp, _cp)
+                    logger.info(
+                        "Phase two: handed %d fillet cluster(s) to the build",
+                        len(stitched_clusters_payload))
+                except Exception:
+                    logger.exception(
+                        "Failed to hand fillet clusters to the build subprocess")
+
             # --- Ground-truth dump for the stitched stage ---
             # Write what the ACTUAL server produced to a file so it
             # can be inspected directly (logger.info from the worker
@@ -2261,67 +2509,44 @@ class JobQueue:
             "stitched-clusters → export: %d group(s) feeding fillet apply",
             len(stitched_clusters),
         )
+        # The build was pre-warmed at ingest and handed its input after
+        # recognition, so it built concurrently with the analysis viz. Reuse
+        # that handle bundle; if pre-warm was skipped/failed, launch + feed it
+        # now (synchronous fallback).
+        _launch = getattr(job, '_cad_launch', None)
+        if _launch is None:
+            _launch = self._launch_cad_subprocess(
+                job, getattr(job, '_num_variants', 1))
+        # Make sure the subprocess has its input (no-op if already handed over).
+        self._write_cad_input(_launch, tree, cleaned, all_body_results,
+                              decomposition)
+        job._cad_launch = None
+        proc_handle = _launch['proc_handle']
+        cad_input_path = _launch['cad_input_path']
+        tmp_out = _launch['tmp_out']
+        cad_log_path = _launch['cad_log_path']
+        cad_err_path = _launch['cad_err_path']
+        cad_log_fh = _launch['cad_log_fh']
+        cad_err_fh = _launch['cad_err_fh']
+        cad_stream_dir = _launch['cad_stream_dir']
+        deadline = _launch['deadline']
+        # Guarantee phase-two clusters are delivered before we block on the
+        # build. If the stitched stage already dropped them the file exists; if
+        # it errored (or this is a synchronous fallback launch) drop what we
+        # have now so the waiting subprocess proceeds instead of timing out.
+        _cp2 = _launch.get('clusters_path')
+        if _cp2 is not None and not Path(_cp2).exists():
+            try:
+                import os as _os2
+                with open(str(_cp2) + ".tmp", "wb") as _f:
+                    pickle.dump(stitched_clusters, _f)
+                _os2.replace(str(_cp2) + ".tmp", str(_cp2))
+            except Exception:
+                logger.debug("Fallback clusters write failed", exc_info=True)
+        # Continue ingesting from wherever the dwell loop's concurrent ingest
+        # left off, so streamed steps aren't double-counted.
+        _stream_ingested = getattr(job, '_cad_stream_ingested', 0)
         try:
-            tmp_in = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            pickle.dump(
-                (tree, cleaned, all_body_results, decomposition,
-                 stitched_clusters),
-                tmp_in,
-            )
-            tmp_in.close()
-        except Exception:
-            logger.exception("Job %s: failed to serialize pipeline data for CadQuery subprocess", job.id)
-            raise
-
-        tmp_out = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-        tmp_out.close()
-
-        num_variants = getattr(job, '_num_variants', 1)
-        script = f"""
-import pickle, sys, logging, traceback, faulthandler
-faulthandler.enable()
-logging.basicConfig(
-    level=logging.INFO, stream=sys.stdout,
-    format='%(levelname)s %(name)s: %(message)s',
-)
-sys.path.insert(0, '.')
-try:
-    with open(r'{tmp_in.name}', 'rb') as f:
-        tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
-    from mesh2param.pipeline.export_cadquery import export_cadquery
-    result = export_cadquery(tree, cleaned, use_llm=False, num_variants={num_variants},
-                             body_results=all_body_results if decomposition.is_multi_body else None,
-                             stitched_clusters=stitched_clusters)
-    result.solid = None
-    with open(r'{tmp_out.name}', 'wb') as f:
-        pickle.dump(result, f)
-except BaseException as _exc:
-    print('=== SUBPROCESS EXCEPTION ===', flush=True)
-    traceback.print_exc(file=sys.stdout)
-    sys.stdout.flush()
-    sys.exit(2)
-"""
-        try:
-            # Use Popen + poll loop instead of subprocess.run so a UI
-            # cancel can terminate the subprocess immediately. Without
-            # this the worker stays blocked inside run() for up to the
-            # full timeout, and any newly-submitted job sits in the
-            # queue with status="queued" until the worker frees up.
-            # IMPORTANT: redirect to FILES, not PIPE. With PIPE the
-            # parent only drains stdout after proc.wait() returns —
-            # once the OS pipe buffer (~64 KB on Windows) fills up
-            # mid-run, the subprocess deadlocks on its next print.
-            cad_log_path = Path("data") / f"cad_subproc_{job.id}.log"
-            cad_log_path.parent.mkdir(parents=True, exist_ok=True)
-            cad_err_path = Path("data") / f"cad_subproc_{job.id}.err.log"
-            cad_log_fh = open(cad_log_path, "w", encoding="utf-8")
-            cad_err_fh = open(cad_err_path, "w", encoding="utf-8")
-            proc_handle = subprocess.Popen(
-                [sys.executable, "-c", script],
-                stdout=cad_log_fh, stderr=cad_err_fh, text=True,
-            )
-            job._cad_subprocess = proc_handle
-            deadline = time.time() + 600.0
             try:
                 while True:
                     if job.status == "error":
@@ -2332,7 +2557,7 @@ except BaseException as _exc:
                             proc_handle.wait(timeout=5)
                         except subprocess.TimeoutExpired:
                             proc_handle.kill()
-                        Path(tmp_in.name).unlink(missing_ok=True)
+                        Path(cad_input_path).unlink(missing_ok=True)
                         Path(tmp_out.name).unlink(missing_ok=True)
                         raise RuntimeError("Cancelled by user")
                     # Heartbeat so the watchdog doesn't classify the
@@ -2341,6 +2566,11 @@ except BaseException as _exc:
                     # STUCK_THRESHOLD_S; only its internal `deadline`
                     # below should bound it.
                     job.last_activity_at = time.time()
+                    # Ingest any construction steps the subprocess has streamed
+                    # to disk since we last looked, so the UI's right pane
+                    # accretes features live while the build is still running.
+                    _stream_ingested = _ingest_streamed_steps(
+                        job, cad_stream_dir, _stream_ingested)
                     try:
                         proc_handle.wait(timeout=0.5)
                         break
@@ -2384,10 +2614,10 @@ except BaseException as _exc:
                 proc.stderr = ""
         except Exception:
             logger.exception("Job %s: CadQuery subprocess failed", job.id)
-            Path(tmp_in.name).unlink(missing_ok=True)
+            Path(cad_input_path).unlink(missing_ok=True)
             Path(tmp_out.name).unlink(missing_ok=True)
             raise
-        Path(tmp_in.name).unlink(missing_ok=True)
+        Path(cad_input_path).unlink(missing_ok=True)
 
         if proc.returncode != 0:
             # Preserve the input pickle for offline replay.
@@ -2396,7 +2626,7 @@ except BaseException as _exc:
                 preserved = Path("data") / f"cad_subproc_{job.id}_input.pkl"
                 preserved.parent.mkdir(parents=True, exist_ok=True)
                 import shutil
-                shutil.copy(tmp_in.name, str(preserved))
+                shutil.copy(str(cad_input_path), str(preserved))
             except Exception as _cpy_exc:
                 logger.warning("Failed to preserve subproc input pkl: %s", _cpy_exc)
             logger.error(
@@ -2454,8 +2684,21 @@ except BaseException as _exc:
             logger.debug("Could not persist Onshape export data for job %s",
                          job.id, exc_info=True)
 
+        # The streamed steps were a live preview; the result's construction
+        # steps are authoritative (fully tessellated, post-reconciliation).
+        # Swap to them and bump the version so the UI loads the final geometry.
         job.steps = result.construction_steps
         job.cad_volume = result.cad_volume
+        job.building_live = False
+        job.steps_version += 1
+        try:
+            import shutil as _sh
+            _sh.rmtree(cad_stream_dir, ignore_errors=True)
+            _cp_done = getattr(job, '_cad_clusters_path', None)
+            if _cp_done:
+                Path(_cp_done).unlink(missing_ok=True)
+        except Exception:
+            pass
         # Store variants
         job.variants = []
         for v in getattr(result, 'variants', []):
@@ -2468,135 +2711,20 @@ except BaseException as _exc:
         if job.variants:
             job.steps = job.variants[0]['steps']  # default to first variant
 
-        # --- Build checkpoint: the 3D model is now built (holes cut,
-        # bodies combined) but fillets/chamfers are NOT yet applied.
-        # Show that un-blended solid and offer a breakpoint here so the
-        # user can inspect the base build before the intent/apply stages.
-        try:
-            build_v = getattr(result, 'pre_blend_tess_vertices', None)
-            build_f = getattr(result, 'pre_blend_tess_faces', None)
-            if build_v is None or build_f is None:
-                build_v = result.tess_vertices
-                build_f = result.tess_faces
-            if build_v is not None and build_f is not None:
-                _check_cancelled()
-                job.progress = 94
-                job.progress_stage = "3D model built (before fillets & chamfers)"
-                job.progress_vertices = np.asarray(
-                    build_v, dtype=np.float64,
-                ).flatten().tolist()
-                job.progress_faces = np.asarray(
-                    build_f, dtype=np.int64,
-                ).flatten().tolist()
-                job.progress_colors = None
-                job.progress_colors_per_face = False
-                job.progress_edges = None
-                job.progress_edge_colors = None
-                # Clear the multi-body decomposition pieces from earlier
-                # stages — otherwise the frontend renders those stale
-                # pieces instead of the built CAD solid (pieces take
-                # precedence over progress_vertices in the viewer).
-                job._decomp_pieces = None
-                job.progress_version += 1
-                _dwell_if_not_step_through("build")
-                _pause_for_review("build")
-        except Exception as _build_exc:
-            logger.debug("Build checkpoint viz failed: %s", _build_exc)
+        # (Removed: the "3D model built (before fillets)" pre-blend checkpoint
+        # stage — the two-phase right-pane build now shows the un-blended solid
+        # accreting, then the fillets going on, so this left-pane snapshot was
+        # redundant.)
 
-        # --- Stage 7: Fillet & Chamfer Intent Overlay ---
-        # Show the un-blended solid (gray) with the actual fillet
-        # (cyan, quarter-round) and chamfer (orange, bevel) SURFACES
-        # painted on, so you can see what each blend looks like — like
-        # the blend-graph stage, but on the rebuilt CAD solid. The
-        # geometry comes from result.intent_mesh; falls back to edge
-        # lines if patch assembly produced nothing.
-        intent_mesh = getattr(result, 'intent_mesh', None) or {}
-        blend_edges = getattr(result, 'blend_edge_overlay', None) or []
-        pre_v = getattr(result, 'pre_blend_tess_vertices', None)
-        pre_f = getattr(result, 'pre_blend_tess_faces', None)
-        try:
-            n_patches = 0
-            if intent_mesh.get("vertices") and intent_mesh.get("faces"):
-                _check_cancelled()
-                # colors are per-face (numFaces*3); count non-gray faces
-                # just for the status label.
-                n_patches = len(blend_edges)
-                job.progress = 96
-                job.progress_stage = (
-                    f"Fillet & chamfer intent: {n_patches} blend surface(s)"
-                )
-                job.progress_vertices = intent_mesh["vertices"]
-                job.progress_faces = intent_mesh["faces"]
-                job.progress_colors = intent_mesh.get("colors")
-                job.progress_colors_per_face = True
-                job.progress_edges = None
-                job.progress_edge_colors = None
-                job._decomp_pieces = None  # render the solid, not stale pieces
-                job.progress_version += 1
-                job.debug_summary.append(
-                    f"Stage 7: {n_patches} fillet/chamfer blend surface(s) shown"
-                )
-                _dwell_if_not_step_through("intent")
-                _pause_for_review("intent")
-            elif pre_v is not None and pre_f is not None:
-                # Fallback: solid + cyan edge lines (no surface patches).
-                _check_cancelled()
-                job.progress = 96
-                job.progress_stage = (
-                    f"Fillet & chamfer intent: {len(blend_edges)} edge(s) to blend"
-                )
-                job.progress_vertices = np.asarray(
-                    pre_v, dtype=np.float64,
-                ).flatten().tolist()
-                job.progress_faces = np.asarray(
-                    pre_f, dtype=np.int64,
-                ).flatten().tolist()
-                job.progress_colors = None
-                job.progress_colors_per_face = False
-                if blend_edges:
-                    flat = []
-                    for seg in blend_edges:
-                        (ax, ay, az), (bx, by, bz) = seg[0], seg[1]
-                        flat.extend([ax, ay, az, bx, by, bz])
-                    job.progress_edges = flat
-                else:
-                    job.progress_edges = None
-                job.progress_edge_colors = None
-                job._decomp_pieces = None
-                job.progress_version += 1
-                _dwell_if_not_step_through("intent")
-                _pause_for_review("intent")
-        except Exception as _intent_exc:
-            logger.debug("Stage 7 (intent overlay) failed: %s", _intent_exc)
+        # (Removed: the "Fillet & Chamfer Intent Overlay" left-pane viz stage —
+        # consolidated into the two-phase right-pane build, which shows the real
+        # fillets going on after the stitched stage.)
 
-        # --- Stage 8: Apply fillets & chamfers ---
-        # Show the final solid (post-apply). The actual application
-        # already ran inside the CAD subprocess; this stage frames it
-        # as its own viz checkpoint so step-through users see the
-        # before/after contrast vs. Stage 7.
-        try:
-            final_v = result.tess_vertices
-            final_f = result.tess_faces
-            if final_v is not None and final_f is not None:
-                _check_cancelled()
-                job.progress = 99
-                job.progress_stage = "Applying fillets & chamfers to model"
-                job.progress_vertices = np.asarray(
-                    final_v, dtype=np.float64,
-                ).flatten().tolist()
-                job.progress_faces = np.asarray(
-                    final_f, dtype=np.int64,
-                ).flatten().tolist()
-                job.progress_colors = None
-                job.progress_colors_per_face = False
-                job.progress_edges = None
-                job.progress_edge_colors = None
-                job._decomp_pieces = None  # render the solid, not stale pieces
-                job.progress_version += 1
-                _dwell_if_not_step_through("apply")
-                _pause_for_review("apply")
-        except Exception as _apply_exc:
-            logger.debug("Stage 8 (apply) viz failed: %s", _apply_exc)
+        # (Removed: the "Apply fillets & chamfers" left-pane viz stage. The
+        # two-phase build now applies fillets live in the RIGHT build pane right
+        # after the stitched stage, so re-showing the post-apply solid on the
+        # left was redundant. The reconciliation fate overlay below stays — it's
+        # a real diagnostic (which groups matched/applied), not a re-show.)
 
         # --- Debug stage: Blend reconciliation fate overlay ---
         # Paint every fillet face by what the apply stage did with its

@@ -39,6 +39,7 @@ def recognize_features(
     cleaned: CleanedMesh,
     config: RecognizeConfig | None = None,
     topo_blends: list[dict] | None = None,
+    build_mesh: CleanedMesh | None = None,
 ) -> FeatureTree:
     """Recognize manufacturing features from surface data and topology.
 
@@ -80,14 +81,21 @@ def recognize_features(
     # Computed once; drives the base axis and, for multi-segment parts
     # (RackMount = base plate + two side plates), emits the non-primary
     # segments as JOIN extrude features below.
+    # The EXTRUSION plan / build geometry uses the FULL-density mesh
+    # (build_mesh) for accurate cross-sections and profiles; the region-based
+    # feature detection above/below uses `cleaned`, which may be a decimated
+    # copy whose flats segment cleanly. They share a coordinate frame, so the
+    # coordinate-based features and the build line up. When build_mesh is None
+    # (clean CAD), the two are the same mesh.
+    plan_mesh = build_mesh if build_mesh is not None else cleaned
     extrusion_plan = None
     try:
         if config.use_component_planner:
             from mesh2param.pipeline.extrusion import plan_extrusions_components
-            extrusion_plan = plan_extrusions_components(cleaned)
+            extrusion_plan = plan_extrusions_components(plan_mesh)
         else:
             from mesh2param.pipeline.extrusion import plan_extrusions
-            extrusion_plan = plan_extrusions(cleaned)
+            extrusion_plan = plan_extrusions(plan_mesh)
     except Exception:
         logger.exception("Extrusion engine failed; using legacy base logic")
 
@@ -262,7 +270,12 @@ def recognize_features(
     except Exception:
         logger.exception("Stage 5 failed finding pockets")
         raise
+    n_seg_faces = len(cleaned.faces) if cleaned is not None else 0
+    _dropped_detail = 0
     for pf, rids in pocket_features:
+        if config.conservative_detail and _drop_conservative_cut(pf, base_feature):
+            _dropped_detail += 1
+            continue
         pf.dependencies = [base_idx]
         features.append(pf)
         assigned.update(rids)
@@ -299,6 +312,10 @@ def recognize_features(
         logger.exception("Stage 5 failed finding fillets/chamfers")
         raise
     for fc, rids in fillet_chamfer:
+        if config.conservative_detail and _drop_conservative_blend(
+                fc, n_seg_faces):
+            _dropped_detail += 1
+            continue
         # Fillets/chamfers depend on whichever features own their neighbor surfaces
         fc.dependencies = _resolve_dependencies(
             rids, features, region_lookup,
@@ -307,6 +324,9 @@ def recognize_features(
             fc.dependencies = [base_idx]
         features.append(fc)
         assigned.update(rids)
+    if config.conservative_detail and _dropped_detail:
+        logger.info("Conservative detail gate: dropped %d weak feature(s)",
+                    _dropped_detail)
 
     # --- 6. Remaining unassigned regions → absorb into base ---
     remaining = set(r.region_id for r in regions) - assigned
@@ -318,6 +338,13 @@ def recognize_features(
             [base_feature.face_indices, remaining_faces]
         )
         assigned.update(remaining)
+
+    # Parametric arc representation: extract each sketch's SHARP corners + the
+    # per-corner fillet RADII so the CadQuery and Onshape exports both draw the
+    # SAME true tangent arcs (editable radii) instead of a polyline of sampled
+    # points. Same source (corners, fillets) feeds both exporters -> identical
+    # geometry, the way Onshape models a rounded outline (lines + tangent arcs).
+    _attach_arc_segments(features)
 
     # Build dependency DAG
     dep_graph = nx.DiGraph()
@@ -399,6 +426,87 @@ def _thin_axis_tapered(verts: np.ndarray, bbox: np.ndarray, axis: int,
     if max(a_min, a_max) < 1e-9:
         return False
     return (min(a_min, a_max) / max(a_min, a_max)) < ratio_thresh
+
+
+def _attach_arc_segments(features: list) -> None:
+    """Add a parametric arc representation to each sketch_geometry in place.
+
+    For each loop of points we recover the SHARP corner polygon and the
+    per-corner fillet radius via `_regularize_outline` (the same routine that
+    rounded the outline), and store them as `corners` (list of [x, y]) and
+    `fillets` (list of radii aligned with corners; 0 = sharp). Pattern loops get
+    `extra_corners` / `extra_fillets`. Both the CadQuery and Onshape exports
+    consume these to draw true tangent arcs; `points` stays for the overlay and
+    any consumer that hasn't been migrated.
+    """
+    from mesh2param.pipeline.regularize import _regularize_outline
+
+    def _seg(pts):
+        if not pts or len(pts) < 3:
+            return None, None
+        P = np.asarray([(float(p[0]), float(p[1])) for p in pts], dtype=float)
+        # Reject ROUND / organic outlines (a screw or bore circle): regularize
+        # would fit a bogus polygon with absurd corner radii. Axis-aligned sides
+        # must dominate the perimeter.
+        seg = np.roll(P, -1, axis=0) - P
+        L = np.linalg.norm(seg, axis=1)
+        d = seg / (L[:, None] + 1e-12)
+        na = np.abs(d).max(1) > np.cos(np.radians(10.0))
+        if L.sum() <= 0 or float(L[na].sum() / L.sum()) < 0.6:
+            return None, None
+        try:
+            sc, fl = _regularize_outline([(float(x), float(y)) for x, y in P])
+            if sc and len(sc) >= 3:
+                fl = fl or {}
+                rads = [float(fl.get(i, 0.0)) for i in range(len(sc))]
+                # Sanity: a fillet radius can't be a big fraction of the part.
+                bbox = float(max(np.ptp(P[:, 0]), np.ptp(P[:, 1])))
+                if bbox > 0 and any(r > 0.5 * bbox for r in rads):
+                    return None, None
+                return ([[float(x), float(y)] for x, y in sc], rads)
+        except Exception:
+            logger.debug("arc-segment extraction failed", exc_info=True)
+        return None, None
+
+    for f in features:
+        sg = f.sketch_geometry or {}
+        c, r = _seg(sg.get("points"))
+        if c is not None:
+            sg["corners"] = c
+            sg["fillets"] = r
+        extra = sg.get("extra_loops")
+        if extra:
+            ec, er = [], []
+            for lp in extra:
+                cc, rr = _seg(lp)
+                ec.append(cc)
+                er.append(rr)
+            sg["extra_corners"] = ec
+            sg["extra_fillets"] = er
+
+
+def _drop_conservative_cut(feat: Feature, base_feature: Feature) -> bool:
+    """True if a POCKET/SLOT cut is geometric nonsense for a dirty part.
+
+    On AI/scan meshes the pocket finder turns surface bumps into deep phantom
+    cuts (AI1, a 2 mm-base plate, came back with two 39 mm-deep "slots"). A
+    real cut into the base material can't be much deeper than the base it cuts
+    into — gate any cut deeper than 1.5x the base extrusion depth. The locked
+    build (base + bosses + holes) is unaffected; only these region-derived
+    cuts are dropped."""
+    base_depth = abs(getattr(base_feature, "depth", 0.0) or 0.0)
+    if base_depth < 1e-6:
+        return False
+    return abs(getattr(feat, "depth", 0.0) or 0.0) > 1.5 * base_depth
+
+
+def _drop_conservative_blend(feat: Feature, n_seg_faces: int) -> bool:
+    """True if a FILLET/CHAMFER is too weakly supported to trust on a dirty
+    part. Micro-strips of 1-2 faces are mesh noise, not edge blends; require a
+    backing proportional to mesh density (so the bar scales with triangle
+    count) with a small absolute floor."""
+    floor = max(8, int(0.004 * n_seg_faces))
+    return len(feat.face_indices) < floor
 
 
 def _hole_coaxial_with_boss(hole: Feature, bosses: list[Feature]) -> bool:

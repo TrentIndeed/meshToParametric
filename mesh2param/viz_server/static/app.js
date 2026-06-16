@@ -3,6 +3,67 @@ import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/exampl
 
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
+// Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
+// polyline of THREE.Vector3 (a TRUE curve, not the old chord between sampled
+// outline points). The in-plane axes are the two indices other than `ax`,
+// ascending — matching the backend's (u_axis, v_axis) convention.
+function arcToPoints(arc) {
+  const axes = [0, 1, 2].filter(a => a !== arc.ax);
+  const ua = axes[0], va = axes[1];
+  const sweep = Math.abs(arc.a1 - arc.a0);
+  const n = Math.max(8, Math.ceil(sweep / (Math.PI / 48)));
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = arc.a0 + (arc.a1 - arc.a0) * (i / n);
+    const p = [0, 0, 0];
+    p[ua] = arc.cu + arc.r * Math.cos(t);
+    p[va] = arc.cv + arc.r * Math.sin(t);
+    p[arc.ax] = arc.pos;
+    pts.push(new THREE.Vector3(p[0], p[1], p[2]));
+  }
+  return pts;
+}
+
+// Shared feature-tree row rendering — used by BOTH the main left-sidebar tree
+// and the live-build pane's in-pane tree, so the two are guaranteed identical
+// (same icons, same name, same detail). Single source of truth.
+const FEATURE_ICON_MAP = {
+  'Sketch': ['sketch.png', 'sketch'],
+  'Extrude': ['extrude.png', 'extrude'],
+  'Through': ['hole.png', 'hole'],
+  'Blind': ['hole.png', 'hole'],
+  'Hole': ['hole.png', 'hole'],
+  'Chamfer': ['chamfer.png', 'chamfer'],
+  'Side Profile': ['sketch.png', 'sketch'],
+  'Side Cut': ['chamfer.png', 'chamfer'],
+  'Fillet': ['fillet.png', 'fillet'],
+  'Pocket': ['shell.png', 'pocket'],
+  'Boss': ['extrude.png', 'boss'],
+  'Join': ['extrude.png', 'boss'],
+  'Slot': ['shell.png', 'slot'],
+  'Loft': ['loft.png', 'extrude'],
+  'Revolve': ['revolve.png', 'extrude'],
+  'Sweep': ['sweep.png', 'extrude'],
+  'Shell': ['shell.png', 'pocket'],
+  'Original': ['bodies.png', 'sketch'],
+};
+function featureIconInfo(name) {
+  for (const [key, [file, cls]] of Object.entries(FEATURE_ICON_MAP)) {
+    if (name.includes(key)) return { file, cls };
+  }
+  return { file: 'component.png', cls: 'extrude' };
+}
+// Inner HTML for a `.feature-item` row (icon + name + detail).
+function featureRowInnerHTML(name, volume) {
+  const { file, cls } = featureIconInfo(name);
+  const shortName = (name || '').split(/\s*[—→]\s*/)[0].trim();
+  const detail = (volume > 0) ? volume.toLocaleString() + ' mm³' : '2D';
+  return '<div class="icon ' + cls + '">' +
+    '<img src="/static/icons/' + file + '" style="width:22px;height:22px;border-radius:50%;"></div>' +
+    '<div class="texts"><div class="name">' + shortName + '</div>' +
+    '<div class="detail">' + detail + '</div></div>';
+}
+
 // Horizontal scroll on timeline with mouse wheel
 document.getElementById('timeline').addEventListener('wheel', (e) => {
   e.preventDefault();
@@ -626,6 +687,427 @@ function _renderProgressGeometry(pg) {
   document.getElementById('empty-state').style.display = 'none';
 }
 
+// ── Live dual-pane build (right pane) ──
+// While the pipeline runs, the left pane (#viewer) shows analysis stages on
+// the original mesh; this module owns the right pane (#live-build-pane), where
+// the CAD model accretes feature-by-feature as construction steps stream in
+// from the build subprocess. Self-contained: its own renderer/scene/camera so
+// it never touches the main viewer's state.
+const LiveBuild = (() => {
+  let pane, renderer, scene, camera, controls, group, sub, treeList;
+  let started = false, frameDone = false, userOrbited = false, userPaused = false;
+
+  // Live feature-tree rows use the SAME `.feature-item` markup + shared renderer
+  // as the main sidebar tree, so the two trees are identical (user request).
+  function _treeAdd(name, idx, volume) {
+    if (!treeList) return;
+    const row = document.createElement('div');
+    row.className = 'feature-item';
+    row.dataset.idx = idx;
+    row.innerHTML = featureRowInnerHTML(name, volume);
+    row.style.pointerEvents = 'auto';
+    row.onclick = () => loadStepInPane(idx);
+    treeList.querySelectorAll('.feature-item.active').forEach(r => r.classList.remove('active'));
+    row.classList.add('active');
+    treeList.appendChild(row);
+    treeList.scrollTop = treeList.scrollHeight;
+  }
+
+  function _highlightRow(idx) {
+    if (!treeList) return;
+    treeList.querySelectorAll('.feature-item.active').forEach(r => r.classList.remove('active'));
+    const row = treeList.querySelector('.feature-item[data-idx="' + idx + '"]');
+    if (row) { row.classList.add('active'); row.scrollIntoView({ block: 'nearest' }); }
+  }
+
+  // Render a specific construction step into the pane (clicking a tree row).
+  async function loadStepInPane(idx) {
+    userPaused = true;   // stop the auto-advance so the picked step stays up
+    let data = null;
+    try {
+      const res = await fetch('/api/job/' + curJob + '/step/' + idx);
+      if (res.ok) data = await res.json();
+    } catch (e) { return; }
+    if (!data || data.error || !data.vertices || !data.vertices.length) return;
+    if (data.is_sketch && !data.sketch_overlay) {
+      _renderSketchLines(data);
+    } else {
+      try { _renderSolid(data, false); } catch (e) { return; }
+      // A "Sketch X" step carries the solid-so-far PLUS the new sketch as a
+      // blue overlay — draw it so clicking a sketch actually SHOWS the sketch,
+      // not just the unchanged-looking solid.
+      if (data.sketch_overlay && data.sketch_overlay.length >= 6) {
+        _addSketchOverlay(data.sketch_overlay);
+      }
+      _addOverlayArcs(data.overlay_arcs);
+    }
+    _highlightRow(idx);
+    if (sub) sub.textContent = (data.name || '') + '  ·  step ' + (idx + 1);
+  }
+
+  // Blue sketch lines on top of the current solid (overlay = flat array of
+  // 3D points, consecutive pairs forming segments). Added to `group` so it
+  // inherits the same centering offset as the solid.
+  function _addSketchOverlay(overlay) {
+    const pts = [];
+    for (let i = 0; i + 2 < overlay.length; i += 3) {
+      pts.push(new THREE.Vector3(overlay[i], overlay[i + 1], overlay[i + 2]));
+    }
+    if (pts.length < 2) return;
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const mat = new THREE.LineBasicMaterial({ color: 0x58A6FF, depthTest: false });
+    const lines = new THREE.LineSegments(geo, mat);
+    lines.renderOrder = 3;
+    group.add(lines);
+  }
+
+  // Rounded corners as TRUE arcs (one smooth THREE.Line per arc), not chords.
+  function _addOverlayArcs(arcs) {
+    if (!arcs || !arcs.length) return;
+    const mat = new THREE.LineBasicMaterial({ color: 0x58A6FF, depthTest: false });
+    for (const arc of arcs) {
+      const pts = arcToPoints(arc);
+      if (pts.length < 2) continue;
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat);
+      line.renderOrder = 3;
+      group.add(line);
+    }
+  }
+
+  function _renderSketchLines(data) {
+    _clearGroup();
+    const verts = data.vertices, idxs = data.faces;
+    const pts = [];
+    for (let f = 0; f < idxs.length; f += 3) {
+      const a = idxs[f], b = idxs[f + 1];
+      pts.push(new THREE.Vector3(verts[a * 3], verts[a * 3 + 1], verts[a * 3 + 2]));
+      pts.push(new THREE.Vector3(verts[b * 3], verts[b * 3 + 1], verts[b * 3 + 2]));
+    }
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    group.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x58A6FF })));
+    _addOverlayArcs(data.overlay_arcs);
+    group.position.set(0, 0, 0);
+    const box = new THREE.Box3().setFromObject(group);
+    group.position.sub(box.getCenter(new THREE.Vector3()));
+  }
+  // Animation pump state: steps stream in (targetCount grows); the pump walks
+  // shownIdx up to targetCount one step at a time with a delay, so features
+  // visibly pop in one-by-one instead of jumping straight to the final solid.
+  let targetCount = 0, shownIdx = -1, pumping = false, curJob = null;
+  const STEP_MS = 480;
+
+  function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function ensure() {
+    if (pane) return;
+    pane = document.createElement('div');
+    pane.id = 'live-build-pane';
+    pane.innerHTML =
+      '<div class="pane-label">Building model</div>' +
+      '<div class="lbp-tree"><div class="lbp-tree-title">Feature tree</div>' +
+      '<div class="lbp-tree-list"></div></div>' +
+      '<div class="lbp-sub"></div>';
+    document.body.appendChild(pane);
+    sub = pane.querySelector('.lbp-sub');
+    treeList = pane.querySelector('.lbp-tree-list');
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+    camera.position.set(120, 90, 120);
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000, 0);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.4;
+    pane.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enableZoom = false;  // custom wheel zoom below (matches main viewer)
+
+    // Explicit wheel-zoom: dolly the camera along the view direction. The main
+    // viewer disables OrbitControls' built-in zoom and rolls its own; the live
+    // pane needs the same or the scroll wheel does nothing here.
+    renderer.domElement.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const dir = new THREE.Vector3().subVectors(camera.position, controls.target);
+      let dist = dir.length() || 1;
+      const sign = e.deltaY > 0 ? 1 : -1;
+      dist = Math.max(1, Math.min(1e5, dist * (1 + sign * 0.1)));
+      dir.setLength(dist);
+      camera.position.copy(controls.target).add(dir);
+      camera.updateProjectionMatrix();
+      userOrbited = true;  // user took over zoom — stop auto-orienting
+    }, { passive: false });
+    controls.addEventListener('start', () => { userOrbited = true; });
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 0.9));
+    const key = new THREE.DirectionalLight(0xffffff, 1.6);
+    key.position.set(80, 120, 100); scene.add(key);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.6);
+    fill.position.set(-90, 40, -60); scene.add(fill);
+
+    group = new THREE.Group();
+    scene.add(group);
+
+    (function loop() {
+      requestAnimationFrame(loop);
+      if (!pane || pane.style.display === 'none') return;
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+  }
+
+  function resize() {
+    if (!renderer) return;
+    const w = pane.clientWidth || 1, h = pane.clientHeight || 1;
+    renderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+
+  function _clearGroup() {
+    while (group.children.length) {
+      const c = group.children[0];
+      if (c.geometry) c.geometry.dispose();
+      if (c.material) {
+        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+        else c.material.dispose();
+      }
+      group.remove(c);
+    }
+  }
+
+  function _renderSolid(data, frame) {
+    _clearGroup();
+    const verts = new Float32Array(data.vertices);
+    const indices = data.faces;
+    const numFaces = Math.floor(indices.length / 3);
+    const positions = new Float32Array(numFaces * 9);
+    for (let i = 0; i < numFaces; i++) {
+      const a = indices[i*3], b = indices[i*3+1], c = indices[i*3+2];
+      positions[i*9]   = verts[a*3]; positions[i*9+1] = verts[a*3+1]; positions[i*9+2] = verts[a*3+2];
+      positions[i*9+3] = verts[b*3]; positions[i*9+4] = verts[b*3+1]; positions[i*9+5] = verts[b*3+2];
+      positions[i*9+6] = verts[c*3]; positions[i*9+7] = verts[c*3+1]; positions[i*9+8] = verts[c*3+2];
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xB8C0C8, metalness: 0.35, roughness: 0.45, side: THREE.FrontSide,
+    });
+    group.add(new THREE.Mesh(geo, mat));
+    // Model centered at origin; frame the camera only when asked (first solid,
+    // and again on expand-to-full) so the orbit isn't reset on every accretion.
+    group.position.set(0, 0, 0);
+    const box = new THREE.Box3().setFromObject(group);
+    const center = box.getCenter(new THREE.Vector3());
+    group.position.sub(center);
+    if (frame) _reframe();
+  }
+
+  function _reframe() {
+    const box = new THREE.Box3().setFromObject(group);
+    if (box.isEmpty()) return;
+    const size = box.getSize(new THREE.Vector3());
+    const r = Math.max(size.x, size.y, size.z) || 50;
+    // Orient toward the broad face that has the MOST extrudes/bosses, so the
+    // user sees the most features built. The plate's broad face is normal to
+    // the thinnest bbox axis; we look along that axis from whichever side
+    // carries more geometry (more vertices = the side with the bosses/screws).
+    const dims = [size.x, size.y, size.z];
+    let thin = 0;
+    if (dims[1] < dims[thin]) thin = 1;
+    if (dims[2] < dims[thin]) thin = 2;
+    // Vote on +/- side of center along `thin` by vertex count.
+    let plus = 0, minus = 0;
+    const mesh = group.children.find(c => c.geometry && c.geometry.attributes && c.geometry.attributes.position);
+    if (mesh) {
+      const pos = mesh.geometry.attributes.position;
+      const c = box.getCenter(new THREE.Vector3());
+      const cAxis = [c.x, c.y, c.z][thin];
+      for (let i = 0; i < pos.count; i++) {
+        const val = pos.getComponent(i, thin) + mesh.position.getComponent(thin) - cAxis;
+        if (val > 0) plus++; else minus++;
+      }
+    }
+    const sign = (minus > plus) ? -1 : 1;  // camera on the busier side
+    const eye = [0, 0, 0];
+    const u = (thin + 1) % 3, v = (thin + 2) % 3;
+    eye[thin] = sign * r * 1.7;     // mostly looking down the plate normal
+    eye[u] = r * 0.55;              // slight tilt so it reads as 3D
+    eye[v] = r * 0.45;
+    camera.position.set(eye[0], eye[1], eye[2]);
+    controls.target.set(0, 0, 0);
+    camera.near = r * 0.01; camera.far = r * 50;
+    camera.updateProjectionMatrix();
+  }
+
+  // Walk shownIdx up to targetCount, rendering one step at a time with a delay
+  // so features accrete visibly. Re-enters safely as more steps stream in.
+  async function _pump() {
+    if (pumping) return;
+    pumping = true;
+    try {
+      while (shownIdx + 1 < targetCount && curJob && !userPaused) {
+        const idx = shownIdx + 1;
+        let data = null;
+        try {
+          const res = await fetch(`/api/job/${curJob}/step/${idx}`);
+          if (res.ok) data = await res.json();
+        } catch (e) { /* transient — treat as empty */ }
+        shownIdx = idx;
+        if (!data || data.error || !data.vertices || data.vertices.length === 0) continue;
+        _treeAdd(data.name, idx, data.volume);
+        if (data.is_sketch && !data.sketch_overlay) {
+          // Pure sketch (just construction lines): keep the prior solid on
+          // screen, flash the label, advance quickly.
+          if (sub) sub.textContent = (data.name || '') + '  ·  ' + (idx + 1) + '/' + targetCount;
+          await _sleep(160);
+          continue;
+        }
+        // Re-frame on EVERY new solid (until the user takes over) so the camera
+        // keeps facing the busiest side as bosses accrete — the final view ends
+        // up looking at the side with the MOST extrudes, not the base plate's
+        // symmetric default.
+        try { _renderSolid(data, !userOrbited); frameDone = true; }
+        catch (e) { console.warn('[LiveBuild] render failed', e); continue; }
+        // Sketch steps carry the solid-so-far PLUS the new profile as a blue
+        // overlay (straight segments) + true arcs — draw them so the sketch
+        // actually shows during the live accretion, not just the solid.
+        if (data.sketch_overlay && data.sketch_overlay.length >= 6) {
+          _addSketchOverlay(data.sketch_overlay);
+        }
+        _addOverlayArcs(data.overlay_arcs);
+        if (sub) sub.textContent = (data.name || '') + '  ·  ' + (idx + 1) + '/' + targetCount;
+        await _sleep(STEP_MS);
+      }
+    } finally { pumping = false; }
+  }
+
+  function update(jobId, numSteps, version) {
+    ensure();
+    curJob = jobId;
+    if (numSteps > targetCount) targetCount = numSteps;
+    _pump();
+  }
+
+  function show() {
+    ensure();
+    if (started && document.body.classList.contains('live-split')) return;
+    started = true;
+    document.body.classList.remove('live-full');
+    document.body.classList.add('live-split');
+    pane.style.display = 'block';
+    resize();
+    _pumpViewerResize();  // resize the LEFT (main) viewer through the glide
+  }
+
+  // On build completion: expand the right pane to fill the viewer and show the
+  // FINISHED model immediately — NO reload/flash, and NO further accretion
+  // animation. The accretion pump is stopped here so the build doesn't keep
+  // "building" for several seconds after it's actually done.
+  function expandToFull() {
+    ensure();
+    started = true;
+    userPaused = true;   // stop the accretion pump — the build is complete
+    document.body.classList.remove('live-split');
+    document.body.classList.add('live-full');
+    pane.style.display = 'block';
+    const label = pane.querySelector('.pane-label');
+    if (label) label.textContent = 'Parametric model';
+    // Jump straight to the final construction step so the complete model shows
+    // at once, instead of waiting for the pump to walk the remaining steps.
+    if (curJob && targetCount > 0) {
+      const lastIdx = targetCount - 1;
+      fetch('/api/job/' + curJob + '/step/' + lastIdx)
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (data && data.vertices && data.vertices.length) {
+            try { _renderSolid(data, false); } catch (e) {}
+            if (data.sketch_overlay && data.sketch_overlay.length >= 6) {
+              _addSketchOverlay(data.sketch_overlay);
+            }
+            _addOverlayArcs(data.overlay_arcs);
+          }
+          if (sub) sub.textContent = 'complete · click a step to edit';
+        })
+        .catch(() => { if (sub) sub.textContent = 'complete · click a step to edit'; });
+    } else if (sub) {
+      sub.textContent = 'complete · click a step to edit';
+    }
+    // The model just SLIDES from the right half to full — keep the camera
+    // exactly where the user left it (no reframe/jump), only resize the canvas
+    // through the glide so it's the same view, bigger.
+    _pumpViewerResize();
+  }
+
+  // Hand back to the interactive main viewer (user clicked a step / feature).
+  function dismiss() {
+    if (!started && !document.body.classList.contains('live-full')
+        && !document.body.classList.contains('live-split')) return;
+    // Hand the EXACT current view to the main viewer so revealing it shows the
+    // same model from the same angle — no jump, the view just "stays put" while
+    // the underlying canvas swaps.
+    try { _syncMainCamera(camera.position, controls.target); } catch (e) {}
+    started = false;
+    document.body.classList.remove('live-split');
+    document.body.classList.remove('live-full');
+    if (pane) pane.style.display = 'none';
+    _pumpViewerResize();
+  }
+
+  function isActive() {
+    return document.body.classList.contains('live-full')
+        || document.body.classList.contains('live-split');
+  }
+
+  function reset() {
+    targetCount = 0; shownIdx = -1; frameDone = false; curJob = null;
+    userOrbited = false; userPaused = false;
+    if (group) _clearGroup();
+    if (sub) sub.textContent = '';
+    if (treeList) treeList.innerHTML = '';
+    const label = pane && pane.querySelector('.pane-label');
+    if (label) label.textContent = 'Building model';
+  }
+
+  window.addEventListener('resize', () => { if (started) resize(); });
+  return { show, hide: dismiss, dismiss, update, reset, expandToFull, isActive, resize };
+})();
+
+// Keep both renderers sized correctly DURING the CSS split/expand transition
+// (~0.45s) so the model glides from center to the left half instead of
+// stretching and snapping.
+function _pumpViewerResize(ms = 520) {
+  const t0 = (window.performance || Date).now();
+  (function step() {
+    try { handleResize(); } catch (e) {}
+    try { LiveBuild.resize(); } catch (e) {}
+    if (((window.performance || Date).now() - t0) < ms) requestAnimationFrame(step);
+  })();
+}
+
+// Copy a camera pose onto the MAIN viewer so handing off from the live-build
+// pane reveals the identical view (both models are centered at the origin).
+function _syncMainCamera(pos, target) {
+  try {
+    camera.position.copy(pos);
+    controls.target.copy(target);
+    camera.updateProjectionMatrix();
+    controls.update();
+  } catch (e) { /* main camera not ready */ }
+}
+
+// Clicking anywhere in the timeline or feature tree means the user wants the
+// interactive main viewer — dismiss the expanded live-build pane to reveal it.
+['timeline', 'feature-list'].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('click', () => { try { LiveBuild.dismiss(); } catch (e) {} }, true);
+});
+
 // ── Load step geometry ──
 async function loadStep(index) {
   console.debug('[loadStep]', index, 'of', steps.length, 'jobId:', currentJobId);
@@ -690,6 +1172,15 @@ async function loadStep(index) {
       const geo = new THREE.BufferGeometry().setFromPoints(points);
       const mat = new THREE.LineBasicMaterial({ color: 0x58A6FF, linewidth: 2 });
       modelGroup.add(new THREE.LineSegments(geo, mat));
+      // Rounded corners as TRUE arcs (smooth curves), never chord polylines.
+      if (data.overlay_arcs && data.overlay_arcs.length) {
+        for (const arc of data.overlay_arcs) {
+          const apts = arcToPoints(arc);
+          if (apts.length < 2) continue;
+          modelGroup.add(new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints(apts), mat));
+        }
+      }
     } else {
       console.debug('[loadStep] rendering solid mesh, verts:', Math.round(verts.length / 3), 'faces:', Math.round(indices.length / 3));
       // Build non-indexed geometry so each face has its own vertices
@@ -753,6 +1244,28 @@ async function loadStep(index) {
         // in the viewer as spurious "spikes" or bumps crossing the sketch.)
 
         console.debug('[loadStep] added sketch overlay:', pts.length / 2, 'edges');
+      }
+
+      // Rounded corners as TRUE arcs: sample each into a smooth polyline and
+      // draw thin tubes along it — so curves read as curves, never chords.
+      if (data.overlay_arcs && data.overlay_arcs.length) {
+        const arcTubeMat = new THREE.MeshBasicMaterial({ color: 0x58A6FF, depthTest: false });
+        for (const arc of data.overlay_arcs) {
+          const apts = arcToPoints(arc);
+          for (let i = 0; i + 1 < apts.length; i++) {
+            const a = apts[i], b = apts[i + 1];
+            const len = a.distanceTo(b);
+            if (len < 0.01) continue;
+            const tubeR = Math.max(0.3, len * 0.04);
+            const tubeGeo = new THREE.CylinderGeometry(tubeR, tubeR, len, 6, 1);
+            tubeGeo.rotateX(Math.PI / 2);
+            const tube = new THREE.Mesh(tubeGeo, arcTubeMat);
+            tube.position.copy(a).add(b).multiplyScalar(0.5);
+            tube.lookAt(b);
+            tube.renderOrder = 1;
+            modelGroup.add(tube);
+          }
+        }
       }
     }
   } catch (e) {
@@ -824,6 +1337,12 @@ window.playBuildAnimation = async function() {
     return;
   }
 
+  // The play animation renders into the MAIN viewer via loadStep(). After a
+  // build the viewer is in live-full mode with the main viewer HIDDEN behind
+  // the LiveBuild pane — so loadStep would draw invisibly (label advances, no
+  // visual). Hand off to the main viewer first so the replay is actually seen.
+  try { LiveBuild.dismiss(); } catch (e) {}
+
   _animPlaying = true;
   window._pipelineRotate = true;
   btn.classList.add('playing');
@@ -865,64 +1384,42 @@ function populateUI(statusData) {
   timeline.innerHTML = '';
   steps = statusData.steps;
 
-  // PNG icon mapping — icons from /static/icons/
-  const I = (file, cls) => ({ cls, svg: `<img src="/static/icons/${file}" style="width:22px;height:22px;border-radius:50%;">` });
-  const iconMap = {
-    'Sketch':   I('sketch.png', 'sketch'),
-    'Extrude':  I('extrude.png', 'extrude'),
-    'Through':  I('hole.png', 'hole'),
-    'Blind':    I('hole.png', 'hole'),
-    'Chamfer':  I('chamfer.png', 'chamfer'),
-    'Side Profile': I('sketch.png', 'sketch'),
-    'Side Cut': I('chamfer.png', 'chamfer'),
-    'Fillet':   I('fillet.png', 'fillet'),
-    'Pocket':   I('shell.png', 'pocket'),
-    'Boss':     I('extrude.png', 'boss'),
-    'Slot':     I('shell.png', 'slot'),
-    'Loft':     I('loft.png', 'extrude'),
-    'Revolve':  I('revolve.png', 'extrude'),
-    'Sweep':    I('sweep.png', 'extrude'),
-    'Shell':    I('shell.png', 'pocket'),
-    'Original': I('bodies.png', 'sketch'),
-  };
+  // (Icon mapping moved to the module-level featureRowInnerHTML helper so the
+  // sidebar and live-build trees render identically.)
 
   // Hide sketches folder — sketches go inline under Body
   const sketchesFolder = document.getElementById('sketches-folder');
   sketchesFolder.style.display = 'none';
 
-  // Add "Mesh" button at the start of timeline
+  // Add "Mesh" button at the start of timeline. We prefer the PIPELINE mesh
+  // (/api/job/{id}/mesh) — the decimated, aligned frame the CAD was built in —
+  // so the Mesh view, its thumbnail and the Compare view/thumbnail all share
+  // ONE orientation (fixes the misaligned compare thumbnail) and the button is
+  // never grayed just because the raw upload preview wasn't kept.
+  let cmpMeshData = savedMeshPreview
+    ? { vertices: savedMeshPreview.mesh_vertices, faces: savedMeshPreview.mesh_faces }
+    : null;
   const meshBtn = document.createElement('div');
   meshBtn.className = 'timeline-step timeline-special timeline-dashed';
   meshBtn.style.background = 'var(--bg-tertiary)';
   meshBtn.innerHTML = '<span style="font-size:10px;color:var(--text-secondary);">Mesh</span>';
   meshBtn.title = 'Show original mesh';
   meshBtn.onclick = () => {
-    if (savedMeshPreview) {
-      _showRawMesh(savedMeshPreview, false);
-      document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
-      meshBtn.classList.add('active');
-    }
+    if (!cmpMeshData) return;
+    try { LiveBuild.dismiss(); } catch (e) {}
+    _showRawMesh({ mesh_vertices: cmpMeshData.vertices, mesh_faces: cmpMeshData.faces }, false);
+    document.querySelectorAll('.timeline-step').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.feature-item').forEach(el => el.classList.remove('active'));
+    meshBtn.classList.add('active');
   };
   timeline.appendChild(meshBtn);
 
-  // Build feature tree items (left sidebar) — these navigate individual steps
+  // Build feature tree items (left sidebar) — these navigate individual steps.
+  // Uses the SHARED row renderer so the live-build pane tree is identical.
   statusData.steps.forEach((step, i) => {
-    let iconInfo = I('component.png', 'extrude');
-    for (const [key, val] of Object.entries(iconMap)) {
-      if (step.name.includes(key)) { iconInfo = val; break; }
-    }
-    // Strip LLM description after — or →
-    const shortName = step.name.split(/\s*[—→]\s*/)[0].trim();
     const item = document.createElement('div');
     item.className = 'feature-item';
-    item.innerHTML = `
-      <div class="icon ${iconInfo.cls}">${iconInfo.svg}</div>
-      <div class="texts">
-        <div class="name">${shortName}</div>
-        <div class="detail">${step.volume > 0 ? step.volume.toLocaleString() + ' mm³' : '2D'}</div>
-      </div>
-    `;
+    item.innerHTML = featureRowInnerHTML(step.name, step.volume);
     item.onclick = () => loadStep(i);
     list.appendChild(item);
   });
@@ -1090,9 +1587,23 @@ function populateUI(statusData) {
   // Render thumbnails sequentially to avoid WebGL race conditions
   console.debug('[populateUI] queued', thumbQueue.length, 'thumbnails for rendering');
   renderThumbQueue().then(async () => {
+    // Prefer the pipeline mesh (same frame as the CAD) for the Mesh view and
+    // both thumbnails. Always available after the run, so the button never
+    // grays out and the compare thumbnail matches the compare view.
+    if (currentJobId) {
+      try {
+        const r = await fetch(`/api/job/${currentJobId}/mesh`);
+        if (r.ok) {
+          const pm = await r.json();
+          if (pm && pm.vertices && pm.vertices.length) {
+            cmpMeshData = { vertices: pm.vertices, faces: pm.faces };
+          }
+        }
+      } catch (e) { /* fall back to savedMeshPreview */ }
+    }
     // Render Mesh thumbnail
-    if (savedMeshPreview) {
-      const url = renderMeshThumbnail(savedMeshPreview.mesh_vertices, savedMeshPreview.mesh_faces);
+    if (cmpMeshData) {
+      const url = renderMeshThumbnail(cmpMeshData.vertices, cmpMeshData.faces);
       if (url) {
         meshBtn.style.backgroundImage = `url(${url})`;
         meshBtn.style.backgroundSize = 'cover';
@@ -1127,8 +1638,10 @@ function populateUI(statusData) {
     if (variants.length > 0) {
       await fetch(`/api/job/${currentJobId}/variant/${activeVariant}`, { method: 'POST' });
     }
-    // Render Compare thumbnail showing both mesh + CAD side by side
-    if (savedMeshPreview && statusData.steps.length > 0) {
+    // Render Compare thumbnail showing both mesh + CAD side by side. Uses the
+    // SAME pipeline mesh as the Compare view, so the thumbnail and the view
+    // line up in one orientation.
+    if (cmpMeshData && statusData.steps.length > 0) {
       const lastIdx = statusData.steps.length - 1;
       const cadUrl2 = currentJobId ? `/api/job/${currentJobId}/step/${lastIdx}` : `/api/step/${lastIdx}`;
       fetch(cadUrl2).then(r => r.json()).then(cadData => {
@@ -1143,10 +1656,10 @@ function populateUI(statusData) {
           ts.add(tl);
 
           // Mesh side
-          const mv = new Float32Array(savedMeshPreview.mesh_vertices);
+          const mv = new Float32Array(cmpMeshData.vertices);
           const mg = new THREE.BufferGeometry();
           mg.setAttribute('position', new THREE.BufferAttribute(mv, 3));
-          mg.setIndex(savedMeshPreview.mesh_faces);
+          mg.setIndex(cmpMeshData.faces);
           mg.computeVertexNormals();
           const mm = new THREE.Mesh(mg, new THREE.MeshStandardMaterial({ color: 0x8B949E, metalness: 0.1, roughness: 0.8 }));
 
@@ -1672,6 +2185,8 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
     const _analyzeStartedAt = Date.now();
     let _lastProgress = -1;
     let _lastProgressAt = Date.now();
+    // Fresh run — drop any stale right-pane build from a previous analyze.
+    try { LiveBuild.reset(); LiveBuild.hide(); } catch (e) {}
     const statusData = await new Promise((resolve, reject) => {
       const poll = setInterval(async () => {
         try {
@@ -1702,9 +2217,19 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             }
           }
 
-          // Render progress geometry on the 3D model
+          // Render progress geometry on the 3D model (LEFT pane = analysis)
           if (d.progress_geometry) {
             _renderProgressGeometry(d.progress_geometry);
+          }
+
+          // RIGHT pane = CAD model accreting live. As soon as the build
+          // subprocess streams its first construction step, split the viewer
+          // and accrete features there in real time. Both panes advance on
+          // their own — the left through analysis stages, the right through
+          // construction steps.
+          if (d.status === 'processing' && (d.building_live || (d.num_steps || 0) > 0)) {
+            LiveBuild.show();
+            LiveBuild.update(myJobId, d.num_steps || 0, d.steps_version || 0);
           }
 
           // Update debug summary panel (visible only when Debug toggle is on).
@@ -1807,8 +2332,14 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           }
 
           if (_cancelledJobId === myJobId) { clearInterval(poll); reject(new Error('Cancelled')); return; }
-          if (d.status === 'done') { clearInterval(poll); resolve(d); }
-          else if (d.status === 'error') { clearInterval(poll); reject(new Error(d.error)); }
+          if (d.status === 'done') {
+            clearInterval(poll);
+            // Keep the live pane: expand it to full + recenter the finished
+            // model (no reload flash). Only expand if it was actually showing.
+            if (LiveBuild.isActive()) LiveBuild.expandToFull();
+            resolve(d);
+          }
+          else if (d.status === 'error') { clearInterval(poll); LiveBuild.dismiss(); reject(new Error(d.error)); }
         } catch (e) { console.warn('[analyze] poll error:', e); }
       }, 500);
     });
@@ -2066,14 +2597,20 @@ function finishLoad(statusData) {
       progressBar.style.width = '100%';
       loading.classList.remove('show');
       window._pipelineRotate = false;
-      // Animate camera only when CAD model first loads
+      // Animate camera only when CAD model first loads — but NOT while the
+      // live-build pane is showing the model: the main viewer is hidden behind
+      // it and will inherit the live pane's exact camera on handoff (dismiss).
       try {
-        const box = new THREE.Box3().setFromObject(modelGroup);
-        const pos = bestCameraPos(box);
-        console.debug('[finishLoad] model loaded, animating camera to face largest profile');
-        animateCamera(pos, { x: 0, y: 0, z: 0 }, 1.2);
-        // Auto-play build animation after camera settles
-        setTimeout(() => { if (typeof playBuildAnimation === 'function') playBuildAnimation(); }, 1500);
+        if (!LiveBuild.isActive()) {
+          const box = new THREE.Box3().setFromObject(modelGroup);
+          const pos = bestCameraPos(box);
+          console.debug('[finishLoad] model loaded, animating camera to face largest profile');
+          animateCamera(pos, { x: 0, y: 0, z: 0 }, 1.2);
+        }
+        // (Removed: the ending auto-play build animation. The live pane already
+        // animates the build as it streams; replaying it at the end was
+        // redundant and — in live-full mode — drew into the hidden main viewer
+        // so the visual never changed. The manual Play button still works.)
       } catch (e) {
         console.error('[finishLoad] camera animation failed', e);
       }

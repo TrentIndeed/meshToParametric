@@ -33,6 +33,10 @@ class BodyResult:
     graph: object
     edges: list
     blends: list
+    # The mesh the REGIONS live on (for segmentation viz). For dirty/AI parts
+    # this is a DECIMATED copy whose flats segment cleanly; the tree's build
+    # geometry comes from the full mesh. For clean CAD it is the full mesh.
+    seg_mesh: CleanedMesh | None = None
 
 
 def recognize_body(sub_cleaned: CleanedMesh, scan_mode: bool) -> BodyResult:
@@ -42,6 +46,13 @@ def recognize_body(sub_cleaned: CleanedMesh, scan_mode: bool) -> BodyResult:
     topology -> blend identification -> recognize_features. This is EXACTLY
     what viz_server/job_queue._process_single_body runs (minus the viz), so a
     standalone reproduction calling this matches the app's feature tree.
+
+    DECOUPLING (dirty/AI only): the BUILD (component planner, base/join
+    profiles, holes) uses the FULL-density mesh for accuracy, while
+    SEGMENTATION + feature recognition run on a DECIMATED copy so noisy flats
+    stay ONE region instead of shattering into hundreds (which spawned bogus
+    chamfers/slots). The two share a coordinate frame, so the coordinate-based
+    features line up with the full-density build.
     """
     from mesh2param.pipeline.fit import fit_surfaces
     from mesh2param.pipeline.peel_via_topology import identify_blends_from_topology
@@ -50,27 +61,82 @@ def recognize_body(sub_cleaned: CleanedMesh, scan_mode: bool) -> BodyResult:
     from mesh2param.pipeline.topology import build_topology
 
     seg = SegmentConfig(noise_robust=scan_mode)
-    regions = segment_mesh(sub_cleaned, seg)
-    fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
+
+    # DECIMATE FIRST (scan/AI only). The expensive analysis — segment, fit,
+    # regularize, topology — all runs on a mesh at the reference triangle
+    # density, so it's FAST and the noisy flats stay ONE region instead of
+    # shattering into hundreds. The full-density mesh is kept ONLY as
+    # build_mesh, for the component planner's cross-section build. Previously
+    # we segmented the full mesh first and threw that work away — slow, and it
+    # left the viz showing the fragmented full-mesh segmentation.
+    seg_mesh = sub_cleaned
+    build_mesh = None
+    if scan_mode:
+        decimated = _decimate_to_density(sub_cleaned)
+        if decimated is not None and len(decimated.faces) < len(sub_cleaned.faces):
+            seg_mesh = decimated
+            build_mesh = sub_cleaned
+
+    regions = segment_mesh(seg_mesh, seg)
+    fitted = fit_surfaces(regions, seg_mesh, FitConfig())
     if scan_mode:
         try:
             from mesh2param.pipeline.regularize import regularize_mesh
-            regularize_mesh(sub_cleaned, regions, fitted, snap_angle_deg=12.0)
-            regions = segment_mesh(sub_cleaned, seg)
-            fitted = fit_surfaces(regions, sub_cleaned, FitConfig())
+            regularize_mesh(seg_mesh, regions, fitted, snap_angle_deg=12.0)
+            regions = segment_mesh(seg_mesh, seg)
+            fitted = fit_surfaces(regions, seg_mesh, FitConfig())
         except Exception:
             logger.exception("Regularization failed — using raw fit")
-    graph, edges = build_topology(regions, fitted, sub_cleaned, TopologyConfig())
+
+    graph, edges = build_topology(regions, fitted, seg_mesh, TopologyConfig())
     try:
-        blends = identify_blends_from_topology(regions, fitted, edges, sub_cleaned)
+        blends = identify_blends_from_topology(regions, fitted, edges, seg_mesh)
     except Exception:
         logger.exception("Blend identification failed")
         blends = []
+    # On dirty AI/scan parts the build is robust but the region-based detail
+    # finders hallucinate fillets/chamfers/slots from surface noise — gate
+    # them conservatively (build stays locked, weak detail dropped).
+    rec_cfg = RecognizeConfig(conservative_detail=scan_mode)
     tree = recognize_features(
-        regions, fitted, graph, edges, sub_cleaned,
-        RecognizeConfig(), topo_blends=blends,
+        regions, fitted, graph, edges, seg_mesh,
+        rec_cfg, topo_blends=blends, build_mesh=build_mesh,
     )
-    return BodyResult(tree, regions, fitted, graph, edges, blends)
+    return BodyResult(tree, regions, fitted, graph, edges, blends, seg_mesh)
+
+
+def _decimate_to_density(mesh: CleanedMesh, faces_per_cm2: float = 120.0,
+                         min_faces: int = 4_000) -> CleanedMesh | None:
+    """A decimated copy at the reference triangle density (faces per cm^2),
+    scaled with surface area. Used ONLY for segmentation; the build keeps the
+    full mesh. Returns None on failure."""
+    try:
+        import trimesh
+        import numpy as np
+        from mesh2param.pipeline.ingest import _decimate
+        from mesh2param.models.mesh import CleanedMesh as _CM
+        tm = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces,
+                             process=False)
+        area_cm2 = float(tm.area) / 100.0
+        target = int(np.clip(faces_per_cm2 * area_cm2, min_faces,
+                             len(mesh.faces)))
+        if target >= len(mesh.faces):
+            return None
+        dm = _decimate(tm, target)
+        dm.fix_normals()
+        verts = np.asarray(dm.vertices, dtype=float)
+        faces = np.asarray(dm.faces)
+        return _CM(
+            vertices=verts,
+            faces=faces,
+            normals=np.asarray(dm.face_normals, dtype=float),
+            is_watertight=bool(dm.is_watertight),
+            bbox=np.array([verts.min(0), verts.max(0)]),
+            metadata=dict(mesh.metadata),
+        )
+    except Exception:
+        logger.exception("Segmentation decimation failed")
+        return None
 
 
 def convert_mesh(

@@ -482,7 +482,7 @@ def segment_inner_rings(
             p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
             if not p.is_valid:
                 p = p.buffer(0)
-            if not p.is_empty and p.area > 1.0:
+            if not p.is_empty and p.area > 0.1:
                 loops.append(p)
         # A hole is a loop with ODD containment depth among the
         # SECTION's own loops — merely lying inside the segment outline
@@ -497,7 +497,11 @@ def segment_inner_rings(
             )
             if depth % 2 != 1:
                 continue
-            if p.area < min_frac * max(outer.area, 1.0):
+            # Absolute floor (not relative to the outer): small mounting bores
+            # — AI meshes make them ~0.4 mm radius — are a tiny fraction of a
+            # big plate but are real through-holes. The 3-station persistence
+            # check below is what actually rejects noise voids.
+            if p.area < 0.12:
                 continue
             try:
                 if outer.contains(p.representative_point()):
@@ -952,6 +956,100 @@ def _track_axis_components(
     return out
 
 
+def _symmetrize_rect_corners(coords: list, arc_samples: int = 18) -> list:
+    """Rebuild an axis-aligned rounded rectangle with ALL corners at the
+    measured radius.
+
+    An AI/scan mesh samples some corners densely (the arc survives
+    simplification) and others sparsely (the arc collapses to a sharp 90°), so
+    the base profile comes out a rectangle with, say, two rounded corners and
+    two sharp ones — the user's "one side is sharp for no reason". When the
+    outline is clearly a rectangle with a MAJORITY of corners rounded at a
+    consistent radius and at least one left sharp, rebuild it cleanly with every
+    corner rounded. Leaves non-rectangles, fully-sharp rectangles, and
+    already-symmetric rounded rectangles unchanged.
+    """
+    import numpy as np
+    P = np.asarray(coords, dtype=float)
+    if len(P) < 8:
+        return coords
+    umin, umax = float(P[:, 0].min()), float(P[:, 0].max())
+    vmin, vmax = float(P[:, 1].min()), float(P[:, 1].max())
+    W, H = umax - umin, vmax - vmin
+    if W < 2.0 or H < 2.0:
+        return coords
+    # Rectangularity: most of the perimeter must run along an axis.
+    seg = np.roll(P, -1, axis=0) - P
+    L = np.linalg.norm(seg, axis=1)
+    d = seg / (L[:, None] + 1e-9)
+    near_axis = np.maximum(np.abs(d[:, 0]), np.abs(d[:, 1])) > np.cos(np.radians(12.0))
+    if L.sum() <= 0 or float(L[near_axis].sum() / L.sum()) < 0.7:
+        return coords
+    # CRITICAL GUARD: only rebuild a TRUE rectangle — the profile must nearly
+    # FILL its bounding box. A plate with U-tabs, mounting ears, notches or
+    # slots fills much less of its bbox, and rebuilding it as a plain rounded
+    # rectangle would ERASE those features (this regressed Mesh5's U-tabs).
+    # A rounded rectangle only loses the four little corner triangles, so it
+    # stays ≥ ~95% of the bbox.
+    try:
+        from shapely.geometry import Polygon as _SPoly
+        prof_area = abs(_SPoly([(float(a), float(b)) for a, b in P]).buffer(0).area)
+    except Exception:
+        return coords
+    if W * H <= 0 or prof_area / (W * H) < 0.93:
+        return coords
+    # Window tight enough to capture a corner's arc + its two tangent points
+    # but exclude the far ends of the straight sides.
+    win = 0.3 * min(W, H)
+    corners = [(umax, vmin), (umax, vmax), (umin, vmax), (umin, vmin)]
+    radii, sharp_count = [], 0
+    for cu, cv in corners:
+        m = (np.abs(P[:, 0] - cu) < win) & (np.abs(P[:, 1] - cv) < win)
+        pts = P[m]
+        if len(pts) < 3:
+            sharp_count += 1
+            continue
+        # Fillet radius ~ how far the straight sides END from the bbox corner
+        # (the tangent insets), i.e. the MAX inset along each axis within the
+        # corner window — not the nearest arc sample.
+        du = np.abs(pts[:, 0] - cu)
+        dv = np.abs(pts[:, 1] - cv)
+        r_est = min(float(du.max()), float(dv.max()))
+        if r_est > 0.3:
+            radii.append(r_est)
+        else:
+            sharp_count += 1
+    rounded = [r for r in radii if r > 0.3]
+    if len(rounded) < 2 or sharp_count == 0:
+        return coords  # fully sharp, fully rounded, or ambiguous — leave alone
+    r = min(float(np.median(rounded)), 0.45 * min(W, H))
+    if r < 0.3:
+        return coords
+    out: list = []
+
+    def _arc(cx, cy, a0, a1):
+        for s in range(arc_samples + 1):
+            a = a0 + (a1 - a0) * s / arc_samples
+            out.append((float(cx + r * np.cos(a)), float(cy + r * np.sin(a))))
+
+    out.append((umin + r, vmin))
+    out.append((umax - r, vmin))
+    _arc(umax - r, vmin + r, -np.pi / 2, 0.0)       # bottom-right
+    out.append((umax, vmax - r))
+    _arc(umax - r, vmax - r, 0.0, np.pi / 2)         # top-right
+    out.append((umin + r, vmax))
+    _arc(umin + r, vmax - r, np.pi / 2, np.pi)       # top-left
+    out.append((umin, vmin + r))
+    _arc(umin + r, vmin + r, np.pi, 1.5 * np.pi)     # bottom-left
+    clean: list = []
+    for pt in out:
+        if not clean or abs(pt[0] - clean[-1][0]) > 1e-6 or abs(pt[1] - clean[-1][1]) > 1e-6:
+            clean.append(pt)
+    logger.info("Rect-corner symmetrize: rebuilt rounded rectangle r=%.2f "
+                "(%d rounded, %d sharp corners)", r, len(rounded), sharp_count)
+    return clean
+
+
 def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
     """Clean a raw slice outline into a sketchable profile.
 
@@ -978,10 +1076,14 @@ def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
         from mesh2param.pipeline.regularize import regularize_profile_2d
         reg = regularize_profile_2d(simplified)
         if reg and len(reg) >= 3:
-            return [(float(x), float(y)) for x, y in reg]
+            return _symmetrize_rect_corners(
+                [(float(x), float(y)) for x, y in reg])
     except Exception:
         pass
-    return simplified
+    # Even when regularize bails (it rejects densely-sampled rounded outlines),
+    # symmetrize the corners so a half-sharp rectangle becomes a clean rounded
+    # one instead of extruding with one square side.
+    return _symmetrize_rect_corners(simplified)
 
 
 def plan_extrusions_components(
@@ -1090,7 +1192,22 @@ def plan_extrusions_components(
     # match shapes or to gate on a part-fraction threshold.
     unclaimed = np.ones(total, dtype=bool)
     chosen = []
-    for c in sorted(candidates, key=lambda c: -c["area"]):
+    # PREFER the base-plate's axis. A human sketches on (or parallel to) the
+    # base plate and extrudes along its normal; a body whose sketch plane is
+    # TANGENTIAL/perpendicular to the base — a wall sketched on its own side
+    # face and extruded sideways — unions badly with the base (the fused outer
+    # face can't be filleted) and is NOT how it's modelled. So process
+    # base-axis candidates first: each claims its material before a
+    # perpendicular VIEW of the same wall can, and the perpendicular candidate
+    # is then dropped as redundant. Coverage-safe: a wall that ONLY a
+    # perpendicular candidate explains still owns unclaimed material and is
+    # kept. Base axis = the largest-profile candidate's axis (the base plate).
+    base_axis = max(candidates, key=lambda c: c["area"])["axis"]
+
+    def _claim_order(c):
+        return (c["axis"] != base_axis, -c["area"])
+
+    for c in sorted(candidates, key=_claim_order):
         own = int(np.count_nonzero(c["_mem"]))
         if own == 0:
             continue

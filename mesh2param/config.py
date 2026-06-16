@@ -17,6 +17,13 @@ class IngestConfig(BaseModel):
     # collapse). Scans arrive at 300K-2.5M faces; segmentation cost is
     # superlinear in faces, so cap before Stage 2. 0 disables.
     max_faces: int = 30_000
+    # Dirty/scan path decimates HARDER. The segmentation + density thresholds
+    # were tuned on clean CAD meshes of 1.6k-9.5k faces; AI/scan meshes left at
+    # the 30k cap are 3-19x denser, so a flat face has far more triangles for
+    # noise to shatter into fragments. Decimate detected dirty/scan inputs to
+    # this lower cap to land them near the clean-CAD triangle regime (clean CAD
+    # is below the cap and untouched). 0 = fall back to max_faces.
+    dirty_max_faces: int = 12_000
     # Screened-Poisson surface reconstruction for ragged scan input. Only
     # runs when the cleaned mesh is NOT watertight after normal repair —
     # clean CAD meshes are left untouched, because Poisson SMOOTHS the
@@ -166,6 +173,16 @@ class RecognizeConfig(BaseModel):
     # removing too much — pending visual debug); set False to fall back to the
     # legacy planner for those. See pipeline/extrusion.py.
     use_component_planner: bool = True
+    # Conservative detail recognition (set for dirty AI/scan parts). The
+    # component planner's BUILD (base + bosses + holes) is robust on noisy
+    # meshes, but the region-based DETAIL finders (fillets/chamfers/pockets/
+    # slots) hallucinate features from surface bumps — AI-generated plates
+    # come back with phantom slots and chamfers that aren't in the real part.
+    # When True, detail features must clear a higher evidence bar (backing
+    # face count relative to mesh density, geometric sanity vs. part size);
+    # weakly-supported ones are DROPPED rather than emitted. The locked build
+    # is never touched. See recognize._filter_conservative_detail.
+    conservative_detail: bool = False
 
     def model_post_init(self, __context) -> None:
         logger.debug(

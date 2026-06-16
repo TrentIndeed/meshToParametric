@@ -34,7 +34,114 @@ class ConstructionStep:
     tess_vertices: np.ndarray  # (V, 3)
     tess_faces: np.ndarray  # (F, 3)
     volume: float = 0.0
-    sketch_overlay: np.ndarray | None = None  # (N, 3) — pairs of 3D points for blue sketch lines
+    sketch_overlay: np.ndarray | None = None  # (N, 3) — pairs of 3D points for blue sketch LINES
+    # True-arc overlay segments so the viewer draws curves, not chords. Each:
+    # {ax, pos, cu, cv, r, a0, a1} = a circular arc in the sketch plane (the
+    # out-of-plane axis `ax` sits at `pos`; centre (cu,cv), radius r, angles).
+    overlay_arcs: list | None = None
+
+
+# --- Live construction-step streaming -------------------------------------
+# The web UI's dual-pane "live build" view wants each construction step to
+# appear on the right pane the moment it's built, not all at once when the
+# CadQuery SUBPROCESS finishes and the result pickle is read back. Because the
+# build runs in a separate process (VTK/Three.js isolation), we stream over the
+# filesystem: when `stream_dir` is set, every ConstructionStep appended to the
+# primary build list is written atomically to `{stream_dir}/NNNN.pkl`. The
+# parent (viz_server/job_queue) scans that dir in its existing poll loop and
+# appends new steps to `job.steps` live. Same-process callers leave it None.
+_stream_ctx: dict = {"dir": None, "n": 0}
+
+
+def _set_step_stream_dir(stream_dir: str | None) -> None:
+    """Arm (or disarm) live step streaming for the current build."""
+    _stream_ctx["dir"] = stream_dir
+    _stream_ctx["n"] = 0
+    if stream_dir:
+        try:
+            import os
+            os.makedirs(stream_dir, exist_ok=True)
+        except Exception:
+            logger.debug("Could not create step stream dir %s", stream_dir,
+                         exc_info=True)
+
+
+def _stream_step(step: "ConstructionStep") -> None:
+    """Write one step to the stream dir atomically (.tmp -> os.replace).
+
+    Best-effort: any failure here must never break the build."""
+    d = _stream_ctx["dir"]
+    if not d:
+        return
+    try:
+        import os
+        import pickle
+        n = _stream_ctx["n"]
+        payload = {
+            "name": step.name,
+            "tess_vertices": step.tess_vertices,
+            "tess_faces": step.tess_faces,
+            "volume": step.volume,
+            "sketch_overlay": step.sketch_overlay,
+            "overlay_arcs": step.overlay_arcs,
+        }
+        tmp = os.path.join(d, f".{n:04d}.tmp")
+        final = os.path.join(d, f"{n:04d}.pkl")
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f)
+        os.replace(tmp, final)
+        _stream_ctx["n"] = n + 1
+    except Exception:
+        logger.debug("Step streaming failed for %r", getattr(step, "name", "?"),
+                     exc_info=True)
+
+
+def _await_stitched_clusters(path: str, timeout: float = 180.0):
+    """Block until the parent drops the stitched fillet clusters at `path`,
+    then load and return them.
+
+    Two-phase build: the prismatic model (base + bosses + holes) builds and
+    streams FIRST — the moment the feature tree is ready — then waits HERE for
+    the fillet clusters, which the parent computes CONCURRENTLY (overlapping all
+    the analysis stages) and drops atomically at `path`. Returns [] on timeout
+    so the model still exports (without fillets) if the clusters never arrive.
+    """
+    import os
+    import pickle
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    data = pickle.load(f)
+                logger.info("Two-phase build: received %d fillet cluster(s)",
+                            len(data) if data else 0)
+                return data or []
+            except Exception:
+                logger.exception("Failed to load stitched clusters from %s", path)
+                return []
+        _t.sleep(0.2)
+    logger.warning("Stitched clusters not delivered within %.0fs; exporting "
+                   "without fillets", timeout)
+    return []
+
+
+class _StreamingStepList(list):
+    """A list that mirrors each appended ConstructionStep to the stream dir.
+
+    Used for the ONE primary build list so deferred chamfers / stitched
+    fillets — which `.append`/`.extend` onto that same list after the base
+    build — also stream in order, with no second list to double-count."""
+
+    def append(self, step) -> None:
+        super().append(step)
+        if isinstance(step, ConstructionStep):
+            _stream_step(step)
+
+    def extend(self, it) -> None:
+        for s in it:
+            self.append(s)
 
 
 @dataclass
@@ -115,6 +222,8 @@ def export_cadquery(
     num_variants: int = 1,
     body_results: list | None = None,
     stitched_clusters: list[dict] | None = None,
+    stream_dir: str | None = None,
+    stitched_clusters_path: str | None = None,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -135,6 +244,9 @@ def export_cadquery(
         "export_cadquery called: %d features, use_llm=%s, output_path=%s",
         feature_tree.num_features, use_llm, output_path,
     )
+    # Arm live step streaming (parent ingests files as they appear). Only the
+    # primary/default variant streams — see _build_stepwise's `stream` flag.
+    _set_step_stream_dir(stream_dir)
     mesh_volume = _estimate_mesh_volume(cleaned)
 
     # Extract base profile (needed by both LLM and heuristic paths).
@@ -220,11 +332,17 @@ def export_cadquery(
         if f.type == FeatureType.BOSS and f.operation == "JOIN"
         and (f.sketch_geometry or {}).get("type") == "polygon"
     ]
+    _base_sg = (profile_tree.features[0].sketch_geometry or {}) \
+        if profile_tree.features else {}
     build_args = dict(
         profiles=profiles, depth=depth, extrude_dir=extrude_dir,
         extrude_start=extrude_start, holes=hole_features,
         chamfers=chamfer_features, fillets=fillet_features, cleaned=build_cleaned,
         joins=join_features,
+        # Carried parametric arc data for the BASE outer profile -> exact OCC
+        # tangent fillets matching the Onshape sketch.
+        base_corners=_base_sg.get("corners"),
+        base_fillets=_base_sg.get("fillets"),
     )
 
     logger.debug(
@@ -316,7 +434,7 @@ def export_cadquery(
         solid, script, steps, body0_chamfers = _build_stepwise(
             **build_args, build_order=llm_order,
             skip_fillets=is_multi_body, skip_chamfers=True,
-            as_built_out=as_built_record,
+            as_built_out=as_built_record, stream=True,
         )
         deferred_chamfers_all.extend(body0_chamfers)
 
@@ -443,6 +561,15 @@ def export_cadquery(
         # only if peeled_fillets wasn't supplied (legacy path / testing).
         try:
             if solid is not None:
+                # Two-phase build: the prismatic solid above already built and
+                # streamed. If the fillet clusters weren't passed inline, wait
+                # for the parent to drop them (it computes them concurrently),
+                # then apply blends as phase two.
+                if not stitched_clusters and stitched_clusters_path:
+                    logger.info("CHECKPOINT: base solid built — awaiting fillet "
+                                "clusters for phase two")
+                    stitched_clusters = _await_stitched_clusters(
+                        stitched_clusters_path)
                 clusters_in = list(stitched_clusters or [])
 
                 # --- Snapshot the un-blended solid for the Stage 7
@@ -776,7 +903,7 @@ def _extract_profile_and_holes(
             if len(base_engine_profile) < 3:
                 base_engine_profile = None
             for ring in _bsg.get("inner") or []:
-                rp = _clean_engine_polygon(ring)
+                rp = _clean_engine_polygon(ring, min_area=0.1)  # keep tiny bores
                 if len(rp) >= 3:
                     base_engine_inner.append(rp)
     if base_span is not None:
@@ -1669,6 +1796,7 @@ def _extract_profile_and_holes(
 
 def _clean_engine_polygon(
     pts: list[tuple[float, float]], tolerance: float = 0.5,
+    min_area: float = 1.0,
 ) -> list[tuple[float, float]]:
     """Simplify + repair an engine-derived profile for CadQuery.
 
@@ -1677,6 +1805,10 @@ def _clean_engine_polygon(
     extrudes a self-intersecting wire into an EMPTY shape with no error.
     Round-trip through shapely: simplify, buffer(0)-repair, keep the
     largest part, return its exterior.
+
+    `min_area` is the floor below which the polygon is treated as noise and
+    dropped. Pass a small value (e.g. 0.1) for tiny mounting bores — an AI mesh
+    makes them ~0.4 mm radius (~0.5 mm²), well under the default 1 mm² floor.
     """
     from shapely.geometry import Polygon as _CP
 
@@ -1689,15 +1821,18 @@ def _clean_engine_polygon(
         # Repair + light dedupe ONLY. Aggressive simplification flattened
         # the mesh-traced corner ARCS into sharp corners (297 -> 11 pts),
         # so _draw_profile_with_arcs had nothing to rebuild and the
-        # stitched outline-fillet clusters found no edge within snap.
-        p = p.simplify(0.05, preserve_topology=True)
-        if not p.is_valid:
-            p = p.buffer(0)
+        # stitched outline-fillet clusters found no edge within snap. And on a
+        # tiny bore (a few mm² or less) simplify(0.05) collapses the circle to a
+        # triangle or to nothing — skip it there and keep the sampled ring.
+        if p.area >= 4.0:
+            p = p.simplify(0.05, preserve_topology=True)
+            if not p.is_valid:
+                p = p.buffer(0)
         if p.is_empty:
             return []
         if p.geom_type == "MultiPolygon":
             p = max(p.geoms, key=lambda g: g.area)
-        if p.area < 1.0:
+        if p.area < min_area:
             return []
         return [(float(x), float(y)) for x, y in p.exterior.coords[:-1]]
     except Exception:
@@ -2171,6 +2306,9 @@ def _build_stepwise(
     skip_chamfers: bool = False,
     joins: list[Feature] | None = None,
     as_built_out: dict | None = None,
+    stream: bool = False,
+    base_corners: list | None = None,
+    base_fillets: list | None = None,
 ) -> tuple[object, str, list[ConstructionStep], list[dict]]:
     """Build a clean CAD solid from scratch, step by step.
 
@@ -2206,7 +2344,13 @@ def _build_stepwise(
     origin_3d = [0.0, 0.0, 0.0]
     origin_3d[primary_axis] = extrude_start
 
-    steps: list[ConstructionStep] = []
+    # The primary variant streams each step to disk as it's built (live UI);
+    # the deferred-chamfer / stitched-fillet passes in export_cadquery append
+    # onto this same returned list, so they stream too. Other variants/bodies
+    # use a plain list to avoid double-counting the stream.
+    steps: list[ConstructionStep] = (
+        _StreamingStepList() if (stream and _stream_ctx["dir"]) else []
+    )
     script_lines = ["import cadquery as cq", ""]
 
     # --- Step 0: Sketch (outer profile only — cutouts get their own steps) ---
@@ -2229,6 +2373,27 @@ def _build_stepwise(
     from shapely.geometry import Polygon as _BasePoly, Point as _BasePoint
     _main_poly = _BasePoly(profiles[0])
     _main_area = abs(_main_poly.area)
+    # Standoff/boss footprints in the base's (u,v) plane. A small mounting hole
+    # that sits UNDER a standoff must be cut PLATE-ONLY (baked into the base
+    # extrude so the solid standoff caps it from above), not drilled straight
+    # through the standoff. A free bolt hole (no standoff over it) still cuts
+    # through. Only same-axis bosses share the base's u,v plane.
+    _boss_foot = []
+    for _jf in (joins or []):
+        _jsg = _jf.sketch_geometry or {}
+        if _jsg.get('axis_idx') != primary_axis:
+            continue
+        for _loop in [_jsg.get('points')] + list(_jsg.get('extra_loops') or []):
+            if _loop and len(_loop) >= 3:
+                try:
+                    _bp = _BasePoly(_loop)
+                    if not _bp.is_valid:
+                        _bp = _bp.buffer(0)
+                    if not _bp.is_empty:
+                        _boss_foot.append(_bp)
+                except Exception:
+                    pass
+
     base_inner_cutouts: list = []
     extra_profiles: list = []
     for _p in profiles[1:]:
@@ -2243,34 +2408,53 @@ def _build_stepwise(
         # mesh traces a 2.5mm hole as a jagged 38-gon whose inflated
         # perimeter gives a misleadingly low circularity (0.44).
         _area = abs(_poly.area)
+        _pt = _BasePoint(_c.x, _c.y)
+        _under_boss = any(bf.contains(_pt) for bf in _boss_foot)
         if _area > 0.05 * _main_area:
             base_inner_cutouts.append(_p)        # window/bore -> bake into base
+        elif _under_boss:
+            # Mounting hole under a standoff: cut PLATE-ONLY (baked here), the
+            # solid standoff above caps it.
+            base_inner_cutouts.append(_p)
         else:
-            extra_profiles.append(_p)            # bolt hole -> loop cut (own feature)
+            extra_profiles.append(_p)            # free bolt hole -> through cut
 
-    # Sketch wireframe overlay: outer boundary + each baked-in hole.
-    for profile in [profiles[0], *base_inner_cutouts]:
-        n_pts = len(profile)
-        verts = np.zeros((n_pts, 3))
-        for pi, (u, v_coord) in enumerate(profile):
-            verts[pi, ax_u] = u
-            verts[pi, ax_v] = v_coord
-            verts[pi, primary_axis] = extrude_start
-        # Edge connectivity: degenerate triangles (v0, v1, v0) for wireframe
-        faces = np.array(
-            [[(vert_offset + i, vert_offset + (i + 1) % n_pts, vert_offset + i)]
-             for i in range(n_pts)],
-            dtype=np.int64,
-        ).reshape(-1, 3)
-        all_sketch_verts.append(verts)
-        all_sketch_faces.append(faces)
-        vert_offset += n_pts
+    # Sketch wireframe overlay: outer boundary + each baked-in hole. The outer
+    # boundary draws as STRAIGHT segments + true tangent ARCS (no chord polyline
+    # on the rounded corners) when the parametric corners+fillets are carried —
+    # the same source the solid and the Onshape sketch use. Holes chord their
+    # own (already finely sampled) points.
+    _overlay_line_pts = []   # flat list of 3D points, consecutive PAIRS = a segment
+    _overlay_arcs = []
+    _ol, _oa = _overlay_for_ring(
+        profiles[0], primary_axis, extrude_start,
+        corners=base_corners, fillets=base_fillets)
+    _overlay_line_pts.extend(_ol)
+    _overlay_arcs.extend(_oa)
+    for profile in base_inner_cutouts:
+        _il, _ia = _overlay_for_ring(profile, primary_axis, extrude_start)
+        _overlay_line_pts.extend(_il)
+        _overlay_arcs.extend(_ia)
 
-    sketch_verts = np.vstack(all_sketch_verts)
-    sketch_faces = np.vstack(all_sketch_faces)
+    # Build a degenerate-triangle wireframe from the straight segments so the
+    # is_sketch render path (which walks faces as edges) still shows the lines;
+    # the arcs ride alongside in overlay_arcs.
+    if _overlay_line_pts:
+        sketch_verts = np.asarray(_overlay_line_pts, dtype=np.float64)
+        _m = len(sketch_verts) // 2
+        sketch_faces = np.array(
+            [[2 * i, 2 * i + 1, 2 * i] for i in range(_m)], dtype=np.int64)
+    else:
+        # Fully circular outer ring (no straights) — fall back to chords so the
+        # step still carries geometry for the endpoint.
+        sketch_verts = np.vstack(all_sketch_verts) if all_sketch_verts else \
+            np.zeros((0, 3))
+        sketch_faces = np.vstack(all_sketch_faces) if all_sketch_faces else \
+            np.zeros((0, 3), dtype=np.int64)
 
     steps.append(ConstructionStep(
-        name="Sketch Profile", tess_vertices=sketch_verts, tess_faces=sketch_faces, volume=0.0,
+        name="Sketch Profile", tess_vertices=sketch_verts, tess_faces=sketch_faces,
+        volume=0.0, overlay_arcs=_overlay_arcs or None,
     ))
     script_lines.append(f"# Step 1: Sketch profile on {plane_name} plane")
     script_lines.append(f'result = cq.Workplane("{plane_name}", origin={tuple(origin_3d)})')
@@ -2290,13 +2474,17 @@ def _build_stepwise(
     tgt_hi = max(extrude_start, extrude_start + _ed * depth)
 
     wp_pos = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp_pos = _draw_profile_with_holes(wp_pos, profiles[0], base_inner_cutouts).extrude(depth)
+    wp_pos = _draw_profile_with_holes(
+        wp_pos, profiles[0], base_inner_cutouts,
+        corners=base_corners, fillets=base_fillets).extrude(depth)
     bb_pos = wp_pos.val().BoundingBox()
     pos_vals = [(bb_pos.xmin, bb_pos.xmax), (bb_pos.ymin, bb_pos.ymax), (bb_pos.zmin, bb_pos.zmax)]
     pos_overlap = min(pos_vals[primary_axis][1], tgt_hi) - max(pos_vals[primary_axis][0], tgt_lo)
 
     wp_neg = cq.Workplane(plane_name, origin=tuple(origin_3d))
-    wp_neg = _draw_profile_with_holes(wp_neg, profiles[0], base_inner_cutouts).extrude(-depth)
+    wp_neg = _draw_profile_with_holes(
+        wp_neg, profiles[0], base_inner_cutouts,
+        corners=base_corners, fillets=base_fillets).extrude(-depth)
     bb_neg = wp_neg.val().BoundingBox()
     neg_vals = [(bb_neg.xmin, bb_neg.xmax), (bb_neg.ymin, bb_neg.ymax), (bb_neg.zmin, bb_neg.zmax)]
     neg_overlap = min(neg_vals[primary_axis][1], tgt_hi) - max(neg_vals[primary_axis][0], tgt_lo)
@@ -2357,20 +2545,54 @@ def _build_stepwise(
                 j_extra.append((lp, lin))
             j_len = float(span[1]) - float(span[0])
             plane_j = plane_map[ax_j]
-            origin_j = [0.0, 0.0, 0.0]
-            origin_j[ax_j] = float(span[0])
             jx_u, jx_v = [a for a in range(3) if a != ax_j]
+            # Put the sketch on the span face ADJACENT to the existing solid and
+            # extrude AWAY from it — otherwise a boss BELOW the base sketches at
+            # the far end (span[0]) and extrudes back INTO the plate, so the
+            # profile visibly floats off the part. Pick the span endpoint nearer
+            # the current solid's centre along this axis.
+            try:
+                _bb = wp.val().BoundingBox()
+                _ctr = [(_bb.xmin + _bb.xmax) / 2, (_bb.ymin + _bb.ymax) / 2,
+                        (_bb.zmin + _bb.zmax) / 2][ax_j]
+            except Exception:
+                _ctr = (float(span[0]) + float(span[1])) / 2
+            sketch_at = (float(span[0])
+                         if abs(float(span[0]) - _ctr) <= abs(float(span[1]) - _ctr)
+                         else float(span[1]))
+            origin_j = [0.0, 0.0, 0.0]
+            origin_j[ax_j] = sketch_at
 
-            # Sketch overlay wireframe in world coords
+            # Sketch overlay wireframe in world coords — include EVERY loop of a
+            # pattern (AI1's four corner screws are ONE sketch with four loops),
+            # so the sketch shows all four profiles, not just the first. The main
+            # loop (and any rounded extra loop) draws as STRAIGHT segments + true
+            # tangent ARCS — no chord polyline on curves — from the carried
+            # corners+fillets; circular holes chord their own points.
             j_overlay = []
-            for ring_pts in [j_pts, *j_inner]:
-                n_pts = len(ring_pts)
-                for pj in range(n_pts):
-                    for uu, vv in (ring_pts[pj], ring_pts[(pj + 1) % n_pts]):
-                        p3 = [0.0, 0.0, 0.0]
-                        p3[jx_u], p3[jx_v] = uu, vv
-                        p3[ax_j] = float(span[0])
-                        j_overlay.append(p3)
+            j_arcs = []
+            _ml, _ma = _overlay_for_ring(
+                j_pts, ax_j, sketch_at,
+                corners=sg.get("corners"), fillets=sg.get("fillets"))
+            j_overlay.extend(_ml)
+            j_arcs.extend(_ma)
+            for ring_pts in j_inner:
+                _rl, _ra = _overlay_for_ring(ring_pts, ax_j, sketch_at)
+                j_overlay.extend(_rl)
+                j_arcs.extend(_ra)
+            for _li, (_lp, _lin) in enumerate(j_extra):
+                _ec = (sg.get("extra_corners") or [None] * (_li + 1))[_li] \
+                    if sg.get("extra_corners") else None
+                _ef = (sg.get("extra_fillets") or [None] * (_li + 1))[_li] \
+                    if sg.get("extra_fillets") else None
+                _ll, _la = _overlay_for_ring(
+                    _lp, ax_j, sketch_at, corners=_ec, fillets=_ef)
+                j_overlay.extend(_ll)
+                j_arcs.extend(_la)
+                for ring_pts in _lin:
+                    _rl, _ra = _overlay_for_ring(ring_pts, ax_j, sketch_at)
+                    j_overlay.extend(_rl)
+                    j_arcs.extend(_ra)
             v_pre, f_pre = _tessellate_solid(wp, fast=True)
             steps.append(ConstructionStep(
                 name=f"Sketch Join {ji}",
@@ -2378,6 +2600,7 @@ def _build_stepwise(
                 tess_faces=np.asarray(f_pre, dtype=np.int64),
                 volume=abs(float(wp.val().Volume())),
                 sketch_overlay=np.asarray(j_overlay, dtype=np.float64),
+                overlay_arcs=j_arcs or None,
             ))
 
             # Extrude with the sign whose result overlaps the span
@@ -2386,9 +2609,15 @@ def _build_stepwise(
             for sign in (1.0, -1.0):
                 try:
                     wpj = cq.Workplane(plane_j, origin=tuple(origin_j))
-                    wpj = _draw_profile_with_holes(wpj, j_pts, j_inner)
-                    for lp, lin in j_extra:
-                        wpj = _draw_profile_with_holes(wpj, lp, lin)
+                    wpj = _draw_profile_with_holes(
+                        wpj, j_pts, j_inner,
+                        corners=sg.get("corners"), fillets=sg.get("fillets"))
+                    for _li, (lp, lin) in enumerate(j_extra):
+                        _ec = (sg.get("extra_corners") or [None] * (_li + 1))[_li] \
+                            if sg.get("extra_corners") else None
+                        _ef = (sg.get("extra_fillets") or [None] * (_li + 1))[_li] \
+                            if sg.get("extra_fillets") else None
+                        wpj = _draw_profile_with_holes(wpj, lp, lin, _ec, _ef)
                     wpj = wpj.extrude(sign * j_len)
                     bbj = wpj.val().BoundingBox()
                     j_vals = [
@@ -4370,7 +4599,8 @@ def build_blend_intent_edges(
     return np.asarray(overlay_pairs, dtype=np.float64).reshape(-1, 2, 3)
 
 
-def _draw_profile_with_holes(wp2d, outer: list, inners: list):
+def _draw_profile_with_holes(wp2d, outer: list, inners: list,
+                             corners: list = None, fillets: list = None):
     """Draw the outer boundary plus inner cutout wires on one workplane.
 
     Extruding the result produces the cross-section WITH holes in a single
@@ -4378,8 +4608,11 @@ def _draw_profile_with_holes(wp2d, outer: list, inners: list):
     windowed solid) — the lowest-step base for a tube (annular sketch) or
     any prismatic part whose through-cutouts belong to the profile, rather
     than extrude-then-cut.
+
+    `corners`/`fillets` (if given) drive exact tangent fillets on the OUTER
+    boundary from the carried parametric data (matches the Onshape sketch).
     """
-    wp = _draw_profile_with_arcs(wp2d, outer)
+    wp = _draw_profile_with_arcs(wp2d, outer, corners, fillets)
     for inner in inners:
         wp = _draw_profile_with_arcs(wp, inner)
     return wp
@@ -4700,7 +4933,129 @@ def _draw_exact_corner_arcs(wp2d, sharp_pts, fillets):
     return wp.close()
 
 
-def _draw_profile_with_arcs(wp2d, pts: list):
+def _sketch_overlay_arcs(corners, fillets, ax, plane_pos):
+    """Sketch-overlay wireframe for a rounded outline as STRAIGHT segments +
+    true ARC descriptors (no chord polyline on the curves).
+
+    Mirrors onshape/feature_builder._analytic_tangent_arcs EXACTLY (same
+    tangent-length / centre-on-bisector math) so the viewer overlay, the
+    CadQuery solid, and the Onshape sketch are one geometry, not three
+    independent re-detections.
+
+    corners:   sharp-corner polygon, list of (u, v) in mm (sketch-plane coords).
+    fillets:   per-corner radii (mm) aligned with corners; 0/None = sharp.
+    ax:        out-of-plane axis index (0/1/2). The two in-plane axes are the
+               remaining indices in ascending order -> (u_axis, v_axis).
+    plane_pos: constant value along `ax`.
+
+    Returns (line_pts, arcs):
+      line_pts: list of 3D points, consecutive PAIRS = one straight segment
+                (same flat format as ConstructionStep.sketch_overlay).
+      arcs:     list of {"ax","pos","cu","cv","r","a0","a1"} — a circular arc
+                in the sketch plane swept CCW from a0 to a1 about (cu, cv).
+    """
+    P = np.asarray(corners, dtype=float)
+    n = len(P)
+    if n < 3:
+        return [], []
+    fdict = {}
+    if fillets:
+        for i, r in enumerate(fillets):
+            if r and float(r) > 0.05:
+                fdict[i] = float(r)
+    if not fdict:
+        # nothing rounds — caller falls back to plain chords
+        return [], []
+    u_axis, v_axis = [a for a in range(3) if a != ax]
+
+    def _to3(p2):
+        q = [0.0, 0.0, 0.0]
+        q[u_axis] = float(p2[0])
+        q[v_axis] = float(p2[1])
+        q[ax] = float(plane_pos)
+        return q
+
+    node_pts = []  # (entry_pt, exit_pt, arc or None)
+    for i in range(n):
+        V = P[i]
+        r = fdict.get(i)
+        if not r:
+            node_pts.append((V, V, None))
+            continue
+        a = P[(i - 1) % n] - V
+        b = P[(i + 1) % n] - V
+        la, lb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+        if la < 1e-9 or lb < 1e-9:
+            node_pts.append((V, V, None))
+            continue
+        a, b = a / la, b / lb
+        phi = float(np.arccos(np.clip(a @ b, -1.0, 1.0)))
+        if phi < np.radians(10) or phi > np.radians(170):
+            node_pts.append((V, V, None))
+            continue
+        t = r / np.tan(phi / 2.0)
+        if t > 0.6 * min(la, lb):
+            node_pts.append((V, V, None))
+            continue
+        T1 = V + a * t
+        T2 = V + b * t
+        C = V + (a + b) / np.linalg.norm(a + b) * (r / np.sin(phi / 2.0))
+        ang1 = float(np.arctan2(T1[1] - C[1], T1[0] - C[0]))
+        ang2 = float(np.arctan2(T2[1] - C[1], T2[0] - C[0]))
+        sweep = (ang2 - ang1) % (2.0 * np.pi)
+        if sweep > np.pi:
+            ang1, ang2 = ang2, ang1
+        if ang2 < ang1:
+            ang2 += 2.0 * np.pi
+        node_pts.append((T1, T2, (C, float(r), ang1, ang2)))
+
+    line_pts = []
+    arcs = []
+    for i in range(n):
+        _, exit_pt, _ = node_pts[i]
+        entry_next, _, arc_next = node_pts[(i + 1) % n]
+        d = entry_next - exit_pt
+        seg_len = float(np.linalg.norm(d))
+        if seg_len > 1e-9:
+            line_pts.append(_to3(exit_pt))
+            line_pts.append(_to3(entry_next))
+        if arc_next is not None:
+            C, r, a0, a1 = arc_next
+            arcs.append({
+                "ax": int(ax), "pos": float(plane_pos),
+                "cu": float(C[0]), "cv": float(C[1]),
+                "r": float(r), "a0": float(a0), "a1": float(a1),
+            })
+    return line_pts, arcs
+
+
+def _overlay_for_ring(ring_pts, ax, plane_pos, corners=None, fillets=None):
+    """(line_pts, arcs) for ONE closed sketch ring. With parametric
+    corners+fillets it returns straights + true arcs; otherwise it chords the
+    ring's own points (holes/circles, already finely sampled). Same flat
+    point-pair format as ConstructionStep.sketch_overlay throughout."""
+    if corners is not None and len(corners) >= 3 and fillets:
+        try:
+            lp, arcs = _sketch_overlay_arcs(corners, fillets, ax, plane_pos)
+            if arcs:
+                return lp, arcs
+        except Exception:
+            logger.debug("overlay arc build failed; chording ring", exc_info=True)
+    u_axis, v_axis = [a for a in range(3) if a != ax]
+    line_pts = []
+    n = len(ring_pts)
+    for i in range(n):
+        for (uu, vv) in (ring_pts[i], ring_pts[(i + 1) % n]):
+            q = [0.0, 0.0, 0.0]
+            q[u_axis] = float(uu)
+            q[v_axis] = float(vv)
+            q[ax] = float(plane_pos)
+            line_pts.append(q)
+    return line_pts, []
+
+
+def _draw_profile_with_arcs(wp2d, pts: list, corners: list = None,
+                            fillets: list = None):
     """Draw a closed profile, rebuilding polygonized corner arcs as true
     arcs (threePointArc) so the solid gets ONE arc edge per outline
     corner instead of N sliver segments. Sliver chains made OCC's
@@ -4708,7 +5063,20 @@ def _draw_profile_with_arcs(wp2d, pts: list):
     real arcs roll cleanly and match the original design intent.
 
     Falls back to a plain polyline on any irregularity.
+
+    When the PARAMETRIC representation is supplied (`corners` = sharp polygon,
+    `fillets` = per-corner radii aligned with corners), draw exact OCC tangent
+    fillets from it — the SAME source the Onshape export uses, so the viewer's
+    solid and the Onshape sketch are identical, not independently re-detected.
     """
+    if corners and len(corners) >= 3 and fillets:
+        _fdict = {i: float(r) for i, r in enumerate(fillets) if r and r > 0.05}
+        if _fdict:
+            try:
+                return _draw_exact_corner_arcs(
+                    wp2d, [(float(c[0]), float(c[1])) for c in corners], _fdict)
+            except Exception:
+                logger.debug("carried-arc draw failed; re-detecting", exc_info=True)
     try:
         # Preferred: EXACT tangent corner arcs (OCC MakeFillet2d on a
         # sharp polygon, re-drawn with native workplane commands).

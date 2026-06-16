@@ -345,7 +345,11 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
     from shapely.geometry import Polygon
     P = np.asarray(pts_mm, dtype=float)
     try:
-        s = Polygon(P).buffer(0).simplify(0.4, preserve_topology=True)
+        # Light simplify only. A heavy tolerance (was 0.4) collapses each
+        # rounded corner's arc points down to the bare run intersection, so the
+        # fillet detection below sees no bend and snaps the corner to a sharp
+        # 90°. Keeping the arc samples lets corners be recognised as fillets.
+        s = Polygon(P).buffer(0).simplify(0.12, preserve_topology=True)
         if s.geom_type == "Polygon" and len(s.exterior.coords) >= 5:
             P = np.asarray(s.exterior.coords[:-1], dtype=float)
     except Exception:
@@ -429,18 +433,72 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
             bend.append(j)
             j = (j + 1) % n
             g += 1
-        if len(bend) >= 2:
-            try:
-                _, _, rr = _fit_circle_2d_local(P[bend])
-                if 0.3 < rr < 60.0:
-                    fillets[len(sharp)] = rr
-            except np.linalg.LinAlgError:
-                pass
+        # A radius-r fillet ends BOTH straight runs ~r short of the ideal sharp
+        # corner X (their tangent insets), symmetrically. That inset is a robust
+        # GEOMETRIC measure of the radius; a least-squares circle fit to a few
+        # near-collinear bend points is NOT — it returns a huge radius (R=10 on a
+        # 25mm tab) from noise, which showed up as one bogus rounded corner per
+        # tab while the siblings stayed sharp. So measure the inset always, and
+        # trust the circle fit only when it AGREES with it.
+        try:
+            e1 = P[(m1[-1] + 1) % n]   # run k's far endpoint (flanks the corner)
+            e2 = P[m2[0]]              # run k+1's near endpoint
+            r1 = float(np.linalg.norm(np.asarray(e1) - X))
+            r2 = float(np.linalg.norm(np.asarray(e2) - X))
+            inset = min(r1, r2)
+            symmetric = abs(r1 - r2) <= 0.5 * max(r1, r2, 1e-9)
+            r_fillet = None
+            if len(bend) >= 2:
+                try:
+                    _, _, rr = _fit_circle_2d_local(P[bend])
+                except np.linalg.LinAlgError:
+                    rr = None
+                if (rr is not None and 0.3 < rr < 60.0 and inset > 0.3
+                        and symmetric and abs(rr - inset) <= 0.6 * max(rr, inset)):
+                    # Fit agrees with the geometric inset — a genuine arc.
+                    r_fillet = rr
+                elif 0.3 < inset < 60.0 and symmetric:
+                    # Fit disagrees (misfit on noisy points) — fall back to the
+                    # inset, which reflects the ACTUAL corner geometry.
+                    r_fillet = inset
+            elif 0.3 < inset < 60.0 and symmetric:
+                # Too few bend points to fit a circle — the inset alone tells us
+                # whether the corner is rounded (and by how much) vs sharp.
+                r_fillet = inset
+            if r_fillet is not None:
+                fillets[len(sharp)] = r_fillet
+        except Exception:
+            pass
         sharp.append((float(X[0]), float(X[1])))
+
+    # Unify fillet radii across repeated/symmetric corners. A real part uses a
+    # small palette of radii; a mesh estimates each corner independently and
+    # noisily — a row of IDENTICAL tabs came back 6.3 / 6.5 / 8.2 / 10.0, which
+    # renders as lopsided corners. Single-linkage cluster the detected radii by
+    # relative proximity (split where consecutive values jump >1.4x, so a 1mm
+    # body fillet never merges with a ~7mm tab round) and snap each corner to its
+    # cluster median, so identical features come out identical.
+    if len(fillets) >= 2:
+        vals = sorted(fillets.values())
+        clusters, cur = [], [vals[0]]
+        for a, b in zip(vals, vals[1:]):
+            if b <= a * 1.4:
+                cur.append(b)
+            else:
+                clusters.append(cur)
+                cur = [b]
+        clusters.append(cur)
+        rep = {}
+        for cl in clusters:
+            med = float(np.median(cl))
+            for v in cl:
+                rep[v] = med
+        fillets = {i: rep[r] for i, r in fillets.items()}
+
     return (sharp, fillets) if len(sharp) >= 3 else (None, None)
 
 
-def regularize_profile_2d(pts_mm: list, arc_samples: int = 8) -> list | None:
+def regularize_profile_2d(pts_mm: list, arc_samples: int = 18) -> list | None:
     """Stage F (sketch): clean a bumpy 2D outline into axis-aligned straight
     sides meeting at exact corners, with tangent arcs at the rounded ones.
 
@@ -517,11 +575,29 @@ def regularize_profile_2d(pts_mm: list, arc_samples: int = 8) -> list | None:
         return float(np.median(ang[lg])) if lg.any() else 0.0
     try:
         from shapely.geometry import Polygon
-        a_in = abs(Polygon(pts_mm).buffer(0).area)
-        a_out = abs(Polygon(out).buffer(0).area)
+        _pin = Polygon(pts_mm).buffer(0)
+        _pout = Polygon(out).buffer(0)
+        a_in = abs(_pin.area)
+        a_out = abs(_pout.area)
         if a_in > 0 and abs(a_out - a_in) / a_in > 0.03:
             return None
     except Exception:
+        return None
+    # SHAPE-FIDELITY GATE: reject a rebuild that REMOVES curvature. Squaring a
+    # rounded tab / U-shaped end (Mesh5) deletes the arc segments; the direction
+    # matters — ROUNDING a sharp input (AI1) is the whole point and must be
+    # kept. So compare the length of non-axis-aligned (curved/diagonal)
+    # perimeter before vs after: if the rebuild dropped most of it, it flattened
+    # real curves — keep the original.
+    def _curve_len(p):
+        Q = np.asarray(p, dtype=float)
+        s = np.roll(Q, -1, axis=0) - Q
+        ln = np.linalg.norm(s, axis=1)
+        di = s / (ln[:, None] + 1e-12)
+        near_axis = np.abs(di).max(1) > np.cos(np.radians(15.0))
+        return float(ln[~near_axis].sum())
+    cl_in = _curve_len(pts_mm)
+    if cl_in > 2.0 and _curve_len(out) < 0.6 * cl_in:
         return None
     if _straight_dev(out) >= _straight_dev(pts_mm) - 0.05:
         return None

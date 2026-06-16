@@ -283,6 +283,50 @@ def _to_segment(cand: dict, gain_frac: float, coverage: float) -> ExtrusionSegme
     )
 
 
+def _reaxis_to_base(seg: ExtrusionSegment, base_axis: int) -> ExtrusionSegment:
+    """Re-express a body that sweeps PERPENDICULAR to the base plate as a
+    BASE-AXIS extrude: sketch its footprint on the base plane and extrude along
+    the base normal. A wall sketched on its own side face (extruded sideways)
+    unions badly with the base — its outer face fuses perpendicular to the base
+    plate and can't be filleted. Re-extruded along the base axis, the same wall
+    is a clean box whose outer edge is a 2D sketch corner (rounds in-profile).
+
+    The footprint is the body's axis-aligned extent projected onto the base
+    plane — exact for a rectangular wall; for a J/L wall it's the bounding box
+    (the small flange notch is the trade for a clean, filletable outer edge).
+    Interior rings (the wall's through-holes) are dropped here and re-emitted as
+    tangential cuts downstream. No-op when the body already sweeps the base
+    axis.
+    """
+    if seg.axis_idx == base_axis:
+        return seg
+    P = np.asarray(seg.profile, dtype=float)
+    if len(P) < 3:
+        return seg
+    u, v = seg.axes_uv
+    ext = {
+        seg.axis_idx: (float(seg.start), float(seg.end)),
+        u: (float(P[:, 0].min()), float(P[:, 0].max())),
+        v: (float(P[:, 1].min()), float(P[:, 1].max())),
+    }
+    nonbase = [i for i in range(3) if i != base_axis]   # ascending = (u, v)
+    nu, nv = nonbase[0], nonbase[1]
+    (u0, u1), (v0, v1) = ext[nu], ext[nv]
+    s0, s1 = ext[base_axis]
+    nd = np.zeros(3)
+    nd[base_axis] = 1.0
+    return ExtrusionSegment(
+        axis_idx=base_axis,
+        direction=nd,
+        start=s0,
+        end=s1,
+        profile=[(u0, v0), (u1, v0), (u1, v1), (u0, v1)],
+        area=abs((u1 - u0) * (v1 - v0)),
+        gain_frac=seg.gain_frac,
+        coverage_frac=seg.coverage_frac,
+    )
+
+
 def _slice_components(mesh: trimesh.Trimesh, axis: int, pos: float):
     """Outer-outline polygons of the cross-section at `pos` along `axis`.
 
@@ -1238,6 +1282,18 @@ def plan_extrusions_components(
         chosen, coverage = area_chosen, area_cov
 
     segments = [_to_segment(c, gf, cov) for c, gf, cov in chosen]
+    # Re-express any body that still sweeps PERPENDICULAR to the base plate as a
+    # base-axis box (footprint on the base plane). The base (segment 0, the
+    # largest profile) defines the base axis and is untouched; a wall the
+    # selector kept as a sideways extrude becomes a clean base-axis box so its
+    # outer edge is a fillet-able 2D sketch corner rather than a fused
+    # perpendicular face. Its through-holes are re-emitted as tangential cuts
+    # downstream (recognize).
+    if segments:
+        base_ax = segments[0].axis_idx
+        segments = [segments[0]] + [
+            _reaxis_to_base(s, base_ax) for s in segments[1:]
+        ]
     return ExtrusionPlan(
         segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
     )

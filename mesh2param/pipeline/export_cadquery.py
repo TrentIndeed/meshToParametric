@@ -1613,18 +1613,22 @@ def _extract_profile_and_holes(
                 rdir = rdir / (np.linalg.norm(rdir) + 1e-15)
                 if abs(float(rdir @ ext_axis)) >= 0.9:
                     return True
-                # A sideways hole is real only if it pierces a JOIN body:
-                # its center must lie inside that join's profile (in the
-                # join plane) — axis-parallel alone let tab-relief
-                # artifacts ride along as "side-plate holes".
+                # A sideways hole is real only if it pierces a JOIN body: its
+                # centre must lie inside that join's 3D volume (its profile in
+                # the join plane AND within the join's span). The hole may run
+                # ALONG the join's extrude axis (a coaxial standoff bore) OR
+                # PERPENDICULAR to it (a mounting hole drilled tangentially
+                # through a wall the engine extrudes along the base axis) —
+                # either is a real hole, not a tab-relief artifact floating in
+                # the base air. (Don't require the hole to parallel the join
+                # axis: a wall built as a base-axis box has its through-holes
+                # running across the wall, perpendicular to the extrude.)
                 sg_rh = rh.sketch_geometry or {}
                 for cc in (sg_rh.get("centers") or [sg_rh.get("center")]):
                     if cc is None:
                         continue
                     c3 = np.asarray(cc, dtype=float)
                     for jax, (ju, jv), jpath, jspan in _join_lookup:
-                        if abs(rdir[jax]) < 0.9:
-                            continue
                         in_span = (
                             jspan[0] - 1.0 <= c3[jax] <= jspan[1] + 1.0
                         )

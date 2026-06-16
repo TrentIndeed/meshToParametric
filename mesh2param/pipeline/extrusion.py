@@ -1190,41 +1190,54 @@ def plan_extrusions_components(
     # nothing else covers it — so it survives no matter how little of the part
     # it is). Volume is consulted ONLY for this redundancy test, never to
     # match shapes or to gate on a part-fraction threshold.
-    unclaimed = np.ones(total, dtype=bool)
-    chosen = []
-    # PREFER the base-plate's axis. A human sketches on (or parallel to) the
-    # base plate and extrudes along its normal; a body whose sketch plane is
-    # TANGENTIAL/perpendicular to the base — a wall sketched on its own side
-    # face and extruded sideways — unions badly with the base (the fused outer
-    # face can't be filleted) and is NOT how it's modelled. So process
-    # base-axis candidates first: each claims its material before a
-    # perpendicular VIEW of the same wall can, and the perpendicular candidate
-    # is then dropped as redundant. Coverage-safe: a wall that ONLY a
-    # perpendicular candidate explains still owns unclaimed material and is
-    # kept. Base axis = the largest-profile candidate's axis (the base plate).
+    # Selection by self-coverage, largest profile first (sketch the biggest
+    # face, extrude the short way). We run the SAME claim loop with two orders
+    # and keep the LESS-FRAGMENTED result:
+    #   - area-first  : the original order.
+    #   - base-axis-first : PREFER the base-plate's axis. A human sketches on
+    #     (parallel to) the base plate and extrudes along its normal; a body
+    #     whose sketch plane is TANGENTIAL/perpendicular to the base — a wall
+    #     sketched on its own side face and extruded sideways — unions badly
+    #     with the base (the fused outer face can't be filleted) and is NOT how
+    #     it's modelled. Processing base-axis candidates first lets a
+    #     base-parallel body claim before a perpendicular VIEW of the same wall.
+    # Keeping whichever yields FEWER segments honours the base-axis preference
+    # WHENEVER it's clean, yet falls back to the perpendicular extrude when the
+    # base-axis view FRAGMENTS a wall — a wall's through-holes disconnect its
+    # base-axis slices into pieces, so its clean perpendicular run must not be
+    # traded for several base-axis fragments. base axis = largest-profile axis.
     base_axis = max(candidates, key=lambda c: c["area"])["axis"]
 
-    def _claim_order(c):
-        return (c["axis"] != base_axis, -c["area"])
+    def _select(order_key):
+        unclaimed = np.ones(total, dtype=bool)
+        chosen = []
+        for c in sorted(candidates, key=order_key):
+            own = int(np.count_nonzero(c["_mem"]))
+            if own == 0:
+                continue
+            new = int(np.count_nonzero(c["_mem"] & unclaimed))
+            if new / own < keep_self_frac:
+                continue  # redundant — its material already belongs to another
+            # Claim PRECISELY the material this object explains: tight axial
+            # band so a plate's claim does NOT bleed up into the domed bases of
+            # the screws abutting its top face.
+            unclaimed &= ~_voxels_in_prism(
+                occupied, c, pitch, tol_cells=0.5, axial_tol_cells=0.1,
+            )
+            cov = 1.0 - float(np.count_nonzero(unclaimed)) / total
+            chosen.append((c, new / total, cov))
+        return chosen, 1.0 - float(np.count_nonzero(unclaimed)) / total
 
-    for c in sorted(candidates, key=_claim_order):
-        own = int(np.count_nonzero(c["_mem"]))
-        if own == 0:
-            continue
-        new = int(np.count_nonzero(c["_mem"] & unclaimed))
-        if new / own < keep_self_frac:
-            continue  # redundant — its material already belongs to another
-        # Claim PRECISELY the material this object explains: tight axial band
-        # so a plate's claim does NOT bleed up into the fat domed bases of the
-        # screws abutting its top face.
-        unclaimed &= ~_voxels_in_prism(
-            occupied, c, pitch, tol_cells=0.5, axial_tol_cells=0.1,
-        )
-        coverage = 1.0 - float(np.count_nonzero(unclaimed)) / total
-        chosen.append((c, new / total, coverage))
+    area_chosen, area_cov = _select(lambda c: -c["area"])
+    base_chosen, base_cov = _select(
+        lambda c: (c["axis"] != base_axis, -c["area"]))
+    # Prefer base-axis only when it covers comparably AND is no more fragmented.
+    if base_cov >= area_cov - 1e-6 and len(base_chosen) <= len(area_chosen):
+        chosen, coverage = base_chosen, base_cov
+    else:
+        chosen, coverage = area_chosen, area_cov
 
     segments = [_to_segment(c, gf, cov) for c, gf, cov in chosen]
-    coverage = 1.0 - float(np.count_nonzero(unclaimed)) / total
     return ExtrusionPlan(
         segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
     )

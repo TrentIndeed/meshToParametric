@@ -1,5 +1,14 @@
 # TODO
 
+## Web UI bugs
+- [ ] **End-of-build auto-animation doesn't change the object visual.** When the
+  build finishes and the play/replay animation runs, the feature-name label
+  advances but the 3D model in the pane doesn't update step-to-step. (Earlier
+  fix dismissed the LiveBuild pane so the main viewer's loadStep is visible, and
+  removed the redundant ending auto-play — but the symptom persists, so the
+  replay still isn't repainting the visible canvas. Re-trace which renderer the
+  end-of-build animation drives vs which one is on screen.)
+
 ## Product vision & release gates
 
 **Target statement (the bar to hit before release):**
@@ -129,6 +138,20 @@ by refusing rather than silently shipping wrong geometry.
 - [ ] Mesh1 hole recall is 2/6: the four Y-axis plate corner holes are not
   recognized as THROUGH_HOLE features (absorbed into other features). Measured
   by the hole-accuracy metric; needs a recognition fix.
+- [ ] **Asymmetric corner-thickness blend detection on mirror-symmetric parts.**
+  RackMount's side plates are mirror twins, but the blend graph detects the
+  corner fillet that wraps ACROSS the plate thickness on the LEFT plate (one
+  record spanning x:-44..-39, the full thickness) yet SPLITS the RIGHT plate
+  into two face records (x:39..41 + x:44..46) with the thickness-crease faces
+  between them left unclassified — so the right corner's thickness fillet is
+  never applied (user-visible: blue blend overlay across the thickness on the
+  left corners, missing on the right; right side-plate corner creases stay
+  sharp). Root = `docs/SEGMENTATION_HANDOFF.md` corner-triangle classification
+  at fillet-fillet junctions, borderline on the slightly-asymmetric mesh.
+  Robust fix: either symmetric corner-triangle classification, OR detect the
+  part's mirror plane and complete/mirror blend records across it (the
+  symmetry-constraint inference in the Scans+AI Stage E item). Diagnose with
+  `scripts/diag_blend_sides.py` (lists blend records by side + x-range).
 
 ## Profile extraction (root cause located 2026-06-10)
 - [ ] RackMount side plates rebuild ~0.6mm short on every filleted side

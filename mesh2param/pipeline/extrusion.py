@@ -315,49 +315,22 @@ def _reaxis_to_base(seg: ExtrusionSegment, base_axis: int) -> ExtrusionSegment:
     s0, s1 = ext[base_axis]
     nd = np.zeros(3)
     nd[base_axis] = 1.0
-    w, h = u1 - u0, v1 - v0
-    # ROUND the footprint corners. Re-axised, the footprint corners become the
-    # wall's VERTICAL edges; a human sketches them rounded so they fillet
-    # in-profile. A sharp footprint leaves those edges sharp and the post-build
-    # fillet can't roll across them (the long cap edge fillets, the short
-    # vertical edges stay sharp). Radius = the part's whole-mm fillet, capped
-    # below half the thin wall so the round never self-intersects.
-    r = min(2.0, 0.45 * min(w, h))
-    if r >= 0.3:
-        prof = _rounded_rect_profile(u0, u1, v0, v1, r)
-    else:
-        prof = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    # NOTE: a SHARP footprint rectangle. An earlier attempt rounded these
+    # corners (so the wall's vertical edges fillet in-profile) but that REMOVED
+    # the corner edges the post-build perimeter-WRAP fillet groups chain
+    # through, so the long-edge wraps stopped rolling (net regression). The
+    # right fix is to decouple the wrap apply from the corners (or fix the
+    # asymmetric corner-thickness blend detection) — see docs/TODO.md.
     return ExtrusionSegment(
         axis_idx=base_axis,
         direction=nd,
         start=s0,
         end=s1,
-        profile=prof,
-        area=abs(w * h),
+        profile=[(u0, v0), (u1, v0), (u1, v1), (u0, v1)],
+        area=abs((u1 - u0) * (v1 - v0)),
         gain_frac=seg.gain_frac,
         coverage_frac=seg.coverage_frac,
     )
-
-
-def _rounded_rect_profile(u0, u1, v0, v1, r, n=8):
-    """Outline of an axis-aligned rectangle [u0,u1]x[v0,v1] with all four
-    corners rounded to radius r, sampled n points per corner arc. The arc
-    samples let `_regularize_outline` recover the exact tangent fillets so the
-    export draws true corner arcs (not chords)."""
-    r = float(min(r, 0.5 * (u1 - u0), 0.5 * (v1 - v0)))
-    # corner centres: (cu, cv), arc start-angle (CCW), in CCW outline order
-    corners = [
-        (u1 - r, v0 + r, -np.pi / 2),  # bottom-right
-        (u1 - r, v1 - r, 0.0),         # top-right
-        (u0 + r, v1 - r, np.pi / 2),   # top-left
-        (u0 + r, v0 + r, np.pi),       # bottom-left
-    ]
-    pts: list[tuple[float, float]] = []
-    for cu, cv, a0 in corners:
-        for k in range(n + 1):
-            a = a0 + (np.pi / 2) * (k / n)
-            pts.append((float(cu + r * np.cos(a)), float(cv + r * np.sin(a))))
-    return pts
 
 
 def _slice_components(mesh: trimesh.Trimesh, axis: int, pos: float):

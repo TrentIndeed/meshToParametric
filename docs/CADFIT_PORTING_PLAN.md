@@ -87,7 +87,51 @@ Close the operation gap. `revolve_detect` exists; wire it through:
 
 ---
 
-## Phase 5 — The segmentation experiment (the decision you asked for)
+## Phase 5 — RESULT (2026-06-17): KEEP segmentation; add a contour fallback
+
+A/B ran (`scripts/diag_seg_ab.py`, `pipeline/contour_recon.py`) on clean CAD
+(Mesh1–5) + AI (1,6,11,13,14). Path A = segment→fit→topology→recognize→export;
+Path B = plan_extrusions→extrude→residual, NO segmentation. Both share the
+residual loop, so the delta is segmentation's contribution. cad_vol_err %:
+
+| part | A (recog) | B (no seg) | | part | A | B |
+|---|---|---|---|---|---|---|
+| Mesh1 | 9.5 | **2.9** | | AI1 | 0.9 | 1.1 |
+| Mesh2 | **0.5** | 1.6 | | AI6 | **9.6** | 22.0 |
+| Mesh3 | **3.0** | 23.1 | | AI11 | 49.7 | **21.0** |
+| Mesh4 | **0.0** | 0.8 | | AI13 | **22.3** | 132.8 |
+| Mesh5 | **2.2** | 5.9 | | AI14 | **1.3** | 18.8 |
+
+**Verdict (pre-committed gate → "A wins broadly → KEEP"):** recognition wins
+8/10, incl. 4/5 AI. Segmentation earns its keep. Do NOT replace it.
+
+**Two findings that refine the plan:**
+1. **Segmentation's value is concentrated in HOLE/POCKET identification, not the
+   base shape.** Path B's failures (AI13 132%, AI14 18.8%, Mesh3 23%) are
+   OVER-builds: the extrusion engine reproduces the base prism fine, but B
+   can't cut holes precisely (the residual box-CUT is too crude for round
+   holes), so it fills them. Recognition finds holes precisely — that's the
+   win. So the base-shape half is segmentation-free-capable TODAY; the
+   feature-subtraction half is where segmentation is load-bearing.
+2. **There is a real subset where recognition mis-fires and B is better**
+   (AI11: A 49.7% → B 21%). So the contour path is a valuable FALLBACK, not a
+   replacement.
+
+**Actionable outcome → "best-of-both" router (recommended next):** run
+recognition; when its cad_vol_err is poor (e.g. > 15%), also run
+`reconstruct_segmentation_free` and keep whichever matches the target better.
+Cheap (only failing parts pay for B), self-correcting (the residual loop's
+IoU-pick-the-better philosophy at the path level), and it rescues recognition's
+worst cases (AI11) with zero risk to the wins. Wiring lives in `convert.py` /
+`job_queue`; gate behind cad_vol_err + 18/7 like everything else.
+
+**Caveat:** n=10, and Path B is handicapped (extrude-only, no hole cutting), so
+the experiment slightly favors A. A fairer B (silhouette/cylinder residual
+candidates that can cut round holes — Phase 2 remainder) might shift the AI
+numbers; revisit after that lands. But the headline ("keep segmentation, add a
+contour fallback") is robust to that caveat.
+
+### Original Phase 5 design
 
 **Question:** is this repo's segmentation stage (region-growing + ~10 peeling
 passes + noise-robust merge) *better in the long run* than CADFit's

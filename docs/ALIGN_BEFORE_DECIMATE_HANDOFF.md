@@ -144,6 +144,17 @@ denoise + Poisson + voxel-repair then run on the full 1M–2.5M-face mesh — pr
 `_denoise_scan` and `_voxel_remesh_repair` first; if either is > ~20s on the
 densest scan, use the cost-guard cap.
 
+### ALSO do this while you're in here: GATE the alignment (skip when already
+aligned). Many AI meshes (Meshy/Tripo) arrive roughly axis-aligned, so the
+canonical rotation is unnecessary and only introduces a small pose error — this
+is most of why "align makes AI models look worse." In `align_to_canonical_frame`,
+after computing the candidate frame, measure how axis-aligned the dominant face
+normals ALREADY are (area-weighted fraction of faces whose normal is within ~3–5°
+of a world axis, or `max |R - I|`). If already aligned, return the IDENTITY
+transform and don't rotate. Combined with the high-res fix above, this keeps
+alignment for the genuinely tilted inputs that need it and leaves clean AI meshes
+untouched. See the Design Q&A (§7, Q2) for the rationale.
+
 ---
 
 ## 4. How to verify
@@ -207,3 +218,104 @@ feature sweep), `scripts/diag_ingest.py`.
 - Ingest time on the densest scan not materially worse.
 - `dirty_max_faces` semantics narrowed to "segmentation cap" in code comments;
   new `align_max_faces` documented in `config.py`.
+
+---
+
+## 7. Design Q&A (conceptual context for whoever picks this up)
+
+These are the design tensions behind this fix and the AI-mesh path generally.
+Captured here so a fresh instance has the *why*, not just the *what*. Answers are
+grounded in the code as of 2026-06-16.
+
+### Q1 — A curved edge in a mesh could be a FILLET (blend between two faces) OR the side-profile of a real designed RADIUS. How does the blend stage tell them apart, and how does the program decide which way to model it?
+
+It's genuinely ambiguous in a raw mesh. `peel_via_topology.identify_blends_from_topology`
+resolves it with a **geometric "fillet signature"**, NOT by trusting edge tags
+(the topology fillet-tag is unreliable — fit.py often classifies a partial arc as
+a sphere/cone, or merges a through-hole cylinder to 360°). A curved region is
+called a **fillet** only if ALL of:
+
+- **Small, mm-scale radius** — measured downstream from median perpendicular
+  distance to the edge line, not the raw cylinder-fit radius (which is garbage
+  for partial arcs).
+- **Bridges two flat faces tangentially** — the "bridge test": some region face
+  normals align with an adjacent plane's normal (dot > 0.866) AND the region's
+  normals sweep a **bounded arc ≤ ~90°** (a real fillet rolls at most a
+  quarter-circle).
+- **Axis doesn't pierce an adjacent plane** — bores/boss-walls/countersinks
+  pierce; a fillet runs tangent.
+- **Long-thin-strip shape** — runs *along* an edge (length ≫ radius), not a ring
+  or a blocky 3D corner.
+
+What this REJECTS (→ treated as real geometry, not a fillet):
+- **Bore/hole walls** — radial normals never align → recognized as a hole.
+- **Boss / cylindrical side walls** — normals sweep 180°+ (fail ≤90° spread) →
+  real cylinder surface, becomes an extrude/boss.
+- **Countersink cones** — uniform half-angle normals fail tangency.
+- **A designed curved radius that's part of the silhouette** — too big / sweeps
+  too far to be a fillet, so it stays in the **cross-section profile** and gets
+  extruded as the outline (the way base-plate corner radii become sketch arcs).
+
+**Decision rule in one line:** *small tangent arc bridging two faces with bounded
+sweep → fillet (peeled off, re-applied as a blend feature after the build);
+everything else curved → part of the shape itself* (profile arc, cylinder, cone,
+revolve). HONEST CAVEAT: this is a heuristic threshold cascade, and the
+borderline cases (a generous rolled edge vs. a small designed radius) are exactly
+where it's fragile — it's the recurring source of the side-plate fillet bugs and
+the left/right asymmetry (see `docs/TODO.md` "Asymmetric corner-thickness blend
+detection" and `docs/SEGMENTATION_HANDOFF.md`).
+
+### Q2 — Do AI meshes even need the align stage? It's the main stage making the model look worse.
+
+**Conceptually yes, but right now it does more harm than good — fix it, don't
+remove it.** Two separate reasons it hurts:
+
+1. **It computes the frame on the over-decimated mesh** — the bug this whole doc
+   is about. Coarse normals → slightly-wrong rotation → every world-axis
+   assumption inherits a tilt/skew → "looks worse."
+2. **Many AI meshes arrive roughly axis-aligned**, so the canonical rotation is
+   unnecessary and only adds a small pose error.
+
+**Why it exists:** the extrusion engine, axis snapping, and prismatic reasoning
+are all *world-axis-relative* (slice along X/Y/Z, assume dominant faces are
+axis-parallel). A genuinely tilted scan/AI mesh MUST be rotated onto its own
+frame or all of that breaks.
+
+**Recommendation:** (a) run it on high-res (this doc's main fix), and (b) **gate
+it** — make it a no-op when the part is already aligned (return identity if the
+dominant normals are already within a few degrees of world axes; see §3 "ALSO do
+this"). That keeps alignment for the tilted inputs that need it and stops it from
+nudging already-clean AI meshes off-true.
+
+### Q3 — How clean do segmentation + topology need to look on AI meshes for the program to recreate the part?
+
+**Not pixel-perfect — but they must recover the part's dominant PRISMATIC
+STRUCTURE.** Concretely the program needs:
+
+- **The major planar faces as single, large regions** (base plate, each wall,
+  the big flats). This is the hard requirement and the main AI-mesh failure: a
+  flat AI face shatters into hundreds/thousands of slivers (seg 46→7341 on a real
+  part), so the extrusion engine's cross-section tracking + "biggest face"
+  selection have nothing to lock onto. `noise_robust` merge recovers 50–70%; the
+  dense/complex parts are still over-fragmented (the open "region-growing
+  robustness" TODO).
+- **Curved strips identifiable per Q1** — over-fragmentation breaks the fillet
+  bridge test (the arc gets split, normals don't form a clean bounded sweep),
+  which is part of why corner-fillet detection goes asymmetric.
+- **Topology edges good enough to find holes + the sharp outline** — tolerant of
+  noise on smooth/fillet edges, but needs the sharp silhouette and hole rims.
+
+**Does NOT need:** every triangle classified right, perfectly closed regions, or
+exact fillet strips. The build is driven by (extrusion profile + holes + blend
+records); if the big faces, outline, holes, and dominant blends survive, recovery
+works (the detail finders are deliberately conservative on dirty parts — drop
+weak evidence rather than hallucinate).
+
+**Practical bar:** if a human glancing at the segmentation viz can pick out "base
+plate / two walls / holes / rolled edges" as distinct regions, the program can
+rebuild it. When the flats look like confetti, it can't. So **getting
+segmentation into the clean-CAD triangle regime is the single highest-leverage
+AI-mesh lever** (the `dirty_max_faces` cap + the region-growing robustness work)
+— more than any individual feature fix. This is also exactly why getting the
+alignment+decimation ordering right (this doc) matters: a good frame makes the
+segmentation cleaner, which makes everything downstream tractable.

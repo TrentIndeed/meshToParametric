@@ -17,13 +17,24 @@ class IngestConfig(BaseModel):
     # collapse). Scans arrive at 300K-2.5M faces; segmentation cost is
     # superlinear in faces, so cap before Stage 2. 0 disables.
     max_faces: int = 30_000
-    # Dirty/scan path decimates HARDER. The segmentation + density thresholds
-    # were tuned on clean CAD meshes of 1.6k-9.5k faces; AI/scan meshes left at
-    # the 30k cap are 3-19x denser, so a flat face has far more triangles for
-    # noise to shatter into fragments. Decimate detected dirty/scan inputs to
-    # this lower cap to land them near the clean-CAD triangle regime (clean CAD
-    # is below the cap and untouched). 0 = fall back to max_faces.
+    # DEPRECATED / UNUSED by ingest as of the align-before-decimate fix.
+    # Originally meant to decimate dirty/scan inputs to a lower triangle regime
+    # for segmentation. In practice it ran BEFORE Poisson/voxel repair, which
+    # re-inflated the mesh back to ~max_faces, so it was effectively a no-op —
+    # and forcing it to actually bite (post-repair) both collapsed alignment
+    # quality and shattered segmentation (verified: scripts/diag_align_resolution.py
+    # + scripts/diag_ai_parts.py). Segmentation-density reduction is now owned
+    # by convert._decimate_to_density (reference faces/cm^2 from a high-res
+    # mesh). Kept only so external configs don't break; no code reads it.
     dirty_max_faces: int = 12_000
+    # Cost-guard cap applied BEFORE denoise/repair/align on dirty/scan inputs,
+    # so those steps + the canonical-frame alignment run on a HIGH-resolution
+    # mesh (good area-weighted normals -> accurate frame). Only huge scans
+    # (>this) get pre-decimated here; after align the mesh is capped back to
+    # max_faces. >=~80k is plenty for a prismatic part's dominant normals; keep
+    # it low enough that bilateral denoise + Poisson/voxel repair stay fast.
+    # 0 = no cost guard (align on the full mesh).
+    align_max_faces: int = 120_000
     # Screened-Poisson surface reconstruction for ragged scan input. Only
     # runs when the cleaned mesh is NOT watertight after normal repair —
     # clean CAD meshes are left untouched, because Poisson SMOOTHS the

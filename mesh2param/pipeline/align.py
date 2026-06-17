@@ -112,12 +112,38 @@ def _reorder_axes_by_extent(mesh: trimesh.Trimesh) -> np.ndarray:
     return P
 
 
-def align_to_canonical_frame(mesh: trimesh.Trimesh):
+def _axis_misalignment(mesh: trimesh.Trimesh) -> float:
+    """Area-weighted mean angle (deg) of face normals to their NEAREST world
+    axis. 0 = every face is perfectly axis-aligned (a true prismatic part on
+    its frame); larger = more tilted/organic. Used to decide whether a
+    candidate rotation actually HELPS."""
+    n = np.asarray(mesh.face_normals, dtype=float)
+    a = np.asarray(mesh.area_faces, dtype=float)
+    if len(n) == 0 or a.sum() <= 0:
+        return 0.0
+    cosv = np.clip(np.abs(n).max(axis=1), 0.0, 1.0)  # cos(angle to nearest axis)
+    ang = np.degrees(np.arccos(cosv))
+    return float((a * ang).sum() / a.sum())
+
+
+def align_to_canonical_frame(mesh: trimesh.Trimesh,
+                             improve_margin_deg: float = 1.0):
     """Rotate `mesh` onto its natural orthogonal frame.
 
     Returns (aligned_mesh, transform_4x4, method) where applying
     transform to the input yields the aligned mesh. `method` is
-    "normals" or "obb". Pure rotation/permutation — no scaling.
+    "normals", "obb", or "identity" (rotation wouldn't help — no rotation).
+    Pure rotation/permutation — no scaling.
+
+    GATE: a candidate frame is applied only if it measurably IMPROVES
+    axis-alignment (area-weighted mean normal-to-axis angle drops by more than
+    improve_margin_deg). Many AI meshes (Meshy/Tripo) arrive roughly aligned,
+    where the dominant-normal frame is ~identity (no gain) or the OBB fallback
+    is an actively-bad rotation — in both cases rotating only injects pose
+    error, so we keep the pose (identity). Genuinely tilted parts (e.g. the
+    wrench scan) still get rotated because the gain is real. This is stricter
+    than a fixed "within N degrees" tolerance: it skips no-op AND harmful
+    rotations while keeping the small-but-helpful ones.
     """
     R = _frame_from_normals(mesh)
     method = "normals"
@@ -134,6 +160,17 @@ def align_to_canonical_frame(mesh: trimesh.Trimesh):
     T[:3, :3] = R
     aligned = mesh.copy()
     aligned.apply_transform(T)
+
+    # Apply the rotation only if it actually improves axis-alignment. The
+    # extent reorder below is a pure axis permutation (preserves angle-to-
+    # nearest-axis), so measuring after R alone is sufficient.
+    before = _axis_misalignment(mesh)
+    after = _axis_misalignment(aligned)
+    if after >= before - improve_margin_deg:
+        logger.info("Canonical-frame alignment skipped — %s rotation does not "
+                    "improve axis-alignment (%.1f -> %.1f deg mean)",
+                    method, before, after)
+        return mesh, np.eye(4), "identity"
 
     # Stable, intuitive axis order (length->X, thickness->Z).
     P = _reorder_axes_by_extent(aligned)

@@ -1,10 +1,56 @@
 # Handoff: Align on the high-res mesh, decimate only for segmentation
 
 **For:** a fresh Claude instance picking up this fix.
-**Status:** diagnosed + planned, NOT implemented. Listed in `docs/TODO.md` under
-"Scans + AI-generated … Still TODO".
-**Scope:** `mesh2param/pipeline/ingest.py` (`ingest_mesh`) ordering only. No new
-algorithms — a reorder + one cost guard.
+**Status:** ✅ IMPLEMENTED 2026-06-17 — but the plan's root-cause hypothesis was
+WRONG; see "## OUTCOME" below before trusting §2–§3.
+**Scope:** `mesh2param/pipeline/ingest.py` (`ingest_mesh`) + `align.py` (gate) +
+`config.py` (`align_max_faces`).
+
+---
+
+## OUTCOME (2026-06-17) — read this first
+
+The reorder was implemented, but verification showed the handoff's diagnosis was
+wrong in two ways. The fix that actually shipped is a corrected version:
+
+**What was wrong with the plan:**
+1. **The old 12k `dirty_max_faces` cap was effectively a NO-OP.** It ran BEFORE
+   `_poisson_reconstruct` (which re-decimates to `max_faces`) and
+   `_voxel_remesh_repair` (uncapped marching cubes), so segmentation always saw
+   ~`max_faces`, never 12k. Moving the 12k cap to AFTER repair (as §3 directs)
+   made it finally bite — and that **regressed production segmentation on 11/15
+   AI parts** (it hands `convert._decimate_to_density` a pre-coarsened mesh) and
+   **collapsed alignment quality** (decimating the clean repaired surface to 12k
+   reintroduces normal wobble: AI4 alignQ 0.79→0.38).
+2. **"High-res gives a better frame" is false.** `_frame_from_normals` is
+   resolution-STABLE (verified `scripts/diag_align_resolution.py`); these AI
+   parts are already axis-aligned, so the frame is ~identity at every
+   resolution. The high-res mesh helps only because `_frame_from_normals` *finds
+   a frame at all* where the low-res mesh returned `None` → a bad OBB rotation.
+
+**What actually shipped:**
+- Cost-guard decimate to `align_max_faces` (120k) BEFORE denoise/repair/align so
+  `_frame_from_normals` has enough triangles to find a frame. (As §3 intended.)
+- Align on that high-res mesh.
+- After align, cap the output at **`max_faces` (30k), NOT `dirty_max_faces`** —
+  30k is the empirical sweet spot (12k AND 120k both segment worse). Segmentation
+  density is owned by `convert._decimate_to_density`, not a 12k ingest pre-pass.
+- **GATE** (`align.py`): apply the candidate rotation only if it MEASURABLY
+  improves axis-alignment (area-weighted mean normal-to-axis angle drops by
+  >1°). This skips no-op rotations (already-aligned AI parts) AND actively-bad
+  OBB rotations, while keeping small-but-helpful ones (the wrench). This is
+  stricter and more correct than the "within N°" gate §3 suggested.
+
+**Validation (end-to-end CAD volume error, `scripts/diag_ai_build.py`):**
+every tested AI part improved dramatically — AI1 11.6%→0.9% (now PASS),
+AI6 100%→20.3%, AI11 100%→49.7%, AI13 58%→22%, AI14 100%→1.3% (now PASS).
+Clean CAD unchanged (`test_step_comparison` 18 passed / 7 xfailed). The
+production region-count "regression" turned out to be a misleading proxy — the
+correct alignment frame dominates build quality. NOTE:
+`tests/test_align.py::test_scan1_wrench_becomes_axis_aligned` fails, but it
+fails identically on `main` (pre-existing, unrelated to this fix).
+
+The original plan (§2–§7 below) is kept for context but is partly superseded.
 
 ---
 

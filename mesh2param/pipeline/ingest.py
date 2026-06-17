@@ -96,11 +96,19 @@ def ingest_mesh(
     try:
         mesh = _remove_degenerate_faces(mesh, config.min_face_area)
         mesh = _merge_vertices(mesh, config.merge_tolerance)
-        # Dirty/scan inputs decimate to the lower cap so flat faces stop
-        # over-fragmenting in segmentation (the thresholds were tuned on the
-        # clean-CAD triangle regime). Clean CAD is below max_faces anyway.
-        _cap = (config.dirty_max_faces or config.max_faces) \
-            if needs_frontend else config.max_faces
+        # Decimation cap depends on the path:
+        #   * Clean CAD: drop to max_faces (it's usually already below).
+        #   * Dirty/scan: only a COST-GUARD cap here (align_max_faces, ~120k) so
+        #     denoise/repair AND the canonical-frame alignment run on a
+        #     high-resolution mesh — alignment derives its rotation from
+        #     area-weighted face normals, which coarse triangles degrade. After
+        #     align the mesh is capped to max_faces (see the OUTPUT CAP below);
+        #     segmentation density is convert._decimate_to_density's job, NOT a
+        #     12k pre-pass here. align_max_faces=0 disables the guard.
+        if needs_frontend:
+            _cap = config.align_max_faces or config.max_faces
+        else:
+            _cap = config.max_faces
         mesh = _decimate(mesh, _cap)
         mesh = _fix_normals(mesh)
         # Scan front-end: feature-preserving denoise flattens scanner
@@ -150,6 +158,22 @@ def ingest_mesh(
                 on_stage("align", mesh.copy())
             except Exception:
                 logger.debug("on_stage(align) failed", exc_info=True)
+
+    # OUTPUT CAP (dirty/scan only): bound the high-res working mesh back to
+    # max_faces for downstream memory/speed. NOT the aggressive dirty_max_faces
+    # (12k) cap — verified (scripts/diag_align_resolution.py) that decimating
+    # the clean denoised+repaired surface that hard REINTRODUCES normal wobble
+    # (alignQ collapsed 0.79->0.38 on AI4) AND shatters segmentation: it hands
+    # convert.py a pre-coarsened mesh that its own _decimate_to_density then
+    # degrades further (production region counts 11/15 AI parts worse). The old
+    # 12k cap ran BEFORE Poisson/voxel repair, which re-inflated to ~max_faces,
+    # so it was effectively a no-op — segmentation always saw ~max_faces. Keep
+    # that: cap here at max_faces and let convert._decimate_to_density own the
+    # segmentation-density reduction (it decimates to a reference faces/cm^2
+    # from a HIGH-res mesh, which segments far cleaner than a 12k pre-pass).
+    if needs_frontend and config.max_faces and len(mesh.faces) > config.max_faces:
+        mesh = _decimate(mesh, config.max_faces)
+        mesh = _fix_normals(mesh)
 
     mesh, unit_scale = _normalize_scale(mesh, config)
 

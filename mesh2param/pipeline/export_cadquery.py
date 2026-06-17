@@ -227,6 +227,8 @@ def export_cadquery(
     residual_refine: bool = True,
     residual_refine_min_error_pct: float = 5.0,
     fillet_refine: bool = False,
+    contour_fallback: bool = True,
+    contour_fallback_min_error_pct: float = 15.0,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -762,6 +764,35 @@ def export_cadquery(
                 variants[0].cad_volume = _solid_volume(solid)
         except Exception:
             logger.debug("fillet_refine errored, ignoring", exc_info=True)
+
+    # Best-of-both router (Phase 5 outcome, docs/CADFIT_PORTING_PLAN.md): when
+    # recognition STILL matches the mesh poorly, also build the
+    # segmentation-free contour path and keep whichever solid matches the
+    # target better. Cheap insurance — only poor builds pay for the second
+    # reconstruction — and it rescues recognition mis-fires (validated:
+    # AI11 49.7% -> 21%) with zero risk to good builds (skipped below the
+    # threshold). Lazy import avoids a circular dependency (contour_recon
+    # imports helpers from this module).
+    if contour_fallback and solid is not None and mesh_volume > 0:
+        _cur_vol = variants[0].cad_volume if variants else _solid_volume(solid)
+        _cur_err = abs(_cur_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
+        if _cur_err >= contour_fallback_min_error_pct:
+            try:
+                from mesh2param.pipeline.contour_recon import (
+                    reconstruct_segmentation_free,
+                )
+                b = reconstruct_segmentation_free(cleaned)
+                if b.solid is not None and b.volume_error_pct < _cur_err - 1.0:
+                    logger.info(
+                        "Contour fallback wins: recognition %.1f%% -> "
+                        "contour %.1f%% volume error", _cur_err,
+                        b.volume_error_pct)
+                    solid = b.solid
+                    if variants:
+                        variants[0].cad_volume = b.cad_volume
+            except Exception:
+                logger.debug("contour fallback errored, ignoring",
+                             exc_info=True)
 
     # Primary result uses the first (best) variant
     cad_volume = variants[0].cad_volume if variants else 0.0

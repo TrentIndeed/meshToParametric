@@ -78,6 +78,40 @@ def test_perfect_recon_no_ops():
     assert res.iou_final > 0.97
 
 
+def test_box_cover_splits_l_shaped_residual():
+    # An L-shaped residual must be covered by MORE than one box (a single bbox
+    # would overshoot into the empty corner).
+    from mesh2param.pipeline.iou_refine import _box_cover
+    mask = np.zeros((40, 40, 10), dtype=bool)
+    mask[2:38, 2:12, 2:8] = True     # one limb
+    mask[2:12, 2:38, 2:8] = True     # perpendicular limb -> L
+    origin = np.zeros(3)
+    boxes = _box_cover(mask, origin, pitch=1.0, min_cells=20, max_boxes=10)
+    # Splits the non-convex shape into multiple candidate boxes (a single bbox
+    # would engulf the empty corner). Aggregate tightness is enforced by the
+    # loop's per-box IoU gate, proven in the end-to-end L test below — here we
+    # just check the structural split and that no candidate escapes the bbox.
+    assert len(boxes) >= 2, len(boxes)
+    idx = np.argwhere(mask)
+    gmin = origin + (idx.min(0) - 0.5)
+    gmax = origin + (idx.max(0) + 0.5)
+    for bmin, bmax in boxes:
+        assert np.all(bmin >= gmin - 1e-6) and np.all(bmax <= gmax + 1e-6)
+
+
+def test_l_shaped_residual_refines_better_than_bbox():
+    # Target = base slab + an L-shaped wall on top; recon = base slab only.
+    base = _box([40, 40, 6], [0, 0, 3])
+    limb1 = _box([36, 8, 10], [0, -14, 11])
+    limb2 = _box([8, 36, 10], [-14, 0, 11])
+    target = trimesh.util.concatenate([base, limb1, limb2])
+    recon = base.copy()
+    res = refine_against_target(target, recon, res=56, max_iters=4)
+    assert res.iou_final > res.iou_initial + 0.05
+    # The L is covered by multiple add boxes, not one overshooting bbox.
+    assert len([o for o in res.ops if o.op == "add"]) >= 2, [o.op for o in res.ops]
+
+
 def test_refinement_never_lowers_iou():
     base = _box([20, 20, 6], [0, 0, 3])
     boss = _box([8, 5, 7], [3, 0, 9])

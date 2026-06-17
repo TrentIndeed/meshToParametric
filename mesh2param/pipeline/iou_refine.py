@@ -129,33 +129,59 @@ def voxel_iou(target_mesh, recon_mesh, res: int = 64) -> float:
     return _iou(t, r)
 
 
-def _largest_component_bbox(mask: np.ndarray, origin, pitch,
-                            min_cells: int):
-    """World AABB of the largest connected True-component of `mask`, or None
-    if no component is at least `min_cells` big."""
-    if not mask.any():
-        return None
-    try:
-        from scipy import ndimage
-        labels, n = ndimage.label(mask)
-        if n == 0:
-            return None
-        sizes = ndimage.sum(np.ones_like(labels), labels,
-                            index=np.arange(1, n + 1))
-        biggest = int(np.argmax(sizes)) + 1
-        if sizes[biggest - 1] < min_cells:
-            return None
-        comp = labels == biggest
-    except Exception:
-        comp = mask
-        if int(np.count_nonzero(comp)) < min_cells:
-            return None
-    idx = np.argwhere(comp)
-    lo_cell = idx.min(0)
-    hi_cell = idx.max(0)
-    box_min = origin + (lo_cell - 0.5) * pitch
-    box_max = origin + (hi_cell + 0.5) * pitch
-    return box_min, box_max
+def _box_cover(mask: np.ndarray, origin, pitch, min_cells: int,
+               max_boxes: int = 10, min_fill: float = 0.6):
+    """A set of world-space AABBs covering the True voxels of `mask` without
+    much overshoot.
+
+    A single bounding box of a non-box residual (L-shaped, stepped,
+    distributed) overshoots badly — it adds/cuts volume that isn't in the
+    residual, so the volume gate rejects it (this is exactly why AI11/AI13
+    didn't improve with the v1 single-box patch). Instead we recursively
+    subdivide: take a region's tight filled bbox; if it is densely filled
+    (>= min_fill) or tiny, emit it; otherwise split along its longest axis at
+    the median of filled cells and recurse. Disconnected chunks fall out of the
+    recursion naturally. Capped at `max_boxes` so a pathological residual can't
+    explode the op list.
+    """
+    idx0 = np.argwhere(mask)
+    if len(idx0) < min_cells:
+        return []
+    boxes = []
+    stack = [(idx0.min(0), idx0.max(0))]
+    shape = np.array(mask.shape)
+    while stack and len(boxes) < max_boxes:
+        lo, hi = stack.pop()
+        sub = mask[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1]
+        local = np.argwhere(sub)
+        if len(local) == 0:
+            continue
+        tlo = lo + local.min(0)
+        thi = lo + local.max(0)
+        cnt = len(local)
+        dims = thi - tlo + 1
+        vol = int(np.prod(dims))
+        fill = cnt / max(1, vol)
+        if (fill >= min_fill or vol <= 8 or cnt < min_cells
+                or len(boxes) >= max_boxes - 1):
+            box_min = origin + (tlo - 0.5) * pitch
+            box_max = origin + (thi + 0.5) * pitch
+            boxes.append((box_min, box_max))
+            continue
+        # Split along the longest axis at the median filled coordinate.
+        ax = int(np.argmax(dims))
+        coord = (local[:, ax] + lo[ax])
+        mid = int(np.median(coord))
+        if mid <= tlo[ax] or mid >= thi[ax]:
+            box_min = origin + (tlo - 0.5) * pitch
+            box_max = origin + (thi + 0.5) * pitch
+            boxes.append((box_min, box_max))
+            continue
+        hi1 = thi.copy(); hi1[ax] = mid
+        lo2 = tlo.copy(); lo2[ax] = mid + 1
+        stack.append((tlo.copy(), np.minimum(hi1, shape - 1)))
+        stack.append((lo2, thi.copy()))
+    return boxes
 
 
 def _apply_box(occ: np.ndarray, origin, pitch, box_min, box_max,
@@ -180,12 +206,17 @@ def refine_against_target(target_mesh, recon_mesh, *,
     """Greedily patch `recon_mesh` toward `target_mesh` with add/cut boxes.
 
     Each iteration: pick the larger of the under-residual (target minus recon)
-    and over-residual (recon minus target); take its largest connected
-    component's bounding box; apply it in voxel space ONLY if IoU improves by
-    at least `min_gain`. Stops when no patch helps, the residual is below
+    and over-residual (recon minus target); cover it with a set of tight boxes
+    (`_box_cover`); apply each box in voxel space, keeping only those that
+    strictly improve IoU. Stops when no box helps, the residual is below
     `min_residual_frac` of the target volume, or `max_iters` is hit. Returns
     the accepted ops + IoU trajectory (all in voxel space; meshes are not
-    mutated). A caller can replay `ops` as CadQuery box add/cut operations.
+    mutated). A caller replays `ops` as CadQuery box add/cut operations.
+
+    `min_gain` gates whether a residual is worth attacking at all; within a
+    cover, each box only needs to strictly improve IoU (small cover boxes each
+    contribute little but together track a non-box residual far better than one
+    overshooting bbox).
     """
     origin, pitch, shape = _shared_lattice([target_mesh, recon_mesh], res)
     t = _occupancy(target_mesh, origin, pitch, shape)
@@ -201,7 +232,7 @@ def refine_against_target(target_mesh, recon_mesh, *,
         over = r & ~t        # recon has this in EXCESS -> cut
         cur_iou = _iou(t, r)
 
-        # Try the larger residual first.
+        # Attack the larger residual first.
         candidates = sorted(
             [("add", under), ("cut", over)],
             key=lambda kv: -int(np.count_nonzero(kv[1])),
@@ -210,20 +241,18 @@ def refine_against_target(target_mesh, recon_mesh, *,
         for op, mask in candidates:
             if int(np.count_nonzero(mask)) < min_cells:
                 continue
-            bbox = _largest_component_bbox(mask, origin, pitch, min_cells)
-            if bbox is None:
-                continue
-            box_min, box_max = bbox
-            r_try = _apply_box(r, origin, pitch, box_min, box_max, op)
-            iou_try = _iou(t, r_try)
-            if iou_try >= cur_iou + min_gain:
-                r = r_try
-                result.ops.append(RefineOp(op, box_min, box_max,
-                                           cur_iou, iou_try))
-                logger.info("Residual refine: %s box, IoU %.3f -> %.3f",
-                            op, cur_iou, iou_try)
-                applied = True
-                break
+            cover = _box_cover(mask, origin, pitch, min_cells)
+            for box_min, box_max in cover:
+                r_try = _apply_box(r, origin, pitch, box_min, box_max, op)
+                iou_try = _iou(t, r_try)
+                if iou_try >= cur_iou + 1e-4:   # keep any box that helps
+                    r = r_try
+                    result.ops.append(RefineOp(op, box_min, box_max,
+                                               cur_iou, iou_try))
+                    cur_iou = iou_try
+                    applied = True
+            if applied:
+                break       # recompute residuals before the other op
         if not applied:
             break
 

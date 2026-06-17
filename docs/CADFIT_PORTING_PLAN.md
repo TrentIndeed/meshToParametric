@@ -29,7 +29,22 @@ Residual-refinement post-pass with axis-aligned box patches, gated on volume-
 error improvement, skipped when the build is already good. Foundation + safety
 net. Validated: AI6 20.3%→13.2%, no regressions, guardrail intact.
 
-## Phase 2 — Upgrade residual candidates: box → real geometry (highest value)
+## Phase 2 — IN PROGRESS (2026-06-17)
+Landed so far:
+- **Greedy box-cover** (`iou_refine._box_cover`) replaced the single overshoot
+  bbox — tracks L/stepped/distributed residuals. End-to-end: **AI6 20.3% → 9.6%
+  (now PASS)**. AI1/AI14 correctly untouched.
+- **Fillet-by-IoU sweep** (`export_cadquery._fillet_refine_solid`, OPT-IN, off
+  by default): the volume/IoU-based alternative to blend-graph + stitching —
+  sweep a global fillet radius, keep what improves voxel IoU. Validated (sharp
+  target stays sharp; filleted target pulls in a fillet) but SLOW (~rebuild +
+  voxelize per radius), hence off by default and v1 = one global radius.
+
+Still open in Phase 2 (below): silhouette/revolve residual candidates (AI11 49.7%
+and AI13 22.3% don't move — their residual is a shape/topology mismatch, not a
+chunk a box-cover can patch), and PER-EDGE, locally-scored fillets.
+
+### Original Phase 2 spec — Upgrade residual candidates: box → real geometry
 The v1 box patches only help box-shaped residuals (why AI11/AI13 didn't move).
 Replace/augment the box candidate in `iou_refine` / `_residual_refine_solid`:
 1. **Extrude the residual silhouette.** For an under/over residual component,

@@ -226,6 +226,7 @@ def export_cadquery(
     stitched_clusters_path: str | None = None,
     residual_refine: bool = True,
     residual_refine_min_error_pct: float = 5.0,
+    fillet_refine: bool = False,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -751,6 +752,16 @@ def export_cadquery(
             except Exception:
                 logger.debug("residual_refine post-pass errored, ignoring",
                              exc_info=True)
+
+    # Opt-in fillet detection by IoU sweep (alternative to the blend-graph
+    # path). Off by default — see _fillet_refine_solid.
+    if fillet_refine and solid is not None:
+        try:
+            solid = _fillet_refine_solid(solid, cleaned)
+            if variants:
+                variants[0].cad_volume = _solid_volume(solid)
+        except Exception:
+            logger.debug("fillet_refine errored, ignoring", exc_info=True)
 
     # Primary result uses the first (best) variant
     cad_volume = variants[0].cad_volume if variants else 0.0
@@ -6175,6 +6186,71 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
     except Exception:
         logger.debug("Residual refine post-pass failed", exc_info=True)
         return solid, cad_vol
+
+
+def _fillet_refine_solid(solid, cleaned: CleanedMesh, *,
+                         max_radius_frac: float = 0.04,
+                         n_radii: int = 6):
+    """Opt-in fillet detection by IoU sweep (CADFit `refine_edges` style).
+
+    The blend-graph + stitching fillet path (peel_via_topology +
+    _apply_recognized_fillets_to_solid) MEASURES fillet radii from mesh
+    curvature and maps them onto solid edges — the fragile, bug-prone path the
+    fillet handoffs document. This is the alternative: don't measure, SEARCH.
+    Sweep a global fillet radius over the solid's edges; build each; score by
+    voxel IoU against the target mesh; keep the radius that best improves it.
+    A sharp-edged target loses IoU when filleted, so it self-selects to no
+    fillet. Dissolves the fillet-vs-designed-radius ambiguity by construction.
+
+    OFF by default: it rebuilds + voxelizes the solid once per radius (slow),
+    and v1 applies ONE global radius to all edges (good for uniformly-filleted
+    parts, crude for mixed). Per-edge radii + a local (per-edge) IoU score are
+    the next increment (docs/CADFIT_PORTING_PLAN.md, Phase 2.3). Volume is a
+    weak fillet signal, so we score on voxel IoU at elevated resolution, not
+    bulk volume. Returns the (possibly) filleted solid; any failure or
+    non-improvement returns the input unchanged.
+    """
+    try:
+        import numpy as _np
+        from mesh2param.pipeline.iou_refine import voxel_iou
+    except Exception:
+        return solid
+    if solid is None:
+        return solid
+    try:
+        target = trimesh.Trimesh(vertices=cleaned.vertices,
+                                 faces=cleaned.faces, process=False)
+        diag = float(_np.linalg.norm(target.bounds[1] - target.bounds[0])) or 1.0
+
+        def _iou_of(s):
+            tv, tf = _tessellate_solid(s)
+            if tv is None or tf is None or len(tv) == 0:
+                return -1.0
+            recon = trimesh.Trimesh(
+                vertices=_np.asarray(tv, float).reshape(-1, 3),
+                faces=_np.asarray(tf, _np.int64).reshape(-1, 3), process=False)
+            return voxel_iou(target, recon, res=96)
+
+        base_iou = _iou_of(solid)
+        if base_iou < 0:
+            return solid
+        best_solid, best_iou = solid, base_iou
+        # Largest radius first: a too-big fillet fails fast in OCC.
+        for r in sorted(_np.linspace(0.01 * diag, max_radius_frac * diag,
+                                     n_radii), reverse=True):
+            try:
+                cand = solid.edges().fillet(float(r))
+            except Exception:
+                continue
+            iou = _iou_of(cand)
+            if iou > best_iou + 1e-3:
+                best_solid, best_iou = cand, iou
+        if best_iou > base_iou + 1e-3:
+            logger.info("Fillet refine: IoU %.3f -> %.3f", base_iou, best_iou)
+        return best_solid
+    except Exception:
+        logger.debug("Fillet refine failed", exc_info=True)
+        return solid
 
 
 def _estimate_mesh_volume(cleaned: CleanedMesh) -> float:

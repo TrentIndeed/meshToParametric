@@ -288,6 +288,10 @@ def export_cadquery(
 
     if profiles is None or len(profiles) == 0:
         logger.error("Failed to extract base profile from mesh")
+        if contour_fallback:
+            fb = _contour_fallback_result(cleaned, mesh_volume)
+            if fb is not None:
+                return fb
         return CadQueryResult(mesh_volume=mesh_volume, status="FAIL")
 
     # --- Multi-body construction ---
@@ -773,6 +777,13 @@ def export_cadquery(
     # AI11 49.7% -> 21%) with zero risk to good builds (skipped below the
     # threshold). Lazy import avoids a circular dependency (contour_recon
     # imports helpers from this module).
+    # Build collapsed entirely (no solid from any variant): take the contour
+    # path outright rather than returning nothing.
+    if contour_fallback and solid is None:
+        fb = _contour_fallback_result(cleaned, mesh_volume)
+        if fb is not None:
+            return fb
+
     if contour_fallback and solid is not None and mesh_volume > 0:
         _cur_vol = variants[0].cad_volume if variants else _solid_volume(solid)
         _cur_err = abs(_cur_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
@@ -6132,6 +6143,31 @@ def _solid_volume(solid) -> float:
         return abs(float(solid.val().Volume()))
     except Exception:
         return 0.0
+
+
+def _contour_fallback_result(cleaned: CleanedMesh, mesh_volume: float):
+    """Build a CadQueryResult from the segmentation-free contour path, or None.
+
+    Used when recognition produces NO usable solid (profile extraction failed,
+    or the build collapsed) — the catastrophic case where the contour fallback
+    is most valuable but the normal router (which guards on an existing solid)
+    would skip it."""
+    try:
+        from mesh2param.pipeline.contour_recon import (
+            reconstruct_segmentation_free)
+        b = reconstruct_segmentation_free(cleaned)
+        if b.solid is None:
+            return None
+        tv, tf = _tessellate_solid(b.solid)
+        logger.info("Contour fallback produced a solid where recognition "
+                    "could not (%.1f%% volume error)", b.volume_error_pct)
+        return CadQueryResult(
+            solid=b.solid, tess_vertices=tv, tess_faces=tf,
+            mesh_volume=mesh_volume, cad_volume=b.cad_volume,
+            volume_error_pct=b.volume_error_pct, status=b.status)
+    except Exception:
+        logger.debug("contour fallback result failed", exc_info=True)
+        return None
 
 
 def _refine_op_to_solid(op, cq):

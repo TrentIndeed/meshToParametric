@@ -7,6 +7,28 @@ residual loop actually *reconstruct* (not just patch volume), wire in the other
 borrowed algorithms, and run the experiment that decides whether to keep, demote,
 or replace this repo's segmentation stage.
 
+## Status (2026-06-17): full AI-set validation
+
+After Phases 2 + 5 + the router + contour-on-failure fallback, end-to-end
+`cad_vol_err` across ALL 15 AI parts (`scripts/diag_ai_build.py`):
+- **PASS 9/15:** AI1 0.9, AI2 2.8, AI3 1.4, AI6 9.6, AI8 2.1, AI11 7.3,
+  AI13 1.4, AI14 1.3, AI15 1.3. (Most started the session at 50–100% / FAIL.)
+- **FAIL 6/15:** AI4 25.6, AI5 17.6, AI7 24.2, AI9 81.5, AI10 25.5, AI12 13.5.
+
+The residual loop + router + cylinder candidates are TAPPED OUT for the 6 fails:
+recognition-vs-contour A/B shows the best available path is still 13–82% on
+them (`diag_seg_ab`). They are dense/fragmented meshes (AI9/AI12: 140–200
+regions — the "confetti" problem) where the BASE recognition is wrong, so no
+amount of residual patching rescues them. Also note real run-to-run
+NON-DETERMINISM (AI12 seen at 100 / 26.8 / 13.5 across runs — unseeded RANSAC in
+fit.py + KMeans in segment.py).
+
+**Next lever for the remaining 6 is UPSTREAM, not here:** (a) region-growing
+robustness on dense AI meshes (the open `docs/SEGMENTATION_HANDOFF.md` /
+"confetti" problem), and (b) seeding the pipeline RNGs for determinism. Both are
+larger, separate efforts. The contour-on-failure fallback now guarantees these
+never return nothing / 100% — they degrade to the contour path's number instead.
+
 ## Guiding principle
 This repo's bet was "get every stage right, no global correction." CADFit's was
 "forgive weak stages with a global IoU loop." We now have the loop

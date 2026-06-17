@@ -67,6 +67,28 @@ def test_correct_solid_is_left_unchanged():
     assert abs(new_vol - vol_before) / vol_before < 0.02
 
 
+def test_round_hole_cut_via_cylinder():
+    # Target = slab with a round through-hole; recon = solid slab. The residual
+    # refine should CUT a cylinder, dropping the volume error.
+    slab = cq.Workplane().box(40, 40, 12)
+    drill = trimesh.creation.cylinder(radius=7.0, height=20.0)
+    slab_tm = trimesh.creation.box(extents=[40, 40, 12])
+    target_tm = slab_tm.difference(drill)
+    if not getattr(target_tm, "is_volume", True) or target_tm.volume <= 0:
+        pytest.skip("boolean backend unavailable")
+    target = CleanedMesh(
+        vertices=np.asarray(target_tm.vertices, float),
+        faces=np.asarray(target_tm.faces, np.int64),
+        normals=np.asarray(target_tm.face_normals, float),
+        is_watertight=True,
+        bbox=np.array([target_tm.bounds[0], target_tm.bounds[1]]))
+    mesh_vol = abs(float(target_tm.volume))
+    err_before = _vol_err(_solid_volume(slab), mesh_vol)
+    refined, new_vol = _residual_refine_solid(slab, target, mesh_vol)
+    err_after = _vol_err(new_vol, mesh_vol)
+    assert err_after < err_before - 0.02, (err_before, err_after)
+
+
 def test_failure_is_a_noop():
     # mesh_volume <= 0 -> returns the solid unchanged, no exception.
     target = _cleaned([10, 10, 10])

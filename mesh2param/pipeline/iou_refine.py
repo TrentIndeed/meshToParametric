@@ -48,20 +48,47 @@ class VoxelField:
 
 @dataclass
 class RefineOp:
-    """One accepted residual patch."""
+    """One accepted residual patch.
+
+    kind:
+      "box"      — axis-aligned box [box_min, box_max] (fallback / chunky bits).
+      "prism"    — `polygon` (Nx2 world coords on the two non-`axis` axes)
+                   extruded along `axis` from `lo` to `hi` (world). Tracks
+                   L/stepped prismatic residuals cleanly.
+      "cylinder" — disk of `radius` about `center` (2D world on the two
+                   non-`axis` axes) extruded along `axis` from `lo` to `hi`.
+                   The key candidate for round holes/bosses (the
+                   segmentation-free path's main weakness, Phase 5).
+    """
 
     op: str                    # "add" | "cut"
-    box_min: np.ndarray        # world AABB of the patch
-    box_max: np.ndarray
-    iou_before: float
-    iou_after: float
+    box_min: np.ndarray = None
+    box_max: np.ndarray = None
+    iou_before: float = 0.0
+    iou_after: float = 0.0
+    kind: str = "box"
+    axis: int = 2
+    polygon: np.ndarray = None     # (N,2) world coords on the two non-axis axes
+    center: np.ndarray = None      # (2,) world coords on the two non-axis axes
+    radius: float = 0.0
+    lo: float = 0.0                # world coord along `axis`
+    hi: float = 0.0
 
     def to_dict(self) -> dict:
-        return {"op": self.op,
-                "box_min": np.asarray(self.box_min, float).tolist(),
-                "box_max": np.asarray(self.box_max, float).tolist(),
-                "iou_before": float(self.iou_before),
-                "iou_after": float(self.iou_after)}
+        d = {"op": self.op, "kind": self.kind,
+             "iou_before": float(self.iou_before),
+             "iou_after": float(self.iou_after)}
+        if self.kind == "box":
+            d["box_min"] = np.asarray(self.box_min, float).tolist()
+            d["box_max"] = np.asarray(self.box_max, float).tolist()
+        else:
+            d.update(axis=int(self.axis), lo=float(self.lo), hi=float(self.hi))
+            if self.kind == "prism":
+                d["polygon"] = np.asarray(self.polygon, float).tolist()
+            else:
+                d["center"] = np.asarray(self.center, float).tolist()
+                d["radius"] = float(self.radius)
+        return d
 
 
 @dataclass
@@ -69,11 +96,18 @@ class RefineResult:
     iou_initial: float
     iou_final: float
     ops: list[RefineOp] = field(default_factory=list)
+    # Box-only fallback op-set. The voxel-optimal op-set (`ops`, which may use
+    # prisms/cylinders) is not always the REAL-volume-optimal one once built in
+    # CadQuery (voxel quantization + boolean interactions). The export builder
+    # builds both and keeps whichever has the lower real volume error, so a
+    # shape op can never regress a part below its box-only result.
+    box_ops: list[RefineOp] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"iou_initial": float(self.iou_initial),
                 "iou_final": float(self.iou_final),
-                "ops": [o.to_dict() for o in self.ops]}
+                "ops": [o.to_dict() for o in self.ops],
+                "box_ops": [o.to_dict() for o in self.box_ops]}
 
 
 def _shared_lattice(meshes, res: int):
@@ -198,6 +232,139 @@ def _apply_box(occ: np.ndarray, origin, pitch, box_min, box_max,
     return out
 
 
+def _largest_component(mask: np.ndarray, min_cells: int):
+    """Largest connected True-component of `mask` (or None if all < min_cells)."""
+    if not mask.any():
+        return None
+    try:
+        from scipy import ndimage
+        labels, n = ndimage.label(mask)
+        if n == 0:
+            return None
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        biggest = int(sizes.argmax())
+        if sizes[biggest] < min_cells:
+            return None
+        return labels == biggest
+    except Exception:
+        return mask if int(mask.sum()) >= min_cells else None
+
+
+def _best_axis_footprint(comp: np.ndarray):
+    """Pick the axis along which `comp` is most prismatic. Returns
+    (axis, foot2d, lo_cell, hi_cell, recon_mask, axis_iou) — recon_mask is the
+    footprint re-extruded over the axis extent (how a prism would fill it)."""
+    best = None
+    for a in range(3):
+        foot = comp.any(axis=a)
+        idx_a = np.argwhere(comp)[:, a]
+        lo_c, hi_c = int(idx_a.min()), int(idx_a.max())
+        recon = np.zeros_like(comp)
+        m = np.moveaxis(recon, a, 0)
+        m[lo_c:hi_c + 1] = foot           # view -> writes back into recon
+        iou = (int((recon & comp).sum())
+               / max(1, int((recon | comp).sum())))
+        if best is None or iou > best[-1]:
+            best = (a, foot, lo_c, hi_c, recon, iou)
+    return best
+
+
+def _footprint_polygon(foot: np.ndarray):
+    """Largest boundary contour of a 2D footprint as (N,2) cell coords, or None."""
+    try:
+        from skimage import measure
+        contours = measure.find_contours(foot.astype(float), 0.5)
+        if not contours:
+            return None
+        poly = max(contours, key=len)        # (N,2) in (row,col) float
+        if len(poly) < 4:
+            return None
+        # Decimate to keep the CadQuery wire light.
+        step = max(1, len(poly) // 64)
+        return poly[::step]
+    except Exception:
+        return None
+
+
+def _shape_op(comp: np.ndarray, origin, pitch, op: str):
+    """Turn a residual component into a clean prism/cylinder RefineOp +
+    its voxel recon_mask, or (None, None) to fall back to a box-cover."""
+    axis, foot, lo_c, hi_c, recon, axis_iou = _best_axis_footprint(comp)
+    if axis_iou < 0.75:
+        return None, None        # not prismatic along any axis -> use boxes
+    uv = tuple(i for i in range(3) if i != axis)
+    lo_w = float(origin[axis] + (lo_c - 0.5) * pitch)
+    hi_w = float(origin[axis] + (hi_c + 0.5) * pitch)
+
+    def _foot_rc_to_world(rc):
+        # foot index (i along uv[0], j along uv[1]) -> world (u,v)
+        return np.column_stack([origin[uv[0]] + rc[:, 0] * pitch,
+                                origin[uv[1]] + rc[:, 1] * pitch])
+
+    poly_rc = _footprint_polygon(foot)
+    if poly_rc is None:
+        return None, None
+    poly_w = _foot_rc_to_world(poly_rc)
+
+    def _extrude_foot2d(foot2d):
+        """Re-extrude a 2D footprint mask over the axis extent into a 3D mask."""
+        out = np.zeros_like(comp)
+        m = np.moveaxis(out, axis, 0)
+        m[lo_c:hi_c + 1] = foot2d
+        return out
+
+    # Circular? Fit a circle to the boundary (resolution-robust, unlike a
+    # disk-area test): small radial RMS relative to the radius => a round
+    # hole/boss => emit an exact CYLINDER (cleaner than a polygonal prism).
+    try:
+        from mesh2param.pipeline.contour_fit import fit_circle_2d
+        c2, r2, rms = fit_circle_2d(poly_w)
+        if np.isfinite(r2) and r2 > 1.5 * pitch and rms < 0.12 * r2:
+            # Rasterize the ACTUAL disk (not the component) so the voxel
+            # acceptance reflects what export will build.
+            rr, cc = np.indices(foot.shape)
+            cen = ((c2[0] - origin[uv[0]]) / pitch,
+                   (c2[1] - origin[uv[1]]) / pitch)
+            disk = ((rr - cen[0]) ** 2 + (cc - cen[1]) ** 2) <= (r2 / pitch) ** 2
+            opd = RefineOp(op=op, kind="cylinder", axis=axis,
+                           center=np.asarray(c2, float), radius=float(r2),
+                           lo=lo_w, hi=hi_w)
+            return opd, _extrude_foot2d(disk)
+    except Exception:
+        pass
+
+    # Prism: rasterize the ACTUAL (decimated) polygon as the acceptance mask.
+    try:
+        from skimage.draw import polygon as _sk_polygon
+        fill = np.zeros_like(foot)
+        rr, cc = _sk_polygon(poly_rc[:, 0], poly_rc[:, 1], shape=foot.shape)
+        fill[rr, cc] = True
+        recon_actual = _extrude_foot2d(fill)
+    except Exception:
+        recon_actual = recon          # fall back to the component footprint
+    opd = RefineOp(op=op, kind="prism", axis=axis, polygon=poly_w,
+                   lo=lo_w, hi=hi_w)
+    return opd, recon_actual
+
+
+def _greedy_box_apply(t, r, mask, op, origin, pitch, min_cells, start_iou):
+    """Apply a box-cover of `mask` to a COPY of r, keeping only boxes that
+    strictly improve IoU. Returns (r_new, ops, iou)."""
+    rr = r
+    cur = start_iou
+    ops: list[RefineOp] = []
+    for box_min, box_max in _box_cover(mask, origin, pitch, min_cells):
+        r_try = _apply_box(rr, origin, pitch, box_min, box_max, op)
+        iou_try = _iou(t, r_try)
+        if iou_try >= cur + 1e-4:
+            rr = r_try
+            ops.append(RefineOp(op, box_min=box_min, box_max=box_max,
+                                iou_before=cur, iou_after=iou_try))
+            cur = iou_try
+    return rr, ops, cur
+
+
 def refine_against_target(target_mesh, recon_mesh, *,
                           res: int = 64,
                           max_iters: int = 4,
@@ -220,41 +387,71 @@ def refine_against_target(target_mesh, recon_mesh, *,
     """
     origin, pitch, shape = _shared_lattice([target_mesh, recon_mesh], res)
     t = _occupancy(target_mesh, origin, pitch, shape)
-    r = _occupancy(recon_mesh, origin, pitch, shape)
+    r0 = _occupancy(recon_mesh, origin, pitch, shape)
 
-    iou0 = _iou(t, r)
+    iou0 = _iou(t, r0)
     t_count = max(1, int(np.count_nonzero(t)))
     min_cells = max(1, int(min_residual_frac * t_count))
-    result = RefineResult(iou_initial=iou0, iou_final=iou0)
 
-    for _ in range(max_iters):
-        under = t & ~r       # recon is MISSING this -> add
-        over = r & ~t        # recon has this in EXCESS -> cut
-        cur_iou = _iou(t, r)
+    def _run_loop(use_shapes: bool):
+        r = r0.copy()
+        ops: list[RefineOp] = []
+        for _ in range(max_iters):
+            under = t & ~r       # recon is MISSING this -> add
+            over = r & ~t        # recon has this in EXCESS -> cut
+            cur_iou = _iou(t, r)
+            candidates = sorted(
+                [("add", under), ("cut", over)],
+                key=lambda kv: -int(np.count_nonzero(kv[1])),
+            )
+            applied = False
+            for op, mask in candidates:
+                if int(np.count_nonzero(mask)) < min_cells:
+                    continue
+                # Path 1 (shapes only): largest component as ONE prism/cylinder
+                # (round holes/bosses cut cleanly) + box-cover the leftover.
+                p1_r, p1_ops, p1_iou = r, [], cur_iou
+                if use_shapes:
+                    comp = _largest_component(mask, min_cells)
+                    if comp is not None:
+                        shape_op, recon = _shape_op(comp, origin, pitch, op)
+                        if shape_op is not None and recon is not None:
+                            r1 = (r | recon) if op == "add" else (r & ~recon)
+                            iou1 = _iou(t, r1)
+                            if iou1 >= cur_iou + 1e-4:
+                                shape_op.iou_before = cur_iou
+                                shape_op.iou_after = iou1
+                                resid1 = ((t & ~r1) if op == "add"
+                                          else (r1 & ~t))
+                                r1b, ops1b, iou1b = _greedy_box_apply(
+                                    t, r1, resid1, op, origin, pitch,
+                                    min_cells, iou1)
+                                p1_r, p1_ops, p1_iou = (
+                                    r1b, [shape_op] + ops1b, iou1b)
+                # Path 2: box-cover of the whole residual.
+                p2_r, p2_ops, p2_iou = _greedy_box_apply(
+                    t, r, mask, op, origin, pitch, min_cells, cur_iou)
 
-        # Attack the larger residual first.
-        candidates = sorted(
-            [("add", under), ("cut", over)],
-            key=lambda kv: -int(np.count_nonzero(kv[1])),
-        )
-        applied = False
-        for op, mask in candidates:
-            if int(np.count_nonzero(mask)) < min_cells:
-                continue
-            cover = _box_cover(mask, origin, pitch, min_cells)
-            for box_min, box_max in cover:
-                r_try = _apply_box(r, origin, pitch, box_min, box_max, op)
-                iou_try = _iou(t, r_try)
-                if iou_try >= cur_iou + 1e-4:   # keep any box that helps
-                    r = r_try
-                    result.ops.append(RefineOp(op, box_min, box_max,
-                                               cur_iou, iou_try))
-                    cur_iou = iou_try
+                if p1_iou >= p2_iou and p1_iou > cur_iou + 1e-4:
+                    r, cur_iou = p1_r, p1_iou
+                    ops.extend(p1_ops)
                     applied = True
-            if applied:
-                break       # recompute residuals before the other op
-        if not applied:
-            break
+                elif p2_iou > cur_iou + 1e-4:
+                    r, cur_iou = p2_r, p2_iou
+                    ops.extend(p2_ops)
+                    applied = True
+                if applied:
+                    break
+            if not applied:
+                break
+        return ops, _iou(t, r)
 
-    result.iou_final = _iou(t, r)
-    return result
+    ops_shape, iou_shape = _run_loop(use_shapes=True)
+    ops_box, iou_box = _run_loop(use_shapes=False)
+    # `ops` = the voxel-best; the export builder also tries `box_ops` and keeps
+    # whichever wins on REAL volume error (voxel IoU doesn't always predict it).
+    if iou_shape >= iou_box:
+        return RefineResult(iou_initial=iou0, iou_final=iou_shape,
+                            ops=ops_shape, box_ops=ops_box)
+    return RefineResult(iou_initial=iou0, iou_final=iou_box,
+                        ops=ops_box, box_ops=ops_box)

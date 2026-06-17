@@ -6134,6 +6134,61 @@ def _solid_volume(solid) -> float:
         return 0.0
 
 
+def _refine_op_to_solid(op, cq):
+    """Build the CadQuery solid for one iou_refine RefineOp (box / prism /
+    cylinder), or None. Prisms/cylinders are built in world space along the
+    op's axis so no plane-local bookkeeping is needed."""
+    try:
+        if op.kind == "box":
+            lo = np.asarray(op.box_min, float)
+            hi = np.asarray(op.box_max, float)
+            dims = hi - lo
+            if np.any(dims <= 1e-6):
+                return None
+            return cq.Solid.makeBox(
+                float(dims[0]), float(dims[1]), float(dims[2]),
+                cq.Vector(float(lo[0]), float(lo[1]), float(lo[2])))
+
+        height = float(op.hi - op.lo)
+        if height <= 1e-6:
+            return None
+        ax = int(op.axis)
+        uv = tuple(i for i in range(3) if i != ax)
+        axis_unit = np.zeros(3)
+        axis_unit[ax] = 1.0
+
+        if op.kind == "cylinder":
+            if op.radius <= 1e-6:
+                return None
+            base = np.zeros(3)
+            base[ax] = float(op.lo)
+            base[uv[0]] = float(op.center[0])
+            base[uv[1]] = float(op.center[1])
+            return cq.Solid.makeCylinder(
+                float(op.radius), height, cq.Vector(*base),
+                cq.Vector(*axis_unit))
+
+        if op.kind == "prism":
+            poly = np.asarray(op.polygon, float)
+            if poly.ndim != 2 or len(poly) < 3:
+                return None
+            pts = []
+            for (u, v) in poly:
+                p = np.zeros(3)
+                p[ax] = float(op.lo)
+                p[uv[0]] = float(u)
+                p[uv[1]] = float(v)
+                pts.append(cq.Vector(*p))
+            wire = cq.Wire.makePolygon(pts + [pts[0]])
+            face = cq.Face.makeFromWires(wire)
+            return cq.Solid.extrudeLinear(face, cq.Vector(*(axis_unit * height)))
+    except Exception:
+        logger.debug("refine op -> solid failed (kind=%s)",
+                     getattr(op, "kind", "?"), exc_info=True)
+        return None
+    return None
+
+
 def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
                            max_iters: int = 3):
     """CADFit-style residual-refinement post-pass.
@@ -6151,10 +6206,9 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
     failure or non-improvement returns the input solid unchanged, so it is safe
     to leave on by default. Returns (solid, cad_volume).
 
-    LIMITATION (v1): patches are bounding boxes of the largest residual chunks,
-    which improve volume match but are geometrically crude (a box where a
-    cylindrical boss belongs). Extruding the residual's actual silhouette /
-    revolving it is the natural next increment (see docs/CADFIT_BORROWED.md).
+    Patches are PRISMS (extruded footprint), CYLINDERS (round holes/bosses —
+    Phase 2), or boxes (fallback for chunky bits), chosen per residual by
+    iou_refine. Cylinders are what let the loop cut round holes cleanly.
     """
     cad_vol = _solid_volume(solid)
     if solid is None or mesh_volume <= 0:
@@ -6177,42 +6231,45 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
         if not res.ops:
             return solid, cad_vol
 
-        refined = solid
-        applied = 0
-        for op in res.ops:
-            lo = np.asarray(op.box_min, float)
-            hi = np.asarray(op.box_max, float)
-            dims = hi - lo
-            if np.any(dims <= 1e-6):
-                continue
-            try:
-                box = cq.Solid.makeBox(
-                    float(dims[0]), float(dims[1]), float(dims[2]),
-                    cq.Vector(float(lo[0]), float(lo[1]), float(lo[2])))
-                refined = (refined.union(box) if op.op == "add"
-                           else refined.cut(box))
-                applied += 1
-            except Exception:
-                logger.debug("residual %s box failed, skipping", op.op,
-                             exc_info=True)
-                continue
-        if applied == 0:
-            return solid, cad_vol
+        def _apply(ops):
+            refined = solid
+            applied = 0
+            for op in ops:
+                patch = _refine_op_to_solid(op, cq)
+                if patch is None:
+                    continue
+                try:
+                    refined = (refined.union(patch) if op.op == "add"
+                               else refined.cut(patch))
+                    applied += 1
+                except Exception:
+                    logger.debug("residual %s %s failed, skipping", op.op,
+                                 op.kind, exc_info=True)
+                    continue
+            return (refined, _solid_volume(refined)) if applied else (None, 0.0)
 
-        new_vol = _solid_volume(refined)
         old_err = abs(cad_vol - mesh_volume) / (mesh_volume + 1e-15)
-        new_err = abs(new_vol - mesh_volume) / (mesh_volume + 1e-15)
-        # Keep ONLY if the headline volume error strictly improves. iou_refine
-        # already vetted each op by shape (voxel IoU); this is the final guard
-        # that we didn't trade shape for a worse volume match.
-        if new_err < old_err - 1e-4:
-            logger.info("Residual refine: vol err %.2f%% -> %.2f%% "
-                        "(%d/%d box ops applied)",
-                        old_err * 100, new_err * 100, applied, len(res.ops))
-            return refined, new_vol
+        # Build the voxel-best op-set AND the box-only fallback; keep whichever
+        # wins on REAL volume error (the voxel-optimal path is not always the
+        # real-volume-optimal once built — quantization + boolean interactions).
+        candidates = []
+        for ops in (res.ops, res.box_ops):
+            if not ops:
+                continue
+            cand_solid, cand_vol = _apply(ops)
+            if cand_solid is not None:
+                err = abs(cand_vol - mesh_volume) / (mesh_volume + 1e-15)
+                candidates.append((err, cand_solid, cand_vol))
+        if not candidates:
+            return solid, cad_vol
+        best_err, best_solid, best_vol = min(candidates, key=lambda c: c[0])
+        if best_err < old_err - 1e-4:
+            logger.info("Residual refine: vol err %.2f%% -> %.2f%%",
+                        old_err * 100, best_err * 100)
+            return best_solid, best_vol
         logger.debug("Residual refine: no volume-error improvement "
                      "(%.2f%% -> %.2f%%), keeping original",
-                     old_err * 100, new_err * 100)
+                     old_err * 100, best_err * 100)
         return solid, cad_vol
     except Exception:
         logger.debug("Residual refine post-pass failed", exc_info=True)

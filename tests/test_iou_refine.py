@@ -112,6 +112,47 @@ def test_l_shaped_residual_refines_better_than_bbox():
     assert len([o for o in res.ops if o.op == "add"]) >= 2, [o.op for o in res.ops]
 
 
+def test_cylindrical_residual_yields_cylinder_op():
+    # Target = slab + a round boss; recon = slab. The round residual should be
+    # recognized as a CYLINDER, not staircased into boxes.
+    base = _box([40, 40, 6], [0, 0, 3])
+    boss = trimesh.creation.cylinder(radius=9.0, height=14.0)  # axis = Z
+    boss.apply_translation([0, 0, 13])
+    target = trimesh.util.concatenate([base, boss])
+    recon = base.copy()
+    res = refine_against_target(target, recon, res=64, max_iters=4)
+    assert res.iou_final > res.iou_initial + 0.03
+    kinds = [(o.kind, o.op) for o in res.ops]
+    assert any(k == "cylinder" and op == "add" for k, op in kinds), kinds
+
+
+def test_round_hole_residual_yields_cylinder_cut():
+    # Target = slab with a round hole; recon = solid slab (hole not cut).
+    slab = _box([40, 40, 12], [0, 0, 0])
+    drill = trimesh.creation.cylinder(radius=7.0, height=20.0)  # axis Z
+    target = slab.difference(drill)
+    if not getattr(target, "is_volume", True) or target.volume <= 0:
+        pytest.skip("boolean backend unavailable")
+    recon = slab.copy()
+    res = refine_against_target(target, recon, res=72, max_iters=4)
+    kinds = [(o.kind, o.op) for o in res.ops]
+    assert any(k == "cylinder" and op == "cut" for k, op in kinds), kinds
+
+
+def test_l_residual_yields_prism_or_boxes():
+    # An L-shaped prismatic residual becomes ONE clean prism (preferred) or a
+    # box-cover fallback — either way IoU improves.
+    base = _box([40, 40, 6], [0, 0, 3])
+    limb1 = _box([36, 8, 10], [0, -14, 11])
+    limb2 = _box([8, 36, 10], [-14, 0, 11])
+    target = trimesh.util.concatenate([base, limb1, limb2])
+    recon = base.copy()
+    res = refine_against_target(target, recon, res=56, max_iters=4)
+    assert res.iou_final > res.iou_initial + 0.05
+    kinds = [o.kind for o in res.ops if o.op == "add"]
+    assert ("prism" in kinds) or (len(kinds) >= 2), kinds
+
+
 def test_refinement_never_lowers_iou():
     base = _box([20, 20, 6], [0, 0, 3])
     boss = _box([8, 5, 7], [3, 0, 9])

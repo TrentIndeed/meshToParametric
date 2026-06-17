@@ -289,16 +289,14 @@ regions, which is why it didn't help there). So the merge is validated; the
 remaining work is to push the counts further down on the dense/complex parts.
 
 **Still TODO:**
-- [ ] **Canonical-frame ALIGNMENT runs on the over-decimated mesh.** In
-  `ingest.ingest_mesh` the dirty/scan decimation to `dirty_max_faces` (12k)
-  happens at line ~104, BEFORE `align_to_canonical_frame` at line ~146 — so the
-  alignment computes its frame from area-weighted face normals on a ≤12k mesh.
-  Coarse normals → a worse canonical frame → every downstream world-axis
-  assumption (axis snapping, extrusion silhouettes, prismatic reasoning) starts
-  from a slightly-wrong rotation. ALIGNMENT should run on the HIGHER-triangle
-  mesh; the aggressive 12k decimation should happen ONLY to feed segmentation
-  (which is what the cap was for). Full plan + step-by-step in
-  **`docs/ALIGN_BEFORE_DECIMATE_HANDOFF.md`**.
+- [x] **Canonical-frame ALIGNMENT runs on the over-decimated mesh.** DONE
+  2026-06-17. ingest now cost-guard-decimates to `align_max_faces` (120k)
+  before align and caps the output at `max_faces` (30k) after; align is gated
+  to apply its rotation only when it measurably improves axis-alignment. NB the
+  original diagnosis was partly wrong (the 12k cap was a no-op re-inflated by
+  Poisson/voxel; the frame is resolution-stable) — see the "## OUTCOME" section
+  of **`docs/ALIGN_BEFORE_DECIMATE_HANDOFF.md`**. End-to-end CAD volume error
+  improved on every tested AI part (two now PASS); clean CAD unchanged.
 - [ ] **Region-growing robustness for dense AI meshes** — the post-merge helps
   50–70% but complex parts (EnclosureLid 1077, TaperedHousing 2667) are still
   over-fragmented. Fix the GROWING/curvature-split that shatters them, not just

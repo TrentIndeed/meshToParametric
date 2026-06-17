@@ -224,6 +224,8 @@ def export_cadquery(
     stitched_clusters: list[dict] | None = None,
     stream_dir: str | None = None,
     stitched_clusters_path: str | None = None,
+    residual_refine: bool = True,
+    residual_refine_min_error_pct: float = 5.0,
 ) -> CadQueryResult:
     """Reconstruct the part as a CadQuery solid and optionally export STEP.
 
@@ -729,6 +731,26 @@ def export_cadquery(
             logger.warning("Variant '%s' failed, skipping", h_name)
 
     logger.info("Built %d variants: %s", len(variants), [v.name for v in variants])
+
+    # CADFit-style residual-refinement post-pass: patch the primary solid
+    # toward the target mesh, keeping the result only if the volume error
+    # strictly improves. Pure safety net — a no-op when recognition already
+    # matched the mesh (clean CAD), so it cannot regress those parts.
+    # Skip entirely when the build already matches well (avoids the
+    # tessellation+voxelization cost on the common clean-CAD case, where it
+    # only ever no-ops anyway).
+    if residual_refine and solid is not None and mesh_volume > 0:
+        _pre_vol = variants[0].cad_volume if variants else _solid_volume(solid)
+        _pre_err = abs(_pre_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
+        if _pre_err >= residual_refine_min_error_pct:
+            try:
+                solid, _refined_vol = _residual_refine_solid(
+                    solid, cleaned, mesh_volume)
+                if variants:
+                    variants[0].cad_volume = _refined_vol
+            except Exception:
+                logger.debug("residual_refine post-pass errored, ignoring",
+                             exc_info=True)
 
     # Primary result uses the first (best) variant
     cad_volume = variants[0].cad_volume if variants else 0.0
@@ -6060,6 +6082,99 @@ def _apply_recognized_fillets_to_solid(
         len(applied_steps), _time.time() - pass_start,
     )
     return wp, applied_steps, applied_script
+
+
+def _solid_volume(solid) -> float:
+    """abs volume of a CadQuery solid/Workplane, 0.0 on failure."""
+    try:
+        return abs(float(solid.val().Volume()))
+    except Exception:
+        return 0.0
+
+
+def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
+                           max_iters: int = 3):
+    """CADFit-style residual-refinement post-pass.
+
+    The recognition pipeline is feed-forward — a mis-recognized or missed
+    feature silently propagates. CADFit (github.com/ghadinehme/CADFit) instead
+    BUILDS the result, diffs it against the target, and patches the residual
+    (`under -> add`, `over -> cut`) until it vanishes. This is the keystone
+    borrow: it gives the deterministic pipeline a global safety net.
+
+    Here we tessellate the built solid, run the voxel-IoU residual analysis
+    (pipeline/iou_refine.py) against the target mesh, and apply the proposed
+    axis-aligned add/cut boxes to the CadQuery solid — keeping the result ONLY
+    if it reduces the volume error. It is therefore a pure safety net: any
+    failure or non-improvement returns the input solid unchanged, so it is safe
+    to leave on by default. Returns (solid, cad_volume).
+
+    LIMITATION (v1): patches are bounding boxes of the largest residual chunks,
+    which improve volume match but are geometrically crude (a box where a
+    cylindrical boss belongs). Extruding the residual's actual silhouette /
+    revolving it is the natural next increment (see docs/CADFIT_BORROWED.md).
+    """
+    cad_vol = _solid_volume(solid)
+    if solid is None or mesh_volume <= 0:
+        return solid, cad_vol
+    try:
+        import cadquery as cq
+        from mesh2param.pipeline.iou_refine import refine_against_target
+    except Exception:
+        return solid, cad_vol
+    try:
+        tv, tf = _tessellate_solid(solid)
+        if tv is None or tf is None or len(tv) == 0:
+            return solid, cad_vol
+        recon = trimesh.Trimesh(
+            vertices=np.asarray(tv, float).reshape(-1, 3),
+            faces=np.asarray(tf, np.int64).reshape(-1, 3), process=False)
+        target = trimesh.Trimesh(
+            vertices=cleaned.vertices, faces=cleaned.faces, process=False)
+        res = refine_against_target(target, recon, res=64, max_iters=max_iters)
+        if not res.ops:
+            return solid, cad_vol
+
+        refined = solid
+        applied = 0
+        for op in res.ops:
+            lo = np.asarray(op.box_min, float)
+            hi = np.asarray(op.box_max, float)
+            dims = hi - lo
+            if np.any(dims <= 1e-6):
+                continue
+            try:
+                box = cq.Solid.makeBox(
+                    float(dims[0]), float(dims[1]), float(dims[2]),
+                    cq.Vector(float(lo[0]), float(lo[1]), float(lo[2])))
+                refined = (refined.union(box) if op.op == "add"
+                           else refined.cut(box))
+                applied += 1
+            except Exception:
+                logger.debug("residual %s box failed, skipping", op.op,
+                             exc_info=True)
+                continue
+        if applied == 0:
+            return solid, cad_vol
+
+        new_vol = _solid_volume(refined)
+        old_err = abs(cad_vol - mesh_volume) / (mesh_volume + 1e-15)
+        new_err = abs(new_vol - mesh_volume) / (mesh_volume + 1e-15)
+        # Keep ONLY if the headline volume error strictly improves. iou_refine
+        # already vetted each op by shape (voxel IoU); this is the final guard
+        # that we didn't trade shape for a worse volume match.
+        if new_err < old_err - 1e-4:
+            logger.info("Residual refine: vol err %.2f%% -> %.2f%% "
+                        "(%d/%d box ops applied)",
+                        old_err * 100, new_err * 100, applied, len(res.ops))
+            return refined, new_vol
+        logger.debug("Residual refine: no volume-error improvement "
+                     "(%.2f%% -> %.2f%%), keeping original",
+                     old_err * 100, new_err * 100)
+        return solid, cad_vol
+    except Exception:
+        logger.debug("Residual refine post-pass failed", exc_info=True)
+        return solid, cad_vol
 
 
 def _estimate_mesh_volume(cleaned: CleanedMesh) -> float:

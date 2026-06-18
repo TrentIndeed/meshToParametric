@@ -6409,28 +6409,52 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
             return (refined, _solid_volume(refined)) if applied else (None, 0.0)
 
         old_err = abs(cad_vol - mesh_volume) / (mesh_volume + 1e-15)
-        # Build the voxel-best op-set AND the box-only fallback; keep whichever
-        # wins on REAL volume error. (Tried an exact-IoU arbiter here for
-        # shape-awareness — Pillar 3 — but it regressed the volume metric: it
-        # kept shape-better/volume-worse solids, e.g. AI13 1.4%->13.8%. The
-        # shape gap vs CADFit lives in BASE recognition, not the residual
-        # arbiter, so this stays volume-based; exact IoU (iou_refine.
-        # mesh_iou_exact) is reserved for Pillar 2's base selection.)
-        candidates = []
+        from mesh2param.pipeline.iou_refine import (
+            exact_iou_available, mesh_iou_exact)
+        # Pick the op-set by SHAPE (exact IoU) WHERE THAT METRIC IS RELIABLE
+        # (Linux/container: alpha-wrap available -> true exact IoU; this is the
+        # deployment target and where we optimize to beat CADFit). On Windows
+        # alpha-wrap is missing so exact IoU degrades to a noisy voxel fallback
+        # that mis-ranks candidates — there we keep the validated VOLUME arbiter
+        # (no regression). Build both op-sets either way.
+        built = []
         for ops in (res.ops, res.box_ops):
             if not ops:
                 continue
             cand_solid, cand_vol = _apply(ops)
             if cand_solid is not None:
-                err = abs(cand_vol - mesh_volume) / (mesh_volume + 1e-15)
-                candidates.append((err, cand_solid, cand_vol))
-        if not candidates:
+                built.append((cand_solid, cand_vol))
+        if not built:
             return solid, cad_vol
-        best_err, best_solid, best_vol = min(candidates, key=lambda c: c[0])
-        if best_err < old_err - 1e-4:
+
+        if exact_iou_available():
+            iou0 = mesh_iou_exact(target, recon)
+            best = None    # (iou, solid, vol)
+            for cand_solid, cand_vol in built:
+                ctv, ctf = _tessellate_solid(cand_solid)
+                if ctv is None or len(ctv) == 0:
+                    continue
+                cmesh = trimesh.Trimesh(
+                    vertices=np.asarray(ctv, float).reshape(-1, 3),
+                    faces=np.asarray(ctf, np.int64).reshape(-1, 3),
+                    process=False)
+                ciou = mesh_iou_exact(target, cmesh)
+                if best is None or ciou > best[0]:
+                    best = (ciou, cand_solid, cand_vol)
+            if best is not None and best[0] > iou0 + 1e-3:
+                logger.info("Residual refine: shape IoU %.3f -> %.3f",
+                            iou0, best[0])
+                return best[1], best[2]
+            return solid, cad_vol
+
+        # Volume arbiter (Windows / no reliable exact IoU).
+        best_vol_err, best_solid, best_v = min(
+            ((abs(v - mesh_volume) / (mesh_volume + 1e-15), s, v)
+             for s, v in built), key=lambda c: c[0])
+        if best_vol_err < old_err - 1e-4:
             logger.info("Residual refine: vol err %.2f%% -> %.2f%%",
-                        old_err * 100, best_err * 100)
-            return best_solid, best_vol
+                        old_err * 100, best_vol_err * 100)
+            return best_solid, best_v
         return solid, cad_vol
     except Exception:
         logger.debug("Residual refine post-pass failed", exc_info=True)

@@ -5,3 +5,11 @@ __pycache__/
 tests/visual_reports/
 *.pyc
 .env
+_cadfit_docker/
+_cadfit_tmp/
+_docker/
+models/
+node_modules/
+*.db
+*.stl
+*.step

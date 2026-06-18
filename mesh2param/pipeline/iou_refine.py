@@ -163,17 +163,87 @@ def voxel_iou(target_mesh, recon_mesh, res: int = 64) -> float:
     return _iou(t, r)
 
 
-def _to_manifold(mesh):
-    """trimesh -> manifold3d.Manifold, or None."""
-    import manifold3d
+def _alpha_wrap(mesh):
+    """Guaranteed-watertight wrap of any mesh via pymeshlab's alpha-wrap
+    (decimating huge meshes first for speed). Returns a trimesh, or None if the
+    alpha-wrap plugin is unavailable (e.g. on Windows) / fails. This is what
+    makes exact IoU reliable on dirty AI/scan meshes — the same trick CADFit's
+    iou.py uses."""
     try:
-        mm = manifold3d.Mesh(
-            vert_properties=np.asarray(mesh.vertices, np.float32),
-            tri_verts=np.asarray(mesh.faces, np.uint32))
-        man = manifold3d.Manifold(mm)
-        return man if man.volume() > 1e-12 else None
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=np.asarray(mesh.vertices, np.float64),
+            face_matrix=np.asarray(mesh.faces, np.int32)))
+        if len(mesh.faces) > 50_000:
+            try:
+                ms.meshing_decimation_quadric_edge_collapse(
+                    targetfacenum=50_000, preservenormal=True)
+            except Exception:
+                pass
+        ms.generate_alpha_wrap(alpha=pymeshlab.PercentageValue(1.0),
+                               offset=pymeshlab.PercentageValue(0.1))
+        out = ms.current_mesh()
+        import trimesh
+        return trimesh.Trimesh(vertices=out.vertex_matrix(),
+                               faces=out.face_matrix(), process=True)
     except Exception:
         return None
+
+
+def _to_manifold(mesh):
+    """trimesh -> manifold3d.Manifold, or None. Tries the direct conversion
+    first (fast, no distortion); only when that gives an empty/volume-
+    inconsistent manifold (non-watertight / multi-body) does it fall back to an
+    alpha-wrap. Keeps exact IoU honest on dirty meshes where direct conversion
+    silently under-/over-volumes."""
+    import manifold3d
+
+    def _conv(m):
+        try:
+            mm = manifold3d.Mesh(
+                vert_properties=np.asarray(m.vertices, np.float32),
+                tri_verts=np.asarray(m.faces, np.uint32))
+            man = manifold3d.Manifold(mm)
+            return man if man.volume() > 1e-12 else None
+        except Exception:
+            return None
+
+    direct = _conv(mesh)
+    if direct is not None:
+        try:
+            raw = abs(float(mesh.volume))
+            if raw > 0 and 0.9 <= direct.volume() / raw <= 1.1:
+                return direct        # volume-consistent -> trust direct
+        except Exception:
+            return direct
+    wrapped = _alpha_wrap(mesh)
+    if wrapped is not None:
+        w = _conv(wrapped)
+        if w is not None:
+            return w
+    return direct
+
+
+_EXACT_AVAILABLE = None
+
+
+def exact_iou_available() -> bool:
+    """True iff exact-boolean IoU is RELIABLE here — manifold3d present AND
+    alpha-wrap works (so dirty/non-watertight meshes can be manifoldified).
+    On Windows the alpha-wrap plugin doesn't load, so this is False and callers
+    use the volume metric instead of optimizing a voxel-fallback signal. On
+    Linux (the deployment target) it's True. Cached."""
+    global _EXACT_AVAILABLE
+    if _EXACT_AVAILABLE is None:
+        try:
+            import manifold3d  # noqa: F401
+            import trimesh
+            box = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+            _EXACT_AVAILABLE = _alpha_wrap(box) is not None
+        except Exception:
+            _EXACT_AVAILABLE = False
+    return bool(_EXACT_AVAILABLE)
 
 
 def mesh_iou_exact(target_mesh, recon_mesh, res: int = 64) -> float:

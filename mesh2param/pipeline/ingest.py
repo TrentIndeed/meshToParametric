@@ -340,17 +340,54 @@ def _normalize_scale(
     return mesh, unit_scale
 
 
+def _decimate_deterministic(mesh: trimesh.Trimesh,
+                            max_faces: int) -> trimesh.Trimesh | None:
+    """Deterministic quadric decimation via trimesh's fast-simplification
+    backend, or None if unavailable/failed.
+
+    pymeshlab's quadric decimation parallelises the edge-collapse priority
+    queue, so its tie-breaking — and thus the OUTPUT VERTEX POSITIONS — vary
+    run-to-run even on identical input (same topology, jittered coords). That
+    jitter was the root of the whole AI/scan pipeline's non-determinism (it
+    cascades into segmentation region counts and final cad_vol_err). The
+    fast-simplification library is single-threaded C++ and reproducible, and
+    faster (522k->30k in ~0.6s), so it is the primary path.
+    """
+    try:
+        import fast_simplification  # noqa: F401  (trimesh's backend)
+    except Exception:
+        return None
+    try:
+        out = mesh.simplify_quadric_decimation(face_count=int(max_faces))
+        if out is None or len(out.faces) == 0:
+            return None
+        logger.info("Decimated (deterministic): %d -> %d faces (target %d)",
+                    len(mesh.faces), len(out.faces), max_faces)
+        return out
+    except Exception as e:
+        logger.warning("Deterministic decimation failed (%s) — "
+                       "falling back to pymeshlab", e)
+        return None
+
+
 def _decimate(mesh: trimesh.Trimesh, max_faces: int) -> trimesh.Trimesh:
     """Quadric edge-collapse decimation down to max_faces.
 
     Scanned meshes arrive at 300K-2.5M triangles while carrying the same
     analytic surfaces as a 10K-face CAD export. Segmentation cost grows
-    superlinearly with face count, so cap it here. planarquadric keeps
-    flat areas well-tessellated; topology preservation keeps the mesh
-    manifold for downstream watertightness checks.
+    superlinearly with face count, so cap it here.
+
+    Primary path is the DETERMINISTIC fast-simplification backend (see
+    _decimate_deterministic — reproducible run-to-run, which the pymeshlab path
+    is not). Falls back to pymeshlab's two-stage quadric (non-deterministic but
+    always available) when fast-simplification isn't installed.
     """
     if max_faces <= 0 or len(mesh.faces) <= max_faces:
         return mesh
+
+    det = _decimate_deterministic(mesh, max_faces)
+    if det is not None:
+        return det
 
     try:
         import pymeshlab

@@ -9,6 +9,7 @@ description = "Reverse engineering pipeline: mesh to parametric CAD via Onshape"
 requires-python = ">=3.11"
 dependencies = [
     "trimesh>=4.0",
+    "fast-simplification>=0.1",  # deterministic decimation backend for trimesh
     "numpy>=1.24",
     "scipy>=1.11",
     "scikit-learn>=1.3",

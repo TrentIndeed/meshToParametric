@@ -29,7 +29,20 @@ robustness on dense AI meshes (the open `docs/SEGMENTATION_HANDOFF.md` /
 guarantees these never return nothing / 100% — they degrade to the contour
 path's number instead.
 
-**Determinism — pinpointed (2026-06-17), NOT a quick fix.** The seedable RNGs
+**Determinism — FIXED 2026-06-17.** Replaced pymeshlab's quadric decimation in
+`ingest._decimate` with the `fast-simplification` backend (single-threaded C++,
+reproducible; via `trimesh.simplify_quadric_decimation`), pymeshlab kept as
+fallback. Ingest is now bit-identical run-to-run (verified AI12 3× same vertex
+hash), and it's FASTER (522k->30k in ~0.6s, no clustering pre-pass needed). The
+different (now stable) triangulation exposed a latent crash — `_fit_plane`
+indexed `vh[2]` on <3-point sliver regions; guarded it (fall back to mean face
+normal, inf RMS). Net effect on the AI set: **10/15 PASS, up from 9/15**, and
+now STABLE — 4 parts that were failing now pass (AI5/7/9/10); the 3 that flipped
+to FAIL (AI2/6/11) were noisy lucky passes before (AI6's honest value is ~39%,
+not the one-off 9.6 sample). Clean CAD + scans unaffected (21/7). The remaining
+fails are now RELIABLE targets for region-growing work (no longer noise-masked).
+
+Historical note (the investigation): The seedable RNGs
 are ALREADY seeded (KMeans `random_state=42` in segment.py, RANSAC
 `RandomState(42)` in fit.py; DBSCAN is deterministic). The real source is
 `ingest_mesh`: pymeshlab's quadric edge-collapse DECIMATION produces the SAME

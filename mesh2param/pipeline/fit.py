@@ -565,6 +565,19 @@ def _fit_plane(
     """
     centroid = points.mean(axis=0)
     centered = points - centroid
+    if len(points) < 3:
+        # Underdetermined: a plane needs 3+ non-collinear points. Aggressive
+        # decimation can leave a 1-2 point sliver region; SVD then returns
+        # fewer than 3 rows and vh[2] is out of bounds. Fall back to the mean
+        # face normal and mark the fit as bad (inf RMS) so downstream gating
+        # drops it, rather than crashing the whole build.
+        normal = (np.asarray(normals, dtype=float).mean(axis=0)
+                  if normals is not None and len(normals) > 0
+                  else np.array([0.0, 0.0, 1.0]))
+        nn = float(np.linalg.norm(normal))
+        normal = normal / nn if nn > 1e-12 else np.array([0.0, 0.0, 1.0])
+        return ({"point": centroid.tolist(), "normal": normal.tolist(),
+                 "extent": 0.0}, float("inf"))
     _, s, vh = np.linalg.svd(centered, full_matrices=False)
     normal = vh[2]  # row corresponding to smallest singular value
 

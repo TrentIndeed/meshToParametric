@@ -1,11 +1,17 @@
 services:
   mesh2param:
     build: .
+    image: paramesh-server
     ports:
       - "8081:8080"
     volumes:
-      - ./data:/app/data
+      # Named volume, not a host bind-mount: SQLite locking deadlocks over a
+      # Docker Desktop Windows mount. On Linux either works; named is portable.
+      - paramesh-data:/app/data
     environment:
       - AUTH_SECRET=${AUTH_SECRET:-change-me-in-production}
       - DATABASE_URL=sqlite:////app/data/mesh2param.db
     restart: unless-stopped
+
+volumes:
+  paramesh-data:

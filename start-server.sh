@@ -1,58 +1,62 @@
 #!/usr/bin/env bash
-# Start the Paramesh AI web UI (FastAPI + Three.js viewer).
-# Default parameters: host 127.0.0.1, port 8080.
-# Usage:  ./start-server.sh   (Ctrl+C to stop)
+# Start the Paramesh AI web UI inside the Linux Docker container.
 #
-# Port handling (mirrors start-server.ps1):
-#   1. If something listens on 8080, try to kill it (assumed stale
-#      previous instance) and wait until the port actually frees.
-#   2. If it is still held (another application owns it), fall back to
-#      the first free port in 8081..8090 via PARAMESH_PORT.
+# Why the container: the alpha-wrap watertight repair (ingest) and the exact-IoU
+# residual arbiter only work on Linux — pymeshlab's alpha-wrap plugin won't load
+# on Windows, where they silently no-op and AI/scan meshes come out far worse.
+# This builds + runs the same image that deploys to Hetzner.
 #
-# Runs python in the FOREGROUND via exec: the shell process is replaced
-# by python, so Ctrl+C goes straight to uvicorn (clean shutdown) and the
-# script ends exactly when the server does. Do NOT background + wait here
-# — under git-bash/MSYS, `wait` on a native python.exe can return early
-# and leave the server running orphaned.
+# Usage:
+#   ./start-server.sh             # build (if needed) + run on http://127.0.0.1:8080
+#   ./start-server.sh --no-build  # skip the build, just (re)start the container
+#   ./start-server.sh --native    # old behaviour: native python (NO alpha-wrap)
+# Ctrl+C stops it (the container is removed on exit).
 cd "$(dirname "$0")"
 export PYTHONIOENCODING=utf-8
+IMAGE=paramesh-server
+CONTAINER=paramesh-server
+NO_BUILD=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) NO_BUILD=1 ;;
+        --native) NATIVE=1 ;;
+    esac
+done
 
-port_listeners() {
-    # PIDs of LISTENING sockets on the given port (Windows netstat).
-    netstat -ano 2>/dev/null | awk -v p=":$1" \
-        '$1 ~ /TCP/ && $2 ~ p"$" && $4 == "LISTENING" {print $5}' | sort -u
-}
-
-PORT=8080
-pids=$(port_listeners "$PORT")
-if [ -n "$pids" ]; then
-    for pid in $pids; do
-        echo "Stopping existing process on port $PORT (PID $pid)..."
-        taskkill //F //PID "$pid" >/dev/null 2>&1
-    done
-    # Wait until the LISTEN socket is actually gone (up to 10s)
-    for _ in $(seq 1 20); do
-        sleep 0.5
-        [ -z "$(port_listeners "$PORT")" ] && break
-    done
+if [ -n "$NATIVE" ]; then
+    export PARAMESH_PORT=8080
+    echo "Starting Paramesh AI (native, NO alpha-wrap) at http://127.0.0.1:8080 ..."
+    exec python -m mesh2param.viz_server.app
 fi
 
-# Still busy (another application owns it)? Pick the next free port.
-if [ -n "$(port_listeners "$PORT")" ]; then
-    for candidate in $(seq 8081 8090); do
-        if [ -z "$(port_listeners "$candidate")" ]; then
-            echo "Port 8080 is in use by another application; using port $candidate instead."
-            PORT=$candidate
-            break
-        fi
-    done
-    if [ -n "$(port_listeners "$PORT")" ]; then
-        echo "ERROR: no free port found in 8080-8090." >&2
-        exit 1
-    fi
+if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: Docker is not running. Start Docker (Desktop), or use --native." >&2
+    exit 1
 fi
 
-export PARAMESH_PORT=$PORT
-echo "Starting Paramesh AI server at http://127.0.0.1:$PORT ..."
-echo "Press Ctrl+C to stop."
-exec python -m mesh2param.viz_server.app
+if [ "$NO_BUILD" -eq 0 ]; then
+    echo "Building $IMAGE (Linux image with the alpha-wrap / exact-IoU stack)..."
+    docker build -t "$IMAGE" . || { echo "ERROR: image build failed." >&2; exit 1; }
+fi
+
+docker rm -f "$CONTAINER" >/dev/null 2>&1
+
+# Host path for -v: git-bash on Windows needs the Windows form (pwd -W) and
+# MSYS_NO_PATHCONV so /app/... isn't mangled; plain Linux uses pwd as-is.
+if HOSTROOT=$(pwd -W 2>/dev/null); then export MSYS_NO_PATHCONV=1; else HOSTROOT=$(pwd); fi
+ENVFILE=()
+[ -f .env ] && ENVFILE=(--env-file .env)
+
+# DB in a NAMED volume, not a host bind-mount: SQLite locking deadlocks over
+# Docker Desktop's Windows filesystem mount and hangs startup.
+echo "Starting $CONTAINER at http://127.0.0.1:8080  (Ctrl+C to stop)"
+echo "Note: the Claude CLI (AI chat) is unavailable inside the container; it degrades gracefully."
+exec docker run --rm --name "$CONTAINER" \
+    -p 8080:8080 \
+    -v paramesh-data:/app/data \
+    -v "${HOSTROOT}/mesh2param:/app/mesh2param" \
+    -v "${HOSTROOT}/models:/app/models" \
+    "${ENVFILE[@]}" \
+    -e DATABASE_URL="sqlite:////app/data/mesh2param.db" \
+    -e PYTHONUTF8=1 \
+    "$IMAGE"

@@ -34,14 +34,30 @@ mechanical parts."
 | Needs target mesh | No (recognition) | Yes — IoU-to-target is the optimizer oracle |
 
 ## Head-to-head finding (2026-06-18)
-`scripts/diag_cadfit_compare.py`, bbox-normalized voxel IoU, 6 meshes:
-- **CADFit completed 0/6 within 180s on Windows** (4 timeouts, 2 no-output) — its
-  per-build timeouts use Unix SIGALRM, so slow CadQuery builds hang. NOT a
-  verdict on its algorithm — a verdict on its portability.
-- This repo built all 6 deterministically (IoU 0.75-1.0 except AI13 0.15).
-- Only clean head-to-head (AI3, untimed earlier run): CADFit 0.973 / this 0.953
-  — comparable, CADFit marginally ahead.
-- => A fair ALGORITHMIC benchmark requires CADFit on **Linux (WSL/Docker)**.
+
+**Windows:** CADFit completed 0/6 within 180s (Unix SIGALRM build-timeouts don't
+exist on Windows -> hangs). Not a verdict on its algorithm.
+
+**Linux (Docker, `_cadfit_docker/`):** CADFit runs properly. On the 3 meshes it
+finished (bbox-normalized voxel IoU, higher=better):
+
+| part | this repo IoU | CADFit IoU | this repo vol-err |
+|---|---|---|---|
+| AI1 | 0.752 | **0.828** | 3.4% |
+| AI10 | 0.863 | **0.992** | 4.4% |
+| AI11 | 0.824 | **0.990** | 14.3% |
+
+**CADFit wins all 3 on shape IoU** — its IoU-driven optimization produces
+reconstructions that OVERLAP the target better. Key pattern: this repo gets the
+VOLUME right (3-4%) but the SHAPE less precisely (lower IoU). CADFit's revolve
+(AI11 flange, 0.99) is far cleaner than this repo's silhouette-revolve (0.82).
+
+This repo's real edges: **~10x faster** (CADFit ~9 min/mesh vs ~1 min; it does
+100s of kernel builds/mesh), **robustness** (runs everywhere, deterministic,
+completes all), **volume accuracy**, **named-feature editability**. But on raw
+SHAPE FIDELITY, CADFit currently leads. => the plan below is data-justified:
+to surpass CADFit we must close the shape-IoU gap (Pillars 2/3 + revolve build).
+Caveat: n=3 (alphabetically-first meshes); a fuller run is the open item.
 
 ## The plan — five pillars
 

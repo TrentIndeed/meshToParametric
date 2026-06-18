@@ -56,8 +56,25 @@ def build(part_dir: Path) -> None:
         tree = recognize_features(regions, fitted, graph, edges, c,
                                   RecognizeConfig())
         res = export_cadquery(tree, c, use_llm=False, num_variants=1)
+        # Shape IoU (exact-boolean) vs the cleaned target — the primary quality
+        # metric now (cad_vol_err is volume-only and shape-blind).
+        iou = float("nan")
+        try:
+            import numpy as _np
+            import trimesh as _tm
+            from mesh2param.pipeline.iou_refine import mesh_iou_exact
+            if res.tess_vertices is not None and res.tess_faces is not None:
+                tgt = _tm.Trimesh(vertices=c.vertices, faces=c.faces,
+                                  process=False)
+                rec = _tm.Trimesh(
+                    vertices=_np.asarray(res.tess_vertices, float).reshape(-1, 3),
+                    faces=_np.asarray(res.tess_faces, _np.int64).reshape(-1, 3),
+                    process=False)
+                iou = mesh_iou_exact(tgt, rec)
+        except Exception:
+            pass
         print(f"{nm:<16} regions={len(regions):>4} feats={tree.num_features:>3} "
-              f"cad_vol_err={res.volume_error_pct:>6.1f}%  status={res.status} "
+              f"IoU={iou:>5.3f}  cad_vol_err={res.volume_error_pct:>6.1f}% "
               f"({time.time() - t:.0f}s)", flush=True)
     except Exception as e:
         import traceback

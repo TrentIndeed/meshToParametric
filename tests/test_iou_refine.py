@@ -23,6 +23,21 @@ def _box(extents, center):
     return b
 
 
+def test_mesh_iou_exact_matches_geometry():
+    from mesh2param.pipeline.iou_refine import mesh_iou_exact
+    a = _box([10, 10, 10], [0, 0, 0])
+    assert mesh_iou_exact(a, a.copy()) > 0.99
+    # half-overlap: two equal boxes shifted by half -> exact IoU = 1/3
+    b = _box([10, 10, 10], [5, 0, 0])
+    iou = mesh_iou_exact(a, b)
+    assert 0.30 < iou < 0.36, iou           # sharper than voxel's 0.2-0.45
+    # disjoint
+    far = _box([4, 4, 4], [100, 0, 0])
+    assert mesh_iou_exact(a, far) < 1e-6
+    # exact IoU never exceeds 1 (the multi-body manifold bug is guarded)
+    assert mesh_iou_exact(a, b) <= 1.0
+
+
 def test_voxel_iou_identical_is_one():
     b = _box([10, 10, 10], [0, 0, 0])
     assert voxel_iou(b, b.copy(), res=40) > 0.97

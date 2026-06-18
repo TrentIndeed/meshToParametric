@@ -6410,8 +6410,12 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
 
         old_err = abs(cad_vol - mesh_volume) / (mesh_volume + 1e-15)
         # Build the voxel-best op-set AND the box-only fallback; keep whichever
-        # wins on REAL volume error (the voxel-optimal path is not always the
-        # real-volume-optimal once built — quantization + boolean interactions).
+        # wins on REAL volume error. (Tried an exact-IoU arbiter here for
+        # shape-awareness — Pillar 3 — but it regressed the volume metric: it
+        # kept shape-better/volume-worse solids, e.g. AI13 1.4%->13.8%. The
+        # shape gap vs CADFit lives in BASE recognition, not the residual
+        # arbiter, so this stays volume-based; exact IoU (iou_refine.
+        # mesh_iou_exact) is reserved for Pillar 2's base selection.)
         candidates = []
         for ops in (res.ops, res.box_ops):
             if not ops:
@@ -6427,9 +6431,6 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
             logger.info("Residual refine: vol err %.2f%% -> %.2f%%",
                         old_err * 100, best_err * 100)
             return best_solid, best_vol
-        logger.debug("Residual refine: no volume-error improvement "
-                     "(%.2f%% -> %.2f%%), keeping original",
-                     old_err * 100, best_err * 100)
         return solid, cad_vol
     except Exception:
         logger.debug("Residual refine post-pass failed", exc_info=True)

@@ -163,6 +163,53 @@ def voxel_iou(target_mesh, recon_mesh, res: int = 64) -> float:
     return _iou(t, r)
 
 
+def _to_manifold(mesh):
+    """trimesh -> manifold3d.Manifold, or None."""
+    import manifold3d
+    try:
+        mm = manifold3d.Mesh(
+            vert_properties=np.asarray(mesh.vertices, np.float32),
+            tri_verts=np.asarray(mesh.faces, np.uint32))
+        man = manifold3d.Manifold(mm)
+        return man if man.volume() > 1e-12 else None
+    except Exception:
+        return None
+
+
+def mesh_iou_exact(target_mesh, recon_mesh, res: int = 64) -> float:
+    """Exact volumetric IoU via manifold3d booleans — SHAPE-AWARE and sharper
+    than voxel IoU (no quantization). Used as the arbiter for keep/route
+    decisions, where 'right volume, wrong shape' must be caught (voxel IoU and
+    volume error both miss it at coarse resolution).
+
+    Falls back to voxel_iou when manifold3d is unavailable, a mesh isn't a clean
+    manifold, or the boolean volumes are inconsistent (manifold3d can return
+    vol(A&B) > vol(A|B) on multi-body/self-intersecting meshes — its own docs
+    note this; we detect IoU>1 and fall back).
+    """
+    try:
+        import manifold3d
+    except Exception:
+        return voxel_iou(target_mesh, recon_mesh, res)
+    ma, mb = _to_manifold(target_mesh), _to_manifold(recon_mesh)
+    if ma is None or mb is None:
+        return voxel_iou(target_mesh, recon_mesh, res)
+    try:
+        inter = manifold3d.Manifold.batch_boolean(
+            [ma, mb], manifold3d.OpType.Intersect)
+        uni = manifold3d.Manifold.batch_boolean(
+            [ma, mb], manifold3d.OpType.Add)
+        vi, vu = abs(inter.volume()), abs(uni.volume())
+    except Exception:
+        return voxel_iou(target_mesh, recon_mesh, res)
+    if vu <= 1e-12:
+        return voxel_iou(target_mesh, recon_mesh, res)
+    iou = vi / vu
+    if iou > 1.001 or iou < 0:        # manifold volume bug -> voxel fallback
+        return voxel_iou(target_mesh, recon_mesh, res)
+    return min(iou, 1.0)
+
+
 def _box_cover(mask: np.ndarray, origin, pitch, min_cells: int,
                max_boxes: int = 10, min_fill: float = 0.6):
     """A set of world-space AABBs covering the True voxels of `mask` without

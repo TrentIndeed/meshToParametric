@@ -1,5 +1,11 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+// Loaders for client-side folder thumbnails (parse meshes in the browser to
+// render a small preview, no server round-trip). 3MFLoader pulls fflate itself.
+import { STLLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/STLLoader.js';
+import { OBJLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/OBJLoader.js';
+import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/PLYLoader.js';
+import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
@@ -1840,8 +1846,7 @@ let pendingFile = null;
 let pendingTempPath = null;
 let savedMeshPreview = null; // saved mesh data for comparison view
 
-document.getElementById('file-input').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
+async function previewFile(file) {
   if (!file) return;
   console.debug('[upload] file selected:', file.name, 'size:', (file.size / 1024).toFixed(1), 'KB');
 
@@ -1982,16 +1987,151 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
     console.error('[upload] failed:', err);
     alert('Upload failed: ' + err.message);
     loading.classList.remove('show');
-  } finally {
-    e.target.value = '';
   }
+}
+
+document.getElementById('file-input').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  try { await previewFile(f); } finally { e.target.value = ''; }
 });
+
+// ─── Folder browser ──────────────────────────────────────────────────────────
+// "Open Folder" lists every mesh in the chosen directory in the left sidebar
+// with a client-side 3D thumbnail; clicking one loads it through previewFile().
+const MESH_EXTS = ['stl', 'obj', 'ply', '3mf'];
+let _thumbRenderer = null;
+window._folderActive = false;
+
+const _meshExt = (name) => (name.split('.').pop() || '').toLowerCase();
+const _fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+
+document.getElementById('folder-input')?.addEventListener('change', (e) => {
+  const meshes = Array.from(e.target.files || []).filter(f => MESH_EXTS.includes(_meshExt(f.name)));
+  e.target.value = '';
+  if (!meshes.length) { alert('No mesh files (.stl, .obj, .ply, .3mf) found in that folder.'); return; }
+  meshes.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  openFolderPanel(meshes);
+});
+
+function openFolderPanel(meshes) {
+  window._folderActive = true;
+  const panel = document.getElementById('folder-panel');
+  const list = document.getElementById('folder-list');
+  const rel = meshes[0].webkitRelativePath || '';
+  document.getElementById('folder-title').textContent =
+    (rel.split('/')[0] || 'Folder') + ' · ' + meshes.length + ' meshes';
+  list.innerHTML = '';
+  panel.style.display = 'block';
+  // Keep the sidebar open so the browser stays visible across mesh loads.
+  const sb = document.getElementById('sidebar');
+  sb.classList.remove('closed');
+  if (window.innerWidth <= 768) sb.classList.add('open');
+
+  meshes.forEach((file, i) => {
+    const item = document.createElement('div');
+    item.className = 'folder-item';
+    item.dataset.idx = i;
+    item.innerHTML =
+      '<div class="folder-thumb"><i class="ri-loader-4-line fspin"></i></div>' +
+      '<div class="folder-meta"><div class="folder-name"></div>' +
+      '<div class="folder-ext"></div></div>';
+    item.querySelector('.folder-name').textContent = file.name;
+    item.querySelector('.folder-name').title = file.name;
+    item.querySelector('.folder-ext').textContent = _meshExt(file.name).toUpperCase() + ' · ' + _fmtSize(file.size);
+    item.addEventListener('click', () => {
+      document.querySelectorAll('.folder-item.active').forEach(el => el.classList.remove('active'));
+      item.classList.add('active');
+      previewFile(file);
+    });
+    list.appendChild(item);
+  });
+
+  _renderThumbsSequential(meshes);
+}
+
+window.closeFolderPanel = function () {
+  window._folderActive = false;
+  document.getElementById('folder-panel').style.display = 'none';
+  document.getElementById('folder-list').innerHTML = '';
+};
+
+async function _renderThumbsSequential(meshes) {
+  for (let i = 0; i < meshes.length; i++) {
+    const item = document.querySelector(`.folder-item[data-idx="${i}"]`);
+    if (!item || !window._folderActive) continue;
+    const thumb = item.querySelector('.folder-thumb');
+    try {
+      const url = await _thumbnailFor(meshes[i]);
+      if (url) { thumb.innerHTML = ''; const img = new Image(); img.src = url; thumb.appendChild(img); }
+      else { thumb.innerHTML = '<i class="ri-shape-line"></i>'; }
+    } catch (err) {
+      console.warn('[folder] thumbnail failed for', meshes[i].name, err);
+      thumb.innerHTML = '<i class="ri-error-warning-line"></i>';
+    }
+    await new Promise(r => setTimeout(r, 0));   // yield so the UI stays responsive
+  }
+}
+
+function _getThumbRenderer() {
+  if (_thumbRenderer) return _thumbRenderer;
+  _thumbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+  _thumbRenderer.setSize(128, 128);
+  return _thumbRenderer;
+}
+
+function _firstGeometry(obj) {
+  let geo = null;
+  obj.traverse(c => { if (!geo && c.isMesh && c.geometry) geo = c.geometry; });
+  return geo;
+}
+
+async function _loadGeometry(file) {
+  const ext = _meshExt(file.name);
+  const buf = await file.arrayBuffer();
+  if (ext === 'stl') return new STLLoader().parse(buf);
+  if (ext === 'ply') return new PLYLoader().parse(buf);
+  if (ext === 'obj') return _firstGeometry(new OBJLoader().parse(new TextDecoder().decode(buf)));
+  if (ext === '3mf') return _firstGeometry(new ThreeMFLoader().parse(buf));
+  return null;
+}
+
+async function _thumbnailFor(file) {
+  const geo = await _loadGeometry(file);
+  if (!geo || !geo.attributes || !geo.attributes.position) return null;
+  geo.computeVertexNormals();
+  geo.computeBoundingBox();
+  const c = geo.boundingBox.getCenter(new THREE.Vector3());
+  const sz = geo.boundingBox.getSize(new THREE.Vector3());
+  const scl = 1.7 / (Math.max(sz.x, sz.y, sz.z) || 1);
+
+  const scene = new THREE.Scene();
+  const mat = new THREE.MeshStandardMaterial({ color: 0x9AA4AE, metalness: 0.1, roughness: 0.72 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(-c.x, -c.y, -c.z);
+  const grp = new THREE.Group();
+  grp.add(mesh);
+  grp.scale.setScalar(scl);
+  grp.rotation.x = -Math.PI / 2 + 0.5;   // Z-up part -> tilted iso view
+  grp.rotation.z = 0.5;
+  scene.add(grp);
+  scene.add(new THREE.HemisphereLight(0xE0E8F0, 0x3D4450, 1.2));
+  const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(2, 3, 2); scene.add(key);
+
+  const cam = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
+  cam.position.set(0, 0, 3); cam.lookAt(0, 0, 0);
+  const r = _getThumbRenderer();
+  r.render(scene, cam);
+  const url = r.domElement.toDataURL('image/png');
+  geo.dispose(); mat.dispose();
+  return url;
+}
 
 // Show raw mesh triangles in the viewer (before pipeline)
 function _showRawMesh(previewRes, animateToFit = true) {
   console.debug('[_showRawMesh] verts:', previewRes.mesh_vertices?.length, 'faces:', previewRes.mesh_faces?.length);
-  // Hide feature tree during mesh preview — it shows after pipeline completes
-  document.getElementById('sidebar').classList.add('closed');
+  // Hide feature tree during mesh preview — it shows after pipeline completes.
+  // Keep the sidebar open while browsing a folder so the picker stays visible.
+  if (!window._folderActive) document.getElementById('sidebar').classList.add('closed');
   while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
 
   try {

@@ -382,6 +382,9 @@ class Job:
     # Durable pickle of (tree, cleaned, body_results, decomposition) written at
     # build time so the feature-tree editor can re-run export on a mutated tree.
     cad_bundle_path: str | None = None
+    # STEP of the current built solid (refreshed on each edit) — source for
+    # pickable-edge extraction and the edited-model download.
+    cad_step_path: str | None = None
     steps: list = field(default_factory=list)
     variants: list = field(default_factory=list)  # list of {name, strategy, steps}
     active_variant: int = 0  # index of currently selected variant
@@ -605,6 +608,14 @@ class JobQueue:
         """
         import tempfile
         cad_input_path = Path("data") / f"cad_input_{job.id}.pkl"
+        # Persist the built solid as STEP so the feature-tree editor can extract
+        # pickable edges fast and offer a download without re-running the build.
+        cad_solid_path = Path("data") / f"cad_solid_{job.id}.step"
+        try:
+            Path(cad_solid_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        job.cad_step_path = str(cad_solid_path)
         try:
             cad_input_path.unlink(missing_ok=True)
         except Exception:
@@ -664,6 +675,12 @@ try:
                              stitched_clusters=stitched_clusters,
                              stream_dir=r'{cad_stream_dir}',
                              stitched_clusters_path=r'{clusters_path}')
+    try:
+        if result.solid is not None:
+            import cadquery as _cq
+            _cq.exporters.export(result.solid, r'{cad_solid_path}')
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
     result.solid = None
     with open(r'{tmp_out.name}', 'wb') as f:
         pickle.dump(result, f)

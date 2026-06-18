@@ -1117,6 +1117,8 @@ function _syncMainCamera(pos, target) {
 // ── Load step geometry ──
 async function loadStep(index) {
   console.debug('[loadStep]', index, 'of', steps.length, 'jobId:', currentJobId);
+  // Leave edge-pick mode if active (the model is about to be replaced).
+  if (typeof _pick !== 'undefined' && _pick.active && !_pick.dragging) exitEdgePick();
   // Show feature tree when clicking a step
   document.getElementById('sidebar').classList.remove('closed');
   const url = currentJobId ? `/api/job/${currentJobId}/step/${index}` : `/api/step/${index}`;
@@ -1508,6 +1510,221 @@ window.applyEdits = async function () {
     btn.disabled = false;
   }
 };
+
+window.downloadEditedStep = function () {
+  if (!currentJobId) return;
+  window.location.href = `/api/job/${currentJobId}/download-step`;
+};
+
+// ─── Per-edge fillet/chamfer picking: hover-highlight + drag-arrow ────────────
+const _pick = { active: false, kind: null, edges: [], lines: [], group: null,
+  hovered: -1, selected: -1, arrow: null, dragging: false, radius: 0,
+  maxR: 5, diag: 10, mid: null, dir: null, center: [0, 0, 0] };
+const _pickRay = new THREE.Raycaster();
+
+function _pickXY(ev) {
+  const r = renderer.domElement.getBoundingClientRect();
+  return new THREE.Vector2(
+    ((ev.clientX - r.left) / r.width) * 2 - 1,
+    -((ev.clientY - r.top) / r.height) * 2 + 1);
+}
+
+window.startEdgePick = async function (kind) {
+  if (!currentJobId) { alert('Build a model first.'); return; }
+  exitEdgePick();
+  const status = document.getElementById('et-status');
+  status.innerHTML = '<i class="ri-loader-4-line fspin"></i> Loading edges…';
+  let data;
+  try { data = await (await fetch(`/api/job/${currentJobId}/edges`)).json(); }
+  catch (e) { status.textContent = ''; alert('Could not load edges.'); return; }
+  if (!data.ok || !(data.edges || []).length) {
+    status.textContent = ''; alert(data.error || 'No edges to pick.'); return;
+  }
+  _pick.active = true; _pick.kind = kind; _pick.edges = data.edges;
+  const lo = data.bbox_min, hi = data.bbox_max;
+  _pick.diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) || 10;
+  _pick.maxR = _pick.diag * 0.18;
+  _pick.center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  _pickRay.params.Line.threshold = _pick.diag * 0.012;
+
+  const grp = new THREE.Group();
+  _pick.lines = [];
+  data.edges.forEach((e, i) => {
+    const pts = e.pts.map(p => new THREE.Vector3(p[0], p[1], p[2]));
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: 0x3FA7FF, transparent: true, opacity: 0.4, depthTest: false }));
+    line.renderOrder = 4; line.userData.ei = i;
+    grp.add(line); _pick.lines.push(line);
+  });
+  _pick.group = grp; modelGroup.add(grp);
+
+  setPickHint(`Hover an edge — click to place a ${kind}, then drag the arrow. Esc to cancel.`);
+  status.textContent = '';
+  const dom = renderer.domElement;
+  dom.addEventListener('pointermove', onPickMove);
+  dom.addEventListener('pointerdown', onPickDown, true);
+  window.addEventListener('keydown', onPickKey);
+  document.body.style.cursor = 'crosshair';
+};
+
+function exitEdgePick() {
+  if (_pick.group) { modelGroup.remove(_pick.group); _pick.group.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); }
+  removeArrow();
+  const dom = renderer.domElement;
+  dom.removeEventListener('pointermove', onPickMove);
+  dom.removeEventListener('pointerdown', onPickDown, true);
+  window.removeEventListener('keydown', onPickKey);
+  window.removeEventListener('pointerup', endArrowDrag);
+  Object.assign(_pick, { active: false, kind: null, edges: [], lines: [], group: null, hovered: -1, selected: -1, dragging: false });
+  if (controls) controls.enabled = true;
+  document.body.style.cursor = '';
+  setPickHint(null);
+  document.getElementById('pick-radius-label').style.display = 'none';
+}
+window.exitEdgePick = exitEdgePick;
+
+function onPickKey(ev) { if (ev.key === 'Escape') exitEdgePick(); }
+
+function setPickHint(txt) {
+  const h = document.getElementById('pick-hint');
+  if (!h) return;
+  if (txt) { h.textContent = txt; h.style.display = 'block'; } else h.style.display = 'none';
+}
+
+function _styleLine(i, mode) {
+  const l = _pick.lines[i]; if (!l) return;
+  if (mode === 'hover') { l.material.color.set(0xFFC83D); l.material.opacity = 1; }
+  else if (mode === 'sel') { l.material.color.set(0x3DDC84); l.material.opacity = 1; }
+  else { l.material.color.set(0x3FA7FF); l.material.opacity = 0.4; }
+}
+
+function onPickMove(ev) {
+  if (!_pick.active) return;
+  if (_pick.dragging) { onArrowDrag(ev); return; }
+  _pickRay.setFromCamera(_pickXY(ev), camera);
+  const hits = _pickRay.intersectObjects(_pick.lines, false);
+  const ei = hits.length ? hits[0].object.userData.ei : -1;
+  if (ei === _pick.hovered) return;
+  if (_pick.hovered >= 0 && _pick.hovered !== _pick.selected) _styleLine(_pick.hovered, 'base');
+  _pick.hovered = ei;
+  if (ei >= 0 && ei !== _pick.selected) _styleLine(ei, 'hover');
+  document.body.style.cursor = ei >= 0 ? 'pointer' : 'crosshair';
+}
+
+function onPickDown(ev) {
+  if (!_pick.active || ev.button !== 0) return;
+  // Clicking the arrow handle starts a radius drag.
+  if (_pick.arrow) {
+    _pickRay.setFromCamera(_pickXY(ev), camera);
+    if (_pickRay.intersectObject(_pick.arrow, true).length) {
+      ev.preventDefault(); ev.stopPropagation();
+      startArrowDrag(); return;
+    }
+  }
+  if (_pick.hovered >= 0) {
+    ev.preventDefault(); ev.stopPropagation();
+    selectEdge(_pick.hovered);
+  }
+}
+
+function selectEdge(ei) {
+  if (_pick.selected >= 0 && _pick.selected !== ei) _styleLine(_pick.selected, 'base');
+  _pick.selected = ei; _styleLine(ei, 'sel');
+  const e = _pick.edges[ei];
+  _pick.mid = e.mid;
+  const M = new THREE.Vector3(...e.mid);
+  const C = new THREE.Vector3(..._pick.center);
+  let D = M.clone().sub(C);
+  if (D.lengthSq() < 1e-6) D.set(0, 0, 1);
+  D.normalize();
+  _pick.dir = D;
+  _pick.radius = Math.max(_pick.diag * 0.02, 0.5);
+  buildArrow();
+  setPickHint(`Drag the arrow to set the ${_pick.kind} size, then release to apply. Esc to cancel.`);
+}
+
+function buildArrow() {
+  removeArrow();
+  const M = new THREE.Vector3(..._pick.mid);
+  const arrow = new THREE.ArrowHelper(_pick.dir, M, _arrowLen(), 0x3DDC84,
+    _arrowLen() * 0.35, _pick.diag * 0.03);
+  arrow.line.material.depthTest = false;
+  arrow.cone.material.depthTest = false;
+  arrow.renderOrder = 6;
+  // Fatten the shaft for easier grabbing.
+  arrow.line.material.linewidth = 3;
+  _pick.arrow = arrow; modelGroup.add(arrow);
+  updateRadiusLabel();
+}
+
+function _arrowLen() { return Math.max(_pick.diag * 0.04, _pick.radius * 2.2); }
+
+function updateArrow() {
+  if (!_pick.arrow) return;
+  _pick.arrow.setLength(_arrowLen(), _arrowLen() * 0.35, _pick.diag * 0.03);
+  updateRadiusLabel();
+}
+
+function removeArrow() {
+  if (_pick.arrow) {
+    modelGroup.remove(_pick.arrow);
+    _pick.arrow.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+    _pick.arrow = null;
+  }
+}
+
+function updateRadiusLabel() {
+  const lbl = document.getElementById('pick-radius-label');
+  if (!lbl || _pick.selected < 0) { if (lbl) lbl.style.display = 'none'; return; }
+  // Project the arrow tip to screen.
+  const tip = new THREE.Vector3(..._pick.mid).add(_pick.dir.clone().multiplyScalar(_arrowLen()));
+  tip.project(camera);
+  const r = renderer.domElement.getBoundingClientRect();
+  lbl.style.left = (r.left + (tip.x * 0.5 + 0.5) * r.width) + 'px';
+  lbl.style.top = (r.top + (-tip.y * 0.5 + 0.5) * r.height) + 'px';
+  lbl.textContent = `${_pick.kind === 'fillet' ? 'R' : 'C'} ${_pick.radius.toFixed(2)} mm`;
+  lbl.style.display = 'block';
+}
+
+function startArrowDrag() {
+  _pick.dragging = true;
+  if (controls) controls.enabled = false;
+  document.body.style.cursor = 'ns-resize';
+  window.addEventListener('pointerup', endArrowDrag);
+}
+
+function onArrowDrag(ev) {
+  _pickRay.setFromCamera(_pickXY(ev), camera);
+  // Closest param along the axis (M + t·D) to the camera ray → radius.
+  const M = new THREE.Vector3(..._pick.mid), D = _pick.dir;
+  const O = _pickRay.ray.origin, Rd = _pickRay.ray.direction;
+  const w0 = new THREE.Vector3().subVectors(M, O);
+  const a = Rd.dot(Rd), b = Rd.dot(D), c = D.dot(D), d = Rd.dot(w0), e = D.dot(w0);
+  const den = a * c - b * b;
+  let t = Math.abs(den) < 1e-9 ? e / c : (a * e - b * d) / den;
+  _pick.radius = Math.min(_pick.maxR, Math.max(_pick.diag * 0.005, t / 2.2));
+  updateArrow();
+}
+
+function endArrowDrag() {
+  if (!_pick.dragging) return;
+  _pick.dragging = false;
+  window.removeEventListener('pointerup', endArrowDrag);
+  if (controls) controls.enabled = true;
+  document.body.style.cursor = 'crosshair';
+  confirmEdgeFinish();
+}
+
+function confirmEdgeFinish() {
+  if (_pick.selected < 0 || !(_pick.radius > 0)) return;
+  window._editState.finishes.push({ type: _pick.kind, value: +_pick.radius.toFixed(3), edge_mid: _pick.mid });
+  renderEditChips();
+  const kind = _pick.kind;
+  exitEdgePick();
+  document.getElementById('et-status').textContent = `Applying ${kind}…`;
+  applyEdits();
+}
 
 function populateUI(statusData) {
   console.debug('[populateUI] building tree and timeline for', statusData.steps?.length, 'steps, filename:', statusData.filename);

@@ -232,6 +232,19 @@ body {
 .fe-item .fe-idx { color: var(--text-muted); font-size: 11px; min-width: 18px; }
 .fe-item .fe-x { margin-left: auto; color: var(--text-muted); font-size: 15px; }
 .fe-item.del .fe-x { color: #F85149; }
+#pick-radius-label {
+  position: absolute; z-index: 70; pointer-events: none;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 600;
+  padding: 3px 8px; border-radius: 6px; transform: translate(12px, -50%);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+#pick-hint {
+  position: absolute; bottom: 150px; left: 50%; transform: translateX(-50%);
+  z-index: 60; background: color-mix(in srgb, var(--bg-secondary) 92%, transparent);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px;
+  font-size: 12px; color: var(--text-secondary); backdrop-filter: blur(8px);
+  pointer-events: none; white-space: nowrap;
+}
 
 .feature-item {
   display: flex; align-items: center; gap: 10px;
@@ -876,9 +889,10 @@ body.live-split #viewer-analysis-label { display: block; }
        the recognized feature tree, then rebuild. Shown after a build. -->
   <div id="edit-toolbar" style="display:none;">
     <span class="et-title"><i class="ri-tools-fill"></i> Edit</span>
-    <button class="et-btn" onclick="addFinish('fillet')" title="Round selected edges"><i class="ri-scissors-cut-line"></i> Fillet</button>
-    <button class="et-btn" onclick="addFinish('chamfer')" title="Bevel selected edges"><i class="ri-triangle-line"></i> Chamfer</button>
+    <button class="et-btn" onclick="startEdgePick('fillet')" title="Pick an edge, drag to round it"><i class="ri-scissors-cut-line"></i> Fillet</button>
+    <button class="et-btn" onclick="startEdgePick('chamfer')" title="Pick an edge, drag to bevel it"><i class="ri-triangle-line"></i> Chamfer</button>
     <button class="et-btn" onclick="toggleFeatureEditor()" title="Edit recognized features"><i class="ri-node-tree"></i> Features</button>
+    <button class="et-btn ghost" onclick="downloadEditedStep()" title="Download current model as STEP"><i class="ri-download-2-line"></i> STEP</button>
     <span id="et-chips"></span>
     <button class="et-btn primary" id="et-rebuild" onclick="applyEdits()"><i class="ri-refresh-line"></i> Rebuild</button>
     <button class="et-btn ghost" onclick="resetEdits()" title="Discard edits">Reset</button>
@@ -888,6 +902,9 @@ body.live-split #viewer-analysis-label { display: block; }
     <div class="fe-head">Recognized features <span style="color:var(--text-muted);font-weight:400;">— click to delete on rebuild</span></div>
     <div id="fe-list"></div>
   </div>
+  <!-- Live radius readout while dragging the fillet/chamfer arrow -->
+  <div id="pick-radius-label" style="display:none;"></div>
+  <div id="pick-hint" style="display:none;"></div>
 
   <div id="empty-state">
     <i class="ri-box-3-line"></i>
@@ -1271,7 +1288,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260618editor" type="module"></script>
+<script src="/static/app.js?v=20260618edgepick" type="module"></script>
 </body>
 </html>
 

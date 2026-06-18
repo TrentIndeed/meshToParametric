@@ -698,17 +698,27 @@ async def edit_features(job_id: str, request: Request):
             {"error": "This model can't be edited yet (no saved build)."},
             status_code=400)
     body = await request.json()
+
+    def _mid(f):
+        m = f.get("edge_mid")
+        if isinstance(m, (list, tuple)) and len(m) == 3:
+            return [float(m[0]), float(m[1]), float(m[2])]
+        return None
+
     edits = {
         "deletes": [int(i) for i in body.get("deletes", [])],
         "suppress": [int(i) for i in body.get("suppress", [])],
         "finishes": [
-            {"type": str(f.get("type")), "value": float(f.get("value", 0))}
+            {"type": str(f.get("type")), "value": float(f.get("value", 0)),
+             "edge_mid": _mid(f)}
             for f in body.get("finishes", [])
             if f.get("type") in ("fillet", "chamfer") and float(f.get("value", 0)) > 0
         ],
     }
     from mesh2param.viz_server.rebuild import rebuild_from_bundle
-    res = await asyncio.to_thread(rebuild_from_bundle, bundle, edits)
+    # Refresh the model STEP so edge-picking + download reflect the edited model.
+    out_step = getattr(job, "cad_step_path", None)
+    res = await asyncio.to_thread(rebuild_from_bundle, bundle, edits, out_step)
     if not res.get("ok"):
         return JSONResponse(
             {"error": res.get("error", "rebuild failed"),
@@ -733,6 +743,39 @@ async def edit_features(job_id: str, request: Request):
         "applied": res.get("applied", []), "warnings": res.get("warnings", []),
         "cad_volume": res.get("cad_volume"),
     }
+
+
+@app.get("/api/job/{job_id}/edges")
+async def job_edges(job_id: str):
+    """Pickable CAD edges of the current built model (polylines + midpoints), for
+    the hover-highlight / per-edge fillet picking in the viewer."""
+    import asyncio
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    step_path = getattr(job, "cad_step_path", None)
+    if not step_path or not os.path.exists(step_path):
+        return JSONResponse({"error": "No model edges available yet."}, status_code=400)
+    from mesh2param.viz_server.rebuild import extract_edges
+    res = await asyncio.to_thread(extract_edges, step_path)
+    if not res.get("ok"):
+        return JSONResponse({"error": res.get("error", "edge extraction failed")},
+                            status_code=422)
+    return {"ok": True, "edges": res.get("edges", []),
+            "bbox_min": res.get("bbox_min"), "bbox_max": res.get("bbox_max")}
+
+
+@app.get("/api/job/{job_id}/download-step")
+async def download_step(job_id: str):
+    """Download the current (possibly edited) model as a STEP file."""
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    step_path = getattr(job, "cad_step_path", None)
+    if not step_path or not os.path.exists(step_path):
+        return JSONResponse({"error": "No STEP available."}, status_code=404)
+    fname = (job.filename or "model").rsplit(".", 1)[0] + ".step"
+    return FileResponse(step_path, media_type="application/step", filename=fname)
 
 
 @app.post("/api/queue/reset")

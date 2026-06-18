@@ -227,3 +227,4 @@ out.txt
 # Binary doc exports (keep sources elsewhere; don't version office files)
 *.docx
 *.docx.pdf
+_cadfit_tmp/

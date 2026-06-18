@@ -718,7 +718,17 @@ async def edit_features(job_id: str, request: Request):
     from mesh2param.viz_server.rebuild import rebuild_from_bundle
     # Refresh the model STEP so edge-picking + download reflect the edited model.
     out_step = getattr(job, "cad_step_path", None)
-    res = await asyncio.to_thread(rebuild_from_bundle, bundle, edits, out_step)
+    # Fast path: when the DELETE set is unchanged, reuse the cached base solid
+    # (no export). The build seeds the base with no deletes, so a first
+    # finish-only edit already hits it. Rebuilding the base only on delete change.
+    cur_deletes = frozenset(edits["deletes"]) | frozenset(edits["suppress"])
+    base_step = getattr(job, "cad_editbase_path", None)
+    base_deletes = getattr(job, "_edit_base_deletes", frozenset())
+    base_valid = bool(base_step and os.path.exists(base_step) and cur_deletes == base_deletes)
+    res = await asyncio.to_thread(
+        rebuild_from_bundle, bundle, edits, out_step, base_step, base_valid)
+    if res.get("ok") and not base_valid:
+        job._edit_base_deletes = cur_deletes  # base was rebuilt for this set
     if not res.get("ok"):
         return JSONResponse(
             {"error": res.get("error", "rebuild failed"),

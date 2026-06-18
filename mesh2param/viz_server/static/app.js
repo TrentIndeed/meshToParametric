@@ -1639,7 +1639,7 @@ function selectEdge(ei) {
   if (D.lengthSq() < 1e-6) D.set(0, 0, 1);
   D.normalize();
   _pick.dir = D;
-  _pick.radius = Math.max(_pick.diag * 0.02, 0.5);
+  _pick.radius = Math.max(0.5, Math.round(_pick.diag * 0.02 * 2) / 2);
   buildArrow();
   setPickHint(`Drag the arrow to set the ${_pick.kind} size, then release to apply. Esc to cancel.`);
 }
@@ -1683,7 +1683,8 @@ function updateRadiusLabel() {
   const r = renderer.domElement.getBoundingClientRect();
   lbl.style.left = (r.left + (tip.x * 0.5 + 0.5) * r.width) + 'px';
   lbl.style.top = (r.top + (-tip.y * 0.5 + 0.5) * r.height) + 'px';
-  lbl.textContent = `${_pick.kind === 'fillet' ? 'R' : 'C'} ${_pick.radius.toFixed(2)} mm`;
+  const rtxt = _pick.radius % 1 === 0 ? String(_pick.radius) : _pick.radius.toFixed(1);
+  lbl.textContent = `${_pick.kind === 'fillet' ? 'R' : 'C'} ${rtxt} mm`;
   lbl.style.display = 'block';
 }
 
@@ -1703,7 +1704,9 @@ function onArrowDrag(ev) {
   const a = Rd.dot(Rd), b = Rd.dot(D), c = D.dot(D), d = Rd.dot(w0), e = D.dot(w0);
   const den = a * c - b * b;
   let t = Math.abs(den) < 1e-9 ? e / c : (a * e - b * d) / den;
-  _pick.radius = Math.min(_pick.maxR, Math.max(_pick.diag * 0.005, t / 2.2));
+  // Snap to whole / half-whole millimetres (0.5 increments), min 0.5.
+  const raw = Math.min(_pick.maxR, Math.max(0.5, t / 2.2));
+  _pick.radius = Math.max(0.5, Math.round(raw * 2) / 2);
   updateArrow();
 }
 

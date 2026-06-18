@@ -385,6 +385,9 @@ class Job:
     # STEP of the current built solid (refreshed on each edit) — source for
     # pickable-edge extraction and the edited-model download.
     cad_step_path: str | None = None
+    # Cached BASE solid (tree minus current deletes, no finishes) so finish-only
+    # edits skip the export. _edit_base_deletes tracks which delete set it holds.
+    cad_editbase_path: str | None = None
     steps: list = field(default_factory=list)
     variants: list = field(default_factory=list)  # list of {name, strategy, steps}
     active_variant: int = 0  # index of currently selected variant
@@ -611,11 +614,16 @@ class JobQueue:
         # Persist the built solid as STEP so the feature-tree editor can extract
         # pickable edges fast and offer a download without re-running the build.
         cad_solid_path = Path("data") / f"cad_solid_{job.id}.step"
-        try:
-            Path(cad_solid_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+        # Separate cached BASE solid (no user finishes) so finish-only edits can
+        # skip the export and just re-fillet — see rebuild.rebuild_from_bundle.
+        cad_editbase_path = Path("data") / f"cad_editbase_{job.id}.step"
+        for _p in (cad_solid_path, cad_editbase_path):
+            try:
+                Path(_p).unlink(missing_ok=True)
+            except Exception:
+                pass
         job.cad_step_path = str(cad_solid_path)
+        job.cad_editbase_path = str(cad_editbase_path)
         try:
             cad_input_path.unlink(missing_ok=True)
         except Exception:
@@ -679,6 +687,8 @@ try:
         if result.solid is not None:
             import cadquery as _cq
             _cq.exporters.export(result.solid, r'{cad_solid_path}')
+            import shutil as _sh
+            _sh.copyfile(r'{cad_solid_path}', r'{cad_editbase_path}')
     except Exception:
         traceback.print_exc(file=sys.stdout)
     result.solid = None

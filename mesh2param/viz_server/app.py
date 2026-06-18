@@ -636,6 +636,13 @@ async def job_status(job_id: str):
         "variants": variants_info,
         "active_variant": getattr(job, 'active_variant', 0),
         "debug_summary": list(getattr(job, 'debug_summary', [])),
+        # Feature-tree editor: recognized features (indices match the rebuild
+        # bundle) + whether this build can be edited (has a saved bundle).
+        "editable": bool(getattr(job, "cad_bundle_path", None)),
+        "tree_features": [
+            {"index": i, "type": f.type.value, "depth": round(float(f.depth), 3)}
+            for i, f in enumerate(job.features.features)
+        ] if (job.features is not None and hasattr(job.features, "features")) else [],
     }
 
     # Include progress geometry if pipeline is still running

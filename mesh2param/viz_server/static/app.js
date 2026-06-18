@@ -2370,11 +2370,12 @@ function openFolderPanel(meshes) {
   document.getElementById('folder-title').textContent =
     (rel.split('/')[0] || 'Folder') + ' · ' + meshes.length + ' meshes';
   list.innerHTML = '';
-  panel.style.display = 'block';
-  // Keep the sidebar open so the browser stays visible across mesh loads.
-  const sb = document.getElementById('sidebar');
-  sb.classList.remove('closed');
-  if (window.innerWidth <= 768) sb.classList.add('open');
+  panel.style.display = 'flex';
+  panel.classList.remove('min');
+  // Own left panel; the feature tree shifts to its right (see CSS .folder-open).
+  document.body.classList.add('folder-open');
+  document.body.classList.remove('folder-min');
+  document.getElementById('folder-tab').style.display = 'none';
 
   meshes.forEach((file, i) => {
     const item = document.createElement('div');
@@ -2402,6 +2403,18 @@ window.closeFolderPanel = function () {
   window._folderActive = false;
   document.getElementById('folder-panel').style.display = 'none';
   document.getElementById('folder-list').innerHTML = '';
+  document.getElementById('folder-tab').style.display = 'none';
+  document.body.classList.remove('folder-open', 'folder-min');
+};
+
+window.toggleFolderMin = function () {
+  const panel = document.getElementById('folder-panel');
+  const tab = document.getElementById('folder-tab');
+  const min = !panel.classList.contains('min');
+  panel.classList.toggle('min', min);
+  document.body.classList.toggle('folder-min', min);
+  panel.style.display = min ? 'none' : 'flex';
+  tab.style.display = min ? 'flex' : 'none';
 };
 
 async function _renderThumbsSequential(meshes) {
@@ -2428,40 +2441,55 @@ function _getThumbRenderer() {
   return _thumbRenderer;
 }
 
-function _firstGeometry(obj) {
-  let geo = null;
-  obj.traverse(c => { if (!geo && c.isMesh && c.geometry) geo = c.geometry; });
-  return geo;
-}
-
-async function _loadGeometry(file) {
+// Load a mesh file into an Object3D. For OBJ/3MF this keeps the loader's full
+// scene graph (3MF build items carry per-mesh transforms — using the first raw
+// geometry, as before, dropped those and produced empty/blank thumbnails).
+async function _loadObject(file) {
   const ext = _meshExt(file.name);
   const buf = await file.arrayBuffer();
-  if (ext === 'stl') return new STLLoader().parse(buf);
-  if (ext === 'ply') return new PLYLoader().parse(buf);
-  if (ext === 'obj') return _firstGeometry(new OBJLoader().parse(new TextDecoder().decode(buf)));
-  if (ext === '3mf') return _firstGeometry(new ThreeMFLoader().parse(buf));
+  if (ext === 'stl') return new THREE.Mesh(new STLLoader().parse(buf));
+  if (ext === 'ply') return new THREE.Mesh(new PLYLoader().parse(buf));
+  if (ext === 'obj') return new OBJLoader().parse(new TextDecoder().decode(buf));
+  if (ext === '3mf') return new ThreeMFLoader().parse(buf);
   return null;
 }
 
+function _disposeObj(obj) {
+  obj.traverse(c => {
+    if (c.geometry) c.geometry.dispose();
+    if (c.material) { (Array.isArray(c.material) ? c.material : [c.material]).forEach(m => m.dispose()); }
+  });
+}
+
 async function _thumbnailFor(file) {
-  const geo = await _loadGeometry(file);
-  if (!geo || !geo.attributes || !geo.attributes.position) return null;
-  geo.computeVertexNormals();
-  geo.computeBoundingBox();
-  const c = geo.boundingBox.getCenter(new THREE.Vector3());
-  const sz = geo.boundingBox.getSize(new THREE.Vector3());
+  const obj = await _loadObject(file);
+  if (!obj) return null;
+  obj.updateMatrixWorld(true);
+  let hasMesh = false;
+  obj.traverse(c => {
+    if (c.isMesh && c.geometry && c.geometry.attributes.position) {
+      hasMesh = true;
+      if (!c.geometry.attributes.normal) c.geometry.computeVertexNormals();
+      c.material = new THREE.MeshStandardMaterial({ color: 0x9AA4AE, metalness: 0.1, roughness: 0.72 });
+    }
+  });
+  if (!hasMesh) return null;
+
+  // World-space bounds (honours child transforms), then centre + normalise.
+  const box = new THREE.Box3().setFromObject(obj);
+  if (box.isEmpty()) { _disposeObj(obj); return null; }
+  const c = box.getCenter(new THREE.Vector3());
+  const sz = box.getSize(new THREE.Vector3());
   const scl = 1.7 / (Math.max(sz.x, sz.y, sz.z) || 1);
+  obj.position.sub(c);                     // shift so world centre → origin
+
+  const grp = new THREE.Group();
+  grp.add(obj);
+  grp.scale.setScalar(scl);
+  grp.rotation.x = -Math.PI / 2 + 0.5;     // Z-up part → tilted iso view
+  grp.rotation.z = 0.5;
 
   const scene = new THREE.Scene();
-  const mat = new THREE.MeshStandardMaterial({ color: 0x9AA4AE, metalness: 0.1, roughness: 0.72 });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.set(-c.x, -c.y, -c.z);
-  const grp = new THREE.Group();
-  grp.add(mesh);
-  grp.scale.setScalar(scl);
-  grp.rotation.x = -Math.PI / 2 + 0.5;   // Z-up part -> tilted iso view
-  grp.rotation.z = 0.5;
   scene.add(grp);
   scene.add(new THREE.HemisphereLight(0xE0E8F0, 0x3D4450, 1.2));
   const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(2, 3, 2); scene.add(key);
@@ -2471,16 +2499,16 @@ async function _thumbnailFor(file) {
   const r = _getThumbRenderer();
   r.render(scene, cam);
   const url = r.domElement.toDataURL('image/png');
-  geo.dispose(); mat.dispose();
+  _disposeObj(obj);
   return url;
 }
 
 // Show raw mesh triangles in the viewer (before pipeline)
 function _showRawMesh(previewRes, animateToFit = true) {
   console.debug('[_showRawMesh] verts:', previewRes.mesh_vertices?.length, 'faces:', previewRes.mesh_faces?.length);
-  // Hide feature tree during mesh preview — it shows after pipeline completes.
-  // Keep the sidebar open while browsing a folder so the picker stays visible.
-  if (!window._folderActive) document.getElementById('sidebar').classList.add('closed');
+  // Hide feature tree during mesh preview — it shows after pipeline completes
+  // (the folder browser is a separate left panel, unaffected by this).
+  document.getElementById('sidebar').classList.add('closed');
   while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
 
   try {

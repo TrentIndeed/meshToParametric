@@ -118,7 +118,7 @@ body {
   min-width: 48px; max-width: 400px;
   background: var(--bg-secondary); border-right: 1px solid var(--border);
   overflow-y: auto; overflow-x: hidden; z-index: 50;
-  transition: transform 0.2s ease;
+  transition: transform 0.2s ease, left 0.2s ease;
 }
 #sidebar.closed { transform: translateX(-100%); }
 #sidebar.closed ~ #sidebar-tab { display: flex; }
@@ -139,8 +139,26 @@ body {
   display: flex; align-items: center; gap: 8px;
   white-space: nowrap; overflow: hidden;
 }
-/* ── Folder browser ── */
-#folder-panel { border-bottom: 1px solid var(--border); }
+/* ── Folder browser — own left panel, feature tree shifts right of it ── */
+#folder-panel {
+  position: fixed; top: 48px; left: 0; bottom: 80px; width: 232px;
+  background: var(--bg-secondary); border-right: 1px solid var(--border);
+  overflow-y: auto; overflow-x: hidden; z-index: 52; display: flex;
+  flex-direction: column;
+}
+#folder-panel.min { width: 0; border: none; overflow: hidden; }
+/* When the folder panel is open, push the feature tree to its right. */
+body.folder-open #sidebar { left: 232px; }
+body.folder-open.folder-min #sidebar { left: 0; }
+body.folder-open.folder-min #sidebar-tab { left: 0; }
+#folder-tab {
+  position: fixed; top: 56px; left: 0; z-index: 53;
+  width: 32px; height: 32px; align-items: center; justify-content: center;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-left: none; border-radius: 0 8px 8px 0; cursor: pointer;
+  color: var(--text-secondary); font-size: 15px; transition: color 0.2s;
+}
+#folder-tab:hover { color: var(--accent); }
 .folder-head {
   padding: 10px 14px; font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary);
@@ -151,12 +169,13 @@ body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   text-transform: none; letter-spacing: 0; font-weight: 500;
 }
-.folder-close {
-  margin-left: auto; background: none; border: none; cursor: pointer;
+.folder-min, .folder-close {
+  background: none; border: none; cursor: pointer;
   color: var(--text-muted); font-size: 15px; line-height: 1; padding: 2px;
 }
-.folder-close:hover { color: var(--accent); }
-#folder-list { max-height: 52vh; overflow-y: auto; padding: 6px; }
+.folder-min { margin-left: auto; }
+.folder-min:hover, .folder-close:hover { color: var(--accent); }
+#folder-list { flex: 1; overflow-y: auto; padding: 6px; }
 .folder-item {
   display: flex; align-items: center; gap: 10px; padding: 6px;
   border-radius: 8px; cursor: pointer; border: 1px solid transparent;
@@ -812,21 +831,24 @@ body.live-split #viewer-analysis-label { display: block; }
   <a href="/"><i class="ri-logout-box-r-line"></i> Exit to Landing</a>
 </div>
 
+<!-- Folder browser — its own left panel (left of the feature tree), minimizable -->
+<div id="folder-panel" style="display:none;">
+  <div class="folder-head">
+    <i class="ri-folder-3-line"></i>
+    <span id="folder-title">Folder</span>
+    <button class="folder-min" onclick="toggleFolderMin()" title="Minimize"><i class="ri-contract-left-line"></i></button>
+    <button class="folder-close" onclick="closeFolderPanel()" title="Close folder"><i class="ri-close-line"></i></button>
+  </div>
+  <div id="folder-list"></div>
+</div>
+<!-- Collapsed folder tab (click to expand) -->
+<div id="folder-tab" style="display:none;" onclick="toggleFolderMin()" title="Show folder"><i class="ri-folder-3-line"></i></div>
+
 <!-- Feature Tree Sidebar -->
 <div id="sidebar">
   <div class="header">
     <i class="ri-node-tree"></i> <span>Feature Tree</span>
     <button class="sidebar-toggle" onclick="var s=document.getElementById('sidebar'); if(window.innerWidth<=768){s.classList.toggle('open')}else{s.classList.toggle('closed')}" title="Toggle sidebar"><i class="ri-side-bar-line"></i></button>
-  </div>
-
-  <!-- Folder browser (shown when a folder is opened) -->
-  <div id="folder-panel" style="display:none;">
-    <div class="folder-head">
-      <i class="ri-folder-3-line"></i>
-      <span id="folder-title">Folder</span>
-      <button class="folder-close" onclick="closeFolderPanel()" title="Close folder"><i class="ri-close-line"></i></button>
-    </div>
-    <div id="folder-list"></div>
   </div>
 
   <!-- Component (top-level, like Onshape) -->
@@ -1288,7 +1310,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260618edgepick2" type="module"></script>
+<script src="/static/app.js?v=20260618fixes" type="module"></script>
 </body>
 </html>
 

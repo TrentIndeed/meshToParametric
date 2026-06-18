@@ -25,9 +25,26 @@ fit.py + KMeans in segment.py).
 
 **Next lever for the remaining 6 is UPSTREAM, not here:** (a) region-growing
 robustness on dense AI meshes (the open `docs/SEGMENTATION_HANDOFF.md` /
-"confetti" problem), and (b) seeding the pipeline RNGs for determinism. Both are
-larger, separate efforts. The contour-on-failure fallback now guarantees these
-never return nothing / 100% — they degrade to the contour path's number instead.
+"confetti" problem), and (b) DETERMINISM. The contour-on-failure fallback now
+guarantees these never return nothing / 100% — they degrade to the contour
+path's number instead.
+
+**Determinism — pinpointed (2026-06-17), NOT a quick fix.** The seedable RNGs
+are ALREADY seeded (KMeans `random_state=42` in segment.py, RANSAC
+`RandomState(42)` in fit.py; DBSCAN is deterministic). The real source is
+`ingest_mesh`: pymeshlab's quadric edge-collapse DECIMATION produces the SAME
+topology (e.g. AI12: 30000 faces / 14978 verts every run) but DIFFERENT VERTEX
+POSITIONS run-to-run (verified: 3 distinct vertex hashes; BLAS thread-pinning
+via OMP/MKL/OPENBLAS=1 does NOT fix it — it's VCGlib-internal parallel
+collapse-order tie-breaking). That jitter changes face normals → segmentation
+region counts swing (AI12: 203/217/228) → cad_vol_err swings (AI12 seen at
+13.5 / 18.6 / 29.2 / 45.7 / 100 across runs). Implications:
+  - the 6 failing parts' numbers are NOISE-DOMINATED; treat them as ranges.
+  - region-growing work (a) is hard to measure until this is fixed — they're
+    ENTANGLED, do determinism first.
+  - the fix is a deterministic decimator (replace the pymeshlab call, or find a
+    single-threaded/deterministic VCG mode) — a real, separate effort, not a
+    one-liner. Clean CAD is unaffected (it's below the decimation cap).
 
 ## Guiding principle
 This repo's bet was "get every stage right, no global correction." CADFit's was

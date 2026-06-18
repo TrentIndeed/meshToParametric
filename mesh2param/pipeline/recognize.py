@@ -69,6 +69,22 @@ def recognize_features(
         len(regions), len(fitted), graph.number_of_nodes(), len(edges),
     )
 
+    # REVOLVE check (Phase 4): a turned part (axisymmetric — every cross-section
+    # perpendicular to an axis is round) gets a revolve CANDIDATE stashed on the
+    # tree. The export builder builds both the prismatic solid AND the revolve
+    # and keeps whichever matches the target better (keep-better, like the
+    # contour router) — forcing the revolve is unsafe because its silhouette
+    # build can be badly wrong on a part that prismatic models well. The
+    # harmonic detector is strict, so this is a no-op for prismatic parts.
+    _revolve_candidate = None
+    try:
+        from mesh2param.pipeline.revolve_recognize import try_revolve_tree
+        rev_tree = try_revolve_tree(cleaned)
+        if rev_tree is not None:
+            _revolve_candidate = rev_tree.features[0].sketch_geometry
+    except Exception:
+        logger.debug("revolve recognition check failed", exc_info=True)
+
 
     region_lookup = {r.region_id: r for r in regions}
     fitted_lookup = {f.region_id: f for f in fitted}
@@ -362,6 +378,8 @@ def recognize_features(
             "num_assigned": len(assigned),
         },
     )
+    if _revolve_candidate is not None:
+        tree.metadata["revolve_candidate"] = _revolve_candidate
 
     logger.info(
         "Recognized %d features: %s",

@@ -777,6 +777,46 @@ def export_cadquery(
     # AI11 49.7% -> 21%) with zero risk to good builds (skipped below the
     # threshold). Lazy import avoids a circular dependency (contour_recon
     # imports helpers from this module).
+    # REVOLVE keep-better (Phase 4): if recognition flagged the body as a
+    # revolution, build the revolve and keep it only if it matches the target
+    # BETTER than the prismatic solid. Never forced — a revolve silhouette can
+    # be badly wrong on a part prismatic models well (so this guards against
+    # regression), and it wins for genuine turned parts.
+    _rev_sg = (feature_tree.metadata or {}).get("revolve_candidate")
+    if _rev_sg is not None and mesh_volume > 0:
+        try:
+            from mesh2param.models.feature import Feature as _F
+            rev_feat = _F(type=FeatureType.REVOLVE, face_indices=np.array([0]),
+                          sketch_geometry=_rev_sg)
+            rev_res = _build_revolve_result(rev_feat, cleaned, mesh_volume)
+            cur_vol = (variants[0].cad_volume if variants
+                       else _solid_volume(solid) if solid else 0.0)
+            cur_err = (abs(cur_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
+                       if solid is not None else 1e9)
+            # Clean CAD: STRICT — only swap when the revolve is genuinely better
+            # (protects the volume-accuracy guardrail). Dirty/AI: PREFER the
+            # revolve when it's close and not bad — for a turned part it's the
+            # correct, smooth representation (the mesh-derived prismatic profile
+            # is bumpy), which is what the user wants even at equal volume.
+            scan_mode = bool((getattr(cleaned, "metadata", None) or {})
+                             .get("scan_mode"))
+            use_rev = False
+            if rev_res is not None and rev_res.solid is not None:
+                re = rev_res.volume_error_pct
+                if re < cur_err - 1.0:
+                    use_rev = True
+                elif scan_mode and re <= cur_err + 3.0 and re < 25.0:
+                    use_rev = True
+            if use_rev:
+                logger.info("Revolve chosen: prismatic %.1f%% -> revolve %.1f%%"
+                            " (scan_mode=%s)", cur_err,
+                            rev_res.volume_error_pct, scan_mode)
+                solid = rev_res.solid
+                if variants:
+                    variants[0].cad_volume = rev_res.cad_volume
+        except Exception:
+            logger.debug("revolve keep-better failed", exc_info=True)
+
     # Build collapsed entirely (no solid from any variant): take the contour
     # path outright rather than returning nothing.
     if contour_fallback and solid is None:
@@ -6135,6 +6175,90 @@ def _apply_recognized_fillets_to_solid(
         len(applied_steps), _time.time() - pass_start,
     )
     return wp, applied_steps, applied_script
+
+
+def _build_revolve_result(feature, cleaned: CleanedMesh, mesh_volume: float,
+                          output_path=None):
+    """Build a CadQueryResult for a REVOLVE feature (turned part).
+
+    The feature's sketch_geometry carries axis_origin, axis_dir, and a
+    profile = [(height_along_axis, radius), ...]. We lift the profile into the
+    axis/radial half-plane, close it against the axis (r=0), and revolve 360
+    about the axis. Returns None on any failure so the caller falls back to the
+    prismatic path.
+    """
+    try:
+        import cadquery as cq
+    except Exception:
+        return None
+    sg = feature.sketch_geometry or {}
+    try:
+        origin = np.asarray(sg["axis_origin"], dtype=float)
+        axis = np.asarray(sg["axis_dir"], dtype=float)
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        profile = np.asarray(sg["profile"], dtype=float)   # (M,2): (h, r)
+        if profile.ndim != 2 or len(profile) < 3:
+            return None
+        tmp = (np.array([1.0, 0, 0]) if abs(axis[0]) < 0.9
+               else np.array([0, 1.0, 0]))
+        radial = np.cross(axis, tmp)
+        radial = radial / (np.linalg.norm(radial) + 1e-12)
+        hs = profile[:, 0]
+        rs = np.clip(profile[:, 1], 0.0, None)
+        # Closed loop in the (h, r) half-plane: down the axis, out along the
+        # profile, back to the axis.
+        loop = ([(float(hs[0]), 0.0)]
+                + list(zip(hs.tolist(), rs.tolist()))
+                + [(float(hs[-1]), 0.0)])
+        pts3 = [cq.Vector(*(origin + axis * h + radial * r)) for (h, r) in loop]
+        wire = cq.Wire.makePolygon(pts3 + [pts3[0]])
+        solid = cq.Solid.revolve(wire, [], 360.0, cq.Vector(*origin),
+                                 cq.Vector(*(origin + axis)))
+        wp = cq.Workplane(obj=solid)
+    except Exception:
+        logger.debug("Revolve solid build failed", exc_info=True)
+        return None
+
+    # Patch any residual mismatch (holes/steps the smooth profile missed).
+    try:
+        wp, _ = _residual_refine_solid(wp, cleaned, mesh_volume)
+    except Exception:
+        logger.debug("revolve residual refine failed", exc_info=True)
+
+    cad_vol = _solid_volume(wp)
+    if cad_vol <= 0:
+        return None
+    vol_err = (abs(cad_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
+               if mesh_volume > 0 else 100.0)
+    tv, tf = _tessellate_solid(wp)
+
+    step_path = ""
+    if output_path is not None:
+        try:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            export_solid = wp
+            unit_scale = float((getattr(cleaned, "metadata", None) or {})
+                               .get("unit_scale", 1.0) or 1.0)
+            if unit_scale != 1.0:
+                inv = 1.0 / unit_scale
+                mat = cq.Matrix([[inv, 0, 0, 0], [0, inv, 0, 0], [0, 0, inv, 0]])
+                export_solid = wp.newObject(
+                    [o.transformGeometry(mat) for o in wp.objects])
+            cq.exporters.export(export_solid, str(output_path))
+            step_path = str(output_path)
+        except Exception:
+            logger.debug("revolve STEP export failed", exc_info=True)
+
+    logger.info("Revolve export: cad_vol=%.1f, err=%.2f%%", cad_vol, vol_err)
+    return CadQueryResult(
+        solid=wp, tess_vertices=tv, tess_faces=tf,
+        variants=[BuildVariant(name="revolve", strategy="revolve",
+                               cad_volume=cad_vol)],
+        script="# Revolve reconstruction\nimport cadquery as cq\n",
+        step_path=step_path, mesh_volume=mesh_volume, cad_volume=cad_vol,
+        volume_error_pct=vol_err,
+        status="PASS" if vol_err < 10.0 else "FAIL")
 
 
 def _solid_volume(solid) -> float:

@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 class FeatureType(Enum):
     BASE_EXTRUSION = "BASE_EXTRUSION"
+    REVOLVE = "REVOLVE"
     POCKET = "POCKET"
     THROUGH_HOLE = "THROUGH_HOLE"
     BLIND_HOLE = "BLIND_HOLE"

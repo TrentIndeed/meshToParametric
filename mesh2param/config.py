@@ -50,6 +50,14 @@ class IngestConfig(BaseModel):
     # regularize front-end then recovers it). Only fires when still non-
     # watertight after Poisson, so clean meshes and ragged scans are untouched.
     voxel_repair: bool = True
+    # Final watertight GUARANTEE (dirty/scan only): if the repairs above leave
+    # the mesh non-watertight, alpha-wrap it to a manifold (CADFit-style). The
+    # prismatic reasoning (plan_extrusions, contour recon) needs watertight
+    # input — otherwise non-watertight AI meshes (e.g. contoured thin plates)
+    # yield 0 extrusion segments and collapse to a solid-rectangle base. Gated
+    # at runtime on pymeshlab's alpha-wrap plugin (Linux/container); no-op on
+    # Windows, so dev behavior is unchanged.
+    alpha_wrap_repair: bool = True
     # Scan recovery front-end (off for clean CAD meshes; the scan
     # classifier turns these on). See docs/SCAN_RECOVERY_PLAN.md.
     denoise_scan: bool = False          # feature-preserving surface denoise

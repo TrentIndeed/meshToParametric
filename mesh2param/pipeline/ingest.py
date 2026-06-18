@@ -175,6 +175,29 @@ def ingest_mesh(
         mesh = _decimate(mesh, config.max_faces)
         mesh = _fix_normals(mesh)
 
+    # Final watertight GUARANTEE (dirty/scan only): if the repairs above (and the
+    # output-cap decimation, which can re-open a voxel-repaired mesh) left it
+    # non-watertight, alpha-wrap to a manifold. Without this, non-watertight AI
+    # meshes give plan_extrusions 0 segments and the build collapses to a solid
+    # rectangle (AI10). Gated on the alpha-wrap plugin (Linux); _alpha_wrap
+    # returns None on Windows, so this is a no-op there and clean CAD never
+    # reaches it (needs_frontend is False). fast-simplification keeps the wrap
+    # watertight through the re-cap.
+    if needs_frontend and config.alpha_wrap_repair and not mesh.is_watertight:
+        try:
+            from mesh2param.pipeline.iou_refine import _alpha_wrap
+            wrapped = _alpha_wrap(mesh)
+        except Exception:
+            wrapped = None
+        if wrapped is not None and len(wrapped.faces) > 0 and wrapped.is_watertight:
+            logger.info("Alpha-wrap repair: non-watertight -> watertight "
+                        "manifold (%d -> %d faces)",
+                        len(mesh.faces), len(wrapped.faces))
+            mesh = wrapped
+            if config.max_faces and len(mesh.faces) > config.max_faces:
+                mesh = _decimate(mesh, config.max_faces)
+            mesh = _fix_normals(mesh)
+
     mesh, unit_scale = _normalize_scale(mesh, config)
 
     result = _build_cleaned_mesh(mesh, path)

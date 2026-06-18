@@ -286,6 +286,25 @@ def export_cadquery(
         )
         raise
 
+    # Ensure the base extrudes INTO the material, not away from it. recognize()
+    # fixes the base-plane normal axis but its SIGN can point outward — then the
+    # solid is built on the wrong side of the start face: right volume, wrong
+    # position (0 exact IoU while volume "passes"; AI10). If the extruded span's
+    # midpoint lands outside the mesh extent on the extrude axis, flip the dir
+    # and re-extract so the profile/holes stay consistent with the new basis.
+    _ax = int(np.argmax(np.abs(extrude_dir)))
+    _lo, _hi = float(profile_mesh.bbox[0][_ax]), float(profile_mesh.bbox[1][_ax])
+    _mid = extrude_start + float(extrude_dir[_ax]) * depth / 2.0
+    if not (_lo - 0.1 * depth <= _mid <= _hi + 0.1 * depth):
+        logger.info("Base extrude dir points outward; flipping into material (axis %d)", _ax)
+        extrude_dir = -extrude_dir
+        try:
+            profiles, extrude_start, hole_features, chamfer_features, fillet_features = \
+                _extract_profile_and_holes(profile_tree, profile_mesh, extrude_dir)
+        except Exception:
+            logger.exception("Stage 6b re-extract after dir flip failed")
+            raise
+
     if profiles is None or len(profiles) == 0:
         logger.error("Failed to extract base profile from mesh")
         if contour_fallback:

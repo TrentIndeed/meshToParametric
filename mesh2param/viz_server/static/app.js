@@ -1382,6 +1382,133 @@ function updateActiveStates() {
   document.querySelectorAll('.timeline-special').forEach(el => el.classList.remove('active'));
 }
 
+// ─── Feature-tree editor (StudioCAD-style) ───────────────────────────────────
+// Top bar adds finishing features (fillet/chamfer) and the feature list lets you
+// mark recognized features for deletion; "Rebuild" POSTs the full edit state to
+// /api/job/{id}/edit, which re-runs the CadQuery build and returns a new step.
+window._editState = { deletes: new Set(), finishes: [] };
+let _treeFeatures = [];
+
+function setupEditToolbar(statusData) {
+  const bar = document.getElementById('edit-toolbar');
+  if (!bar) return;
+  const editable = !!statusData.editable && statusData.status === 'done';
+  bar.style.display = editable ? 'flex' : 'none';
+  if (!editable) { document.getElementById('feature-editor').style.display = 'none'; return; }
+  _treeFeatures = statusData.tree_features || [];
+  // Reset edit state for a fresh build (new job_id) so stale edits don't leak.
+  if (bar.dataset.job !== statusData.job_id) {
+    bar.dataset.job = statusData.job_id;
+    window._editState = { deletes: new Set(), finishes: [] };
+    document.getElementById('feature-editor').style.display = 'none';
+  }
+  renderEditChips();
+}
+
+window.addFinish = function (kind) {
+  const dflt = kind === 'fillet' ? '2' : '1';
+  const raw = prompt(`${kind === 'fillet' ? 'Fillet radius' : 'Chamfer distance'} (mm):`, dflt);
+  if (raw === null) return;
+  const v = parseFloat(raw);
+  if (!(v > 0)) { alert('Enter a positive number.'); return; }
+  window._editState.finishes.push({ type: kind, value: v });
+  renderEditChips();
+};
+
+window.toggleFeatureEditor = function () {
+  const fe = document.getElementById('feature-editor');
+  const show = fe.style.display === 'none';
+  fe.style.display = show ? 'block' : 'none';
+  if (show) renderFeatureEditor();
+};
+
+function renderFeatureEditor() {
+  const list = document.getElementById('fe-list');
+  list.innerHTML = '';
+  if (!_treeFeatures.length) { list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No editable features.</div>'; return; }
+  _treeFeatures.forEach(f => {
+    const row = document.createElement('div');
+    const del = window._editState.deletes.has(f.index);
+    row.className = 'fe-item' + (del ? ' del' : '');
+    const info = featureIconInfo(f.type);
+    row.innerHTML = `<span class="fe-idx">${f.index}</span>` +
+      `<img src="/static/icons/${info.file}" style="width:20px;height:20px;border-radius:4px;">` +
+      `<span>${f.type}${f.depth ? ' · ' + f.depth + 'mm' : ''}</span>` +
+      `<i class="fe-x ri-${del ? 'arrow-go-back-line' : 'delete-bin-line'}"></i>`;
+    row.onclick = () => { toggleDeleteFeature(f.index); };
+    list.appendChild(row);
+  });
+}
+
+function toggleDeleteFeature(idx) {
+  const d = window._editState.deletes;
+  if (d.has(idx)) d.delete(idx); else d.add(idx);
+  renderFeatureEditor();
+  renderEditChips();
+}
+
+function renderEditChips() {
+  const chips = document.getElementById('et-chips');
+  if (!chips) return;
+  chips.innerHTML = '';
+  window._editState.finishes.forEach((f, i) => {
+    const c = document.createElement('span');
+    c.className = 'et-chip';
+    c.innerHTML = `<span><b>${f.type === 'fillet' ? 'Fillet' : 'Chamfer'}</b> ${f.value}mm</span><span class="x">&times;</span>`;
+    c.querySelector('.x').onclick = () => { window._editState.finishes.splice(i, 1); renderEditChips(); };
+    chips.appendChild(c);
+  });
+  const nDel = window._editState.deletes.size;
+  if (nDel) {
+    const c = document.createElement('span');
+    c.className = 'et-chip';
+    c.style.borderColor = '#F85149';
+    c.innerHTML = `<span><b>${nDel}</b> deleted</span>`;
+    chips.appendChild(c);
+  }
+}
+
+window.resetEdits = function () {
+  window._editState = { deletes: new Set(), finishes: [] };
+  renderEditChips();
+  document.getElementById('feature-editor').style.display = 'none';
+  document.getElementById('et-status').textContent = '';
+  // Reload the original final model.
+  if (steps && steps.length) loadStep(steps.length - 1);
+};
+
+window.applyEdits = async function () {
+  if (!currentJobId) { alert('Build a model first.'); return; }
+  const es = window._editState;
+  if (!es.finishes.length && !es.deletes.size) { document.getElementById('et-status').textContent = 'No edits to apply.'; return; }
+  const btn = document.getElementById('et-rebuild');
+  const status = document.getElementById('et-status');
+  btn.disabled = true;
+  status.innerHTML = '<i class="ri-loader-4-line fspin"></i> Rebuilding…';
+  try {
+    const res = await fetch(`/api/job/${currentJobId}/edit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deletes: [...es.deletes], finishes: es.finishes }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      status.textContent = '';
+      alert('Rebuild failed: ' + (data.error || res.status) + (data.detail ? '\n' + data.detail : ''));
+      return;
+    }
+    await loadStep(data.step_index);
+    const warn = (data.warnings || []).length ? ' (' + data.warnings.join('; ') + ')' : '';
+    const napp = (data.applied || []).length;
+    status.textContent = `✓ Rebuilt · ${napp} finish${napp === 1 ? '' : 'es'}${es.deletes.size ? ', ' + es.deletes.size + ' deleted' : ''}${warn}`;
+  } catch (e) {
+    console.error('[edit] rebuild error', e);
+    status.textContent = '';
+    alert('Rebuild error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 function populateUI(statusData) {
   console.debug('[populateUI] building tree and timeline for', statusData.steps?.length, 'steps, filename:', statusData.filename);
   const list = document.getElementById('feature-list');
@@ -1429,6 +1556,8 @@ function populateUI(statusData) {
     item.onclick = () => loadStep(i);
     list.appendChild(item);
   });
+
+  setupEditToolbar(statusData);
 
   // --- Bottom timeline: variant thumbnails ---
   // Each variant is a different build order of the same part.

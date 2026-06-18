@@ -677,6 +677,64 @@ async def job_mesh(job_id: str):
     }
 
 
+@app.post("/api/job/{job_id}/edit")
+async def edit_features(job_id: str, request: Request):
+    """Rebuild the model from an EDITED feature tree (StudioCAD-style editing).
+
+    Body: {deletes:[idx], suppress:[idx], finishes:[{type:'fillet'|'chamfer',
+    value:mm}]}. The full edit state is sent each time and applied to the
+    ORIGINAL build bundle (idempotent), so the result replaces a single "Edited"
+    construction step rather than stacking. Returns the new step index; the
+    frontend then loads /step/{index} as usual.
+    """
+    import asyncio
+
+    job = queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    bundle = getattr(job, "cad_bundle_path", None)
+    if not bundle:
+        return JSONResponse(
+            {"error": "This model can't be edited yet (no saved build)."},
+            status_code=400)
+    body = await request.json()
+    edits = {
+        "deletes": [int(i) for i in body.get("deletes", [])],
+        "suppress": [int(i) for i in body.get("suppress", [])],
+        "finishes": [
+            {"type": str(f.get("type")), "value": float(f.get("value", 0))}
+            for f in body.get("finishes", [])
+            if f.get("type") in ("fillet", "chamfer") and float(f.get("value", 0)) > 0
+        ],
+    }
+    from mesh2param.viz_server.rebuild import rebuild_from_bundle
+    res = await asyncio.to_thread(rebuild_from_bundle, bundle, edits)
+    if not res.get("ok"):
+        return JSONResponse(
+            {"error": res.get("error", "rebuild failed"),
+             "detail": res.get("detail")}, status_code=422)
+
+    from mesh2param.pipeline.export_cadquery import ConstructionStep
+    step = ConstructionStep(
+        name="Edited", tess_vertices=np.asarray(res["verts"]),
+        tess_faces=np.asarray(res["faces"]), volume=float(res.get("cad_volume", 0.0)))
+    idx = getattr(job, "_edit_step_index", None)
+    if idx is not None and 0 <= idx < len(job.steps):
+        job.steps[idx] = step
+    else:
+        job.steps.append(step)
+        idx = len(job.steps) - 1
+        job._edit_step_index = idx
+    job.steps_version += 1
+    job.cad_volume = float(res.get("cad_volume", job.cad_volume))
+    return {
+        "ok": True, "step_index": idx, "num_steps": len(job.steps),
+        "faces": int(np.asarray(res["faces"]).shape[0]),
+        "applied": res.get("applied", []), "warnings": res.get("warnings", []),
+        "cad_volume": res.get("cad_volume"),
+    }
+
+
 @app.post("/api/queue/reset")
 async def queue_reset():
     """Last-resort recovery: kill the in-flight CadQuery subprocess,
@@ -905,12 +963,24 @@ async def status_legacy():
     steps_info = [{"index": i, "name": s.name, "volume": round(s.volume, 1),
                    "has_geometry": s.tess_vertices is not None and len(s.tess_vertices) > 0}
                   for i, s in enumerate(job.steps)]
+    # Recognized features (for the feature-tree editor) — indices match the
+    # rebuild bundle's tree.features, so deleting index i here deletes feature i
+    # on rebuild. Only meaningful once a build with a saved bundle exists.
+    tree_features = []
+    if job.features is not None and hasattr(job.features, "features"):
+        for i, f in enumerate(job.features.features):
+            tree_features.append({
+                "index": i, "type": f.type.value,
+                "depth": round(float(f.depth), 3),
+            })
     return {
         "job_id": job.id,
         "status": job.status,
         "tokens_used": queue.tokens_spent,
         "num_steps": len(job.steps),
         "steps": steps_info,
+        "tree_features": tree_features,
+        "editable": bool(getattr(job, "cad_bundle_path", None)),
         "mesh_volume": round(job.mesh_volume, 1),
         "cad_volume": round(job.cad_volume, 1),
         "error": job.error,

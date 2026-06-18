@@ -379,6 +379,9 @@ class Job:
     # Pipeline results
     features: object = None
     cleaned: object = None
+    # Durable pickle of (tree, cleaned, body_results, decomposition) written at
+    # build time so the feature-tree editor can re-run export on a mutated tree.
+    cad_bundle_path: str | None = None
     steps: list = field(default_factory=list)
     variants: list = field(default_factory=list)  # list of {name, strategy, steps}
     active_variant: int = 0  # index of currently selected variant
@@ -707,6 +710,18 @@ except BaseException as _exc:
             os.replace(p + ".tmp", p)
             bundle['input_written'] = True
             bundle['job'].building_live = True  # build is starting -> show pane
+            # Durable copy for interactive re-builds (feature tree editing): the
+            # /api/job/{id}/edit endpoint loads this, mutates the tree, and
+            # re-runs export. Kept separate from cad_input (which gets unlinked).
+            try:
+                dur = Path("data") / f"cad_bundle_{bundle['job'].id}.pkl"
+                with open(str(dur) + ".tmp", "wb") as f:
+                    pickle.dump(
+                        (tree, cleaned, all_body_results, decomposition), f)
+                os.replace(str(dur) + ".tmp", str(dur))
+                bundle['job'].cad_bundle_path = str(dur)
+            except Exception:
+                logger.debug("Could not persist durable CAD bundle", exc_info=True)
             return True
         except Exception:
             logger.exception("Failed to hand input to CAD subprocess")

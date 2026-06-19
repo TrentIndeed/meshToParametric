@@ -128,7 +128,24 @@ def ingest_mesh(
         # closes them so the part has a real volume downstream.
         if config.poisson_reconstruct and not mesh.is_watertight:
             mesh = _poisson_reconstruct(mesh, config)
-        # Last resort: a non-manifold "soup" Poisson can't close (AI meshes).
+        # Prefer ALPHA-WRAP before the voxel fallback. Voxel-remesh (res=96)
+        # quantizes round holes onto the voxel grid -> blocky/bumpy bores that
+        # then fail cylinder detection (a hole comes out a faceted polygon, not
+        # a clean circle). Alpha-wrap watertights while preserving the curve, so
+        # cylinders stay round. Runs on the HIGH-RES mesh (before the output cap)
+        # for the smoothest result. Gated on the plugin (Linux); _alpha_wrap
+        # returns None on Windows, where voxel still covers the fallback.
+        if config.alpha_wrap_repair and not mesh.is_watertight:
+            try:
+                from mesh2param.pipeline.iou_refine import _alpha_wrap
+                wrapped = _alpha_wrap(mesh)
+            except Exception:
+                wrapped = None
+            if wrapped is not None and len(wrapped.faces) > 0 and wrapped.is_watertight:
+                logger.info("Alpha-wrap repair (pre-voxel): %d -> %d faces",
+                            len(mesh.faces), len(wrapped.faces))
+                mesh = wrapped
+        # Last resort: a non-manifold "soup" alpha-wrap/Poisson couldn't close.
         if config.voxel_repair and not mesh.is_watertight:
             mesh = _voxel_remesh_repair(mesh, config)
     except Exception:

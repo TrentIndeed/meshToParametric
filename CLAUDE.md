@@ -11,6 +11,29 @@ Target inflows (all the same "dirty mesh" problem): clean CAD STLs, **physical-p
 - **`docs/FILLET_AND_HOLE_HANDOFF.md`** — historical notes on Stages 4.5–6. The collinear-merge / reconciliation path it documents has been replaced by the stitched-fillets stage and the per-edge measured-radius matcher in `export_cadquery.py`. Read for background; current code is in `viz_server/job_queue.py` (stitched stage block) and `pipeline/export_cadquery.py` (`_apply_recognized_fillets_to_solid`).
 - **`docs/SEGMENTATION_HANDOFF.md`** — open issue with corner-triangle classification at fillet-fillet junctions in Stage 2.
 
+## Claude Operating Protocol (follow every session)
+Designed for the $200 Max plan: maximize repo improvement per unit of allowance,
+no blind rework. Full rationale in `docs/CLAUDE_USAGE_PLAN.md`.
+- **Classify the task**: GEOMETRY/recon vs WEB/infra/docs. The visual rules below
+  apply to GEOMETRY only — don't pay the render tax on a CSS/infra/doc fix.
+- **See before you fix** (GEOMETRY): before diagnosing, run
+  `scripts/diag_render_sheet.py <part>` (in the `mesh2param` container; see plan
+  doc for the mount line) and READ the PNG. Diagnose from the heatmap
+  (red=extra, blue=inside/missing) + overlay, NOT from IoU/volume alone — volume
+  error hides shape failures (AI13: vol_err 1% but a hollow box modeled as a
+  solid-with-pockets, IoU 0.55).
+- **Verify before you claim**: re-render before/after. Clean-CAD changes →
+  `pytest tests/test_step_comparison.py` (must stay 18/7). AI changes → container
+  `diag_ai_build.py` on the AFFECTED parts for exact IoU. Report the delta; never
+  say "works" without it.
+- **Escalate only on a trigger**: "audit/all parts" → one diagnosis subagent per
+  part + synthesis; change to a load-bearing stage (ingest/segment/fit/recognize)
+  → an adversarial-verify subagent that tries to refute the fix; any pipeline
+  behavior change → exactly ONE full AI-set container run (not per tweak).
+- **Budget**: one composited sheet per part (≤1568px); recall memory before
+  re-investigating, record after; product-facing AI features use the metered API,
+  never this dev subscription.
+
 ## Setup
 ```bash
 pip install -e ".[dev]"

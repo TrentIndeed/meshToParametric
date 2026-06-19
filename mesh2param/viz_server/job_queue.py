@@ -434,6 +434,33 @@ class JobQueue:
             target=self._watchdog_loop, daemon=True, name="job-queue-watchdog",
         )
         self._watchdog.start()
+        # Cloud (USE_MODAL=1): poll the parallel Modal calls and finalize jobs
+        # as they complete. No-op cost when disabled (thread just sleeps).
+        self._modal_poller = threading.Thread(
+            target=self._modal_poller_loop, daemon=True, name="modal-poller",
+        )
+        self._modal_poller.start()
+
+    def _modal_poller_loop(self):
+        """Finalize jobs dispatched to Modal as their isolated containers finish."""
+        from mesh2param.viz_server import modal_runner
+        while True:
+            time.sleep(1.0)
+            if not modal_runner.is_enabled():
+                continue
+            for job in list(self._jobs.values()):
+                if job.status == "processing" and getattr(job, "_modal_call_id", None) \
+                        and not getattr(job, "_modal_done", False):
+                    try:
+                        if modal_runner.poll_and_finalize(job):
+                            job._modal_done = True
+                            if self._on_complete and job.status == "done":
+                                try:
+                                    self._on_complete(job)
+                                except Exception:
+                                    logger.debug("on_complete failed", exc_info=True)
+                    except Exception:
+                        logger.exception("Modal poller error on job %s", job.id)
 
     def set_on_complete(self, fn):
         """Set a callback for when a job completes. fn(job) is called."""
@@ -593,7 +620,10 @@ class JobQueue:
                     or job.error == "Job cancelled"
                     or "cancel" in (job.error or "").lower()
                 )
-                keep = cancelled or job.status == "done"
+                # Modal jobs are still "processing" right after dispatch (the
+                # poller finalizes later) — keep their file so re-analyze works.
+                keep = (cancelled or job.status == "done"
+                        or getattr(job, "_modal_call_id", None) is not None)
                 if not keep:
                     Path(job.file_path).unlink(missing_ok=True)
 
@@ -768,6 +798,15 @@ except BaseException as _exc:
             IngestConfig,
         )
         from mesh2param.pipeline.ingest import ingest_mesh
+
+        # Cloud path (USE_MODAL=1): SPAWN the build in an isolated Modal container
+        # and return immediately — the worker fans the queue out to parallel
+        # containers, and the poller thread finalizes each as it completes. With
+        # USE_MODAL unset this is skipped entirely and the local path below runs.
+        from mesh2param.viz_server import modal_runner
+        if modal_runner.is_enabled():
+            modal_runner.dispatch(job)
+            return
 
         job.status = "processing"
         logger.info("Pipeline started for job %s (file=%r)", job.id, job.filename)

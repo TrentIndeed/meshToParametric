@@ -29,7 +29,8 @@ COPY . .
 # pymeshlab, lxml (trimesh's 3MF loader). trimesh pinned to the validated 4.11.5.
 RUN pip install --no-cache-dir -e ".[dev]" && \
     pip install --no-cache-dir \
-        trimesh==4.11.5 cadquery==2.7.0 manifold3d pymeshlab lxml
+        trimesh==4.11.5 cadquery==2.7.0 manifold3d pymeshlab lxml \
+        modal   # optional cloud dispatch (USE_MODAL=1); harmless when unused
 
 # SQLite DB lives here; mounted from the host at run time so it persists.
 RUN mkdir -p /app/data

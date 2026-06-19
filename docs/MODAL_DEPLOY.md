@@ -42,7 +42,28 @@ The web server stays as the front-end (uploads, auth, UI, serving results); the
 **heavy pipeline moves to Modal**, one container per customer job — concurrency-
 safe and parallel by construction. No in-process worker queue to overload.
 
-### Wiring the server to Modal (replaces the local job worker)
+### Enabling it on the server (IMPLEMENTED, flag-gated)
+The wiring is built in `mesh2param/viz_server/modal_runner.py` + the job worker,
+behind `USE_MODAL`. **Default off → the local worker path is 100% unchanged.** To
+turn it on:
+1. `modal deploy modal_app.py` (once) — makes `build_mesh` callable.
+2. Give the server the env (it has `modal` installed in the image):
+   ```
+   USE_MODAL=1
+   MODAL_TOKEN_ID=ak-...          # from modal.com → Settings → API Tokens
+   MODAL_TOKEN_SECRET=as-...      # (or mount ~/.modal.toml)
+   ```
+   (docker-compose: add them under `environment:`.)
+3. That's it. The worker now SPAWNS each job into its own Modal container and a
+   poller finalizes them → concurrent customers run in parallel, isolated. Auth,
+   billing, and the UI are unchanged; only the heavy compute moves out.
+
+Note: the cloud path returns the FINAL model (one step) — the live step-by-step
+"watch it build" pane and the in-browser feature editor (which need the local
+build bundle) are local-only for now; cloud jobs show progress then the result.
+Streaming + cloud editing are the documented next enhancements.
+
+### Wiring details (what modal_runner does)
 1. `modal deploy modal_app.py` — deploys `build_mesh` as a callable cloud function.
 2. In the server, look it up once and dispatch per job:
    ```python

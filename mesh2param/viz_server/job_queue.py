@@ -669,12 +669,19 @@ try:
     import cadquery  # noqa: F401
     print('CAD engine ready; waiting for feature tree...', flush=True)
     _in = r'{cad_input_path}'
-    _dl = time.time() + 300
+    # Wait generously: in STEP MODE the user pauses at each analysis stage, so
+    # the gap from pre-warm to feature-tree-ready can be many minutes. The old
+    # 300s timeout fired during those pauses and surfaced as a bogus "CadQuery
+    # failed". 1 hour covers any realistic step-through.
+    _dl = time.time() + 3600
     while time.time() < _dl:
         if os.path.exists(_in) and os.path.getsize(_in) > 0:
             time.sleep(0.15)   # let the parent's atomic rename settle
             break
         time.sleep(0.1)
+    if not (os.path.exists(_in) and os.path.getsize(_in) > 0):
+        print('No feature tree after wait window; exiting cleanly', flush=True)
+        sys.exit(0)
     with open(_in, 'rb') as f:
         tree, cleaned, all_body_results, decomposition, stitched_clusters = pickle.load(f)
     from mesh2param.pipeline.export_cadquery import export_cadquery

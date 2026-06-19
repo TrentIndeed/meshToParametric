@@ -29,8 +29,11 @@ if [ -n "$NATIVE" ]; then
     exec python -m mesh2param.viz_server.app
 fi
 
-if ! docker info >/dev/null 2>&1; then
-    echo "ERROR: Docker is not running. Start Docker (Desktop), or use --native." >&2
+# Readiness with a TIMEOUT — a half-stuck Docker makes `docker info` hang
+# forever (and so would this script). Fail fast instead.
+if ! timeout 25 docker info >/dev/null 2>&1; then
+    echo "ERROR: Docker isn't responding. Open Docker Desktop and wait until ready" >&2
+    echo "       (a hung Docker can need a restart / 'wsl --shutdown'), or use --native." >&2
     exit 1
 fi
 

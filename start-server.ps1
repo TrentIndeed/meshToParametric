@@ -38,9 +38,15 @@ if ($Native) {
 $image = "paramesh-server"
 $container = "paramesh-server"
 
-docker info *> $null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Docker is not running. Start Docker Desktop, or use -Native." -ForegroundColor Red
+# Docker readiness with a TIMEOUT — a half-stuck Docker Desktop makes `docker
+# info` hang forever (and so would this script). Fail fast instead.
+$dockerJob = Start-Job -ScriptBlock { docker info 2>$null | Out-Null; $LASTEXITCODE }
+$dockerOk = $false
+if (Wait-Job $dockerJob -Timeout 25) { $dockerOk = ((Receive-Job $dockerJob) -eq 0) }
+Stop-Job $dockerJob -ErrorAction SilentlyContinue
+Remove-Job $dockerJob -Force -ErrorAction SilentlyContinue
+if (-not $dockerOk) {
+    Write-Host "ERROR: Docker isn't responding. Open Docker Desktop and wait until it says 'running' (a hung Docker can need a restart / 'wsl --shutdown'), or run with -Native." -ForegroundColor Red
     exit 1
 }
 

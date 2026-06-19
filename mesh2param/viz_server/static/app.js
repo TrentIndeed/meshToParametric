@@ -2351,6 +2351,34 @@ const MESH_EXTS = ['stl', 'obj', 'ply', '3mf'];
 let _thumbRenderer = null;
 window._folderActive = false;
 
+// Thumbnail cache so closing + reopening a folder (or re-picking it) doesn't
+// re-render every mesh. Keyed by a STABLE file identity (path|size|mtime) since
+// re-picking a folder yields fresh File objects. In-memory for the session,
+// mirrored to localStorage so it also survives a page reload (size-capped).
+const _thumbCache = new Map();
+const _THUMB_LS_KEY = 'paramesh_thumb_cache_v1';
+const _thumbKey = (f) => `${f.webkitRelativePath || f.name}|${f.size}|${f.lastModified}`;
+try {
+  const saved = JSON.parse(localStorage.getItem(_THUMB_LS_KEY) || '{}');
+  for (const k in saved) _thumbCache.set(k, saved[k]);
+} catch (e) { /* corrupt/oversized cache — ignore */ }
+let _thumbSaveTimer = null;
+function _persistThumbCache() {
+  // Debounced; drop oldest entries if we blow the localStorage quota.
+  clearTimeout(_thumbSaveTimer);
+  _thumbSaveTimer = setTimeout(() => {
+    let entries = [..._thumbCache.entries()];
+    while (entries.length) {
+      try {
+        localStorage.setItem(_THUMB_LS_KEY, JSON.stringify(Object.fromEntries(entries)));
+        break;
+      } catch (e) {
+        entries = entries.slice(Math.ceil(entries.length / 4));  // quota hit: shed 25%
+      }
+    }
+  }, 800);
+}
+
 const _meshExt = (name) => (name.split('.').pop() || '').toLowerCase();
 const _fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
 
@@ -2417,21 +2445,41 @@ window.toggleFolderMin = function () {
   tab.style.display = min ? 'flex' : 'none';
 };
 
+function _setThumb(thumb, url) {
+  thumb.innerHTML = '';
+  const img = new Image();
+  img.src = url;
+  thumb.appendChild(img);
+}
+
 async function _renderThumbsSequential(meshes) {
+  let cachedAny = false;
   for (let i = 0; i < meshes.length; i++) {
     const item = document.querySelector(`.folder-item[data-idx="${i}"]`);
     if (!item || !window._folderActive) continue;
     const thumb = item.querySelector('.folder-thumb');
+    const key = _thumbKey(meshes[i]);
+    const hit = _thumbCache.get(key);
+    if (hit) {                       // cache hit — instant, no re-render
+      _setThumb(thumb, hit);
+      continue;
+    }
     try {
       const url = await _thumbnailFor(meshes[i]);
-      if (url) { thumb.innerHTML = ''; const img = new Image(); img.src = url; thumb.appendChild(img); }
-      else { thumb.innerHTML = '<i class="ri-shape-line"></i>'; }
+      if (url) {
+        _setThumb(thumb, url);
+        _thumbCache.set(key, url);
+        cachedAny = true;
+      } else {
+        thumb.innerHTML = '<i class="ri-shape-line"></i>';
+      }
     } catch (err) {
       console.warn('[folder] thumbnail failed for', meshes[i].name, err);
       thumb.innerHTML = '<i class="ri-error-warning-line"></i>';
     }
     await new Promise(r => setTimeout(r, 0));   // yield so the UI stays responsive
   }
+  if (cachedAny) _persistThumbCache();
 }
 
 function _getThumbRenderer() {

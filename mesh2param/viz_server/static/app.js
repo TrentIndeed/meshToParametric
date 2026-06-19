@@ -2282,7 +2282,22 @@ async function previewFile(file) {
     saveViewerState('preview');
     savedMeshPreview = previewRes;
     console.debug('[upload] state -> preview, showing raw mesh');
-    _showRawMesh(previewRes);
+
+    // Display the FULL-RESOLUTION mesh parsed client-side. The server preview is
+    // decimated to ~30k faces for the pipeline, which facets/bumps curved AI
+    // meshes — so render the real geometry the user actually has.
+    let _displayPreview = previewRes;
+    try {
+      const obj = await _loadObject(file);
+      const arr = obj && _hasMesh(obj) ? _objToArrays(obj) : null;
+      if (arr) {
+        _displayPreview = { ...previewRes, mesh_vertices: arr.vertices, mesh_faces: arr.faces };
+        console.debug('[upload] showing full-res client mesh:', arr.faces.length / 3, 'faces');
+      }
+    } catch (e) {
+      console.warn('[upload] full-res client parse failed; using server preview', e);
+    }
+    _showRawMesh(_displayPreview);
 
     // Show preview info bar with complexity meter
     document.getElementById('preview-bar').style.display = 'block';
@@ -2535,6 +2550,32 @@ function _hasMesh(obj) {
         && c.geometry.attributes.position.count > 0) found = true;
   });
   return found;
+}
+
+// Flatten a parsed Object3D into { vertices: [x,y,z,...], faces: [i,j,k,...] },
+// merging all meshes (with their world transforms) and generating indices for
+// non-indexed geometry. Used to display the FULL-RESOLUTION uploaded mesh
+// instead of the server's decimated preview.
+function _objToArrays(obj) {
+  obj.updateMatrixWorld(true);
+  const vertices = [];
+  const faces = [];
+  let base = 0;
+  const v = new THREE.Vector3();
+  obj.traverse(c => {
+    if (!c.isMesh || !c.geometry || !c.geometry.attributes.position) return;
+    const pos = c.geometry.attributes.position;
+    const mw = c.matrixWorld;
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(mw);
+      vertices.push(v.x, v.y, v.z);
+    }
+    const idx = c.geometry.index;
+    if (idx) { for (let i = 0; i < idx.count; i++) faces.push(base + idx.getX(i)); }
+    else { for (let i = 0; i < pos.count; i++) faces.push(base + i); }
+    base += pos.count;
+  });
+  return faces.length >= 3 ? { vertices, faces } : null;
 }
 
 // Direct 3MF parse: a .3mf is a ZIP whose model XML holds <vertex x y z> +

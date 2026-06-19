@@ -16,6 +16,16 @@ modal setup          # authenticate in the browser
 modal run modal_app.py                        # all AI1..AI15
 modal run modal_app.py --parts AI9,AI12,AI13  # a subset
 ```
+PROVEN: full 15-part run = **mean IoU 0.780, wall ~195s** (~3.3 min) in parallel
+isolated containers — vs 15-20 min sequential, and no pymeshlab stalls.
+
+### Windows gotchas (one time)
+- Set UTF-8 or the Modal CLI crashes printing its `✓`:
+  `setx PYTHONUTF8 1`  (new shells), or per-shell `$env:PYTHONUTF8=1`.
+- `modal` isn't on PATH after `pip install` — use `python -m modal ...`.
+- A burst of `Task was destroyed ... / aclose(): asynchronous generator is
+  already running` AFTER `✓ App completed` is HARMLESS Modal-on-Windows-3.13
+  shutdown noise — the run already succeeded. (Filter it: `... | Select-String IoU`.)
 The local entrypoint reads `models/<part>/*.3mf` on your machine, ships the bytes
 to Modal, and `build_mesh.starmap` fans them out across containers in parallel.
 Prints each part's IoU + a mean. First run builds the image (~few min, cached

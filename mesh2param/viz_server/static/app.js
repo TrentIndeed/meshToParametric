@@ -2285,19 +2285,28 @@ async function previewFile(file) {
 
     // Display the FULL-RESOLUTION mesh parsed client-side. The server preview is
     // decimated to ~30k faces for the pipeline, which facets/bumps curved AI
-    // meshes — so render the real geometry the user actually has.
+    // meshes — so render the real geometry the user actually has. Keep BOTH so a
+    // toggle can A/B the full mesh vs the decimated copy the pipeline works on.
     let _displayPreview = previewRes;
+    window._previewVariants = null;
     try {
       const obj = await _loadObject(file);
       const arr = obj && _hasMesh(obj) ? _objToArrays(obj) : null;
       if (arr) {
         _displayPreview = { ...previewRes, mesh_vertices: arr.vertices, mesh_faces: arr.faces };
-        console.debug('[upload] showing full-res client mesh:', arr.faces.length / 3, 'faces');
+        window._previewVariants = {
+          which: 'full',
+          full: { vertices: arr.vertices, faces: arr.faces, n: arr.faces.length / 3 },
+          decimated: { vertices: previewRes.mesh_vertices, faces: previewRes.mesh_faces,
+                       n: (previewRes.mesh_faces ? previewRes.mesh_faces.length : 0) / 3 },
+        };
+        console.debug('[upload] full-res', arr.faces.length / 3, 'vs decimated', window._previewVariants.decimated.n);
       }
     } catch (e) {
       console.warn('[upload] full-res client parse failed; using server preview', e);
     }
     _showRawMesh(_displayPreview);
+    _setupQualityToggle();
 
     // Show preview info bar with complexity meter
     document.getElementById('preview-bar').style.display = 'block';
@@ -2354,6 +2363,28 @@ async function previewFile(file) {
     loading.classList.remove('show');
   }
 }
+
+// A/B the full-resolution mesh against the pipeline's decimated copy so you can
+// SEE what decimation does to curves. Shows the face counts on the button.
+function _setupQualityToggle() {
+  const btn = document.getElementById('preview-quality-toggle');
+  if (!btn) return;
+  const v = window._previewVariants;
+  if (!v || !v.decimated.faces || v.decimated.n === 0) { btn.style.display = 'none'; return; }
+  btn.style.display = '';
+  const lbl = () => `Showing: ${v.which === 'full' ? 'Full' : 'Decimated'} (` +
+    `${(v.which === 'full' ? v.full.n : v.decimated.n).toLocaleString()} faces)`;
+  btn.textContent = lbl();
+}
+
+window.togglePreviewQuality = function () {
+  const v = window._previewVariants;
+  if (!v) return;
+  v.which = v.which === 'full' ? 'decimated' : 'full';
+  const m = v.which === 'full' ? v.full : v.decimated;
+  _showRawMesh({ mesh_vertices: m.vertices, mesh_faces: m.faces }, false);
+  _setupQualityToggle();
+};
 
 document.getElementById('file-input').addEventListener('change', async (e) => {
   const f = e.target.files[0];

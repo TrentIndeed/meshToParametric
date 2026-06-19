@@ -1102,6 +1102,10 @@ body.live-split #viewer-analysis-label { display: block; }
     <span id="preview-faces"></span>
     <span id="preview-dims"></span>
     <span id="preview-tokens" style="color:var(--accent)"></span>
+    <button id="preview-quality-toggle" onclick="togglePreviewQuality()" title="Toggle between the full-resolution mesh and the pipeline's decimated copy"
+      style="display:none; margin-left:auto; cursor:pointer; font-family:inherit; font-size:11px; padding:3px 9px; border-radius:6px; border:1px solid var(--border); background:var(--bg-tertiary); color:var(--text-primary);">
+      Showing: Full
+    </button>
   </div>
   <!-- Complexity meter -->
   <div style="display:flex; align-items:center; gap:10px;">
@@ -1310,7 +1314,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260619fullres" type="module"></script>
+<script src="/static/app.js?v=20260619qtoggle" type="module"></script>
 </body>
 </html>
 

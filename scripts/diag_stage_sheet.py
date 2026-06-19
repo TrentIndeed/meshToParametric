@@ -123,19 +123,28 @@ def render(part, out_dir):
     rv, rf = _decimate(raw.vertices, raw.faces)
     cdv, cdf = _decimate(cv, cf)
 
-    # Per-face region colour (on the FULL cleaned faces) + a render sample.
+    # Colour only the SIGNIFICANT regions distinctly; tiny sliver/noise regions
+    # go light grey so they don't masquerade as catastrophic shatter. (Lesson
+    # from AI13: 64 sub-20-face slivers + equal-bright colours made coherent
+    # faces look totally fragmented when the top 6 regions actually held 64%.)
+    total_f = len(cf)
+    sig_min = max(20, int(0.005 * total_f))
+    order = sorted(range(len(regs)), key=lambda i: len(regs[i].face_indices), reverse=True)
+    sig = [i for i in order if len(regs[i].face_indices) >= sig_min][:20]
     try:
         import distinctipy
-        cols = distinctipy.get_colors(max(1, len(regs)), rng=0)
+        palette = distinctipy.get_colors(max(1, len(sig)), rng=0)
     except Exception:
         cmap = plt.cm.tab20
-        cols = [cmap(i % 20)[:3] for i in range(max(1, len(regs)))]
-    fcol = np.tile(np.array([0.78, 0.5, 0.5, 1.0]), (len(cf), 1))  # unassigned=dusty red
-    for ri, reg in enumerate(regs):
-        idx = np.asarray(reg.face_indices, int)
-        idx = idx[(idx >= 0) & (idx < len(cf))]
-        fcol[idx] = (*cols[ri], 1.0)
-    samp = _sample_faces(len(cf))
+        palette = [cmap(k % 20)[:3] for k in range(max(1, len(sig)))]
+    SLIVER = np.array([0.86, 0.87, 0.89, 1.0])
+    fcol = np.tile(SLIVER, (total_f, 1))
+    for k, ri in enumerate(sig):
+        idx = np.asarray(regs[ri].face_indices, int)
+        idx = idx[(idx >= 0) & (idx < total_f)]
+        fcol[idx] = (*palette[k], 1.0)
+    n_sig = len(sig)
+    samp = _sample_faces(total_f)
 
     n_sharp = sum(1 for e in edges if e.transition_type.value == "sharp")
     n_fil = sum(1 for e in edges if e.transition_type.value == "fillet")
@@ -144,13 +153,14 @@ def render(part, out_dir):
 
     fig = plt.figure(figsize=(14.5, 7.2))
     fig.suptitle(
-        f"{part}   scan_mode={dirty}   ext={ext}mm   "
-        f"{len(regs)} regions   edges: sharp={n_sharp} fillet={n_fil} chamfer={n_cham}",
+        f"{part}   scan_mode={dirty}   ext={ext}mm   {len(regs)} regions "
+        f"({n_sig} significant)   edges: sharp={n_sharp} fillet={n_fil} chamfer={n_cham}",
         fontsize=11, y=0.98)
     GREY = (0.62, 0.66, 0.70, 1.0)
     views = [("iso", 22, -60), ("top", 80, -90)]
     titles = ["raw mesh (orig frame)", "cleaned + axes (alignment)",
-              f"segmentation ({len(regs)} regions)", "topology edges"]
+              f"segmentation ({n_sig} significant / {len(regs)} total)",
+              "topology edges"]
     for ri, (vname, elev, azim) in enumerate(views):
         # raw
         ax = fig.add_subplot(2, 4, ri * 4 + 1, projection="3d")

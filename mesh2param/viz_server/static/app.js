@@ -6,6 +6,7 @@ import { STLLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { OBJLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/OBJLoader.js';
 import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/PLYLoader.js';
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
+import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
@@ -2526,13 +2527,71 @@ function _getThumbRenderer() {
 // Load a mesh file into an Object3D. For OBJ/3MF this keeps the loader's full
 // scene graph (3MF build items carry per-mesh transforms — using the first raw
 // geometry, as before, dropped those and produced empty/blank thumbnails).
+function _hasMesh(obj) {
+  if (!obj) return false;
+  let found = false;
+  obj.traverse(c => {
+    if (c.isMesh && c.geometry && c.geometry.attributes && c.geometry.attributes.position
+        && c.geometry.attributes.position.count > 0) found = true;
+  });
+  return found;
+}
+
+// Direct 3MF parse: a .3mf is a ZIP whose model XML holds <vertex x y z> +
+// <triangle v1 v2 v3>. AI exporters (Meshy/Tripo) split the mesh into a
+// SEPARATE object .model file (root 3dmodel.model only has build items) and
+// ThreeMFLoader's full pipeline can blank on that — so scan ALL .model files
+// and extract the core mesh data by regex (fast + low-memory on the ~10MB
+// object XML; DOMParser would build 200k+ nodes). bbox-normalised later, so
+// per-item transforms don't matter for a thumbnail.
+const _VTX_RE = /<vertex\s+x="([-+\deE.]+)"\s+y="([-+\deE.]+)"\s+z="([-+\deE.]+)"/g;
+const _TRI_RE = /<triangle\s+v1="(\d+)"\s+v2="(\d+)"\s+v3="(\d+)"/g;
+function _parse3mfDirect(buf) {
+  let files;
+  try { files = fflate.unzipSync(new Uint8Array(buf)); }
+  catch (e) { console.warn('[3mf] unzip failed', e); return null; }
+  const group = new THREE.Group();
+  for (const name in files) {
+    if (!name.toLowerCase().endsWith('.model')) continue;
+    const xml = new TextDecoder().decode(files[name]);
+    if (xml.indexOf('<vertex') === -1) continue;     // root / metadata model
+    const verts = [];
+    let m;
+    _VTX_RE.lastIndex = 0;
+    while ((m = _VTX_RE.exec(xml)) !== null) verts.push(+m[1], +m[2], +m[3]);
+    const idx = [];
+    _TRI_RE.lastIndex = 0;
+    while ((m = _TRI_RE.exec(xml)) !== null) idx.push(+m[1], +m[2], +m[3]);
+    if (verts.length >= 9 && idx.length >= 3) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+      g.setIndex(idx);
+      group.add(new THREE.Mesh(g));
+    }
+  }
+  return group.children.length ? group : null;
+}
+
 async function _loadObject(file) {
   const ext = _meshExt(file.name);
   const buf = await file.arrayBuffer();
   if (ext === 'stl') return new THREE.Mesh(new STLLoader().parse(buf));
   if (ext === 'ply') return new THREE.Mesh(new PLYLoader().parse(buf));
   if (ext === 'obj') return new OBJLoader().parse(new TextDecoder().decode(buf));
-  if (ext === '3mf') return new ThreeMFLoader().parse(buf);
+  if (ext === '3mf') {
+    // Direct regex parse FIRST — fast and robust on the split-model AI 3MF that
+    // blanks ThreeMFLoader. Fall back to the full loader only if that finds no
+    // mesh (exotic 3MF: components/transforms the regex path doesn't follow).
+    const direct = _parse3mfDirect(buf);
+    if (_hasMesh(direct)) return direct;
+    try {
+      const obj = new ThreeMFLoader().parse(buf.slice(0));
+      if (_hasMesh(obj)) return obj;
+    } catch (e) {
+      console.warn('[3mf] both parsers failed:', file.name, e);
+    }
+    return direct;   // may be null -> placeholder
+  }
   return null;
 }
 

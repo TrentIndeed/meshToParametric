@@ -2461,9 +2461,9 @@ function _disposeObj(obj) {
   });
 }
 
-async function _thumbnailFor(file) {
-  const obj = await _loadObject(file);
-  if (!obj) return null;
+// Render any loaded Object3D to a 128px thumbnail dataURL (centred + normalised
+// in world space so 3MF child transforms are honoured). Disposes the object.
+function _renderObjThumb(obj) {
   obj.updateMatrixWorld(true);
   let hasMesh = false;
   obj.traverse(c => {
@@ -2473,27 +2473,24 @@ async function _thumbnailFor(file) {
       c.material = new THREE.MeshStandardMaterial({ color: 0x9AA4AE, metalness: 0.1, roughness: 0.72 });
     }
   });
-  if (!hasMesh) return null;
-
-  // World-space bounds (honours child transforms), then centre + normalise.
+  if (!hasMesh) { _disposeObj(obj); return null; }
   const box = new THREE.Box3().setFromObject(obj);
   if (box.isEmpty()) { _disposeObj(obj); return null; }
   const c = box.getCenter(new THREE.Vector3());
   const sz = box.getSize(new THREE.Vector3());
   const scl = 1.7 / (Math.max(sz.x, sz.y, sz.z) || 1);
-  obj.position.sub(c);                     // shift so world centre → origin
+  obj.position.sub(c);
 
   const grp = new THREE.Group();
   grp.add(obj);
   grp.scale.setScalar(scl);
-  grp.rotation.x = -Math.PI / 2 + 0.5;     // Z-up part → tilted iso view
+  grp.rotation.x = -Math.PI / 2 + 0.5;
   grp.rotation.z = 0.5;
 
   const scene = new THREE.Scene();
   scene.add(grp);
   scene.add(new THREE.HemisphereLight(0xE0E8F0, 0x3D4450, 1.2));
   const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(2, 3, 2); scene.add(key);
-
   const cam = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
   cam.position.set(0, 0, 3); cam.lookAt(0, 0, 0);
   const r = _getThumbRenderer();
@@ -2501,6 +2498,34 @@ async function _thumbnailFor(file) {
   const url = r.domElement.toDataURL('image/png');
   _disposeObj(obj);
   return url;
+}
+
+async function _thumbnailFor(file) {
+  // 1) Client-side parse (fast, no upload).
+  try {
+    const obj = await _loadObject(file);
+    if (obj) { const url = _renderObjThumb(obj); if (url) return url; }
+  } catch (e) {
+    console.warn('[folder] client-side parse failed for', file.name, '— trying server', e);
+  }
+  // 2) Server fallback: trimesh parses every format reliably (incl. tricky 3MF
+  //    where the browser loader drops build-item transforms).
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/api/thumbnail', { method: 'POST', body: fd });
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (!d.vertices || !d.faces || !d.faces.length) return null;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(d.vertices), 3));
+    geo.setIndex(d.faces);
+    geo.computeVertexNormals();
+    return _renderObjThumb(new THREE.Mesh(geo));
+  } catch (e) {
+    console.warn('[folder] server thumbnail failed for', file.name, e);
+    return null;
+  }
 }
 
 // Show raw mesh triangles in the viewer (before pipeline)

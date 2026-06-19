@@ -782,6 +782,42 @@ async def job_edges(job_id: str):
             "bbox_min": res.get("bbox_min"), "bbox_max": res.get("bbox_max")}
 
 
+@app.post("/api/thumbnail")
+async def thumbnail(file: UploadFile = File(...)):
+    """Lightweight geometry for a folder-browser thumbnail. Parsed with trimesh
+    (handles 3MF scene transforms that the browser's 3MF loader can drop), so
+    AI/.3mf previews always render. The client only calls this when its own
+    client-side parse fails. Returns decimated {vertices, faces}."""
+    import io
+    import trimesh
+    ext = (file.filename or "").rsplit(".", 1)[-1].lower()
+    if ext not in ("stl", "obj", "ply", "3mf"):
+        return JSONResponse({"error": "unsupported"}, status_code=400)
+    data = await file.read()
+    try:
+        loaded = trimesh.load(io.BytesIO(data), file_type=ext, force="mesh")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    if loaded is None or not hasattr(loaded, "faces") or len(loaded.faces) == 0:
+        return JSONResponse({"error": "no geometry"}, status_code=422)
+    # Decimate to keep the thumbnail payload small (a raw AI mesh is 100k+ faces
+    # = ~20MB of JSON). fast-simplification is deterministic and installed.
+    verts = np.asarray(loaded.vertices, np.float64)
+    faces = np.asarray(loaded.faces, np.int64)
+    if len(faces) > 4000:
+        try:
+            import fast_simplification
+            verts, faces = fast_simplification.simplify(
+                verts, faces, target_count=4000)
+        except Exception:
+            # Last resort: keep payload bounded by dropping to the first 4000 tris.
+            faces = faces[:4000]
+    return {
+        "vertices": np.asarray(verts, np.float32).flatten().tolist(),
+        "faces": np.asarray(faces, np.int32).flatten().tolist(),
+    }
+
+
 @app.get("/api/job/{job_id}/download-step")
 async def download_step(job_id: str):
     """Download the current (possibly edited) model as a STEP file."""

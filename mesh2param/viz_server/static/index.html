@@ -816,7 +816,7 @@ body.live-split #viewer-analysis-label { display: block; }
   <a href="/home"><i class="ri-home-4-line"></i> Home</a>
   <div class="divider"></div>
   <div onclick="document.getElementById('file-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-upload-2-line"></i> Upload New Mesh</div>
-  <div onclick="document.getElementById('folder-input').click(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-folder-open-line"></i> Open Folder</div>
+  <div onclick="openFolderPicker(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-folder-open-line"></i> Open Folder</div>
   <div onclick="if(cachedStatusData){downloadSTEP()} else {alert('No model to export')}; document.getElementById('app-menu').classList.remove('show')"><i class="ri-download-2-line"></i> Export STEP</div>
   <div id="onshape-menu-item" onclick="onshapeConnectClick(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-link"></i> Connect Onshape</div>
   <div id="onshape-unbind-item" style="display:none" onclick="unbindOnshapeDocument(); document.getElementById('app-menu').classList.remove('show')"><i class="ri-close-circle-line"></i> Stop building to Onshape</div>
@@ -1072,7 +1072,7 @@ body.live-split #viewer-analysis-label { display: block; }
   <button class="action-btn primary" id="btn-upload" onclick="document.getElementById('file-input').click()">
     <i class="ri-upload-2-line"></i> Upload File
   </button>
-  <button class="action-btn secondary" id="btn-open-folder" onclick="document.getElementById('folder-input').click()" title="Open a folder of meshes">
+  <button class="action-btn secondary" id="btn-open-folder" onclick="openFolderPicker()" title="Open a folder of meshes (no upload — thumbnails render locally)">
     <i class="ri-folder-open-line"></i> Open Folder
   </button>
   <button class="action-btn primary" id="btn-analyze" style="display:none;">
@@ -1310,7 +1310,7 @@ function downloadSTEP() {
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script src="/static/app.js?v=20260619thumbcache" type="module"></script>
+<script src="/static/app.js?v=20260619folderpicker" type="module"></script>
 </body>
 </html>
 

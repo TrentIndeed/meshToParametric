@@ -2357,7 +2357,7 @@ window._folderActive = false;
 // mirrored to localStorage so it also survives a page reload (size-capped).
 const _thumbCache = new Map();
 const _THUMB_LS_KEY = 'paramesh_thumb_cache_v1';
-const _thumbKey = (f) => `${f.webkitRelativePath || f.name}|${f.size}|${f.lastModified}`;
+const _thumbKey = (f) => `${f._relPath || f.webkitRelativePath || f.name}|${f.size}|${f.lastModified}`;
 try {
   const saved = JSON.parse(localStorage.getItem(_THUMB_LS_KEY) || '{}');
   for (const k in saved) _thumbCache.set(k, saved[k]);
@@ -2382,6 +2382,40 @@ function _persistThumbCache() {
 const _meshExt = (name) => (name.split('.').pop() || '').toLowerCase();
 const _fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
 
+// Primary path: File System Access API — opens a normal folder picker with NO
+// "upload N files to this site?" prompt, and reads files locally (nothing is
+// uploaded; thumbnails render in-browser). Falls back to the webkitdirectory
+// input on browsers without it (Firefox/Safari).
+window.openFolderPicker = async function () {
+  if (window.showDirectoryPicker) {
+    let dir;
+    try {
+      dir = await window.showDirectoryPicker({ id: 'paramesh-meshes', mode: 'read' });
+    } catch (e) { return; }   // user cancelled
+    const meshes = [];
+    async function walk(handle, prefix) {
+      for await (const entry of handle.values()) {
+        if (entry.kind === 'file' && MESH_EXTS.includes(_meshExt(entry.name))) {
+          try {
+            const f = await entry.getFile();
+            f._relPath = prefix + entry.name;   // File-System-Access files lack webkitRelativePath
+            meshes.push(f);
+          } catch (e) { /* unreadable file — skip */ }
+        } else if (entry.kind === 'directory') {
+          await walk(entry, prefix + entry.name + '/');
+        }
+      }
+    }
+    try { await walk(dir, (dir.name || 'Folder') + '/'); }
+    catch (e) { console.warn('[folder] walk failed', e); }
+    if (!meshes.length) { alert('No mesh files (.stl, .obj, .ply, .3mf) found in that folder.'); return; }
+    meshes.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    openFolderPanel(meshes);
+  } else {
+    document.getElementById('folder-input').click();   // older-browser fallback
+  }
+};
+
 document.getElementById('folder-input')?.addEventListener('change', (e) => {
   const meshes = Array.from(e.target.files || []).filter(f => MESH_EXTS.includes(_meshExt(f.name)));
   e.target.value = '';
@@ -2394,7 +2428,7 @@ function openFolderPanel(meshes) {
   window._folderActive = true;
   const panel = document.getElementById('folder-panel');
   const list = document.getElementById('folder-list');
-  const rel = meshes[0].webkitRelativePath || '';
+  const rel = meshes[0]._relPath || meshes[0].webkitRelativePath || '';
   document.getElementById('folder-title').textContent =
     (rel.split('/')[0] || 'Folder') + ' · ' + meshes.length + ' meshes';
   list.innerHTML = '';
@@ -2549,31 +2583,16 @@ function _renderObjThumb(obj) {
 }
 
 async function _thumbnailFor(file) {
-  // 1) Client-side parse (fast, no upload).
+  // Thumbnails are generated PURELY in the browser — the folder's meshes are
+  // never uploaded. (Only the one mesh you click to actually work on is sent to
+  // the server.) If a file can't be parsed client-side, a placeholder shows.
   try {
     const obj = await _loadObject(file);
-    if (obj) { const url = _renderObjThumb(obj); if (url) return url; }
+    if (obj) return _renderObjThumb(obj);
   } catch (e) {
-    console.warn('[folder] client-side parse failed for', file.name, '— trying server', e);
+    console.warn('[folder] client-side thumbnail failed for', file.name, e);
   }
-  // 2) Server fallback: trimesh parses every format reliably (incl. tricky 3MF
-  //    where the browser loader drops build-item transforms).
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await fetch('/api/thumbnail', { method: 'POST', body: fd });
-    if (!res.ok) return null;
-    const d = await res.json();
-    if (!d.vertices || !d.faces || !d.faces.length) return null;
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(d.vertices), 3));
-    geo.setIndex(d.faces);
-    geo.computeVertexNormals();
-    return _renderObjThumb(new THREE.Mesh(geo));
-  } catch (e) {
-    console.warn('[folder] server thumbnail failed for', file.name, e);
-    return null;
-  }
+  return null;
 }
 
 // Show raw mesh triangles in the viewer (before pipeline)

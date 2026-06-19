@@ -2967,7 +2967,12 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
           // and accrete features there in real time. Both panes advance on
           // their own — the left through analysis stages, the right through
           // construction steps.
-          if (d.status === 'processing' && (d.building_live || (d.num_steps || 0) > 0)) {
+          // Only split into the dual pane once there's an ACTUAL construction
+          // step to show. Splitting on building_live alone (set the instant the
+          // CAD subprocess gets its input, before the first step streams) left
+          // a blank right pane — most visible in step mode, where the gap is
+          // long. Wait for num_steps > 0 so the right pane always has content.
+          if (d.status === 'processing' && (d.num_steps || 0) > 0) {
             LiveBuild.show();
             LiveBuild.update(myJobId, d.num_steps || 0, d.steps_version || 0);
           }

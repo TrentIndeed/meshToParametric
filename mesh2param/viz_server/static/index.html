@@ -147,6 +147,16 @@ body {
   flex-direction: column;
 }
 #folder-panel.min { width: 0; border: none; overflow: hidden; }
+/* Backdrop filling the left chrome column behind the sidebar (z:50) and folder
+   panel (z:52). Without it, minimizing the folder mid-analysis — when the
+   sidebar is slid off-screen (.closed) — leaves the bare page background showing
+   as a blank block. Only needed while a folder is/was open. */
+#left-chrome-bg {
+  display: none; position: fixed; top: 48px; bottom: 80px; left: 0; width: 240px;
+  background: var(--bg-secondary); border-right: 1px solid var(--border);
+  z-index: 39; pointer-events: none;
+}
+body.folder-open #left-chrome-bg { display: block; }
 /* When the folder panel is open, push the feature tree to its right. */
 body.folder-open #sidebar { left: 232px; }
 body.folder-open.folder-min #sidebar { left: 0; }
@@ -831,6 +841,9 @@ body.live-split #viewer-analysis-label { display: block; }
   <a href="/"><i class="ri-logout-box-r-line"></i> Exit to Landing</a>
 </div>
 
+<!-- Backdrop for the left chrome column (keeps the page bg from showing through
+     when the folder is minimized while the sidebar is off-screen) -->
+<div id="left-chrome-bg"></div>
 <!-- Folder browser — its own left panel (left of the feature tree), minimizable -->
 <div id="folder-panel" style="display:none;">
   <div class="folder-head">

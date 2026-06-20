@@ -65,13 +65,25 @@ def _get_client_ip(request) -> str:
     return request.client.host if request.client else "unknown"
 
 def _is_local_request(ip: str) -> bool:
-    """Direct localhost access = the developer running the server.
+    """Direct local/dev access = the developer running the server.
 
-    Production sits behind Caddy, which always supplies X-Forwarded-For
-    (so _get_client_ip returns the real public IP there); a loopback
-    client IP only happens when hitting uvicorn directly in local dev.
+    Production sits behind Caddy, which always supplies X-Forwarded-For, so
+    _get_client_ip returns the real PUBLIC IP there — a loopback or private IP
+    only appears when hitting uvicorn directly in local dev. In Docker the
+    browser's request reaches the container from the bridge GATEWAY (a private
+    172.x/10.x/192.168.x address, NOT 127.0.0.1), so loopback-only matching
+    wrongly billed dev runs against the guest free-trial cap (HTTP 403 after the
+    first part). Treat loopback + private ranges as local; real users always
+    arrive via X-Forwarded-For with a public IP, so this can't unlock prod.
     """
-    return ip in ("127.0.0.1", "::1", "localhost", "testclient")
+    if ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return True
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(ip)
+        return addr.is_loopback or addr.is_private
+    except ValueError:
+        return False
 
 
 def _check_free_trial(request) -> tuple[bool, str | None]:

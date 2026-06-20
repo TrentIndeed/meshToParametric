@@ -2275,6 +2275,22 @@ async function previewFile(file) {
     document.getElementById('timeline').innerHTML = '';
     currentStep = -1;
     currentJobId = null;
+    // If a previous analysis left the dual/expanded build pane up (live-split or
+    // live-full), tear it down so the main #viewer — where _showRawMesh draws
+    // this newly-picked mesh — is revealed again. Without this, clicking another
+    // folder part only updates the complexity bar; the old built model stays on
+    // top and the new raw mesh renders hidden behind it.
+    try { LiveBuild.reset(); LiveBuild.hide(); } catch (e) {}
+    // Tear down the feature-tree EDITOR (fillet/chamfer edit chips + edge-pick)
+    // left over from the previous build, so it doesn't persist into this new
+    // part's pipeline.
+    try { if (typeof exitEdgePick === 'function') exitEdgePick(); } catch (e) {}
+    window._editState = { deletes: new Set(), finishes: [] };
+    try { renderEditChips(); } catch (e) {}
+    const _fe = document.getElementById('feature-editor');
+    if (_fe) _fe.style.display = 'none';
+    const _ets = document.getElementById('et-status');
+    if (_ets) _ets.textContent = '';
 
     // Show the raw mesh in the 3D viewer
     pendingTempPath = previewRes.temp_path;
@@ -2429,6 +2445,110 @@ function _persistThumbCache() {
 const _meshExt = (name) => (name.split('.').pop() || '').toLowerCase();
 const _fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
 
+// ── Folder persistence across reloads ──
+// The File System Access directory handle is structured-cloneable, so we stash
+// it in IndexedDB and re-open the folder on reload. Browsers reset file
+// permission to 'prompt' on a fresh page load (re-granting needs a user
+// gesture), so when the grant didn't survive we show a one-click "Reopen
+// <folder>" chip that re-grants WITHOUT re-navigating the picker.
+function _folderIDB() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open('paramesh-folder', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function _folderHandleSave(dir) {
+  try {
+    const db = await _folderIDB();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(dir, 'handle');
+      tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+    });
+  } catch (e) { console.warn('[folder] could not persist handle', e); }
+}
+async function _folderHandleLoad() {
+  try {
+    const db = await _folderIDB();
+    return await new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readonly');
+      const rq = tx.objectStore('kv').get('handle');
+      rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error);
+    });
+  } catch (e) { return null; }
+}
+async function _folderHandleClear() {
+  try {
+    const db = await _folderIDB();
+    await new Promise((res) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').delete('handle');
+      tx.oncomplete = () => res(); tx.onerror = () => res();
+    });
+  } catch (e) { /* ignore */ }
+  const chip = document.getElementById('folder-reopen-chip');
+  if (chip) chip.remove();
+}
+
+// Walk a directory handle and return its mesh File objects (sorted).
+async function _walkDir(dir) {
+  const meshes = [];
+  async function walk(handle, prefix) {
+    for await (const entry of handle.values()) {
+      if (entry.kind === 'file' && MESH_EXTS.includes(_meshExt(entry.name))) {
+        try { const f = await entry.getFile(); f._relPath = prefix + entry.name; meshes.push(f); }
+        catch (e) { /* unreadable file — skip */ }
+      } else if (entry.kind === 'directory') {
+        await walk(entry, prefix + entry.name + '/');
+      }
+    }
+  }
+  await walk(dir, (dir.name || 'Folder') + '/');
+  meshes.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return meshes;
+}
+
+// On page load: re-open the last folder if its permission survived; otherwise
+// surface a one-click reopen chip.
+async function restoreFolder() {
+  if (!window.showDirectoryPicker) return;      // FSA unsupported → no handle to restore
+  const dir = await _folderHandleLoad();
+  if (!dir) return;
+  let perm = 'prompt';
+  try { perm = await dir.queryPermission({ mode: 'read' }); } catch (e) { return; }
+  if (perm === 'granted') {
+    try {
+      const meshes = await _walkDir(dir);
+      if (meshes.length) openFolderPanel(meshes);
+    } catch (e) { console.warn('[folder] silent restore failed', e); }
+  } else {
+    _showFolderReopenChip(dir);
+  }
+}
+
+function _showFolderReopenChip(dir) {
+  if (document.getElementById('folder-reopen-chip')) return;
+  const chip = document.createElement('button');
+  chip.id = 'folder-reopen-chip';
+  chip.innerHTML = '<i class="ri-folder-open-line"></i>&nbsp;Reopen ' + (dir.name || 'folder');
+  chip.style.cssText =
+    'position:fixed;left:16px;bottom:16px;z-index:60;display:flex;align-items:center;' +
+    'gap:6px;padding:9px 14px;border:1px solid #30363D;border-radius:8px;background:#161B22;' +
+    'color:#E6EDF3;font-size:13px;font-weight:500;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.4)';
+  chip.onclick = async () => {
+    try {
+      const p = await dir.requestPermission({ mode: 'read' });   // user gesture re-grants
+      if (p !== 'granted') return;
+      const meshes = await _walkDir(dir);
+      chip.remove();
+      if (meshes.length) openFolderPanel(meshes);
+    } catch (e) { console.warn('[folder] reopen failed', e); }
+  };
+  document.body.appendChild(chip);
+}
+
 // Primary path: File System Access API — opens a normal folder picker with NO
 // "upload N files to this site?" prompt, and reads files locally (nothing is
 // uploaded; thumbnails render in-browser). Falls back to the webkitdirectory
@@ -2439,24 +2559,13 @@ window.openFolderPicker = async function () {
     try {
       dir = await window.showDirectoryPicker({ id: 'paramesh-meshes', mode: 'read' });
     } catch (e) { return; }   // user cancelled
-    const meshes = [];
-    async function walk(handle, prefix) {
-      for await (const entry of handle.values()) {
-        if (entry.kind === 'file' && MESH_EXTS.includes(_meshExt(entry.name))) {
-          try {
-            const f = await entry.getFile();
-            f._relPath = prefix + entry.name;   // File-System-Access files lack webkitRelativePath
-            meshes.push(f);
-          } catch (e) { /* unreadable file — skip */ }
-        } else if (entry.kind === 'directory') {
-          await walk(entry, prefix + entry.name + '/');
-        }
-      }
-    }
-    try { await walk(dir, (dir.name || 'Folder') + '/'); }
+    let meshes = [];
+    try { meshes = await _walkDir(dir); }
     catch (e) { console.warn('[folder] walk failed', e); }
     if (!meshes.length) { alert('No mesh files (.stl, .obj, .ply, .3mf) found in that folder.'); return; }
-    meshes.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    _folderHandleSave(dir);                                     // persist for restore-on-reload
+    const chip = document.getElementById('folder-reopen-chip');  // drop any stale reopen chip
+    if (chip) chip.remove();
     openFolderPanel(meshes);
   } else {
     document.getElementById('folder-input').click();   // older-browser fallback
@@ -2514,6 +2623,9 @@ window.closeFolderPanel = function () {
   document.getElementById('folder-list').innerHTML = '';
   document.getElementById('folder-tab').style.display = 'none';
   document.body.classList.remove('folder-open', 'folder-min');
+  // Explicit close = forget it, so it doesn't reopen on the next load. (Minimize
+  // via toggleFolderMin keeps it persisted.)
+  _folderHandleClear();
 };
 
 window.toggleFolderMin = function () {
@@ -2875,7 +2987,16 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
         step_through: document.getElementById('step-through-cb')?.checked ?? true,
       }),
     });
-    if (!res.ok) { console.error('[analyze] /api/run-pipeline HTTP', res.status); alert('Pipeline request failed: HTTP ' + res.status); loading.classList.remove('show'); return; }
+    if (!res.ok) {
+      // Surface the server's reason (e.g. free-trial/monthly-limit on 403)
+      // instead of a bare status code.
+      let reason = 'HTTP ' + res.status;
+      try { const ed = await res.json(); if (ed && ed.error) reason = ed.error; } catch (e) {}
+      console.error('[analyze] /api/run-pipeline failed:', res.status, reason);
+      alert('Pipeline request failed: ' + reason);
+      loading.classList.remove('show');
+      return;
+    }
     let data;
     try { data = await res.json(); } catch (e) { console.error('[analyze] JSON parse failed from /api/run-pipeline', e); alert('Pipeline response invalid'); loading.classList.remove('show'); return; }
     if (data.error) {
@@ -3974,6 +4095,9 @@ function updatePauseAtVisibility() {
 })();
 
 autoLoad();
+// Independent of the viewer/preview restore above: bring back the last opened
+// folder panel (or its one-click reopen chip) if there was one.
+restoreFolder();
 
 function animate() {
   requestAnimationFrame(animate);

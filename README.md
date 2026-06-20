@@ -22,11 +22,12 @@ Reverse-engineering pipeline that converts triangulated mesh files (STL/OBJ/PLY/
 
 Three-panel CAD viewer with AI assistant at [parameshai.com/app](https://parameshai.com/app).
 
-- **Left**: Feature tree with typed icons (sketch, extrude, hole, chamfer)
+- **Left**: Feature tree — typed icons (sketch, extrude, hole, chamfer) plus an editor: edit dimensions and pick edges to add fillets/chamfers (hover-highlight + drag-arrow, measured-radius snap), re-export an edited STEP
 - **Center**: Interactive Three.js 3D viewer with orbit controls, XYZ grid
 - **Right**: AI chatbot — describe parts, suggest edits, analyze dimensions
 - **Bottom**: Timeline with 3D-rendered thumbnails per construction step
-- **Upload flow**: preview mesh → complexity meter → AI thinking process → CAD model
+- **Folder browser**: open a local folder (no upload prompt) for in-browser thumbnails (STL/OBJ/PLY/3MF), cached by path/size/mtime
+- **Upload flow**: full-res preview (+ quality toggle to A/B vs the decimated mesh) → complexity meter → AI thinking process → CAD model
 
 ### Free Tools
 
@@ -64,13 +65,24 @@ claude "hello"  # one-time auth
 ## Running
 
 ```bash
-# Web app
+# Web app (native — no alpha-wrap repair; AI/scan meshes degrade)
 python -m mesh2param.viz_server.app
 # Open http://127.0.0.1:8080
 
 # CLI
 mesh2param convert input.stl --dry-run --output feature_tree.json
 ```
+
+### Docker (recommended for AI/scan meshes)
+
+pymeshlab's alpha-wrap watertight repair + the exact-IoU arbiter are **Linux-only**, so dev and AI work run in a container:
+
+```bash
+.\start-server.ps1            # build + run the server image → http://127.0.0.1:8080
+.\start-server.ps1 -NoBuild   # restart in seconds (-Native for the no-Docker path)
+```
+
+Source is bind-mounted (frontend edits live on refresh; Python edits → `docker restart paramesh-server`). DB lives in a named volume.
 
 ## Testing
 
@@ -104,11 +116,25 @@ mesh2param/
   viz_server/    — FastAPI web app + Three.js viewer + job queue
   db/            — SQLite (User, MeshJob, JobStep, WaitlistEntry, SupportTicket)
   api/           — REST endpoints (auth, chat, settings)
+  viz_server/modal_runner.py — optional Modal dispatch (USE_MODAL) → isolated cloud container per job
   ai.py          — Claude CLI wrapper with injection protection + budget caps
   config.py      — Pydantic settings for all stages
+modal_app.py     — Modal app: build_mesh = full pipeline + exact IoU in an isolated container
+scripts/         — geometry diagnosis (diag_render_sheet, diag_stage_sheet, diag_ai_build, diag_ai_parallel)
 tests/           — pytest suite (visual, correctness, STEP comparison, all-mesh)
-models/          — mesh + reference STEP pairs
+models/          — mesh + reference STEP pairs (+ AI1..AI15 test parts)
 ```
+
+### Cloud parallelism (Modal)
+
+One Modal function (`build_mesh`) is the unit of parallelism for dev and prod — each call runs the whole pipeline in its own isolated container, sidestepping the pymeshlab-can't-run-concurrently wall:
+
+```bash
+modal run modal_app.py                 # all 15 AI test parts in parallel (~3 min)
+modal run modal_app.py --parts AI9,AI12
+```
+
+For the public launch, `modal deploy modal_app.py` once and set `USE_MODAL=1` + Modal tokens on the server — the worker then spawns each customer job into its own container. Default off → unchanged local worker. See [docs/MODAL_DEPLOY.md](docs/MODAL_DEPLOY.md).
 
 ## Pricing (Token-Based)
 
@@ -171,6 +197,10 @@ trimesh, cadquery, pyvista, matplotlib, numpy, scipy, scikit-learn, networkx, fa
 ## Progress & Engineering Notes
 
 This section tracks major changes to the core pipeline, problems hit, and how they were addressed. The pipeline works end-to-end on simple prismatic parts; the main ongoing work is **reliable segmentation on coarse, radial-fan triangulations** (common in 3MF exports from slicers).
+
+### AI/scan ingest — alpha-wrap before voxel, so round holes survive
+
+AI-generated (Meshy/Tripo) and scanned meshes arrive non-watertight, and `voxel_repair` (res 96) quantizes cylindrical bores into blocky circles that fail cylinder detection downstream. The ingest repair order is now **fill_holes → poisson → alpha-wrap (before voxel) → voxel_repair → face cap → late alpha-wrap**: alpha-wrap watertights the mesh while preserving round bores, so voxel_repair rarely fires. Validated AI12 IoU 0.58 → 0.77; full 15-part mean IoU 0.780. Alpha-wrap (pymeshlab) is **Linux-only** — runs in Docker/Modal, no-ops natively on Windows. Reliable exact (boolean) IoU is likewise container-only.
 
 ### Pipeline restructure — per-body segmentation + stitched fillets
 

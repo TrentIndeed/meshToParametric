@@ -52,19 +52,36 @@ Auth: set `AUTH_SECRET` in `.env` (changing it breaks existing password hashes).
 mesh2param convert input.stl --onshape-doc "My Document" --onshape-workspace main
 mesh2param convert input.stl --dry-run --output feature_tree.json
 
-# Web UI (with AI chatbot + dimension planner)
-python -m mesh2param.viz_server.app
-# Open http://127.0.0.1:8080
+# Web UI — native (no alpha-wrap; AI meshes degrade)
+python -m mesh2param.viz_server.app    # http://127.0.0.1:8080
 ```
 
-## Testing
+### Dev runs in DOCKER (Linux) — alpha-wrap + reliable exact IoU are Linux-only
+pymeshlab's alpha-wrap plugin loads on Linux but NOT Windows, so the watertight
+repair (ingest) and the exact-IoU arbiter are no-ops natively. Run the server +
+all geometry diagnostics in containers:
 ```bash
-pytest                                    # all tests
-python run_visuals.py                     # visual reports
-python run_visuals.py --stage 4 5 6       # specific stages
-pytest tests/test_step_comparison.py -v   # STEP comparison
-pytest tests/test_all_meshes.py -v        # all 5 meshes
+.\start-server.ps1            # build+run the server image on http://127.0.0.1:8080
+.\start-server.ps1 -NoBuild   # just (re)start (seconds); -Native for the no-Docker path
 ```
+- Server image = top-level `Dockerfile` (`paramesh-server`); container stays up,
+  source is bind-mounted (frontend edits are live on refresh; Python edits need a
+  `docker restart paramesh-server`, NOT a rebuild). DB in a NAMED volume
+  (`paramesh-data`) — a host bind-mount deadlocks SQLite on Windows.
+- Lean diagnosis image = `_docker/Dockerfile` (`mesh2param`, pipeline + IoU only).
+  Run a diag against mounted source/models:
+  `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W)/mesh2param":/app/mesh2param -v "$(pwd -W)/models":/app/models -v "$(pwd -W)/scripts":/app/scripts mesh2param python scripts/<diag>.py`
+
+## Testing & diagnostics
+```bash
+pytest tests/test_step_comparison.py -v   # clean-CAD guardrail — MUST stay 18/7
+pytest tests/test_all_meshes.py -v        # all 5 reference meshes
+```
+Geometry diagnosis (run in the `mesh2param` container — see the mount line above):
+- `scripts/diag_render_sheet.py <part>` — final mesh-vs-recon + signed-distance heatmap (SEE before you fix; per the Operating Protocol)
+- `scripts/diag_stage_sheet.py <part>` — early stages: raw | cleaned+axes | segmentation | topology
+- `scripts/diag_ai_build.py AIn ...` — per-part exact IoU + cad_vol_err (sequential)
+- `scripts/diag_ai_parallel.py [--workers N]` — same, in a process pool with live per-stage logging (spawn; pymeshlab can't fork). LOCAL parallelism is limited by the pymeshlab-concurrency wall — for a full fast sweep use Modal (below).
 
 ## Package Structure
 ```
@@ -78,12 +95,17 @@ mesh2param/
   onshape/       — REST client (client.py: API-key Basic auth, no HMAC) + FeatureTree→BTM builder (feature_builder.py); live export wired in pipeline/export_onshape.py, BTM conventions documented in feature_builder docstring
   ai.py          — Claude CLI wrapper with injection protection + budget caps
   config.py      — Pydantic settings (IngestConfig, SegmentConfig, FitConfig, TopologyConfig, RecognizeConfig, ExportConfig)
+  viz_server/modal_runner.py — optional Modal dispatch (USE_MODAL); spawn job → isolated cloud container, poller finalizes
 tests/           — pytest suite with fixtures per stage + STEP comparison + all-mesh parametric tests
-models/          — mesh + reference STEP pairs (models/Mesh1/ through models/Mesh5/)
+models/          — mesh + reference STEP pairs (models/Mesh1/ through models/Mesh5/); AI test parts in models/AI1..AI15/
+scripts/         — diag_render_sheet.py, diag_stage_sheet.py, diag_ai_build.py, diag_ai_parallel.py (geometry diagnosis; run in Docker)
+modal_app.py     — Modal app (top-level): build_mesh = full pipeline + exact IoU in an isolated container; `modal run` for parallel dev, `modal deploy` for prod
+Dockerfile / _docker/Dockerfile — server image (paramesh-server) / lean diagnosis image (mesh2param)
+start-server.ps1, start-server.sh — build/run the server container (-NoBuild, -Native flags)
 ```
 
 ## Pipeline Stages
-1. **Mesh Ingestion & Cleanup** — load, repair, remesh → `CleanedMesh`
+1. **Mesh Ingestion & Cleanup** — load, repair, remesh → `CleanedMesh`. Repair order is fill_holes → poisson → **alpha-wrap (BEFORE voxel)** → voxel_repair → face cap → late alpha-wrap. Alpha-wrap runs first so round bores survive watertighting; voxel_repair (res 96) quantizes bores to blocky circles that fail cylinder detection. Alpha-wrap is Linux-only — runs in Docker, no-ops natively.
 2. **Surface Segmentation** — region-growing with normal clustering, curvature-based splitting, surface type classification → `FaceRegion` list
 3. **Primitive Fitting** — RANSAC + least-squares for plane/cylinder/cone/sphere → `FittedSurface` list
 4. **Topology & Edge Classification** — adjacency graph, dihedral angles, sharp/fillet/chamfer/smooth detection → `SurfaceGraph` + `SurfaceEdge` list
@@ -97,14 +119,31 @@ models/          — mesh + reference STEP pairs (models/Mesh1/ through models/M
 - Job queue at `mesh2param/viz_server/job_queue.py` — concurrent users, per-job state
 - Three.js frontend at `mesh2param/viz_server/static/`
 - Endpoints: `POST /api/preview`, `POST /api/run-pipeline`, `GET /api/job/{id}/status`, `GET /api/job/{id}/step/{i}`, `POST /api/chat`, `POST /api/chat/analyze-mesh`
-- Left sidebar: Feature tree with typed icons
+- Left sidebar: Feature tree with typed icons — also an EDITOR: edit dimensions, and pick individual edges to add fillets/chamfers (hover-highlight + drag-arrow in the viewer, measured-radius snap); re-exports an edited STEP. Edits run off a cached base solid for speed.
 - Center: 3D orbit viewer with XYZ grid, MeshPhysicalMaterial, studio lighting
 - Right sidebar: AI chatbot — describe parts, suggest edits, analyze dimensions
 - Bottom: Timeline with 3D-rendered thumbnails per step
+- Folder browser: open a local folder (File System Access API — no "upload files" prompt) and get client-side thumbnails. Thumbnails render fully in-browser (STL/OBJ/PLY/3MF loaders + a direct fflate-based 3MF parser for AI exporters that split the mesh into a sub-`.model`); cached in-memory + localStorage by path|size|mtime.
+- Preview shows the FULL-RES client mesh (not the decimated server preview); a quality toggle A/Bs full vs decimated so decimation damage is visible.
 - Dimension review modal: AI suggests clean dimensions after upload, before pipeline runs
 - Complexity meter: scores 0-100, rejects meshes >10K faces
 - AI thinking process: streams stage-by-stage reasoning to chat during pipeline
 - Runs CadQuery in subprocess to avoid VTK conflicts with Three.js
+- Cloud-optional: with `USE_MODAL=1` the heavy pipeline dispatches to an isolated Modal container per job (see Cloud section); default off → local in-process worker.
+
+## Cloud / parallel (Modal) — `modal_app.py`, full details in `docs/MODAL_DEPLOY.md`
+One Modal function, `build_mesh`, is the unit of parallelism for BOTH dev and prod.
+Each call runs the whole pipeline + exact IoU in its OWN isolated container — which
+is the only thing that beats the pymeshlab-can't-run-concurrently wall (local
+process pools stall on alpha-wrap parts).
+- **Dev sweep (the 15 AI parts in parallel, ~3 min):** `modal run modal_app.py`
+  (or `--parts AI9,AI12`). Proven mean IoU 0.780, wall ~195s. Windows: `PYTHONUTF8=1`
+  + `python -m modal`; the async-shutdown noise after "✓ App completed" is harmless.
+- **Prod (public launch):** `modal deploy modal_app.py` once, then set `USE_MODAL=1`
+  + `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` on the server. The worker then SPAWNS each
+  customer job into its own container; a poller finalizes them. Auth/billing/UI
+  unchanged — only the heavy compute moves out. Cloud path returns the FINAL model
+  (one step); live step-streaming + in-browser editing stay local-only for now.
 
 ## Pages
 - `/` — Landing page (public) with video hero, scroll animation, pricing, FAQ, waitlist

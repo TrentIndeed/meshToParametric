@@ -228,3 +228,12 @@ out.txt
 *.docx
 *.docx.pdf
 _cadfit_tmp/
+_cadfit_docker/
+
+# Generated geometry-diagnosis artifacts (per-AI-part sheets + diagnosis dumps);
+# the tracked reference reports under tests/visual_reports/Mesh*/ stay versioned.
+tests/visual_reports/AI*/
+tests/visual_reports/diagnosis/
+
+# Local Modal smoke/validation scratch scripts
+_modal_*.py

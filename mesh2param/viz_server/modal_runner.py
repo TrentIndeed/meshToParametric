@@ -6,6 +6,13 @@ PARALLEL, each isolated (no pymeshlab-can't-run-concurrently wall, the same one
 that blocks local parallelism). The local worker just SPAWNS each job's Modal
 call and moves on; a poller thread finalizes them as they complete.
 
+Live build streaming: the container also pushes each construction step to a
+shared modal.Queue, partitioned by the job id. The poller drains that partition
+every tick and appends the steps to `job.steps` live — so the cloud build streams
+into the dual-pane viewer step-by-step, just like a local build. If the queue is
+unavailable (or a step is too big), the build still finishes from the final
+result; streaming just degrades to one step.
+
 Default OFF: with USE_MODAL unset the local path is 100% unchanged.
 
 Server env needed when enabled: `modal` installed + MODAL_TOKEN_ID and
@@ -16,14 +23,17 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 APP_NAME = "mesh2param-pipeline"
 FUNC_NAME = "build_mesh"
+STEP_QUEUE_NAME = "mesh2param-steps"
 
 _fn = None
+_queue = None
 
 
 def is_enabled() -> bool:
@@ -38,13 +48,25 @@ def _function():
     return _fn
 
 
+def _step_queue():
+    """The shared step Queue (created on first use). May raise; callers guard."""
+    global _queue
+    if _queue is None:
+        import modal
+        _queue = modal.Queue.from_name(STEP_QUEUE_NAME, create_if_missing=True)
+    return _queue
+
+
 def dispatch(job) -> bool:
     """Spawn the Modal build for this job (non-blocking). The poller finalizes it.
     Returns True if dispatched, False on error (job marked errored)."""
     try:
         data = Path(job.file_path).read_bytes()
-        call = _function().spawn(data, job.filename, True)  # want_geometry=True
+        # stream_key = job.id: the container pushes steps to this Queue partition.
+        call = _function().spawn(data, job.filename, True, job.id)
         job._modal_call_id = call.object_id
+        job._modal_stream_key = job.id
+        job._modal_streamed = False
         job.status = "processing"
         job.progress = 40
         job.progress_stage = "Building in cloud"
@@ -58,24 +80,85 @@ def dispatch(job) -> bool:
         return False
 
 
+def _drain_steps(job) -> bool:
+    """Pull any streamed construction steps for this job and append them live,
+    bumping steps_version so the UI accretes them. Returns True if the
+    end-of-stream sentinel was seen. Best-effort: never raises into the poller."""
+    key = getattr(job, "_modal_stream_key", None)
+    if not key:
+        return False
+    try:
+        import numpy as np
+        from mesh2param.pipeline.export_cadquery import ConstructionStep
+        q = _step_queue()
+        msgs = q.get_many(64, block=False, partition=key)
+    except Exception:
+        return False
+    done = False
+    appended = 0
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("__done__"):
+            done = True
+            continue
+        try:
+            job.steps.append(ConstructionStep(
+                name=m.get("name", f"Step {len(job.steps) + 1}"),
+                tess_vertices=np.asarray(m["tess_vertices"], np.float64).reshape(-1, 3),
+                tess_faces=np.asarray(m["tess_faces"], np.int64).reshape(-1, 3),
+                volume=float(m.get("volume", 0.0) or 0.0),
+            ))
+            appended += 1
+        except Exception:
+            logger.debug("Bad streamed step for job %s", job.id, exc_info=True)
+    if appended:
+        job._modal_streamed = True
+        job.building_live = True
+        job.steps_version = getattr(job, "steps_version", 0) + 1
+        job.progress = min(95, getattr(job, "progress", 40) + appended)
+        job.progress_stage = f"Building model... {len(job.steps)} step(s)"
+        job.last_activity_at = time.time()
+        logger.info("Cloud build: %d step(s) streamed for job %s (%d total)",
+                    appended, job.id, len(job.steps))
+    return done
+
+
+def _clear_partition(job) -> None:
+    key = getattr(job, "_modal_stream_key", None)
+    if not key:
+        return
+    try:
+        _step_queue().clear(partition=key)
+    except Exception:
+        logger.debug("Could not clear step partition for job %s", job.id,
+                     exc_info=True)
+
+
 def poll_and_finalize(job) -> bool:
     """Check the job's Modal call. Returns True when finished (done OR error) so
-    the caller can stop polling it; False while still running."""
+    the caller can stop polling it; False while still running. Drains streamed
+    steps each tick so the build streams into the UI as it runs."""
     cid = getattr(job, "_modal_call_id", None)
     if not cid:
         return True
+    # Stream any steps produced so far BEFORE checking for completion.
+    _drain_steps(job)
     try:
         import modal
         call = modal.FunctionCall.from_id(cid)
         try:
             result = call.get(timeout=0)
         except TimeoutError:
-            return False  # not ready yet
+            return False  # not ready yet — keep polling (and streaming)
     except Exception:
         logger.exception("Modal poll failed for job %s", job.id)
         job.status = "error"
         job.error = "Cloud build failed"
+        _clear_partition(job)
         return True
+    # Result is ready: pick up any final steps still in the queue, then finalize.
+    _drain_steps(job)
     _finalize(job, result)
     return True
 
@@ -87,23 +170,35 @@ def _finalize(job, r: dict) -> None:
     if not r or not r.get("ok"):
         job.status = "error"
         job.error = (r or {}).get("error", "Cloud build returned no result")
+        job.building_live = False
+        _clear_partition(job)
         return
-    tv, tf = r.get("tess_vertices"), r.get("tess_faces")
-    if not tv or not tf:
-        job.status = "error"
-        job.error = "Cloud build produced no geometry"
-        return
-    step = ConstructionStep(
-        name="Model",
-        tess_vertices=np.asarray(tv, np.float64).reshape(-1, 3),
-        tess_faces=np.asarray(tf, np.int64).reshape(-1, 3),
-        volume=float(r.get("cad_volume", 0.0)),
-    )
-    job.steps = [step]
-    job.steps_version = getattr(job, "steps_version", 0) + 1
+
+    # If steps already streamed in, keep them — don't collapse to a single
+    # "Model" step. Only synthesize one final step when nothing streamed.
+    streamed = bool(getattr(job, "_modal_streamed", False)) and len(job.steps) > 0
+    if not streamed:
+        tv, tf = r.get("tess_vertices"), r.get("tess_faces")
+        if not tv or not tf:
+            job.status = "error"
+            job.error = "Cloud build produced no geometry"
+            job.building_live = False
+            _clear_partition(job)
+            return
+        job.steps = [ConstructionStep(
+            name="Model",
+            tess_vertices=np.asarray(tv, np.float64).reshape(-1, 3),
+            tess_faces=np.asarray(tf, np.int64).reshape(-1, 3),
+            volume=float(r.get("cad_volume", 0.0)),
+        )]
+        job.steps_version = getattr(job, "steps_version", 0) + 1
+
     job.cad_volume = float(r.get("cad_volume", 0.0))
+    job.building_live = False
     job.progress = 100
     job.progress_stage = "Done"
     job.status = "done"
-    logger.info("Job %s finalized from Modal (IoU=%s, %s feats, %ss)",
-                job.id, r.get("iou"), r.get("n_features"), r.get("elapsed"))
+    _clear_partition(job)
+    logger.info("Job %s finalized from Modal (IoU=%s, %s feats, %s steps, %ss)",
+                job.id, r.get("iou"), r.get("n_features"), len(job.steps),
+                r.get("elapsed"))

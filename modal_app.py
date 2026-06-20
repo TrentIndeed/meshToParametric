@@ -51,11 +51,53 @@ image = (
 app = modal.App("mesh2param-pipeline", image=image)
 
 
+STEP_QUEUE_NAME = "mesh2param-steps"
+_STEP_MAX_BYTES = 950_000  # modal.Queue items cap at 1 MiB; stay under it
+
+
+def _make_step_sink(stream_key: str):
+    """Build a `sink(payload, n)` that forwards each construction step to the
+    shared step Queue, partitioned by `stream_key`. The web server's poller
+    drains that partition live so the cloud build streams step-by-step, exactly
+    like a local build. Best-effort: a dropped step just reappears in the final
+    result. Returns (sink, queue) or (None, None) if the Queue is unavailable."""
+    import numpy as np
+    try:
+        q = modal.Queue.from_name(STEP_QUEUE_NAME, create_if_missing=True)
+    except Exception:
+        return None, None
+
+    def _sink(payload: dict, n: int) -> None:
+        v, f = payload.get("tess_vertices"), payload.get("tess_faces")
+        if v is None or f is None:
+            return
+        va = np.asarray(v, np.float32).reshape(-1, 3)
+        fa = np.asarray(f, np.int32).reshape(-1, 3)
+        if va.nbytes + fa.nbytes > _STEP_MAX_BYTES:
+            return  # too big for a Queue item; final result will carry it
+        msg = {
+            "i": n,
+            "name": payload.get("name", f"Step {n + 1}"),
+            "tess_vertices": va,
+            "tess_faces": fa,
+            "volume": float(payload.get("volume", 0.0) or 0.0),
+        }
+        try:
+            q.put(msg, partition=stream_key, partition_ttl=3600)
+        except Exception:
+            pass
+
+    return _sink, q
+
+
 @app.function(cpu=4.0, memory=8192, timeout=900)
-def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False) -> dict:
+def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
+               stream_key: str | None = None) -> dict:
     """Full mesh->CAD pipeline on ONE mesh, in an isolated container. The unit of
     parallelism for both dev validation and production jobs. Returns metrics; with
-    want_geometry=True also returns the tessellated solid + STEP for the viewer."""
+    want_geometry=True also returns the tessellated solid + STEP for the viewer.
+    With stream_key set, each construction step is also pushed live to the shared
+    step Queue (partition=stream_key) so the server can stream the build."""
     import os
     import tempfile
     import time
@@ -67,6 +109,10 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False) ->
     with tempfile.NamedTemporaryFile(suffix="." + ext, delete=False) as fh:
         fh.write(mesh_bytes)
         path = fh.name
+
+    step_sink, step_queue = (None, None)
+    if stream_key:
+        step_sink, step_queue = _make_step_sink(stream_key)
 
     try:
         from mesh2param.config import (
@@ -90,7 +136,8 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False) ->
             fitted = fit_surfaces(regions, c, FitConfig())
         graph, edges = build_topology(regions, fitted, c, TopologyConfig())
         tree = recognize_features(regions, fitted, graph, edges, c, RecognizeConfig())
-        res = export_cadquery(tree, c, use_llm=False, num_variants=1)
+        res = export_cadquery(tree, c, use_llm=False, num_variants=1,
+                              stream_sink=step_sink)
 
         iou = None
         try:
@@ -123,6 +170,14 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False) ->
                 "trace": traceback.format_exc()[-1500:],
                 "elapsed": round(time.time() - t0, 1)}
     finally:
+        # Signal end-of-stream so the poller stops draining this partition
+        # promptly (it also stops when the call result arrives).
+        if step_queue is not None and stream_key:
+            try:
+                step_queue.put({"__done__": True}, partition=stream_key,
+                               partition_ttl=3600)
+            except Exception:
+                pass
         try:
             os.unlink(path)
         except Exception:

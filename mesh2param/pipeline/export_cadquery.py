@@ -50,7 +50,12 @@ class ConstructionStep:
 # primary build list is written atomically to `{stream_dir}/NNNN.pkl`. The
 # parent (viz_server/job_queue) scans that dir in its existing poll loop and
 # appends new steps to `job.steps` live. Same-process callers leave it None.
-_stream_ctx: dict = {"dir": None, "n": 0}
+#
+# Cloud builds (Modal) can't share a filesystem with the web server, so the same
+# per-step payload can ALSO be handed to a `sink` callback — `sink(payload, n)` —
+# which the Modal function points at a modal.Queue. Either, both, or neither may
+# be armed; the payload is built once and dispatched to whatever is set.
+_stream_ctx: dict = {"dir": None, "n": 0, "sink": None}
 
 
 def _set_step_stream_dir(stream_dir: str | None) -> None:
@@ -66,34 +71,51 @@ def _set_step_stream_dir(stream_dir: str | None) -> None:
                          exc_info=True)
 
 
+def _set_step_stream_sink(sink) -> None:
+    """Arm (or disarm) a callback sink for live steps: `sink(payload: dict, n)`.
+
+    Resets the shared step counter, so call this (or _set_step_stream_dir)
+    exactly once at the start of a build before any steps are emitted."""
+    _stream_ctx["sink"] = sink
+    _stream_ctx["n"] = 0
+
+
 def _stream_step(step: "ConstructionStep") -> None:
-    """Write one step to the stream dir atomically (.tmp -> os.replace).
+    """Mirror one step to whichever live sinks are armed (dir and/or callback).
 
     Best-effort: any failure here must never break the build."""
     d = _stream_ctx["dir"]
-    if not d:
+    sink = _stream_ctx["sink"]
+    if not d and sink is None:
         return
-    try:
-        import os
-        import pickle
-        n = _stream_ctx["n"]
-        payload = {
-            "name": step.name,
-            "tess_vertices": step.tess_vertices,
-            "tess_faces": step.tess_faces,
-            "volume": step.volume,
-            "sketch_overlay": step.sketch_overlay,
-            "overlay_arcs": step.overlay_arcs,
-        }
-        tmp = os.path.join(d, f".{n:04d}.tmp")
-        final = os.path.join(d, f"{n:04d}.pkl")
-        with open(tmp, "wb") as f:
-            pickle.dump(payload, f)
-        os.replace(tmp, final)
-        _stream_ctx["n"] = n + 1
-    except Exception:
-        logger.debug("Step streaming failed for %r", getattr(step, "name", "?"),
-                     exc_info=True)
+    n = _stream_ctx["n"]
+    payload = {
+        "name": step.name,
+        "tess_vertices": step.tess_vertices,
+        "tess_faces": step.tess_faces,
+        "volume": step.volume,
+        "sketch_overlay": step.sketch_overlay,
+        "overlay_arcs": step.overlay_arcs,
+    }
+    if d:
+        try:
+            import os
+            import pickle
+            tmp = os.path.join(d, f".{n:04d}.tmp")
+            final = os.path.join(d, f"{n:04d}.pkl")
+            with open(tmp, "wb") as f:
+                pickle.dump(payload, f)
+            os.replace(tmp, final)
+        except Exception:
+            logger.debug("Step file-streaming failed for %r",
+                         getattr(step, "name", "?"), exc_info=True)
+    if sink is not None:
+        try:
+            sink(payload, n)
+        except Exception:
+            logger.debug("Step sink-streaming failed for %r",
+                         getattr(step, "name", "?"), exc_info=True)
+    _stream_ctx["n"] = n + 1
 
 
 def _await_stitched_clusters(path: str, timeout: float = 180.0):
@@ -223,6 +245,7 @@ def export_cadquery(
     body_results: list | None = None,
     stitched_clusters: list[dict] | None = None,
     stream_dir: str | None = None,
+    stream_sink=None,
     stitched_clusters_path: str | None = None,
     residual_refine: bool = True,
     residual_refine_min_error_pct: float = 5.0,
@@ -249,9 +272,11 @@ def export_cadquery(
         "export_cadquery called: %d features, use_llm=%s, output_path=%s",
         feature_tree.num_features, use_llm, output_path,
     )
-    # Arm live step streaming (parent ingests files as they appear). Only the
+    # Arm live step streaming (parent ingests files as they appear, or a sink
+    # callback forwards them — e.g. to a modal.Queue for cloud builds). Only the
     # primary/default variant streams — see _build_stepwise's `stream` flag.
     _set_step_stream_dir(stream_dir)
+    _set_step_stream_sink(stream_sink)
     mesh_volume = _estimate_mesh_volume(cleaned)
 
     # Extract base profile (needed by both LLM and heuristic paths).
@@ -2487,7 +2512,9 @@ def _build_stepwise(
     # onto this same returned list, so they stream too. Other variants/bodies
     # use a plain list to avoid double-counting the stream.
     steps: list[ConstructionStep] = (
-        _StreamingStepList() if (stream and _stream_ctx["dir"]) else []
+        _StreamingStepList()
+        if (stream and (_stream_ctx["dir"] or _stream_ctx["sink"]))
+        else []
     )
     script_lines = ["import cadquery as cq", ""]
 

@@ -58,10 +58,12 @@ turn it on:
    poller finalizes them → concurrent customers run in parallel, isolated. Auth,
    billing, and the UI are unchanged; only the heavy compute moves out.
 
-Note: the cloud path returns the FINAL model (one step) — the live step-by-step
-"watch it build" pane and the in-browser feature editor (which need the local
-build bundle) are local-only for now; cloud jobs show progress then the result.
-Streaming + cloud editing are the documented next enhancements.
+Note: live step-by-step streaming IS implemented for cloud jobs — the container
+pushes each construction step to a shared `modal.Queue` (partition = job id) and
+the server's poller drains it into the dual-pane "watch it build" view, same as a
+local build (validated: 8 steps streamed, IoU 0.90). The **in-browser feature
+editor** still needs the local build bundle, so editing remains local-only;
+cloud editing is the documented next enhancement.
 
 ### Wiring details (what modal_runner does)
 1. `modal deploy modal_app.py` — deploys `build_mesh` as a callable cloud function.
@@ -87,13 +89,17 @@ Streaming + cloud editing are the documented next enhancements.
 4. Auth/billing/token-metering stay in the web server (unchanged). Only the
    compute moves out.
 
-### Live build streaming (the dual-pane "watch it build" view)
-Two options, in order of effort:
-- **Simple:** return the final result from `build_mesh` and skip per-step streaming
-  for cloud jobs (show a progress spinner). Fastest to ship.
-- **Streaming:** have `build_mesh` write each `ConstructionStep` to a `modal.Queue`
-  or `modal.Dict` keyed by call id; the server's status endpoint drains it. This
-  preserves the existing live-build UX. (Do this after the simple path works.)
+### Live build streaming (the dual-pane "watch it build" view) — IMPLEMENTED
+`build_mesh(..., stream_key=job.id)` pushes each `ConstructionStep` to a shared
+`modal.Queue` (`mesh2param-steps`, partition = job id) via `export_cadquery`'s
+`stream_sink` hook — the same per-step payload the local file-stream uses. The
+poller (`modal_runner.poll_and_finalize`) drains that partition each tick, appends
+the steps to `job.steps`, and bumps `steps_version` so the right pane accretes
+features live; a `{"__done__": True}` sentinel flushes end-of-stream. Guards:
+items over ~950 KiB are skipped (Queue cap is 1 MiB) and reappear in the final
+result; if the queue is unavailable the build still finalizes from the single
+returned model. Overlays (sketch lines/arcs) are omitted from cloud steps to stay
+under the item cap.
 
 ## Cost (per the 2026 research)
 - Pay-per-second CPU, scale-to-zero — no idle charge.

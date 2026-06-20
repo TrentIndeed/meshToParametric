@@ -2455,6 +2455,105 @@ mechanical part, determine the optimal construction order for building it in Cad
 # ---------------------------------------------------------------------------
 
 
+def _bore_profile(cleaned, center, axis_dir, r_hint):
+    """Probe a bore's void radius along its axis (via mesh cross-sections) and
+    return its radius LEVELS — so a stepped / counterbored through-bore (a
+    different diameter along its length) is cut at each section's REAL radius
+    instead of one averaged cylinder.
+
+    Returns ``{"axis": int, "levels": [{"radius","start","end"}, ...]}`` in world
+    axis-coordinates (the outer ends overshoot the faces; an interior boundary
+    sits at the step midpoint), or ``None`` when the bore reads as a single
+    uniform level — in which case the caller keeps the original single-cylinder
+    cut, so clean prismatic parts are unchanged. Conservative by design: only a
+    clear, substantial multi-level step survives the gates below.
+    """
+    try:
+        import trimesh
+        from shapely.geometry import Point
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return None
+    try:
+        axis = int(np.argmax(np.abs(axis_dir)))
+        us = [i for i in (0, 1, 2) if i != axis]
+        cu, cv = float(center[us[0]]), float(center[us[1]])
+        a_lo = float(cleaned.bbox[0][axis])
+        a_hi = float(cleaned.bbox[1][axis])
+        span = a_hi - a_lo
+        if span <= 1e-6 or r_hint <= 0:
+            return None
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+        n = int(np.clip(span / max(0.5, r_hint * 0.35), 24, 90))
+        ts = np.linspace(a_lo + span * 0.012, a_hi - span * 0.012, n)
+        r_min = max(0.5, 0.35 * r_hint)
+        r_cap = 3.5 * r_hint
+        radii = np.zeros(n)
+        p = Point(cu, cv)
+        for k, t in enumerate(ts):
+            g = _section_material(mesh, axis, float(t))
+            if g is None or g.contains(p):
+                continue                            # solid here — no bore
+            d = float(g.distance(p))
+            radii[k] = d if d <= r_cap else 0.0     # runaway void at a part edge
+        # Segment contiguous bore stations into ~constant-radius levels.
+        tol = max(0.4, 0.2 * r_hint)
+        levels = []
+        k = 0
+        while k < n:
+            if radii[k] < r_min:
+                k += 1
+                continue
+            j = k
+            band = [radii[k]]
+            while (j + 1 < n and radii[j + 1] >= r_min
+                   and abs(radii[j + 1] - float(np.median(band))) <= tol):
+                j += 1
+                band.append(radii[j])
+            if (j - k + 1) >= 2:                     # ignore single-station spikes
+                levels.append({"radius": float(np.median(band)), "i0": k, "i1": j})
+            k = j + 1
+        if len(levels) < 2:
+            return None
+        rs = [lv["radius"] for lv in levels]
+        if not all(0.4 * r_hint <= r <= 3.0 * r_hint for r in rs):
+            return None
+        if (max(rs) - min(rs)) < max(0.5, 0.2 * r_hint):
+            return None                             # not a real step — one bore
+        bore_stations = max(1, levels[-1]["i1"] - levels[0]["i0"])
+        if any((lv["i1"] - lv["i0"] + 1) < 0.12 * bore_stations for lv in levels):
+            return None                             # a level too thin to trust
+        margin = max(1.0, 0.1 * span)
+        out = []
+        for idx, lv in enumerate(levels):
+            start = (a_lo - margin) if idx == 0 else \
+                0.5 * (float(ts[levels[idx - 1]["i1"]]) + float(ts[lv["i0"]]))
+            end = (a_hi + margin) if idx == len(levels) - 1 else \
+                0.5 * (float(ts[lv["i1"]]) + float(ts[levels[idx + 1]["i0"]]))
+            out.append({"radius": lv["radius"], "start": start, "end": end})
+        return {"axis": axis, "levels": out}
+    except Exception:
+        logger.debug("bore profile failed", exc_info=True)
+        return None
+
+
+def _stepped_cutter(cq, center, bore):
+    """A CadQuery cut solid = union of coaxial cylinders, one per bore level."""
+    axis = bore["axis"]
+    e = [0.0, 0.0, 0.0]
+    e[axis] = 1.0
+    sol = None
+    for lv in bore["levels"]:
+        o = [float(center[0]), float(center[1]), float(center[2])]
+        o[axis] = float(lv["start"])
+        pl = cq.Plane(origin=cq.Vector(*o), normal=cq.Vector(*e))
+        cyl = cq.Workplane(pl).circle(float(lv["radius"])).extrude(
+            float(lv["end"] - lv["start"]))
+        sol = cyl if sol is None else sol.union(cyl)
+    return sol
+
+
 def _build_stepwise(
     profiles: list[list[tuple[float, float]]],
     depth: float,
@@ -3224,24 +3323,37 @@ def _build_stepwise(
             hole_name += f" — {note}"
 
         try:
-            # Compose the hole-cut solid as the union of cylinders at all
-            # group centers. cut_start was computed for the primary center;
-            # for each additional center we shift the start parallel along
-            # the projected XY plane so the cylinder sits where the center
-            # is, while keeping the same axis depth.
-            hole_plane = cq.Plane(
-                origin=cq.Vector(*cut_start.tolist()),
-                normal=cq.Vector(*h_dir.tolist()),
-            )
-            hole_solid = cq.Workplane(hole_plane).circle(radius).extrude(cut_length)
-            for c in centers_all[1:]:
-                shift = c - center
-                shift_plane = cq.Plane(
+            # Probe the bore's TRUE radius profile from the mesh. A stepped /
+            # counterbored through-bore (a different Ø along its length) is cut
+            # at each section's real radius instead of one averaged cylinder; a
+            # uniform bore returns None and keeps the original single cylinder,
+            # so clean prismatic parts are unchanged.
+            bore = None
+            if is_through and cleaned is not None:
+                bore = _bore_profile(cleaned, center, h_dir, radius)
+
+            def _cutter_at(c_each):
+                if bore is not None:
+                    return _stepped_cutter(cq, np.asarray(c_each, dtype=float), bore)
+                # Single-cylinder cut at this center (original behaviour).
+                shift = np.asarray(c_each, dtype=float) - center
+                pl = cq.Plane(
                     origin=cq.Vector(*(cut_start + shift).tolist()),
                     normal=cq.Vector(*h_dir.tolist()),
                 )
-                extra = cq.Workplane(shift_plane).circle(radius).extrude(cut_length)
-                hole_solid = hole_solid.union(extra)
+                return cq.Workplane(pl).circle(radius).extrude(cut_length)
+
+            # Compose the hole-cut solid as the union of cutters at all group
+            # centers (each a single cylinder, or a stepped stack of cylinders).
+            hole_solid = _cutter_at(center)
+            for c in centers_all[1:]:
+                hole_solid = hole_solid.union(_cutter_at(c))
+            if bore is not None:
+                logger.info(
+                    "Stepped bore at %s: %d levels r=%s",
+                    np.round(center, 1).tolist(), len(bore["levels"]),
+                    [round(lv["radius"], 2) for lv in bore["levels"]],
+                )
 
             # Emit a "Sketch Hole" step showing the circle outline(s) on
             # the pre-cut solid. For a multi-center group, this is one

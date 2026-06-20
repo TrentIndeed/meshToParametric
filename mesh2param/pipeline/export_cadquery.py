@@ -2455,6 +2455,120 @@ mechanical part, determine the optimal construction order for building it in Cad
 # ---------------------------------------------------------------------------
 
 
+def _detect_blind_pockets(cleaned, extrude_dir):
+    """Detect blind pocket / slot recesses on the extrude-axis faces directly
+    from the MESH (robust to the shattered segmentation that mis-recognizes
+    them). A region that is VOID just inside a face but SOLID deeper in is a
+    blind pocket; one that stays void all the way through is a hole (skipped —
+    holes handle those).
+
+    Returns a list of {plane_name, origin_t, profile_uv, depth, sign} ready for
+    a no-boss cut-extrude: draw `profile_uv` on `plane_name` at the face and
+    extrude `sign*depth` to cut. Conservative gates keep clean prismatic parts
+    untouched.
+    """
+    try:
+        import trimesh
+        from shapely.geometry import MultiPolygon, Point, Polygon as SPoly
+        from shapely.ops import unary_union
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return []
+    try:
+        axis = int(np.argmax(np.abs(extrude_dir)))
+        us = [i for i in (0, 1, 2) if i != axis]
+        a_lo = float(cleaned.bbox[0][axis])
+        a_hi = float(cleaned.bbox[1][axis])
+        span = a_hi - a_lo
+        diag = float(np.linalg.norm(cleaned.bbox[1] - cleaned.bbox[0]))
+        if span <= 1e-6 or diag <= 0:
+            return []
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+
+        def sect(t):
+            return _section_material(mesh, axis, float(t))
+
+        def outline(geom):
+            """Outer outline (interior holes filled) of a (Multi)Polygon."""
+            if geom is None:
+                return None
+            polys = list(geom.geoms) if isinstance(geom, MultiPolygon) else [geom]
+            rings = [SPoly(p.exterior) for p in polys if p.area > 0]
+            return unary_union(rings) if rings else None
+
+        # Silhouette = outline of the section with the MOST material (fewest
+        # voids), so shallow face pockets don't eat into it.
+        samples = np.linspace(a_lo + span * 0.05, a_hi - span * 0.05, 7)
+        sil = None
+        sil_area = -1.0
+        mids = []
+        for t in samples:
+            g = sect(t)
+            if g is None:
+                continue
+            mids.append((t, g))
+            if g.area > sil_area:
+                sil_area = g.area
+                sil = outline(g)
+        if sil is None or sil_area <= 0:
+            return []
+        # Through-voids: empty regions that persist deep inside (holes / cutouts).
+        # Anything matching these near a face is NOT a blind pocket.
+        through_void = sil
+        for _t, g in mids:
+            through_void = through_void.intersection(sil.difference(g.buffer(0)))
+            if through_void.is_empty:
+                break
+
+        min_area = max(4.0, 0.004 * sil_area)
+        min_depth = max(0.8, 0.03 * span)
+        pockets = []
+        for face_t, sign in ((a_hi, -1.0), (a_lo, +1.0)):
+            inner_t = face_t + sign * max(0.5, span * 0.04)
+            mi = sect(inner_t)
+            if mi is None:
+                continue
+            void = sil.difference(mi.buffer(0))
+            if through_void is not None and not through_void.is_empty:
+                void = void.difference(through_void.buffer(0.5))
+            if void.is_empty:
+                continue
+            polys = list(void.geoms) if isinstance(void, MultiPolygon) else [void]
+            for poly in polys:
+                if not isinstance(poly, SPoly) or poly.area < min_area:
+                    continue
+                cpt = poly.representative_point()
+                # Walk inward; the floor is where material covers this region.
+                depth = None
+                step = max(0.6, span * 0.04)
+                dd = step
+                while dd < span * 0.9:
+                    g = sect(face_t + sign * dd)
+                    if g is not None and g.buffer(-0.3).contains(cpt):
+                        depth = dd
+                        break
+                    dd += step
+                if depth is None or depth < min_depth:
+                    continue            # through (a hole) or too shallow (noise)
+                prof = poly.simplify(max(0.2, 0.01 * diag)).exterior
+                uv = [(float(x), float(y)) for x, y in zip(*prof.xy)]
+                if len(uv) < 4:
+                    continue
+                pockets.append({
+                    "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
+                    "origin_t": face_t,
+                    "axis": axis,
+                    "profile_uv": uv,
+                    "depth": float(depth),
+                    "sign": float(sign),
+                })
+        return pockets
+    except Exception:
+        logger.debug("blind-pocket detection failed", exc_info=True)
+        return []
+
+
 def _bore_profile(cleaned, center, axis_dir, r_hint):
     """Probe a bore's void radius along its axis (via mesh cross-sections) and
     return its radius LEVELS — so a stepped / counterbored through-bore (a
@@ -3470,6 +3584,56 @@ def _build_stepwise(
                 "Failed to cut hole %d (r=%.2f, center=%s, dir=%s): %s",
                 i, radius, center.tolist(), h_dir.tolist(), e,
             )
+
+    # --- Cut blind pockets / slots (no-boss cut-extrudes) ---
+    # Recesses cut partway into a face (the carriage block's face slots). Detected
+    # straight from the mesh (robust to segmentation); a uniform/clean part finds
+    # none, so this is inert there. Each is the void profile extruded inward to
+    # its floor depth, then subtracted — no surrounding boss (unlike blind holes).
+    if cleaned is not None:
+        try:
+            blind_pockets = _detect_blind_pockets(cleaned, extrude_dir)
+        except Exception:
+            blind_pockets = []
+        for pk in blind_pockets:
+            try:
+                o = [0.0, 0.0, 0.0]
+                o[pk["axis"]] = pk["origin_t"]
+                vol_before = abs(float(wp.val().Volume()))
+                # The named-plane normal sign is fiddly, so try BOTH extrude
+                # directions and keep whichever actually removes material (the
+                # one that cuts inward through the face); the other extrudes
+                # outside the solid and removes nothing.
+                wp_done = None
+                for sgn in (pk["sign"], -pk["sign"]):
+                    try:
+                        cutter = (
+                            cq.Workplane(pk["plane_name"], origin=tuple(o))
+                            .polyline(pk["profile_uv"]).close()
+                            .extrude(sgn * pk["depth"])
+                        )
+                        wp_t = wp.cut(cutter)
+                        if vol_before - abs(float(wp_t.val().Volume())) > 0.5:
+                            wp_done = wp_t
+                            break
+                    except Exception:
+                        continue
+                if wp_done is None:
+                    continue                       # neither direction cut — skip
+                wp = wp_done
+                v, f = _tessellate_solid(wp, fast=True)
+                steps.append(ConstructionStep(
+                    name=f"Pocket (depth {pk['depth']:.1f}mm)",
+                    tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+                script_lines.append(
+                    f"# Pocket: {pk['plane_name']} depth={pk['depth']:.2f}"
+                )
+                logger.info("Cut blind pocket on %s, depth %.1f (%d pts)",
+                            pk["plane_name"], pk["depth"], len(pk["profile_uv"]))
+            except Exception as _pk_exc:
+                logger.warning("Failed to cut blind pocket: %s", _pk_exc)
 
     # Fillet application is handled by the caller via
     # _apply_recognized_fillets_to_solid, which runs AFTER all bodies have

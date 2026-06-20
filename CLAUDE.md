@@ -137,21 +137,25 @@ Each call runs the whole pipeline + exact IoU in its OWN isolated container — 
 is the only thing that beats the pymeshlab-can't-run-concurrently wall (local
 process pools stall on alpha-wrap parts).
 - **Dev sweep (the 15 AI parts in parallel, ~3 min):** `modal run modal_app.py`
-  (or `--parts AI9,AI12`). Proven mean IoU 0.780, wall ~195s. Windows: `PYTHONUTF8=1`
+  (or `--parts AI9,AI12`). Proven mean IoU 0.813, wall ~175s. Windows: `PYTHONUTF8=1`
   + `python -m modal`; the async-shutdown noise after "✓ App completed" is harmless.
 - **Prod (public launch):** `modal deploy modal_app.py` once, then set `USE_MODAL=1`
   + `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` on the server. The worker then SPAWNS each
   customer job into its own container; a poller finalizes them. Auth/billing/UI
-  unchanged — only the heavy compute moves out. **Feature parity with local jobs:**
+  unchanged — only the heavy compute moves out. **FULL parity with local jobs.**
+  GEOMETRY: cloud `build_mesh` calls the SAME `pipeline/convert.py:analyze_part`
+  (ingest → decompose → per-body `recognize_body` → cross-body
+  `stitch_fillet_clusters`) the server runs, then `export_cadquery(body_results,
+  stitched_clusters)` — one source of truth, so cloud == local on multi-body parts
+  and stitched fillets (full AI-set mean IoU 0.813, up from 0.780 flat). FEATURES:
   live step-streaming (container → shared `modal.Queue` partitioned by job id →
-  poller drains into the dual-pane viewer), the feature-tree EDITOR + edge-picking
+  poller drains into the dual-pane viewer); the feature-tree EDITOR + edge-picking
   + STEP download + mesh Compare (the container returns the rebuild bundle
-  `(tree, cleaned, None, None)` + STEP bytes; `modal_runner._finalize` lands them
-  on disk and sets `job.features/cleaned/cad_*_path`), and DB persistence + token
-  accounting (poller mirrors the local completion path). Remaining divergence: the
-  cloud path runs the FLAT pipeline (ingest→segment→fit→topology→recognize), not
-  the local multi-body DECOMPOSED pipeline — so multi-body parts build at lower
-  fidelity in the cloud until that pipeline is shared.
+  `(tree, cleaned, body_results, decomposition)` + STEP bytes; `modal_runner.
+  _finalize` lands them on disk and sets `job.features/cleaned/cad_*_path`); and DB
+  persistence + token accounting (poller mirrors the local completion path).
+  **Keep synced:** the stitched-fillets stage is shared in `convert.py` — never
+  re-inline it in `job_queue.py`, or cloud and local will drift.
 
 ## Pages
 - `/` — Landing page (public) with video hero, scroll animation, pricing, FAQ, waitlist

@@ -16,7 +16,7 @@ modal setup          # authenticate in the browser
 modal run modal_app.py                        # all AI1..AI15
 modal run modal_app.py --parts AI9,AI12,AI13  # a subset
 ```
-PROVEN: full 15-part run = **mean IoU 0.780, wall ~195s** (~3.3 min) in parallel
+PROVEN: full 15-part run = **mean IoU 0.813, wall ~175s** (~3 min) in parallel
 isolated containers — vs 15-20 min sequential, and no pymeshlab stalls.
 
 ### Windows gotchas (one time)
@@ -64,20 +64,24 @@ Note: cloud jobs now have FEATURE PARITY with local jobs. Implemented:
   dual-pane "watch it build" view (validated: 8 steps streamed, IoU 0.90).
 - **In-browser feature editor + edge-picking + STEP download + mesh Compare** —
   `build_mesh(want_geometry=True)` also returns the durable rebuild bundle
-  `(tree, cleaned, None, None)` and the STEP bytes; `modal_runner._finalize`
-  writes them to `data/cad_bundle_{id}.pkl` / `cad_solid_{id}.step` (+ edit base)
-  and sets `job.features / job.cleaned / job.cad_*_path`, so `/api/job/{id}/edit`,
-  `/edges`, `/download-step`, and `/mesh` all work (validated: no-op rebuild
-  reproduces the build volume exactly; 801 edges; fillet edit applies).
+  `(tree, cleaned, body_results, decomposition)` and the STEP bytes;
+  `modal_runner._finalize` writes them to `data/cad_bundle_{id}.pkl` /
+  `cad_solid_{id}.step` (+ edit base) and sets `job.features / job.cleaned /
+  job.cad_*_path`, so `/api/job/{id}/edit`, `/edges`, `/download-step`, and
+  `/mesh` all work — multi-body parts rebuild correctly too (validated: no-op
+  rebuild reproduces the build volume; 833 edges; fillet edit applies).
 - **DB persistence + token accounting** — the poller mirrors the local completion
   path (`_tokens_spent += token_cost`, `_save_to_db`), so cloud jobs survive
   restarts and show in history.
 
-Remaining divergence (NOT yet parity): the cloud path runs the FLAT pipeline
-(ingest→segment→fit→topology→recognize→export), while the local worker runs the
-multi-body DECOMPOSED pipeline (decompose → per-body → stitched fillets). Sharing
-that pipeline so cloud builds match local fidelity on multi-body parts is the next
-enhancement.
+GEOMETRY PARITY (achieved): cloud `build_mesh` runs the SAME pipeline as the
+server — `pipeline/convert.py:analyze_part` (ingest → decompose → per-body
+`recognize_body` → cross-body `stitch_fillet_clusters`) then `export_cadquery(
+body_results, stitched_clusters)`. `analyze_part` and the stitched-fillets stage
+are the single source of truth, so cloud == local on multi-body parts and stitched
+fillets. Full AI-set mean IoU rose 0.780 → **0.813** when the cloud switched off
+the old flat pipeline onto this shared path. KEEP SYNCED: never re-inline the
+stitched stage into `job_queue.py` — both sides must call `convert.py`.
 
 ### Wiring details (what modal_runner does)
 1. `modal deploy modal_app.py` — deploys `build_mesh` as a callable cloud function.

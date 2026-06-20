@@ -116,34 +116,33 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
     step_out = None
 
     try:
-        from mesh2param.config import (
-            FitConfig, IngestConfig, RecognizeConfig, SegmentConfig, TopologyConfig)
-        from mesh2param.pipeline.ingest import ingest_mesh
-        from mesh2param.pipeline.segment import segment_mesh
-        from mesh2param.pipeline.fit import fit_surfaces
-        from mesh2param.pipeline.topology import build_topology
-        from mesh2param.pipeline.recognize import recognize_features
+        from mesh2param.config import IngestConfig
+        from mesh2param.pipeline.convert import analyze_part
         from mesh2param.pipeline.export_cadquery import export_cadquery
 
-        c = ingest_mesh(path, IngestConfig(remesh=False, scan_auto=True))
-        dirty = bool((c.metadata or {}).get("scan_mode"))
-        seg = SegmentConfig(noise_robust=dirty)
-        regions = segment_mesh(c, seg)
-        fitted = fit_surfaces(regions, c, FitConfig())
-        if dirty:
-            from mesh2param.pipeline.regularize import regularize_mesh
-            regularize_mesh(c, regions, fitted, snap_angle_deg=12.0)
-            regions = segment_mesh(c, seg)
-            fitted = fit_surfaces(regions, c, FitConfig())
-        graph, edges = build_topology(regions, fitted, c, TopologyConfig())
-        tree = recognize_features(regions, fitted, graph, edges, c, RecognizeConfig())
+        # SAME pipeline the server runs: ingest -> decompose -> per-body
+        # recognize_body -> cross-body stitched fillets. analyze_part is the
+        # single source of truth (mesh2param/pipeline/convert.py), so a cloud
+        # build produces the same geometry a local job does — multi-body parts
+        # and stitched fillets included.
+        analysis = analyze_part(path, IngestConfig(remesh=False, scan_auto=True))
+        c = analysis.cleaned
+        tree = analysis.tree
+        if tree is None:
+            return {"filename": filename, "ok": False,
+                    "error": "no body recognized", "elapsed": round(time.time() - t0, 1)}
         # When the server wants the full job (want_geometry), also write a STEP so
         # we can ship its bytes back for edge-picking + download (editor parity).
         if want_geometry:
             fd, step_out = tempfile.mkstemp(suffix=".step")
             os.close(fd)
-        res = export_cadquery(tree, c, output_path=step_out, use_llm=False,
-                              num_variants=1, stream_sink=step_sink)
+        # EXACT same export call as the local CAD subprocess (job_queue line ~727):
+        # body_results only when multi-body, plus the stitched-fillet clusters.
+        res = export_cadquery(
+            tree, c, use_llm=False, num_variants=1,
+            body_results=analysis.body_results if analysis.multi_body else None,
+            stitched_clusters=analysis.stitched_clusters,
+            output_path=step_out, stream_sink=step_sink)
 
         iou = None
         try:
@@ -162,7 +161,7 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
         out = {
             "filename": filename, "ok": True, "iou": iou,
             "vol_err": float(res.volume_error_pct),
-            "n_regions": len(regions), "n_features": tree.num_features,
+            "n_regions": analysis.n_regions, "n_features": tree.num_features,
             "elapsed": round(time.time() - t0, 1),
         }
         if want_geometry:
@@ -170,14 +169,14 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
             out["tess_vertices"] = np.asarray(res.tess_vertices, np.float32).reshape(-1).tolist()
             out["tess_faces"] = np.asarray(res.tess_faces, np.int32).reshape(-1).tolist()
             out["cad_volume"] = float(res.cad_volume)
-            # Editor parity: the durable rebuild bundle (same tuple the local
-            # worker pickles) so /api/job/{id}/edit can re-run the build, plus the
-            # STEP bytes for edge-picking + download, plus the source mesh volume.
-            # The cloud flat pipeline has no decomposition, so body_results /
-            # decomposition are None — rebuild_from_bundle tolerates that.
+            # Editor parity: the durable rebuild bundle — the SAME 4-tuple the
+            # local worker pickles, (tree, cleaned, body_results, decomposition) —
+            # so /api/job/{id}/edit rebuilds multi-body parts correctly too, plus
+            # the STEP bytes for edge-picking + download and the source volume.
             try:
-                out["bundle_bytes"] = pickle.dumps((tree, c, None, None),
-                                                   protocol=pickle.HIGHEST_PROTOCOL)
+                out["bundle_bytes"] = pickle.dumps(
+                    (tree, c, analysis.body_results, analysis.decomposition),
+                    protocol=pickle.HIGHEST_PROTOCOL)
             except Exception:
                 out["bundle_bytes"] = None
             if step_out and os.path.exists(step_out):

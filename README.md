@@ -134,6 +134,8 @@ modal run modal_app.py                 # all 15 AI test parts in parallel (~3 mi
 modal run modal_app.py --parts AI9,AI12
 ```
 
+Cloud jobs are at **full parity** with local: `build_mesh` calls the same `pipeline/convert.py:analyze_part` (ingest → decompose → per-body recognition → cross-body stitched fillets) the server runs, then the same `export_cadquery`, and streams steps + returns the editor bundle. One source of truth, so cloud == local geometry (full AI-set mean IoU 0.81).
+
 For the public launch, `modal deploy modal_app.py` once and set `USE_MODAL=1` + Modal tokens on the server — the worker then spawns each customer job into its own container. Default off → unchanged local worker. See [docs/MODAL_DEPLOY.md](docs/MODAL_DEPLOY.md).
 
 ## Pricing (Token-Based)
@@ -200,7 +202,7 @@ This section tracks major changes to the core pipeline, problems hit, and how th
 
 ### AI/scan ingest — alpha-wrap before voxel, so round holes survive
 
-AI-generated (Meshy/Tripo) and scanned meshes arrive non-watertight, and `voxel_repair` (res 96) quantizes cylindrical bores into blocky circles that fail cylinder detection downstream. The ingest repair order is now **fill_holes → poisson → alpha-wrap (before voxel) → voxel_repair → face cap → late alpha-wrap**: alpha-wrap watertights the mesh while preserving round bores, so voxel_repair rarely fires. Validated AI12 IoU 0.58 → 0.77; full 15-part mean IoU 0.780. Alpha-wrap (pymeshlab) is **Linux-only** — runs in Docker/Modal, no-ops natively on Windows. Reliable exact (boolean) IoU is likewise container-only.
+AI-generated (Meshy/Tripo) and scanned meshes arrive non-watertight, and `voxel_repair` (res 96) quantizes cylindrical bores into blocky circles that fail cylinder detection downstream. The ingest repair order is now **fill_holes → poisson → alpha-wrap (before voxel) → voxel_repair → face cap → late alpha-wrap**: alpha-wrap watertights the mesh while preserving round bores, so voxel_repair rarely fires. Validated AI12 IoU 0.58 → 0.77; full 15-part mean IoU 0.81. Alpha-wrap (pymeshlab) is **Linux-only** — runs in Docker/Modal, no-ops natively on Windows. Reliable exact (boolean) IoU is likewise container-only.
 
 ### Pipeline restructure — per-body segmentation + stitched fillets
 

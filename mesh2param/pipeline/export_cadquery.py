@@ -2462,13 +2462,15 @@ def _detect_face_pockets(cleaned, extrude_dir):
     excludes through features (they're void at mid) — so it can't mis-fire on
     through slots/holes (the carriage-block lesson).
 
-    The recess polygon keeps its interior holes (through-holes + raised hubs), so
-    the cut preserves them. Returns [{plane_name, axis, face_t, sign, depth,
-    exterior_uv, interiors_uv}].
+    Each recess interior is CLASSIFIED: solid at mid-thickness = a raised HUB
+    (preserve, don't cut), void at mid = a THROUGH-HOLE (cut through, so it
+    doesn't survive as a raised post). Depth is the MEDIAN floor over several
+    sample points (robust to a noisy single point). Returns [{plane_name, axis,
+    face_t, sign, depth, exterior_uv, hubs_uv, holes_uv, a_lo, a_hi}].
     """
     try:
         import trimesh
-        from shapely.geometry import MultiPolygon, Polygon as SPoly
+        from shapely.geometry import MultiPolygon, Point, Polygon as SPoly
         from mesh2param.pipeline.recognize import _section_material
     except Exception:
         return []
@@ -2503,31 +2505,72 @@ def _detect_face_pockets(cleaned, extrude_dir):
                 try:
                     if p.area < max(20.0, 0.01 * m_mid.area):
                         continue
-                    cpt = p.representative_point()       # a point in the SOLID recess
-                    depth = 0.0
-                    for dd in np.linspace(max(0.5, span * 0.05), span * 0.85, 24):
-                        g = _section_material(mesh, axis, face_t + sign * dd)
-                        if g is not None and g.buffer(-0.3).contains(cpt):
-                            depth = float(dd)
-                            break
-                    if depth < max(0.8, 0.03 * span):
-                        continue                          # too shallow / through
                     ps = p.simplify(max(0.2, 0.003 * span))
                     if not isinstance(ps, SPoly) or ps.is_empty:
                         continue
                     ext = [(float(x), float(y)) for x, y in zip(*ps.exterior.xy)]
                     if len(ext) < 4:
                         continue
-                    ints = []
-                    for ring in ps.interiors:
-                        iv = [(float(x), float(y)) for x, y in zip(*ring.xy)]
-                        if len(iv) >= 4 and abs(SPoly(ring).area) > 2.0:
-                            ints.append(iv)
-                    out.append({
-                        "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
-                        "axis": axis, "face_t": face_t, "sign": sign, "depth": depth,
-                        "exterior_uv": ext, "interiors_uv": ints,
-                    })
+
+                    def _floor(pt):
+                        for dd in np.linspace(max(0.5, span * 0.05), span * 0.85, 24):
+                            g = _section_material(mesh, axis, face_t + sign * dd)
+                            if g is not None and g.buffer(-0.3).contains(pt):
+                                return float(dd)
+                        return None
+
+                    # MEDIAN floor over several sample points in the recess (a
+                    # single point is fragile on a noisy scan).
+                    samples = [ps.representative_point()]
+                    mnx, mny, mxx, mxy = ps.bounds
+                    for fx, fy in ((0.3, 0.5), (0.7, 0.5), (0.5, 0.3),
+                                   (0.5, 0.7), (0.35, 0.35), (0.65, 0.65)):
+                        q = Point(mnx + (mxx - mnx) * fx, mny + (mxy - mny) * fy)
+                        if ps.contains(q):
+                            samples.append(q)
+                    depths = [d for d in (_floor(q) for q in samples) if d is not None]
+                    if not depths:
+                        continue
+                    depth = float(np.median(depths))
+                    if depth < max(0.8, 0.03 * span):
+                        continue                          # too shallow / through
+
+                    # CUT SHAPE = recess MINUS material near the floor. Any region
+                    # still SOLID near the floor (a raised hub/boss — including one
+                    # present on a single face) is excluded from the cut and thus
+                    # PRESERVED. This is general (no per-feature guessing) and
+                    # handles a variable-depth recess. Through-holes (void at mid)
+                    # are additionally cut all the way through so they don't
+                    # survive as raised posts.
+                    mfloor = _section_material(mesh, axis, face_t + sign * 0.85 * depth)
+                    cut_shape = (ps.difference(mfloor.buffer(0))
+                                 if mfloor is not None else ps)
+                    for cs in (g2 for g2 in getattr(cut_shape, "geoms", [cut_shape])
+                               if isinstance(g2, SPoly) and not g2.is_empty):
+                        if cs.area < max(20.0, 0.01 * m_mid.area):
+                            continue
+                        cext = [(float(x), float(y)) for x, y in zip(*cs.exterior.xy)]
+                        if len(cext) < 4:
+                            continue
+                        interiors, throughs = [], []
+                        for ring in cs.interiors:
+                            iv = [(float(x), float(y)) for x, y in zip(*ring.xy)]
+                            rp = SPoly(ring)
+                            if len(iv) < 4 or abs(rp.area) <= 2.0:
+                                continue
+                            interiors.append(iv)        # preserved in the pocket cut
+                            try:
+                                frac = m_mid.intersection(rp).area / (rp.area + 1e-9)
+                            except Exception:
+                                frac = 0.0
+                            if frac < 0.5:
+                                throughs.append(iv)     # void at mid -> cut through
+                        out.append({
+                            "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
+                            "axis": axis, "face_t": face_t, "sign": sign, "depth": depth,
+                            "exterior_uv": cext, "interiors_uv": interiors,
+                            "holes_uv": throughs, "a_lo": a_lo, "a_hi": a_hi,
+                        })
                 except Exception:
                     logger.debug("face-pocket: polygon failed", exc_info=True)
                     continue
@@ -3642,31 +3685,54 @@ def _build_stepwise(
                 o[pk["axis"]] = pk["face_t"]
 
                 def _pocket_cutter(sgn):
+                    # Recess = exterior to depth, MINUS its interiors (hubs/bosses
+                    # solid near the floor + hole regions), so anything solid stays
+                    # solid. Through-holes are cut all the way through below.
                     cut = (cq.Workplane(pk["plane_name"], origin=tuple(o))
                            .polyline(pk["exterior_uv"]).close()
                            .extrude(sgn * pk["depth"]))
                     for iv in pk["interiors_uv"]:
                         try:
-                            hole = (cq.Workplane(pk["plane_name"], origin=tuple(o))
+                            keep = (cq.Workplane(pk["plane_name"], origin=tuple(o))
                                     .polyline(iv).close()
                                     .extrude(sgn * pk["depth"]))
-                            cut = cut.cut(hole)         # preserve hubs/through-holes
+                            cut = cut.cut(keep)         # preserve hub/hole region
                         except Exception:
                             continue
                     return cut
 
                 vb = abs(float(wp.val().Volume()))
                 wp_done = None
+                used_sgn = pk["sign"]
                 for sgn in (pk["sign"], -pk["sign"]):
                     try:
                         wt = wp.cut(_pocket_cutter(sgn))
                         if vb - abs(float(wt.val().Volume())) > 0.5:
                             wp_done = wt
+                            used_sgn = sgn
                             break
                     except Exception:
                         continue
                 if wp_done is None:
                     continue
+                # Cut the recess's THROUGH-HOLES all the way through (the scan's
+                # hole detection misses them, so without this they'd remain as
+                # raised posts in the recess floor).
+                a_lo, a_hi = pk["a_lo"], pk["a_hi"]
+                tspan = (a_hi - a_lo) + 2.0
+                for iv in pk["holes_uv"]:
+                    try:
+                        oo = [0.0, 0.0, 0.0]
+                        oo[pk["axis"]] = a_lo - 1.0
+                        for s2 in (1.0, -1.0):
+                            thru = (cq.Workplane(pk["plane_name"], origin=tuple(oo))
+                                    .polyline(iv).close().extrude(s2 * tspan))
+                            wt2 = wp_done.cut(thru)
+                            if abs(float(wp_done.val().Volume())) - abs(float(wt2.val().Volume())) > 0.5:
+                                wp_done = wt2
+                                break
+                    except Exception:
+                        continue
                 # SKETCH step: the recess outline on the face.
                 try:
                     seg = []
@@ -3703,9 +3769,10 @@ def _build_stepwise(
                 ))
                 script_lines.append(
                     f"# Face pocket {pi + 1} on {pk['plane_name']}, depth {pk['depth']:.2f}")
-                logger.info("Cut face pocket %d on %s depth %.1f (%d holes)",
+                logger.info("Cut face pocket %d on %s depth %.1f "
+                            "(%d regions kept, %d holes through)",
                             pi + 1, pk["plane_name"], pk["depth"],
-                            len(pk["interiors_uv"]))
+                            len(pk["interiors_uv"]), len(pk["holes_uv"]))
             except Exception as _fp_exc:
                 logger.warning("Failed to cut face pocket: %s", _fp_exc)
 

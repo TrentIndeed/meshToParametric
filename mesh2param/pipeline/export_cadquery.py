@@ -2455,6 +2455,110 @@ mechanical part, determine the optimal construction order for building it in Cad
 # ---------------------------------------------------------------------------
 
 
+def _detect_tangent_holes(cleaned, extrude_dir):
+    """Detect circular through-holes whose axis is PERPENDICULAR to the extrude
+    axis (the carriage block's 'tangent' holes), straight from the MESH — robust
+    to the broken fit that mis-locates them as short/blind cylinders. Each hole
+    carries its radius LEVELS along the axis, so a STEPPED tangent hole (wide for
+    part of its length, narrow for the rest) is cut correctly.
+
+    Returns [{axis, cu, cv, levels: [(radius, t0, t1), ...]}] in world coords
+    (outer ends overshoot the faces). Empty when there are no tangent holes.
+    """
+    try:
+        import trimesh
+        from shapely.geometry import MultiPolygon, Point, Polygon as SPoly
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return []
+    try:
+        ext_axis = int(np.argmax(np.abs(extrude_dir)))
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+        out = []
+        for axis in (0, 1, 2):
+            if axis == ext_axis:
+                continue                          # extrude-axis holes handled elsewhere
+            a_lo = float(cleaned.bbox[0][axis])
+            a_hi = float(cleaned.bbox[1][axis])
+            span = a_hi - a_lo
+            if span <= 1e-6:
+                continue
+            g = _section_material(mesh, axis, 0.5 * (a_lo + a_hi))
+            if g is None:
+                continue
+            polys = list(g.geoms) if isinstance(g, MultiPolygon) else [g]
+            cands = []
+            for p in polys:
+                for ring in p.interiors:
+                    ip = SPoly(ring)
+                    per = ip.length
+                    circ = 4.0 * np.pi * ip.area / (per * per + 1e-9)
+                    if ip.area >= 3.0 and circ > 0.7:
+                        rp = ip.representative_point()
+                        cands.append((float(rp.x), float(rp.y)))
+            for (cu, cv) in cands:
+                n = int(np.clip(span / 2.0, 16, 60))
+                ts = np.linspace(a_lo + span * 0.02, a_hi - span * 0.02, n)
+                pt = Point(cu, cv)
+                radii = np.zeros(n)
+                for k, t in enumerate(ts):
+                    gg = _section_material(mesh, axis, float(t))
+                    if gg is not None and not gg.contains(pt):
+                        radii[k] = float(gg.distance(pt))
+                rmax = float(radii.max())
+                if rmax < 1.0:
+                    continue
+                if np.mean(radii > max(0.5, 0.3 * rmax)) < 0.5:
+                    continue                       # not through-ish
+                tol = max(0.5, 0.25 * rmax)
+                rmin = max(0.5, 0.3 * rmax)
+                levels = []
+                k = 0
+                while k < n:
+                    if radii[k] < rmin:
+                        k += 1
+                        continue
+                    j = k
+                    band = [radii[k]]
+                    while (j + 1 < n and radii[j + 1] >= rmin
+                           and abs(radii[j + 1] - float(np.median(band))) <= tol):
+                        j += 1
+                        band.append(radii[j])
+                    levels.append({"radius": float(np.median(band)), "i0": k, "i1": j})
+                    k = j + 1
+                if not levels:
+                    continue
+                # Merge mesh-noise levels: absorb a level into the previous one
+                # when it's short OR its radius is close (so a wide→narrow step
+                # doesn't fragment into wide→narrow→bulge→narrow).
+                min_len = max(2.0, 0.12 * span)
+                merged = [levels[0]]
+                for lv in levels[1:]:
+                    prev = merged[-1]
+                    short = (float(ts[lv["i1"]] - ts[lv["i0"]]) < min_len)
+                    close = abs(lv["radius"] - prev["radius"]) <= tol
+                    if short or close:
+                        prev["i1"] = lv["i1"]      # keep prev (longer/earlier) radius
+                    else:
+                        merged.append(lv)
+                levels = merged
+                margin = max(1.0, 0.06 * span)
+                lv_out = []
+                for idx, lv in enumerate(levels):
+                    start = (a_lo - margin) if idx == 0 else \
+                        0.5 * (float(ts[levels[idx - 1]["i1"]]) + float(ts[lv["i0"]]))
+                    end = (a_hi + margin) if idx == len(levels) - 1 else \
+                        0.5 * (float(ts[lv["i1"]]) + float(ts[levels[idx + 1]["i0"]]))
+                    lv_out.append((lv["radius"], float(start), float(end)))
+                out.append({"axis": axis, "cu": cu, "cv": cv, "levels": lv_out,
+                            "a_lo": a_lo, "a_hi": a_hi})
+        return out
+    except Exception:
+        logger.debug("tangent hole detection failed", exc_info=True)
+        return []
+
+
 def _build_stepwise(
     profiles: list[list[tuple[float, float]]],
     depth: float,
@@ -3358,6 +3462,84 @@ def _build_stepwise(
                 "Failed to cut hole %d (r=%.2f, center=%s, dir=%s): %s",
                 i, radius, center.tolist(), h_dir.tolist(), e,
             )
+
+    # --- Tangent holes (axis PERPENDICULAR to the extrude axis) ---
+    # The carriage block's side holes, which the broken fit mis-locates. Detected
+    # straight from the mesh and cut as STEPPED bores (a wide section + a narrow
+    # section). Each gets a SKETCH step before the cut. A redundant cut (hole
+    # already there) removes nothing and is skipped, so this is inert when the
+    # normal hole path already handled them and never over-cuts.
+    if cleaned is not None:
+        try:
+            tangent_holes = _detect_tangent_holes(cleaned, extrude_dir)
+        except Exception:
+            tangent_holes = []
+        for ti, th in enumerate(tangent_holes):
+            try:
+                axis = th["axis"]
+                us = [k for k in (0, 1, 2) if k != axis]
+                e = [0.0, 0.0, 0.0]
+                e[axis] = 1.0
+                # Stepped cutter: one coaxial cylinder per radius level.
+                cutsolid = None
+                for (r, t0, t1) in th["levels"]:
+                    if t1 - t0 <= 0:
+                        continue
+                    o = [0.0, 0.0, 0.0]
+                    o[us[0]] = th["cu"]
+                    o[us[1]] = th["cv"]
+                    o[axis] = t0
+                    cyl = (cq.Workplane(cq.Plane(
+                        origin=cq.Vector(*o), normal=cq.Vector(*e)))
+                        .circle(r).extrude(t1 - t0))
+                    cutsolid = cyl if cutsolid is None else cutsolid.union(cyl)
+                if cutsolid is None:
+                    continue
+                vb = abs(float(wp.val().Volume()))
+                wt = wp.cut(cutsolid)
+                if vb - abs(float(wt.val().Volume())) < 0.5:
+                    continue                       # already cut / no-op — skip
+                # SKETCH step: the widest level's circle on the entry face.
+                try:
+                    r0 = max(r for r, _, _ in th["levels"])
+                    seg = []
+                    prev = None
+                    for kk in range(41):
+                        ang = 2.0 * np.pi * kk / 40.0
+                        p3 = [0.0, 0.0, 0.0]
+                        p3[us[0]] = th["cu"] + r0 * np.cos(ang)
+                        p3[us[1]] = th["cv"] + r0 * np.sin(ang)
+                        p3[axis] = th["a_lo"]
+                        if prev is not None:
+                            seg.append(prev)
+                            seg.append(list(p3))
+                        prev = list(p3)
+                    vsk, fsk = _tessellate_solid(wp, fast=True)
+                    steps.append(ConstructionStep(
+                        name=f"Sketch Tangent Hole {ti + 1}",
+                        tess_vertices=np.asarray(vsk, np.float64),
+                        tess_faces=np.asarray(fsk, np.int64),
+                        volume=abs(float(wp.val().Volume())),
+                        sketch_overlay=np.asarray(seg, np.float64) if seg else None,
+                    ))
+                except Exception:
+                    logger.debug("tangent-hole sketch overlay failed", exc_info=True)
+                wp = wt
+                v, f = _tessellate_solid(wp, fast=True)
+                nlv = len(th["levels"])
+                steps.append(ConstructionStep(
+                    name=(f"Tangent Hole {ti + 1}"
+                          + (f" (stepped, {nlv} dia)" if nlv > 1 else "")),
+                    tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+                script_lines.append(
+                    f"# Tangent hole {ti + 1} on {'XYZ'[axis]} axis, {nlv} level(s)")
+                logger.info("Cut tangent hole %d axis %s, %d level(s) r=%s",
+                            ti + 1, "XYZ"[axis], nlv,
+                            [round(r, 1) for r, _, _ in th["levels"]])
+            except Exception as _th_exc:
+                logger.warning("Failed to cut tangent hole: %s", _th_exc)
 
     # Fillet application is handled by the caller via
     # _apply_recognized_fillets_to_solid, which runs AFTER all bodies have

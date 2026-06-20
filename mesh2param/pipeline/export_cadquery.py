@@ -3480,64 +3480,67 @@ def _build_stepwise(
                 us = [k for k in (0, 1, 2) if k != axis]
                 e = [0.0, 0.0, 0.0]
                 e[axis] = 1.0
-                # Stepped cutter: one coaxial cylinder per radius level.
-                cutsolid = None
-                for (r, t0, t1) in th["levels"]:
+                nlv = len(th["levels"])
+                # One SKETCH + one CUT per diameter level, so a stepped bore
+                # reads as separate sketch->extrude pairs (each diameter drawn
+                # then cut) instead of one sketch cutting both diameters.
+                cut_any = False
+                for li, (r, t0, t1) in enumerate(th["levels"]):
                     if t1 - t0 <= 0:
                         continue
                     o = [0.0, 0.0, 0.0]
                     o[us[0]] = th["cu"]
                     o[us[1]] = th["cv"]
                     o[axis] = t0
-                    cyl = (cq.Workplane(cq.Plane(
+                    cutter = (cq.Workplane(cq.Plane(
                         origin=cq.Vector(*o), normal=cq.Vector(*e)))
                         .circle(r).extrude(t1 - t0))
-                    cutsolid = cyl if cutsolid is None else cutsolid.union(cyl)
-                if cutsolid is None:
-                    continue
-                vb = abs(float(wp.val().Volume()))
-                wt = wp.cut(cutsolid)
-                if vb - abs(float(wt.val().Volume())) < 0.5:
-                    continue                       # already cut / no-op — skip
-                # SKETCH step: the widest level's circle on the entry face.
-                try:
-                    r0 = max(r for r, _, _ in th["levels"])
-                    seg = []
-                    prev = None
-                    for kk in range(41):
-                        ang = 2.0 * np.pi * kk / 40.0
-                        p3 = [0.0, 0.0, 0.0]
-                        p3[us[0]] = th["cu"] + r0 * np.cos(ang)
-                        p3[us[1]] = th["cv"] + r0 * np.sin(ang)
-                        p3[axis] = th["a_lo"]
-                        if prev is not None:
-                            seg.append(prev)
-                            seg.append(list(p3))
-                        prev = list(p3)
-                    vsk, fsk = _tessellate_solid(wp, fast=True)
+                    vb = abs(float(wp.val().Volume()))
+                    wt = wp.cut(cutter)
+                    if vb - abs(float(wt.val().Volume())) < 0.5:
+                        continue                   # this level removed nothing
+                    suffix = (f" Ø{2 * r:.1f} (step {li + 1}/{nlv})"
+                              if nlv > 1 else f" Ø{2 * r:.1f}")
+                    # SKETCH step: THIS level's circle at its own entry plane.
+                    try:
+                        seg = []
+                        prev = None
+                        for kk in range(41):
+                            ang = 2.0 * np.pi * kk / 40.0
+                            p3 = [0.0, 0.0, 0.0]
+                            p3[us[0]] = th["cu"] + r * np.cos(ang)
+                            p3[us[1]] = th["cv"] + r * np.sin(ang)
+                            p3[axis] = t0
+                            if prev is not None:
+                                seg.append(prev)
+                                seg.append(list(p3))
+                            prev = list(p3)
+                        vsk, fsk = _tessellate_solid(wp, fast=True)
+                        steps.append(ConstructionStep(
+                            name=f"Sketch Tangent Hole {ti + 1}{suffix}",
+                            tess_vertices=np.asarray(vsk, np.float64),
+                            tess_faces=np.asarray(fsk, np.int64),
+                            volume=abs(float(wp.val().Volume())),
+                            sketch_overlay=np.asarray(seg, np.float64) if seg else None,
+                        ))
+                    except Exception:
+                        logger.debug("tangent-hole sketch overlay failed", exc_info=True)
+                    # CUT step: extrude just this diameter.
+                    wp = wt
+                    cut_any = True
+                    v, f = _tessellate_solid(wp, fast=True)
                     steps.append(ConstructionStep(
-                        name=f"Sketch Tangent Hole {ti + 1}",
-                        tess_vertices=np.asarray(vsk, np.float64),
-                        tess_faces=np.asarray(fsk, np.int64),
+                        name=f"Tangent Hole {ti + 1}{suffix}",
+                        tess_vertices=v, tess_faces=f,
                         volume=abs(float(wp.val().Volume())),
-                        sketch_overlay=np.asarray(seg, np.float64) if seg else None,
                     ))
-                except Exception:
-                    logger.debug("tangent-hole sketch overlay failed", exc_info=True)
-                wp = wt
-                v, f = _tessellate_solid(wp, fast=True)
-                nlv = len(th["levels"])
-                steps.append(ConstructionStep(
-                    name=(f"Tangent Hole {ti + 1}"
-                          + (f" (stepped, {nlv} dia)" if nlv > 1 else "")),
-                    tess_vertices=v, tess_faces=f,
-                    volume=abs(float(wp.val().Volume())),
-                ))
-                script_lines.append(
-                    f"# Tangent hole {ti + 1} on {'XYZ'[axis]} axis, {nlv} level(s)")
-                logger.info("Cut tangent hole %d axis %s, %d level(s) r=%s",
-                            ti + 1, "XYZ"[axis], nlv,
-                            [round(r, 1) for r, _, _ in th["levels"]])
+                    script_lines.append(
+                        f"# Tangent hole {ti + 1} step {li + 1}: dia {2 * r:.2f} "
+                        f"on {'XYZ'[axis]} axis")
+                if cut_any:
+                    logger.info("Cut tangent hole %d axis %s, %d level(s) r=%s",
+                                ti + 1, "XYZ"[axis], nlv,
+                                [round(r, 1) for r, _, _ in th["levels"]])
             except Exception as _th_exc:
                 logger.warning("Failed to cut tangent hole: %s", _th_exc)
 

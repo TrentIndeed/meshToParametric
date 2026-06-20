@@ -2455,6 +2455,88 @@ mechanical part, determine the optimal construction order for building it in Cad
 # ---------------------------------------------------------------------------
 
 
+def _detect_face_pockets(cleaned, extrude_dir):
+    """Detect BLIND recessed pockets on the extrude-axis faces (the cam gear's
+    circular face recess). A region SOLID at mid-thickness but VOID just inside a
+    face is a face recess. Uses material(mid) - material(face), which INHERENTLY
+    excludes through features (they're void at mid) — so it can't mis-fire on
+    through slots/holes (the carriage-block lesson).
+
+    The recess polygon keeps its interior holes (through-holes + raised hubs), so
+    the cut preserves them. Returns [{plane_name, axis, face_t, sign, depth,
+    exterior_uv, interiors_uv}].
+    """
+    try:
+        import trimesh
+        from shapely.geometry import MultiPolygon, Polygon as SPoly
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return []
+    try:
+        axis = int(np.argmax(np.abs(extrude_dir)))
+        a_lo = float(cleaned.bbox[0][axis])
+        a_hi = float(cleaned.bbox[1][axis])
+        span = a_hi - a_lo
+        if span <= 1e-6:
+            return []
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+        m_mid = _section_material(mesh, axis, 0.5 * (a_lo + a_hi))
+        if m_mid is None or m_mid.is_empty:
+            return []
+        out = []
+        for face_t, sign in ((a_hi, -1.0), (a_lo, 1.0)):
+            try:
+                m_face = _section_material(mesh, axis, face_t + sign * max(0.5, span * 0.05))
+                if m_face is None:
+                    continue
+                recess = m_mid.difference(m_face.buffer(0))
+                if recess.is_empty:
+                    continue
+                # difference may yield Polygon / MultiPolygon / GeometryCollection.
+                geoms = list(getattr(recess, "geoms", [recess]))
+                polys = [g for g in geoms if isinstance(g, SPoly) and not g.is_empty]
+            except Exception:
+                logger.debug("face-pocket: section/diff failed", exc_info=True)
+                continue
+            for p in polys:
+                try:
+                    if p.area < max(20.0, 0.01 * m_mid.area):
+                        continue
+                    cpt = p.representative_point()       # a point in the SOLID recess
+                    depth = 0.0
+                    for dd in np.linspace(max(0.5, span * 0.05), span * 0.85, 24):
+                        g = _section_material(mesh, axis, face_t + sign * dd)
+                        if g is not None and g.buffer(-0.3).contains(cpt):
+                            depth = float(dd)
+                            break
+                    if depth < max(0.8, 0.03 * span):
+                        continue                          # too shallow / through
+                    ps = p.simplify(max(0.2, 0.003 * span))
+                    if not isinstance(ps, SPoly) or ps.is_empty:
+                        continue
+                    ext = [(float(x), float(y)) for x, y in zip(*ps.exterior.xy)]
+                    if len(ext) < 4:
+                        continue
+                    ints = []
+                    for ring in ps.interiors:
+                        iv = [(float(x), float(y)) for x, y in zip(*ring.xy)]
+                        if len(iv) >= 4 and abs(SPoly(ring).area) > 2.0:
+                            ints.append(iv)
+                    out.append({
+                        "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
+                        "axis": axis, "face_t": face_t, "sign": sign, "depth": depth,
+                        "exterior_uv": ext, "interiors_uv": ints,
+                    })
+                except Exception:
+                    logger.debug("face-pocket: polygon failed", exc_info=True)
+                    continue
+        return out
+    except Exception:
+        logger.debug("face-pocket detection failed", exc_info=True)
+        return []
+
+
 def _detect_tangent_holes(cleaned, extrude_dir):
     """Detect circular through-holes whose axis is PERPENDICULAR to the extrude
     axis (the carriage block's 'tangent' holes), straight from the MESH — robust
@@ -3543,6 +3625,89 @@ def _build_stepwise(
                                 [round(r, 1) for r, _, _ in th["levels"]])
             except Exception as _th_exc:
                 logger.warning("Failed to cut tangent hole: %s", _th_exc)
+
+    # --- Face pockets: BLIND recesses on the extrude-axis faces ---
+    # The cam gear's circular face recess. Detected via material(mid)-material(
+    # face) (through-safe: through features are void at mid, so excluded). The
+    # recess profile keeps its interior holes (through-holes + raised hubs), so
+    # the cut preserves them — no boss. Each gets a SKETCH step then a CUT step.
+    if cleaned is not None:
+        try:
+            face_pockets = _detect_face_pockets(cleaned, extrude_dir)
+        except Exception:
+            face_pockets = []
+        for pi, pk in enumerate(face_pockets):
+            try:
+                o = [0.0, 0.0, 0.0]
+                o[pk["axis"]] = pk["face_t"]
+
+                def _pocket_cutter(sgn):
+                    cut = (cq.Workplane(pk["plane_name"], origin=tuple(o))
+                           .polyline(pk["exterior_uv"]).close()
+                           .extrude(sgn * pk["depth"]))
+                    for iv in pk["interiors_uv"]:
+                        try:
+                            hole = (cq.Workplane(pk["plane_name"], origin=tuple(o))
+                                    .polyline(iv).close()
+                                    .extrude(sgn * pk["depth"]))
+                            cut = cut.cut(hole)         # preserve hubs/through-holes
+                        except Exception:
+                            continue
+                    return cut
+
+                vb = abs(float(wp.val().Volume()))
+                wp_done = None
+                for sgn in (pk["sign"], -pk["sign"]):
+                    try:
+                        wt = wp.cut(_pocket_cutter(sgn))
+                        if vb - abs(float(wt.val().Volume())) > 0.5:
+                            wp_done = wt
+                            break
+                    except Exception:
+                        continue
+                if wp_done is None:
+                    continue
+                # SKETCH step: the recess outline on the face.
+                try:
+                    seg = []
+                    prev = None
+                    pts3 = []
+                    us = [k for k in (0, 1, 2) if k != pk["axis"]]
+                    for (u, v) in pk["exterior_uv"]:
+                        p3 = [0.0, 0.0, 0.0]
+                        p3[us[0]] = u
+                        p3[us[1]] = v
+                        p3[pk["axis"]] = pk["face_t"]
+                        pts3.append(list(p3))
+                    for q in pts3:
+                        if prev is not None:
+                            seg.append(prev)
+                            seg.append(q)
+                        prev = q
+                    vsk, fsk = _tessellate_solid(wp, fast=True)
+                    steps.append(ConstructionStep(
+                        name=f"Sketch Pocket {pi + 1}",
+                        tess_vertices=np.asarray(vsk, np.float64),
+                        tess_faces=np.asarray(fsk, np.int64),
+                        volume=abs(float(wp.val().Volume())),
+                        sketch_overlay=np.asarray(seg, np.float64) if seg else None,
+                    ))
+                except Exception:
+                    logger.debug("face-pocket sketch overlay failed", exc_info=True)
+                wp = wp_done
+                v, f = _tessellate_solid(wp, fast=True)
+                steps.append(ConstructionStep(
+                    name=f"Pocket {pi + 1} (depth {pk['depth']:.1f}mm)",
+                    tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+                script_lines.append(
+                    f"# Face pocket {pi + 1} on {pk['plane_name']}, depth {pk['depth']:.2f}")
+                logger.info("Cut face pocket %d on %s depth %.1f (%d holes)",
+                            pi + 1, pk["plane_name"], pk["depth"],
+                            len(pk["interiors_uv"]))
+            except Exception as _fp_exc:
+                logger.warning("Failed to cut face pocket: %s", _fp_exc)
 
     # Fillet application is handled by the caller via
     # _apply_recognized_fillets_to_solid, which runs AFTER all bodies have

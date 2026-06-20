@@ -113,6 +113,7 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
     step_sink, step_queue = (None, None)
     if stream_key:
         step_sink, step_queue = _make_step_sink(stream_key)
+    step_out = None
 
     try:
         from mesh2param.config import (
@@ -136,8 +137,13 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
             fitted = fit_surfaces(regions, c, FitConfig())
         graph, edges = build_topology(regions, fitted, c, TopologyConfig())
         tree = recognize_features(regions, fitted, graph, edges, c, RecognizeConfig())
-        res = export_cadquery(tree, c, use_llm=False, num_variants=1,
-                              stream_sink=step_sink)
+        # When the server wants the full job (want_geometry), also write a STEP so
+        # we can ship its bytes back for edge-picking + download (editor parity).
+        if want_geometry:
+            fd, step_out = tempfile.mkstemp(suffix=".step")
+            os.close(fd)
+        res = export_cadquery(tree, c, output_path=step_out, use_llm=False,
+                              num_variants=1, stream_sink=step_sink)
 
         iou = None
         try:
@@ -160,9 +166,32 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
             "elapsed": round(time.time() - t0, 1),
         }
         if want_geometry:
+            import pickle
             out["tess_vertices"] = np.asarray(res.tess_vertices, np.float32).reshape(-1).tolist()
             out["tess_faces"] = np.asarray(res.tess_faces, np.int32).reshape(-1).tolist()
             out["cad_volume"] = float(res.cad_volume)
+            # Editor parity: the durable rebuild bundle (same tuple the local
+            # worker pickles) so /api/job/{id}/edit can re-run the build, plus the
+            # STEP bytes for edge-picking + download, plus the source mesh volume.
+            # The cloud flat pipeline has no decomposition, so body_results /
+            # decomposition are None — rebuild_from_bundle tolerates that.
+            try:
+                out["bundle_bytes"] = pickle.dumps((tree, c, None, None),
+                                                   protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                out["bundle_bytes"] = None
+            if step_out and os.path.exists(step_out):
+                try:
+                    with open(step_out, "rb") as sfh:
+                        out["step_bytes"] = sfh.read()
+                except Exception:
+                    pass
+            try:
+                import trimesh
+                out["mesh_volume"] = abs(float(trimesh.Trimesh(
+                    vertices=c.vertices, faces=c.faces, process=False).volume))
+            except Exception:
+                out["mesh_volume"] = 0.0
         return out
     except Exception as exc:
         import traceback
@@ -178,10 +207,12 @@ def build_mesh(mesh_bytes: bytes, filename: str, want_geometry: bool = False,
                                partition_ttl=3600)
             except Exception:
                 pass
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
+        for _p in (path, step_out):
+            if _p:
+                try:
+                    os.unlink(_p)
+                except Exception:
+                    pass
 
 
 @app.local_entrypoint()

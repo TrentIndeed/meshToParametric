@@ -194,6 +194,13 @@ def _finalize(job, r: dict) -> None:
         job.steps_version = getattr(job, "steps_version", 0) + 1
 
     job.cad_volume = float(r.get("cad_volume", 0.0))
+    job.mesh_volume = float(r.get("mesh_volume", getattr(job, "mesh_volume", 0.0)) or 0.0)
+
+    # Editor parity: land the rebuild bundle + STEP on disk so the feature-tree
+    # editor, edge-picking, download-step, and the mesh Compare view all work on
+    # cloud jobs exactly as they do locally.
+    _restore_editor_artifacts(job, r)
+
     job.building_live = False
     job.progress = 100
     job.progress_stage = "Done"
@@ -202,3 +209,74 @@ def _finalize(job, r: dict) -> None:
     logger.info("Job %s finalized from Modal (IoU=%s, %s feats, %s steps, %ss)",
                 job.id, r.get("iou"), r.get("n_features"), len(job.steps),
                 r.get("elapsed"))
+
+
+def _restore_editor_artifacts(job, r: dict) -> None:
+    """Reconstitute the local-job server state from the cloud result: write the
+    durable rebuild bundle + STEP (+ a cached edit base), and recover the feature
+    tree / cleaned mesh / bbox / token cost. Best-effort; the model still shows
+    if any of this fails (only editing/compare degrade)."""
+    import shutil
+
+    data = Path("data")
+    try:
+        data.mkdir(exist_ok=True)
+    except Exception:
+        pass
+
+    bundle_bytes = r.get("bundle_bytes")
+    if bundle_bytes:
+        try:
+            bpath = data / f"cad_bundle_{job.id}.pkl"
+            bpath.write_bytes(bundle_bytes)
+            job.cad_bundle_path = str(bpath)
+        except Exception:
+            logger.debug("Could not write cloud rebuild bundle", exc_info=True)
+        # Recover tree + cleaned mesh for the editor list, Compare view, bbox,
+        # and token cost (same fields the local worker sets).
+        try:
+            import pickle
+            tree, cleaned, _, _ = pickle.loads(bundle_bytes)
+            job.features = tree
+            job.cleaned = cleaned
+            _set_bbox_and_tokens(job, tree, cleaned)
+        except Exception:
+            logger.debug("Could not recover tree/cleaned from bundle", exc_info=True)
+
+    step_bytes = r.get("step_bytes")
+    if step_bytes:
+        try:
+            spath = data / f"cad_solid_{job.id}.step"
+            spath.write_bytes(step_bytes)
+            job.cad_step_path = str(spath)
+            ebase = data / f"cad_editbase_{job.id}.step"
+            shutil.copyfile(spath, ebase)
+            job.cad_editbase_path = str(ebase)
+            job._edit_base_deletes = frozenset()  # base = full model, no deletes
+        except Exception:
+            logger.debug("Could not write cloud STEP", exc_info=True)
+
+
+def _set_bbox_and_tokens(job, tree, cleaned) -> None:
+    """Mirror the local worker's bbox + token-cost computation for a cloud job."""
+    try:
+        import numpy as np
+        v = np.asarray(cleaned.vertices, float)
+        if len(v):
+            job.bbox_min = [float(x) for x in v.min(axis=0)]
+            job.bbox_max = [float(x) for x in v.max(axis=0)]
+    except Exception:
+        pass
+    try:
+        from mesh2param.models.feature import FeatureType
+        cost = max(1, cleaned.num_faces // 150)
+        for feat in tree.features:
+            if feat.type in (FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
+                cost += 2
+            elif feat.type in (FeatureType.CHAMFER, FeatureType.FILLET):
+                cost += 2
+            elif feat.type in (FeatureType.POCKET, FeatureType.BOSS, FeatureType.SLOT):
+                cost += 3
+        job.token_cost = max(5, round(cost / 5) * 5)
+    except Exception:
+        logger.debug("Could not compute cloud token cost", exc_info=True)

@@ -58,12 +58,26 @@ turn it on:
    poller finalizes them → concurrent customers run in parallel, isolated. Auth,
    billing, and the UI are unchanged; only the heavy compute moves out.
 
-Note: live step-by-step streaming IS implemented for cloud jobs — the container
-pushes each construction step to a shared `modal.Queue` (partition = job id) and
-the server's poller drains it into the dual-pane "watch it build" view, same as a
-local build (validated: 8 steps streamed, IoU 0.90). The **in-browser feature
-editor** still needs the local build bundle, so editing remains local-only;
-cloud editing is the documented next enhancement.
+Note: cloud jobs now have FEATURE PARITY with local jobs. Implemented:
+- **Live step streaming** — the container pushes each construction step to a
+  shared `modal.Queue` (partition = job id); the poller drains it into the
+  dual-pane "watch it build" view (validated: 8 steps streamed, IoU 0.90).
+- **In-browser feature editor + edge-picking + STEP download + mesh Compare** —
+  `build_mesh(want_geometry=True)` also returns the durable rebuild bundle
+  `(tree, cleaned, None, None)` and the STEP bytes; `modal_runner._finalize`
+  writes them to `data/cad_bundle_{id}.pkl` / `cad_solid_{id}.step` (+ edit base)
+  and sets `job.features / job.cleaned / job.cad_*_path`, so `/api/job/{id}/edit`,
+  `/edges`, `/download-step`, and `/mesh` all work (validated: no-op rebuild
+  reproduces the build volume exactly; 801 edges; fillet edit applies).
+- **DB persistence + token accounting** — the poller mirrors the local completion
+  path (`_tokens_spent += token_cost`, `_save_to_db`), so cloud jobs survive
+  restarts and show in history.
+
+Remaining divergence (NOT yet parity): the cloud path runs the FLAT pipeline
+(ingest→segment→fit→topology→recognize→export), while the local worker runs the
+multi-body DECOMPOSED pipeline (decompose → per-body → stitched fillets). Sharing
+that pipeline so cloud builds match local fidelity on multi-body parts is the next
+enhancement.
 
 ### Wiring details (what modal_runner does)
 1. `modal deploy modal_app.py` — deploys `build_mesh` as a callable cloud function.

@@ -142,9 +142,16 @@ process pools stall on alpha-wrap parts).
 - **Prod (public launch):** `modal deploy modal_app.py` once, then set `USE_MODAL=1`
   + `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` on the server. The worker then SPAWNS each
   customer job into its own container; a poller finalizes them. Auth/billing/UI
-  unchanged — only the heavy compute moves out. Live step-streaming works for cloud
-  jobs (container → shared `modal.Queue` partitioned by job id → poller drains into
-  the dual-pane viewer); only the in-browser feature editor stays local-only.
+  unchanged — only the heavy compute moves out. **Feature parity with local jobs:**
+  live step-streaming (container → shared `modal.Queue` partitioned by job id →
+  poller drains into the dual-pane viewer), the feature-tree EDITOR + edge-picking
+  + STEP download + mesh Compare (the container returns the rebuild bundle
+  `(tree, cleaned, None, None)` + STEP bytes; `modal_runner._finalize` lands them
+  on disk and sets `job.features/cleaned/cad_*_path`), and DB persistence + token
+  accounting (poller mirrors the local completion path). Remaining divergence: the
+  cloud path runs the FLAT pipeline (ingest→segment→fit→topology→recognize), not
+  the local multi-body DECOMPOSED pipeline — so multi-body parts build at lower
+  fidelity in the cloud until that pipeline is shared.
 
 ## Pages
 - `/` — Landing page (public) with video hero, scroll animation, pricing, FAQ, waitlist

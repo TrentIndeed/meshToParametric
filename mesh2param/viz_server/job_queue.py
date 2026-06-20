@@ -454,11 +454,20 @@ class JobQueue:
                     try:
                         if modal_runner.poll_and_finalize(job):
                             job._modal_done = True
-                            if self._on_complete and job.status == "done":
+                            if job.status == "done":
+                                # Parity with the local completion path: account
+                                # tokens + persist to SQLite so cloud jobs survive
+                                # restarts and show in history.
                                 try:
-                                    self._on_complete(job)
+                                    self._tokens_spent += job.token_cost
+                                    self._save_to_db(job)
                                 except Exception:
-                                    logger.debug("on_complete failed", exc_info=True)
+                                    logger.exception("Modal job %s: token/DB save failed", job.id)
+                                if self._on_complete:
+                                    try:
+                                        self._on_complete(job)
+                                    except Exception:
+                                        logger.debug("on_complete failed", exc_info=True)
                     except Exception:
                         logger.exception("Modal poller error on job %s", job.id)
 

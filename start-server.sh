@@ -9,8 +9,11 @@
 # Usage:
 #   ./start-server.sh             # build (if needed) + run on http://127.0.0.1:8080
 #   ./start-server.sh --no-build  # skip the build, just (re)start the container
-#   ./start-server.sh --native    # old behaviour: native python (NO alpha-wrap)
-# Ctrl+C stops it (the container is removed on exit).
+#   ./start-server.sh --native    # native python (NO alpha-wrap)
+#
+# Lifecycle: starting it always (re)starts a FRESH container (any leftover one is
+# dropped first); stopping it (Ctrl+C, or the terminal closing) STOPS AND REMOVES
+# the container — so the script's running state always matches the container's.
 cd "$(dirname "$0")"
 export PYTHONIOENCODING=utf-8
 IMAGE=paramesh-server
@@ -42,7 +45,15 @@ if [ "$NO_BUILD" -eq 0 ]; then
     docker build -t "$IMAGE" . || { echo "ERROR: image build failed." >&2; exit 1; }
 fi
 
+# Start fresh: drop any container left over from a previous run/crash.
 docker rm -f "$CONTAINER" >/dev/null 2>&1
+
+# Stop + remove the container whenever this script exits — Ctrl+C, the terminal
+# closing, or the container dying. NOT exec'd below so this trap can run; the INT/
+# TERM traps just `exit`, which fires the single EXIT cleanup (so it runs once).
+cleanup() { echo; echo "Stopping $CONTAINER ..."; docker rm -f "$CONTAINER" >/dev/null 2>&1; }
+trap cleanup EXIT
+trap 'exit' INT TERM
 
 # Host path for -v: git-bash on Windows needs the Windows form (pwd -W) and
 # MSYS_NO_PATHCONV so /app/... isn't mangled; plain Linux uses pwd as-is.
@@ -52,9 +63,9 @@ ENVFILE=()
 
 # DB in a NAMED volume, not a host bind-mount: SQLite locking deadlocks over
 # Docker Desktop's Windows filesystem mount and hangs startup.
-echo "Starting $CONTAINER at http://127.0.0.1:8080  (Ctrl+C to stop)"
+echo "Starting $CONTAINER at http://127.0.0.1:8080  (Ctrl+C to stop + remove it)"
 echo "Note: the Claude CLI (AI chat) is unavailable inside the container; it degrades gracefully."
-exec docker run --rm --name "$CONTAINER" \
+docker run --rm --name "$CONTAINER" \
     -p 8080:8080 \
     -v paramesh-data:/app/data \
     -v "${HOSTROOT}/mesh2param:/app/mesh2param" \

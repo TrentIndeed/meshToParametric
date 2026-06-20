@@ -78,11 +78,11 @@ mesh2param convert input.stl --dry-run --output feature_tree.json
 pymeshlab's alpha-wrap watertight repair + the exact-IoU arbiter are **Linux-only**, so dev and AI work run in a container:
 
 ```bash
-.\start-server.ps1            # build + run the server image → http://127.0.0.1:8080
-.\start-server.ps1 -NoBuild   # restart in seconds (-Native for the no-Docker path)
+./start-server.sh             # build + run the server image → http://127.0.0.1:8080
+./start-server.sh --no-build  # restart in seconds (--native for the no-Docker path)
 ```
 
-Source is bind-mounted (frontend edits live on refresh; Python edits → `docker restart paramesh-server`). DB lives in a named volume.
+Ctrl+C (or closing the terminal) stops and removes the container; starting the script always (re)launches a fresh one. Source is bind-mounted (frontend edits live on refresh; Python edits → stop + restart the script). DB lives in a named volume.
 
 ## Testing
 

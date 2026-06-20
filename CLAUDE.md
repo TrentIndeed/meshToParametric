@@ -61,8 +61,8 @@ pymeshlab's alpha-wrap plugin loads on Linux but NOT Windows, so the watertight
 repair (ingest) and the exact-IoU arbiter are no-ops natively. Run the server +
 all geometry diagnostics in containers:
 ```bash
-.\start-server.ps1            # build+run the server image on http://127.0.0.1:8080
-.\start-server.ps1 -NoBuild   # just (re)start (seconds); -Native for the no-Docker path
+./start-server.sh             # build+run the server image on http://127.0.0.1:8080
+./start-server.sh --no-build  # just (re)start (seconds); --native for the no-Docker path
 ```
 - Server image = top-level `Dockerfile` (`paramesh-server`); container stays up,
   source is bind-mounted (frontend edits are live on refresh; Python edits need a
@@ -101,7 +101,7 @@ models/          — mesh + reference STEP pairs (models/Mesh1/ through models/M
 scripts/         — diag_render_sheet.py, diag_stage_sheet.py, diag_ai_build.py, diag_ai_parallel.py (geometry diagnosis; run in Docker)
 modal_app.py     — Modal app (top-level): build_mesh = full pipeline + exact IoU in an isolated container; `modal run` for parallel dev, `modal deploy` for prod
 Dockerfile / _docker/Dockerfile — server image (paramesh-server) / lean diagnosis image (mesh2param)
-start-server.ps1, start-server.sh — build/run the server container (-NoBuild, -Native flags)
+start-server.sh — build/run the server container (--no-build, --native flags); Ctrl+C stops + removes it, restarting gives a fresh container
 ```
 
 ## Pipeline Stages

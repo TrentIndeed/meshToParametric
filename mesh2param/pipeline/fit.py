@@ -140,6 +140,18 @@ def fit_surfaces(
                     if (rad > 1.0 * region_diag
                             and plane_rms <= fitted.rms_error * 3.0 + 1e-6):
                         prefer = True
+                # (c) NORMAL CONSISTENCY: tightly-aligned face normals ARE a flat
+                # face — a genuine cylinder/cone/sphere fans its normals around
+                # its axis. Catches flats mis-fit as CONE/SPHERE (the cylinder-
+                # only radius guard above misses those), e.g. the carriage
+                # block's front/back faces after the opposite-face split.
+                if not prefer:
+                    an = normals.mean(axis=0)
+                    nl = float(np.linalg.norm(an))
+                    if nl > 1e-9:
+                        nsp = float(1.0 - np.mean(normals @ (an / nl)))
+                        if nsp < 0.04 and plane_rms <= fitted.rms_error * 4.0 + 1e-6:
+                            prefer = True
                 if prefer:
                     logger.info(
                         "Region %d: %s -> plane (rms %.4f vs %.4f)",

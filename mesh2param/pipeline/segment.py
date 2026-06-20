@@ -182,6 +182,10 @@ def segment_mesh(
         if config.noise_robust:
             labels = _merge_coplanar_fragments(labels, cleaned.normals,
                                                adjacency, config)
+            # Split a region that merged two OPPOSITE flat faces (e.g. the front
+            # and back of a thin plate joined across the rim) — it can't fit a
+            # plane and falls back to a cylinder. Each side then fits as a plane.
+            labels = _split_opposite_normal_regions(labels, cleaned.normals)
     except Exception:
         logger.exception(
             "Stage 2 failed during segmentation passes: faces=%d, labels_shape=%s",
@@ -1292,6 +1296,54 @@ def _peel_axial_tangents_from_curves(
 
     labels = _renumber_labels(labels)
     return labels
+
+
+def _split_opposite_normal_regions(
+    labels: np.ndarray,
+    face_normals: np.ndarray,
+    min_frac: float = 0.2,
+    cos_tol: float = 0.7,
+) -> np.ndarray:
+    """Split a region whose face normals form TWO OPPOSITE, individually-FLAT
+    clusters into separate regions — one per side.
+
+    On thin plates, region-growing can join the front (+axis) and back (-axis)
+    faces across the rim into one region. The fitter then can't make a plane and
+    falls back to a cylinder/cone (the carriage block's "flat faces recognized as
+    cylinders"). Splitting by normal sign lets each side fit as a plane.
+
+    Guarded so it NEVER splits a real bore: a cylinder/cone is also bimodal along
+    an in-plane axis, but each half is still curved — we only split when BOTH
+    sides are themselves flat (tight normals), which a genuine curved surface
+    isn't.
+    """
+    out = labels.copy()
+    if len(labels) == 0:
+        return out
+    next_label = int(labels.max()) + 1
+    for lbl in np.unique(labels):
+        idx = np.where(labels == lbl)[0]
+        if len(idx) < 40:
+            continue
+        n = face_normals[idx]
+        axis = int(np.argmax(np.abs(n).mean(axis=0)))
+        comp = n[:, axis]
+        pos = comp > cos_tol
+        neg = comp < -cos_tol
+        if pos.mean() < min_frac or neg.mean() < min_frac:
+            continue                       # not bimodal-opposite
+        # Each side must be individually flat (a bore's halves are not).
+        mp = n[pos].mean(axis=0)
+        mn = n[neg].mean(axis=0)
+        if float(np.linalg.norm(mp)) > 0.9 and float(np.linalg.norm(mn)) > 0.9:
+            out[idx[neg]] = next_label     # back side -> its own region
+            next_label += 1
+            logger.info(
+                "Split merged opposite-face region %d on %s axis "
+                "(%d front / %d back faces)",
+                int(lbl), "XYZ"[axis], int(pos.sum()), int(neg.sum()),
+            )
+    return out
 
 
 def _split_disconnected_components(

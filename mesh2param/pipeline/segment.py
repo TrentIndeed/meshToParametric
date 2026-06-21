@@ -8,6 +8,7 @@ classification.
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter, defaultdict, deque
 
 import numpy as np
@@ -185,7 +186,11 @@ def segment_mesh(
             # Split a region that merged two OPPOSITE flat faces (e.g. the front
             # and back of a thin plate joined across the rim) — it can't fit a
             # plane and falls back to a cylinder. Each side then fits as a plane.
-            labels = _split_opposite_normal_regions(labels, cleaned.normals)
+            # (PARAMESH_NO_SPLIT=1 disables it — for before/after A/B diagnosis.)
+            if os.environ.get("PARAMESH_NO_SPLIT") != "1":
+                _fc = cleaned.vertices[cleaned.faces].mean(axis=1)
+                labels = _split_opposite_normal_regions(
+                    labels, cleaned.normals, face_centroids=_fc)
     except Exception:
         logger.exception(
             "Stage 2 failed during segmentation passes: faces=%d, labels_shape=%s",
@@ -1298,11 +1303,18 @@ def _peel_axial_tangents_from_curves(
     return labels
 
 
+# Per-call record of split decisions (for A/B diagnosis); cleared each call.
+_SPLIT_EVENTS: list = []
+
+
 def _split_opposite_normal_regions(
     labels: np.ndarray,
     face_normals: np.ndarray,
+    face_centroids: np.ndarray | None = None,
     min_frac: float = 0.2,
     cos_tol: float = 0.7,
+    max_gap: float = 25.0,
+    max_gap_frac: float = 0.5,
 ) -> np.ndarray:
     """Split a region whose face normals form TWO OPPOSITE, individually-FLAT
     clusters into separate regions — one per side.
@@ -1316,8 +1328,16 @@ def _split_opposite_normal_regions(
     an in-plane axis, but each half is still curved — we only split when BOTH
     sides are themselves flat (tight normals), which a genuine curved surface
     isn't.
+
+    THIN-PLATE guard (face_centroids given): the merge-across-the-rim only happens
+    when the two opposite faces are CLOSE along the axis (a thin plate). On a thick
+    block, an opposite-normal region is noise/slopes, and splitting it by sign
+    fragments the face into false grooves (AI15). So only split when the gap
+    between the two clusters' centroids along the axis is small — both in absolute
+    terms (`max_gap` mm) and relative to the in-plane size (`max_gap_frac`).
     """
     out = labels.copy()
+    _SPLIT_EVENTS.clear()      # hold only THIS call's events (no unbounded growth)
     if len(labels) == 0:
         return out
     next_label = int(labels.max()) + 1
@@ -1335,14 +1355,39 @@ def _split_opposite_normal_regions(
         # Each side must be individually flat (a bore's halves are not).
         mp = n[pos].mean(axis=0)
         mn = n[neg].mean(axis=0)
-        if float(np.linalg.norm(mp)) > 0.9 and float(np.linalg.norm(mn)) > 0.9:
-            out[idx[neg]] = next_label     # back side -> its own region
-            next_label += 1
+        if not (float(np.linalg.norm(mp)) > 0.9 and float(np.linalg.norm(mn)) > 0.9):
+            continue
+
+        gap = inplane = None
+        if face_centroids is not None:
+            c = face_centroids[idx]
+            gap = float(abs(c[pos][:, axis].mean() - c[neg][:, axis].mean()))
+            other = [a for a in range(3) if a != axis]
+            inplane = float(max(c[:, other].max(axis=0) - c[:, other].min(axis=0)))
+        _SPLIT_EVENTS.append({
+            "label": int(lbl), "axis": "XYZ"[axis],
+            "n_pos": int(pos.sum()), "n_neg": int(neg.sum()),
+            "gap": None if gap is None else round(gap, 2),
+            "inplane": None if inplane is None else round(inplane, 2),
+        })
+        # THIN-PLATE guard: skip when the opposite faces are far apart (thick part)
+        # — that's where the split fragments a face into false grooves.
+        if gap is not None and (gap > max_gap or
+                                (inplane and gap > max_gap_frac * inplane)):
             logger.info(
-                "Split merged opposite-face region %d on %s axis "
-                "(%d front / %d back faces)",
-                int(lbl), "XYZ"[axis], int(pos.sum()), int(neg.sum()),
+                "Skip opposite-face split of region %d on %s axis: gap=%.1f mm "
+                "too large (inplane=%.1f) — not a thin-plate merge",
+                int(lbl), "XYZ"[axis], gap, inplane or 0.0,
             )
+            continue
+
+        out[idx[neg]] = next_label         # back side -> its own region
+        next_label += 1
+        logger.info(
+            "Split merged opposite-face region %d on %s axis "
+            "(%d front / %d back faces, gap=%.1f mm)",
+            int(lbl), "XYZ"[axis], int(pos.sum()), int(neg.sum()), gap or -1.0,
+        )
     return out
 
 

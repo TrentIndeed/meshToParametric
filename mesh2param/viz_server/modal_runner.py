@@ -63,7 +63,10 @@ def dispatch(job) -> bool:
     try:
         data = Path(job.file_path).read_bytes()
         # stream_key = job.id: the container pushes steps to this Queue partition.
-        call = _function().spawn(data, job.filename, True, job.id)
+        # editor=True: server jobs need the heavy rebuild bundle + STEP bytes back
+        # (edge-picking, download, Compare, /edit). (mesh_bytes, filename,
+        # want_geometry, stream_key, editor)
+        call = _function().spawn(data, job.filename, True, job.id, True)
         job._modal_call_id = call.object_id
         job._modal_stream_key = job.id
         job._modal_streamed = False

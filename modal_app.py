@@ -251,3 +251,99 @@ def main(parts: str = ""):
     if good:
         print(f"\nmean IoU = {sum(good) / len(good):.3f} over {len(good)} parts "
               f"| wall {time.time() - t0:.0f}s")
+
+
+@app.local_entrypoint()
+def render(parts: str = ""):
+    """Dev: build all parts in PARALLEL on Modal (want_geometry), then render a
+    mesh-vs-recon montage LOCALLY from the returned geometry. Fast feedback on
+    whether the recon (incl. the new cut-extrude detectors) generalizes across
+    the set. Output: tests/visual_reports/diagnosis/ALL_parts.png."""
+    import glob
+    import os
+    import pickle
+    import time
+
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    names = [p.strip() for p in parts.split(",") if p.strip()] or \
+        ([f"AI{i}" for i in range(1, 16)] + ["Scan1", "Scan2", "Scan3"])
+    jobs, labels = [], []
+    for p in names:
+        hits = (glob.glob(f"models/{p}/*.3mf") + glob.glob(f"models/{p}/*.stl")
+                + glob.glob(f"models/{p}/*.obj") + glob.glob(f"models/{p}/*.ply"))
+        if not hits:
+            print(f"{p}: no mesh"); continue
+        with open(sorted(hits)[0], "rb") as fh:
+            jobs.append((fh.read(), os.path.basename(sorted(hits)[0]), True))
+            labels.append(p)
+
+    print(f"building {len(jobs)} parts on Modal (parallel)...")
+    t0 = time.time()
+    results = list(build_mesh.starmap(jobs))
+    print(f"built in {time.time() - t0:.0f}s; rendering locally...")
+
+    out_dir = "tests/visual_reports/diagnosis/_parts"
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _deci(V, F, n=4000):
+        if len(F) <= n:
+            return V, F
+        step = int(np.ceil(len(F) / n))
+        return V, F[::step]
+
+    def _panel(ax, V, F, col, title):
+        if V is None or F is None or len(F) == 0:
+            ax.set_title(title + " (none)", fontsize=8); ax.set_axis_off(); return
+        V, F = _deci(V, F)
+        ax.add_collection3d(Poly3DCollection(V[F], alpha=1, facecolor=col,
+                                             edgecolor="#33414f", linewidths=0.04))
+        mn, mx = V.min(0), V.max(0)
+        ax.set_xlim(mn[0], mx[0]); ax.set_ylim(mn[1], mx[1]); ax.set_zlim(mn[2], mx[2])
+        try:
+            ax.set_box_aspect(mx - mn)
+        except Exception:
+            pass
+        ax.view_init(24, -58); ax.set_axis_off(); ax.set_title(title, fontsize=9)
+
+    for p, r in zip(labels, results):
+        fig = plt.figure(figsize=(7, 3.4))
+        try:
+            if not r or not r.get("ok"):
+                fig.text(0.5, 0.5, f"{p} FAILED\n{(r or {}).get('error', '')[:60]}",
+                         ha="center", color="red")
+            else:
+                Vr = np.asarray(r["tess_vertices"], float).reshape(-1, 3)
+                Fr = np.asarray(r["tess_faces"], np.int64).reshape(-1, 3)
+                Vm = Fm = None
+                bb = r.get("bundle_bytes")
+                if bb:
+                    _, cleaned, _, _ = pickle.loads(bb)
+                    Vm = np.asarray(cleaned.vertices, float)
+                    Fm = np.asarray(cleaned.faces, np.int64)
+                _panel(fig.add_subplot(1, 2, 1, projection="3d"), Vm, Fm,
+                       "#9fb4c7", f"{p} MESH")
+                _panel(fig.add_subplot(1, 2, 2, projection="3d"), Vr, Fr,
+                       "#7fa8d8",
+                       f"RECON {r.get('vol_err', 0):.0f}% f={r.get('n_features', 0)}")
+                print(f"{p}: vol_err={r.get('vol_err', 0):.1f}%")
+        except Exception as exc:
+            fig.text(0.5, 0.5, f"{p} render err\n{str(exc)[:50]}", ha="center", color="red")
+        fig.tight_layout(); fig.savefig(f"{out_dir}/{p}.png", dpi=85); plt.close(fig)
+
+    imgs = [(p, f"{out_dir}/{p}.png") for p in labels
+            if os.path.exists(f"{out_dir}/{p}.png")]
+    nc = 3
+    nr = (len(imgs) + nc - 1) // nc
+    fig = plt.figure(figsize=(nc * 7, nr * 3.6))
+    for i, (p, fp) in enumerate(imgs):
+        ax = fig.add_subplot(nr, nc, i + 1)
+        ax.imshow(plt.imread(fp)); ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig("tests/visual_reports/diagnosis/ALL_parts.png", dpi=110)
+    plt.close(fig)
+    print("wrote tests/visual_reports/diagnosis/ALL_parts.png")

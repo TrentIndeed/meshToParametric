@@ -688,6 +688,48 @@ def _find_base_extrusion(
         # 9mm of an 85mm Z extent) and joins fill the rest; a single-segment
         # part (BottomMount) spans the full extent.
         base_span = [float(primary.start), float(primary.end)]
+        # The engine's segment tracks the INNER cross-section run, which face
+        # pockets/recesses can shorten to the middle of a part whose OUTER body is
+        # full-thickness (the cam gear: 46-tooth rim spans the full 33.5mm, but the
+        # face pockets break the run so the base came out 23mm -> "not thick
+        # enough"). Distinguish that from a genuine multi-extrude (RackMount: a wide
+        # base plate UNDER a narrower tower) by the OUTER silhouette: if the outer
+        # boundary is ~constant over the FULL extent, it's ONE prism with internal
+        # cuts -> extrude the base full and let the pockets cut in. A changing outer
+        # keeps the segment span.
+        try:
+            _bax = int(np.argmax(np.abs(direction)))
+            _a0 = float(cleaned.vertices[:, _bax].min())
+            _a1 = float(cleaned.vertices[:, _bax].max())
+            _full = _a1 - _a0
+            if _full - (base_span[1] - base_span[0]) > 0.5:
+                import trimesh
+                from shapely.geometry import Polygon as _SP
+                from shapely.ops import unary_union as _uu
+                _mesh = trimesh.Trimesh(vertices=cleaned.vertices,
+                                        faces=cleaned.faces, process=False)
+                _outers = []
+                for _fr in (0.12, 0.31, 0.5, 0.69, 0.88):
+                    _m = _section_material(_mesh, _bax, _a0 + _fr * _full)
+                    if _m is None or _m.is_empty:
+                        continue
+                    _ext = _uu([_SP(g.exterior) for g in getattr(_m, "geoms", [_m])
+                                if isinstance(g, _SP)])
+                    if not _ext.is_empty:
+                        _outers.append(_ext)
+                if len(_outers) >= 4:
+                    _ar = sorted(o.area for o in _outers)
+                    _lo, _hi = _outers[0], _outers[-1]
+                    _iou = _lo.intersection(_hi).area / (_lo.union(_hi).area + 1e-9)
+                    # constant outer = areas tight AND first/last slices overlap well
+                    if _ar[0] / (_ar[-1] + 1e-9) > 0.85 and _iou > 0.85:
+                        logger.info(
+                            "Base extrusion: outer silhouette constant over full "
+                            "extent (%.1fmm) — extruding base full (was %.1fmm); "
+                            "pockets cut in", _full, base_span[1] - base_span[0])
+                        base_span = [_a0, _a1]
+        except Exception:
+            logger.debug("base full-extent check failed", exc_info=True)
     elif plan is not None:
         logger.info(
             "Extrusion engine inconclusive (%d segments); keeping "

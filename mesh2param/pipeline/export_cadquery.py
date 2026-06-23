@@ -6850,8 +6850,30 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
             faces=np.asarray(tf, np.int64).reshape(-1, 3), process=False)
         target = trimesh.Trimesh(
             vertices=cleaned.vertices, faces=cleaned.faces, process=False)
-        res = refine_against_target(target, recon, res=64, max_iters=max_iters)
-        if not res.ops:
+        # ADAPTIVE resolution. The voxel box-carver at the default res=64 /
+        # 3 iters under-resolves a part that is still BADLY over-solid — a deep
+        # distributed cavity (AI4's hollow enclosure lid) reads as a few coarse
+        # cells, so the carve stops far short (IoU 0.762, vol_err 22%). When the
+        # current solid is still grossly off (>12%), the residual is large and
+        # non-prismatic, so we ALSO refine at res=96 / 5 iters, which tracks the
+        # cavity finely (AI4 -> IoU 0.845, vol_err 6.9%). Resolution is NOT
+        # monotonic (res=128 scored below 96 on AI4), so we keep BOTH passes as
+        # candidates and let the exact-IoU arbiter below pick the winner — the
+        # res=64 candidate is always present, so escalation can only add upside,
+        # never regress. Parts that already fit (<12%) run the cheap pass only.
+        pre_err = abs(cad_vol - mesh_volume) / (mesh_volume + 1e-15)
+        configs = [(64, max_iters)]
+        if pre_err >= 0.12:
+            configs.append((96, max(5, max_iters)))
+        op_sets = []
+        for _rr, _ri in configs:
+            try:
+                rr = refine_against_target(target, recon, res=_rr, max_iters=_ri)
+            except Exception:
+                logger.debug("refine at res=%d failed", _rr, exc_info=True)
+                continue
+            op_sets.extend(ops for ops in (rr.ops, rr.box_ops) if ops)
+        if not op_sets:
             return solid, cad_vol
 
         def _apply(ops):
@@ -6881,9 +6903,7 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
         # that mis-ranks candidates — there we keep the validated VOLUME arbiter
         # (no regression). Build both op-sets either way.
         built = []
-        for ops in (res.ops, res.box_ops):
-            if not ops:
-                continue
+        for ops in op_sets:
             cand_solid, cand_vol = _apply(ops)
             if cand_solid is not None:
                 built.append((cand_solid, cand_vol))

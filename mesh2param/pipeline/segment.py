@@ -183,6 +183,18 @@ def segment_mesh(
         if config.noise_robust:
             labels = _merge_coplanar_fragments(labels, cleaned.normals,
                                                adjacency, config)
+            # Split a wrapped wall-band (side walls fused into one region) so the
+            # walls segment cleanly. Strictly guarded (true box-wrap only) so it
+            # doesn't re-cut real features. PARAMESH_NO_WALLSPLIT=1 disables it.
+            if os.environ.get("PARAMESH_NO_WALLSPLIT") != "1":
+                labels = _split_wrapped_walls(labels, cleaned, adjacency, config)
+            # Consolidate the LARGE coplanar pieces a flat face shattered into
+            # (the slivers are gone by now; this merges the big patches that
+            # share a plane). Plane-equality only, so bores/parallel faces are
+            # untouched. PARAMESH_NO_COPLANAR=1 disables it for A/B diagnosis.
+            if os.environ.get("PARAMESH_NO_COPLANAR") != "1":
+                labels = _merge_coplanar_planar_regions(
+                    labels, cleaned, adjacency, config)
             # Split a region that merged two OPPOSITE flat faces (e.g. the front
             # and back of a thin plate joined across the rim) — it can't fit a
             # plane and falls back to a cylinder. Each side then fits as a plane.
@@ -261,6 +273,216 @@ def _merge_coplanar_fragments(
     logger.info("Noise-robust merge: -> %d regions",
                 len(np.unique(labels[labels >= 0])))
     return labels
+
+
+def _merge_coplanar_planar_regions(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+    config: SegmentConfig,
+    angle_deg: float = 35.0,
+    dist_frac: float = 0.015,
+    coherence_min: float = 0.9,
+) -> np.ndarray:
+    """Merge ADJACENT planar regions that lie on the SAME plane.
+
+    Region growing on a noisy AI/scan mesh splits one physical flat face into
+    several LARGE coplanar regions (the user sees a flat top in two colours).
+    `_merge_coplanar_fragments` only absorbs tiny slivers by boundary dominance;
+    this consolidates the large pieces. Two adjacent regions merge iff:
+      * both are PLANAR — coherent mean normal (|mean unit normal| >= coherence_min,
+        so cylinders/fillets, whose normals fan out, are excluded);
+      * their normals point the SAME way within `angle_deg` (a 90 deg side and a
+        180 deg opposite face both fail — this is direction equality, so opposite
+        faces of a thin plate are never merged); AND
+      * their planes COINCIDE — the mean signed offset of each region's face
+        centroids along the shared normal agrees within `dist_frac` of the bbox
+        diagonal (a recess floor parallel to the top but a few mm below fails).
+    It is therefore a plane-EQUALITY merge, not normal similarity, so it can't
+    eat a bore wall or fuse parallel faces. Gated to noise_robust; clean CAD
+    doesn't shatter so it leaves this off. Union-find per round, to convergence.
+    """
+    labels = labels.copy()
+    verts = np.asarray(cleaned.vertices, dtype=float)
+    faces = np.asarray(cleaned.faces)
+    normals = np.asarray(cleaned.normals, dtype=float)
+    centroids = verts[faces].mean(axis=1)
+    diag = float(np.linalg.norm(verts.max(0) - verts.min(0))) or 1.0
+    dist_tol = dist_frac * diag
+    cos_tol = float(np.cos(np.radians(angle_deg)))
+
+    def _stats(mask):
+        n = normals[mask].mean(axis=0)
+        ln = float(np.linalg.norm(n))
+        if ln > 1e-9:
+            n = n / ln
+        return n, ln  # unit mean normal, coherence
+
+    changed = True
+    rounds = 0
+    while changed and rounds < 25:
+        changed = False
+        rounds += 1
+        uniq = [int(lb) for lb in np.unique(labels[labels >= 0])]
+        masks = {lb: (labels == lb) for lb in uniq}
+        sizes = {lb: int(m.sum()) for lb, m in masks.items()}
+        stat = {lb: _stats(m) for lb, m in masks.items()}
+        # Plane ANCHORS = the coherent (flat) regions. Their plane absorbs any
+        # adjacent region whose faces lie ON that plane — including the noisy
+        # slivers wedged between two coplanar patches, which is what blocks the
+        # patches from being adjacent. We absorb into the LARGEST planar
+        # neighbour so slivers dissolve into the dominant face, not each other.
+        parent = {lb: lb for lb in uniq}
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        # region adjacency
+        radj: dict[int, set[int]] = {lb: set() for lb in uniq}
+        for fi in range(len(labels)):
+            lb = int(labels[fi])
+            if lb < 0:
+                continue
+            for ni in adjacency.get(fi, ()):
+                nl = int(labels[ni])
+                if nl >= 0 and nl != lb:
+                    radj[lb].add(nl)
+
+        for lb in uniq:
+            n_lb, coh_lb = stat[lb]
+            # candidate anchors = coherent planar neighbours, biggest first
+            anchors = sorted(
+                (nb for nb in radj[lb]
+                 if stat[nb][1] >= coherence_min and sizes[nb] >= sizes[lb]),
+                key=lambda nb: -sizes[nb])
+            for a in anchors:
+                n_a = stat[a][0]
+                off_a = float(centroids[masks[a]].dot(n_a).mean())
+                # If THIS region is itself a clean plane pointing a different
+                # way, it's a genuinely distinct face (a perpendicular wall, a
+                # parallel face) — never absorb it. Noisy regions (low coherence)
+                # have no reliable normal, so they're judged purely by geometry.
+                if coh_lb >= coherence_min and abs(float(np.dot(n_a, n_lb))) < cos_tol:
+                    continue
+                # Absorb iff MOST of this region's faces lie ON the anchor plane.
+                # A flat patch / noise sliver on the plane qualifies; a side wall
+                # or bore wall extends AWAY from the plane (centroids off it) and
+                # does not — protecting cylinder/bore detection.
+                d = np.abs(centroids[masks[lb]].dot(n_a) - off_a)
+                on_plane_frac = float(np.mean(d < dist_tol))
+                if on_plane_frac < 0.6:
+                    continue
+                ra, rb = _find(a), _find(lb)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+                    changed = True
+                break
+
+        if changed:
+            for fi in range(len(labels)):
+                lb = int(labels[fi])
+                if lb >= 0:
+                    labels[fi] = _find(lb)
+
+    labels = _renumber_labels(labels)
+    logger.info("Coplanar-region merge: -> %d regions",
+                len(np.unique(labels[labels >= 0])))
+    return labels
+
+
+def _split_wrapped_walls(
+    labels: np.ndarray,
+    cleaned: CleanedMesh,
+    adjacency: dict[int, set[int]],
+    config: SegmentConfig,
+    coh_max: float = 0.4,
+    min_faces: int = 800,
+    min_wall_frac: float = 0.12,
+    wall_coh_min: float = 0.9,
+    min_walls: int = 3,
+    span_frac: float = 0.6,
+) -> np.ndarray:
+    """Split a region that WRAPS the whole part — the side walls fused into one
+    band by region-growing climbing the rounded corners — into one region per
+    wall (AI4 enclosure lid: +X/-X/+Z/-Z walls became a single coherence-0.02
+    region that can't fit a plane).
+
+    STRICTLY GUARDED so it only fires on a genuine box-wrap and never re-cuts a
+    real feature (it regressed AI6 when looser): the region must be (1) almost
+    incoherent (mean normal < `coh_max`), (2) span >= `span_frac` of the bbox in
+    its two widest dims (it goes around the part), AND (3) decompose into
+    >= `min_walls` LARGE FLAT cardinal walls. A bore (no large flat
+    sub-component), a thin-plate front/back merge (only 2 walls), and a single
+    plane (coherent) all fail these gates. Gated to noise_robust.
+    """
+    labels = labels.copy()
+    verts = np.asarray(cleaned.vertices, dtype=float)
+    faces = np.asarray(cleaned.faces)
+    normals = np.asarray(cleaned.normals, dtype=float)
+    centroids = verts[faces].mean(axis=1)
+    bbox = verts.max(0) - verts.min(0)
+    axes = np.eye(3)
+
+    split_any = True
+    rounds = 0
+    while split_any and rounds < 6:
+        split_any = False
+        rounds += 1
+        next_label = int(labels.max()) + 1 if len(labels) else 0
+        for lbl in np.unique(labels):
+            idx = np.where(labels == lbl)[0]
+            if len(idx) < min_faces:
+                continue
+            n = normals[idx]
+            if float(np.linalg.norm(n.mean(0))) > coh_max:
+                continue                     # already a coherent plane
+            # must WRAP: span most of the bbox in >= 2 dims
+            ext = centroids[idx].max(0) - centroids[idx].min(0)
+            if int(np.sum(ext >= span_frac * np.maximum(bbox, 1e-9))) < 2:
+                continue
+            # connected components sharing a signed-cardinal key
+            dots = n @ axes.T
+            nearest = np.argmax(np.abs(dots), axis=1)
+            sgn = (dots[np.arange(len(n)), nearest] < 0).astype(int)
+            keys = (nearest * 2 + sgn).tolist()
+            pos = {int(f): k for k, f in enumerate(idx)}
+            comp = np.full(len(idx), -1, dtype=int)
+            cur = 0
+            for s in range(len(idx)):
+                if comp[s] >= 0:
+                    continue
+                comp[s] = cur
+                stack = [s]
+                while stack:
+                    u = stack.pop()
+                    ku = keys[u]
+                    for nb in adjacency.get(int(idx[u]), ()):
+                        v = pos.get(int(nb))
+                        if v is not None and comp[v] < 0 and keys[v] == ku:
+                            comp[v] = cur
+                            stack.append(v)
+                cur += 1
+            members: dict[int, list[int]] = {}
+            for k in range(len(idx)):
+                members.setdefault(int(comp[k]), []).append(k)
+            big_flat = [
+                cid for cid, mm in members.items()
+                if len(mm) >= min_wall_frac * len(idx)
+                and float(np.linalg.norm(n[mm].mean(0))) >= wall_coh_min
+            ]
+            if len(big_flat) < min_walls:
+                continue                     # not a multi-wall wrap
+            for cid in big_flat:
+                labels[idx[members[cid]]] = next_label
+                next_label += 1
+            split_any = True
+            logger.info("Split wrapped wall-band region %d -> %d walls",
+                        int(lbl), len(big_flat))
+
+    return _renumber_labels(labels)
 
 
 def _build_face_adjacency(faces: np.ndarray) -> dict[int, set[int]]:

@@ -152,6 +152,24 @@ def fit_surfaces(
                         nsp = float(1.0 - np.mean(normals @ (an / nl)))
                         if nsp < 0.04 and plane_rms <= fitted.rms_error * 4.0 + 1e-6:
                             prefer = True
+                # (d) RANK-1 normals = a PLANE by definition. A noisy flat wall
+                # has coherence ~0.9 (normal spread too high for the 0.04 gate
+                # above), yet its normals are still RANK 1 — one direction plus
+                # ISOTROPIC noise — whereas a genuine cylinder/cone fans its
+                # normals along an ARC (RANK 2, a large 2nd singular value). So
+                # when the 2nd singular value of the (unit) normals is small
+                # relative to the 1st, the patch is flat and must be a plane.
+                # This catches the wall-split's freed walls that mis-fit as
+                # CONE/CYLINDER/SPHERE (coherence ~0.90), while a real bore
+                # (rank 2) keeps its curved fit.
+                if not prefer:
+                    try:
+                        sv = np.linalg.svd(normals, compute_uv=False)
+                        ratio = float(sv[1] / sv[0]) if sv[0] > 1e-9 else 1.0
+                    except Exception:
+                        ratio = 1.0
+                    if ratio < 0.45 and plane_rms <= fitted.rms_error * 8.0 + 1e-6:
+                        prefer = True
                 if prefer:
                     logger.info(
                         "Region %d: %s -> plane (rms %.4f vs %.4f)",

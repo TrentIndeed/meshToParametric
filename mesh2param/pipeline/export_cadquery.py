@@ -55,13 +55,46 @@ class ConstructionStep:
 # per-step payload can ALSO be handed to a `sink` callback — `sink(payload, n)` —
 # which the Modal function points at a modal.Queue. Either, both, or neither may
 # be armed; the payload is built once and dispatched to whatever is set.
-_stream_ctx: dict = {"dir": None, "n": 0, "sink": None}
+_stream_ctx: dict = {"dir": None, "n": 0, "sink": None,
+                     "phase_name": None, "phase_t": None}
+
+
+def _stream_phase(name: str) -> None:
+    """Mark the current build SUB-PHASE (e.g. 'Applying fillets…', 'Refining…',
+    'Validating…') and LOG how long the previous phase took.
+
+    The post-build passes (fillet apply / residual refine / IoU validation)
+    stream NO construction steps, so without this the UI sits on a silent
+    "Building model" for minutes. Writing `_phase.txt` into the step stream dir
+    lets the server surface the sub-phase as a stage; the timing log tells us
+    where the minutes actually go. Best-effort — never breaks the build."""
+    import os
+    import time as _t
+    now = _t.time()
+    prev, pt = _stream_ctx.get("phase_name"), _stream_ctx.get("phase_t")
+    if prev and pt:
+        logger.info("[build-phase] '%s' took %.1fs", prev, now - pt)
+    _stream_ctx["phase_name"] = name
+    _stream_ctx["phase_t"] = now
+    logger.info("[build-phase] -> %s", name)
+    d = _stream_ctx.get("dir")
+    if d:
+        try:
+            tmp = os.path.join(d, "._phase.tmp")
+            final = os.path.join(d, "_phase.txt")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(name)
+            os.replace(tmp, final)
+        except Exception:
+            logger.debug("phase marker write failed", exc_info=True)
 
 
 def _set_step_stream_dir(stream_dir: str | None) -> None:
     """Arm (or disarm) live step streaming for the current build."""
     _stream_ctx["dir"] = stream_dir
     _stream_ctx["n"] = 0
+    _stream_ctx["phase_name"] = None
+    _stream_ctx["phase_t"] = None
     if stream_dir:
         try:
             import os
@@ -670,6 +703,8 @@ def export_cadquery(
                 blend_edge_overlay = blend_edge_overlay_out
                 blend_surface_patches = blend_surface_patches_out
 
+                _stream_phase("Applying fillets…")
+
                 # --- Apply deferred chamfers ---
                 if deferred_chamfers_all:
                     try:
@@ -794,6 +829,7 @@ def export_cadquery(
         _pre_vol = variants[0].cad_volume if variants else _solid_volume(solid)
         _pre_err = abs(_pre_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
         if _pre_err >= residual_refine_min_error_pct:
+            _stream_phase("Refining model…")
             try:
                 solid, _refined_vol = _residual_refine_solid(
                     solid, cleaned, mesh_volume)
@@ -895,7 +931,33 @@ def export_cadquery(
     status = "PASS" if volume_error < 10.0 else "FAIL"
 
     # Final tessellation
+    _stream_phase("Validating…")
     tess_verts, tess_faces = _tessellate_solid(solid)
+
+    # CATCH-ALL final step: the post-build passes (residual refine, contour
+    # fallback, revolve keep-better) can REPLACE the solid without emitting a
+    # construction step — the refined geometry then exists only in this final
+    # tessellation/STEP while the UI's "final model" loads the LAST STEP, so
+    # the user saw the pre-refine solid (AI4's underside cavity missing). If
+    # the final solid's volume differs materially from the last step's, append
+    # it as the closing step (reusing the tessellation just computed; the list
+    # is the live-streaming one, so it also reaches the viewer).
+    try:
+        _steps_out = variants[0].construction_steps if variants else None
+        if (_steps_out and tess_verts is not None and len(tess_verts)
+                and mesh_volume > 0):
+            _last_v = float(_steps_out[-1].volume or 0.0)
+            if abs(cad_volume - _last_v) > 0.005 * mesh_volume:
+                _steps_out.append(ConstructionStep(
+                    name="Refined Model",
+                    tess_vertices=np.asarray(tess_verts),
+                    tess_faces=np.asarray(tess_faces),
+                    volume=float(cad_volume),
+                ))
+                logger.info("Appended Refined Model step: %.0f -> %.0f mm^3",
+                            _last_v, cad_volume)
+    except Exception:
+        logger.debug("refined-model catch-all step failed", exc_info=True)
 
     # Export STEP. If ingest normalized the part's scale (unit_scale in
     # CleanedMesh.metadata), scale the solid back so the STEP file is in

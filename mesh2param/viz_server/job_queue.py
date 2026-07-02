@@ -148,6 +148,22 @@ def _build_primitive_mesh(regions, sub_cleaned, fitted_list, color_for_region):
         if f is None or len(region.face_indices) == 0:
             continue
         color = color_for_region.get(region.region_id, [0.6, 0.6, 0.6])
+        # Snap CLAMP: a CYLINDER/CONE/SPHERE fitted to a noisy or barely-curved
+        # region (e.g. the wall-split leftover) has a wild axis/radius, so
+        # projecting the region's vertices onto it flings them far from the mesh
+        # — the "hundreds of weird shards" in the primitive view. Cap how far a
+        # vertex may move to a fraction of the region's own size; a vertex that
+        # would move further is left in place (the fit is bad for it). Good
+        # fits (planes, real bores) move vertices only by the noise amplitude,
+        # well under the cap, so they're unaffected.
+        rvi = np.unique(sub_cleaned.faces[np.asarray(region.face_indices)])
+        rverts = sub_cleaned.vertices[rvi]
+        rdiag = float(np.linalg.norm(rverts.max(0) - rverts.min(0))) if len(rverts) else 0.0
+        # Tight cap: a good fit (plane, real bore) moves a vertex by roughly the
+        # mesh noise amplitude (<~1mm), so this keeps every good fit exact while
+        # a garbage curved fit (wild axis/radius) gets its vertices held at the
+        # mesh — the region then renders as the (correct-looking) mesh patch.
+        max_move = max(0.04 * rdiag, 1.0)
         # Per-region vertex projection cache: map original vertex
         # index -> new index in this region's projected vertex set.
         local_remap: dict[int, int] = {}
@@ -158,9 +174,10 @@ def _build_primitive_mesh(regions, sub_cleaned, fitted_list, color_for_region):
             for vi in tri:
                 vi_int = int(vi)
                 if vi_int not in local_remap:
-                    projected = _project_vertex_to_primitive(
-                        sub_cleaned.vertices[vi_int], f,
-                    )
+                    orig = sub_cleaned.vertices[vi_int]
+                    projected = _project_vertex_to_primitive(orig, f)
+                    if float(np.linalg.norm(projected - orig)) > max_move:
+                        projected = orig          # bad fit for this vertex
                     local_remap[vi_int] = len(local_verts)
                     local_verts.append(projected)
                 new_tri.append(local_remap[vi_int])
@@ -1707,6 +1724,18 @@ except BaseException as _exc:
                     # accretes features live while the build is still running.
                     _stream_ingested = _ingest_streamed_steps(
                         job, cad_stream_dir, _stream_ingested)
+                    # Surface the build SUB-PHASE the subprocess writes to
+                    # _phase.txt (Applying fillets… / Refining… / Validating…)
+                    # so the silent post-step minutes show what's actually
+                    # running instead of a frozen "Building CAD model…".
+                    try:
+                        _phase_f = cad_stream_dir / "_phase.txt"
+                        if _phase_f.exists():
+                            _ph = _phase_f.read_text(encoding="utf-8").strip()
+                            if _ph and job.progress_stage != _ph:
+                                job.progress_stage = _ph
+                    except Exception:
+                        pass
                     try:
                         proc_handle.wait(timeout=0.5)
                         break

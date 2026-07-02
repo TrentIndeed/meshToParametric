@@ -918,9 +918,57 @@ def export_cadquery(
                         "Contour fallback wins: recognition %.1f%% -> "
                         "contour %.1f%% volume error", _cur_err,
                         b.volume_error_pct)
-                    solid = b.solid
+                    fb_solid, fb_vol = b.solid, b.cad_volume
+                    # HYBRID: the fallback carves the big shape (AI4's cavity)
+                    # but is FEATURELESS — adopting it wholesale DROPS the
+                    # recognized cuts (the 4 blind holes, the oval cut-extrude,
+                    # the pockets) and keeps its refiner's blocky add-boxes.
+                    # INTERSECTING it with the recognition solid keeps the
+                    # union of both cut-sets (cavity from the fallback, feature
+                    # cuts from recognition) and drops add material recognition
+                    # doesn't have (the fins). Guarded: keep the hybrid only if
+                    # it scores >= the plain fallback (exact IoU where
+                    # available, else volume error), so it can never regress.
+                    try:
+                        hy = fb_solid.intersect(solid)
+                        hy_vol = _solid_volume(hy)
+                        if hy_vol > 0.25 * mesh_volume:
+                            take_hybrid = True
+                            try:
+                                from mesh2param.pipeline.iou_refine import (
+                                    exact_iou_available, mesh_iou_exact)
+                                if exact_iou_available():
+                                    target = trimesh.Trimesh(
+                                        vertices=cleaned.vertices,
+                                        faces=cleaned.faces, process=False)
+
+                                    def _iou_of(wp):
+                                        tv2, tf2 = _tessellate_solid(wp)
+                                        m2 = trimesh.Trimesh(
+                                            vertices=np.asarray(tv2, float).reshape(-1, 3),
+                                            faces=np.asarray(tf2, np.int64).reshape(-1, 3),
+                                            process=False)
+                                        return mesh_iou_exact(target, m2)
+
+                                    take_hybrid = _iou_of(hy) >= _iou_of(fb_solid) - 1e-4
+                                else:
+                                    take_hybrid = (abs(hy_vol - mesh_volume)
+                                                   <= abs(fb_vol - mesh_volume) + 1e-6)
+                            except Exception:
+                                logger.debug("hybrid scoring failed",
+                                             exc_info=True)
+                            if take_hybrid:
+                                logger.info(
+                                    "Fallback+recognition hybrid kept: "
+                                    "%.0f -> %.0f mm^3 (feature cuts restored)",
+                                    fb_vol, hy_vol)
+                                fb_solid, fb_vol = hy, hy_vol
+                    except Exception:
+                        logger.debug("fallback-hybrid intersect failed",
+                                     exc_info=True)
+                    solid = fb_solid
                     if variants:
-                        variants[0].cad_volume = b.cad_volume
+                        variants[0].cad_volume = fb_vol
             except Exception:
                 logger.debug("contour fallback errored, ignoring",
                              exc_info=True)

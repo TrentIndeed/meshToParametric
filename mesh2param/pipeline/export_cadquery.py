@@ -2765,8 +2765,30 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                                 break
                         if depth is None or depth < max(0.8, inset + 0.3):
                             continue          # through window / too shallow
+                        # SKETCH-INTENT regularization. A round ring is a HOLE:
+                        # carry a fitted circle (centroid + area-equivalent
+                        # radius) so the cut is a true CAD circle, not a jagged
+                        # mesh trace. A non-round ring (the oval recess) gets a
+                        # morphological-closing smooth so its outline reads as a
+                        # designed shape rather than mesh noise.
+                        circ = 4.0 * np.pi * rp.area / (rp.length ** 2 + 1e-9)
+                        _bx = rp.bounds
+                        _w, _h = _bx[2] - _bx[0], _bx[3] - _bx[1]
+                        aspect = max(_w, _h) / max(min(_w, _h), 1e-9)
+                        circle = None
+                        # A true circle: high isoperimetric ratio AND ~square
+                        # bbox. The oval recess scores circ~0.76 but aspect
+                        # ~2 — it must stay an outline, not become a circle.
+                        if circ > 0.82 and aspect < 1.3:
+                            cen = rp.centroid
+                            circle = {"cu": float(cen.x), "cv": float(cen.y),
+                                      "r": float(np.sqrt(rp.area / np.pi))}
+                        smooth = rp.buffer(1.0, join_style=1).buffer(
+                            -1.0, join_style=1).simplify(max(0.25, 0.003 * span))
+                        if smooth.is_empty or smooth.geom_type != "Polygon":
+                            smooth = rp.simplify(max(0.15, 0.002 * span))
                         ext = [(float(x), float(y)) for x, y in
-                               rp.simplify(max(0.15, 0.002 * span)).exterior.coords]
+                               smooth.exterior.coords]
                         if len(ext) < 4:
                             continue
                         taken.append(rp)
@@ -2774,11 +2796,137 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                             "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
                             "axis": axis, "face_t": face_t, "sign": sign,
                             "depth": depth, "exterior_uv": ext,
-                            "area": float(rp.area),
+                            "area": float(rp.area), "circle": circle,
                         })
+        # HOLE-PATTERN intent: holes on the same face that are the same feature
+        # repeated (a bolt pattern) get ONE shared diameter and depth — snap
+        # every circle within 25% of the group median to the median.
+        circles = [r for r in out if r.get("circle")]
+        if len(circles) >= 2:
+            med_r = float(np.median([r["circle"]["r"] for r in circles]))
+            med_d = float(np.median([r["depth"] for r in circles]))
+            for r in circles:
+                if abs(r["circle"]["r"] - med_r) <= 0.25 * med_r:
+                    r["circle"]["r"] = med_r
+                    if abs(r["depth"] - med_d) <= 0.25 * med_d:
+                        r["depth"] = med_d
         return out
     except Exception:
         logger.debug("face-ring recess detection failed", exc_info=True)
+        return []
+
+
+def _detect_standing_bosses(cleaned, extrude_dir,
+                            max_height: float = 4.0,
+                            max_frac: float = 0.25):
+    """Detect SHORT STANDING BOSSES on an extrude-axis face — the enclosure
+    lid's four feet: small pads standing proud of the main face, so the base
+    slab (which spans the full bbox) needs the layer between the pads CUT away.
+
+    Signature: the section right AT the face contains only the pads (small
+    total area), and a few mm deeper the full face appears (area jumps).
+    Returns [{plane_name, axis, face_t, sign, height, keeps: [{cu,cv,r}],
+    silhouette_uv}] — the cut is silhouette MINUS the kept pad circles, from
+    the face to `height`. Round pads snap to one shared radius (pattern
+    intent). Downstream keeps the cut only if it removes volume, so parts
+    whose base already stops at the true face are untouched.
+    """
+    try:
+        import trimesh
+        from shapely.geometry import Polygon as SPoly
+        from shapely.ops import unary_union
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return []
+    try:
+        axis = int(np.argmax(np.abs(extrude_dir)))
+        a_lo = float(cleaned.bbox[0][axis])
+        a_hi = float(cleaned.bbox[1][axis])
+        span = a_hi - a_lo
+        if span <= 1e-6:
+            return []
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+        out = []
+        for face_t, sign in ((a_lo, 1.0), (a_hi, -1.0)):
+            # Scan levels from the face inward, classifying each as a
+            # PADS-level (1..8 small components) or the MAIN face (big area).
+            # Feet = a run of pads-levels ending where the main face appears.
+            # Pads are MEASURED at the deepest pads-only level: right at the
+            # face the discs are jagged mesh nubs (roundness ~0.4), a little
+            # deeper they read as clean circles.
+            levels = np.arange(0.25, max_height, 0.35)
+            pads_at: list = []          # (offset, [pad polys])
+            height = None
+            main = None
+            first_total = None
+            for off in levels:
+                g = _section_material(mesh, axis, face_t + sign * float(off))
+                if g is None or g.is_empty:
+                    continue
+                comps = [p for p in getattr(g, "geoms", [g])
+                         if isinstance(p, SPoly) and p.area > 1.5]
+                total = sum(p.area for p in comps)
+                if first_total is None:
+                    first_total = total
+                if (pads_at and total > max(4.0 * pads_at[-1][2], 100.0)
+                        and len(comps) <= 2):
+                    height = float(off) - 0.15      # main face appeared
+                    main = g
+                    break
+                if 1 <= len(comps) <= 8:
+                    pads_at.append((float(off), comps, total))
+                else:
+                    break
+            if height is None or main is None or not pads_at:
+                continue
+            _, pads, pad_area = pads_at[-1]      # deepest pads-only level
+            if pad_area > max_frac * float(main.area):
+                continue                      # not "small pads on a big face"
+            # Kept pads as circles — the feet pattern is specifically ROUND
+            # pads. A non-round pad (e.g. a thin plate edge landing on the
+            # bbox face, RackMount) can't be covered by a circle and cutting
+            # around a wrong circle would eat real material: skip the face.
+            keeps = []
+            ok = True
+            for p in pads:
+                circ = 4.0 * np.pi * p.area / (p.length ** 2 + 1e-9)
+                if circ < 0.6:
+                    ok = False
+                    break
+                cen = p.centroid
+                r = float(np.sqrt(p.area / np.pi))
+                keeps.append({"cu": float(cen.x), "cv": float(cen.y), "r": r})
+            if not ok:
+                continue
+            if len(keeps) >= 2:
+                med = float(np.median([k["r"] for k in keeps]))
+                for k in keeps:
+                    if abs(k["r"] - med) <= 0.3 * med:
+                        k["r"] = med
+            # silhouette of the full face (outer boundary, holes filled)
+            outers = [SPoly(g.exterior) for g in getattr(main, "geoms", [main])
+                      if isinstance(g, SPoly)]
+            sil = unary_union(outers)
+            if sil.geom_type != "Polygon":
+                sil = max(getattr(sil, "geoms", [sil]), key=lambda g: g.area)
+            sil = sil.buffer(1.0).simplify(0.3)   # margin so the rim clears
+            silhouette = [(float(x), float(y)) for x, y in sil.exterior.coords]
+            out.append({
+                "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
+                "axis": axis, "face_t": face_t, "sign": sign,
+                "height": height, "keeps": keeps, "silhouette_uv": silhouette,
+                # The cut is only meaningful when the between-pads layer is
+                # actually FILLED by the (over-extruded) base slab — then it
+                # removes ~this much. If the solid already models the pads as
+                # separate bosses (AI1's screws), the cut removes almost
+                # nothing but can still clip their domes — the cutter compares
+                # against this to skip that case.
+                "expected_cut": float((main.area - pad_area) * height),
+            })
+        return out
+    except Exception:
+        logger.debug("standing-boss detection failed", exc_info=True)
         return []
 
 
@@ -3995,9 +4143,16 @@ def _build_stepwise(
                 wp_done = None
                 for sgn in (rr["sign"], -rr["sign"]):
                     try:
-                        cut = (cq.Workplane(rr["plane_name"], origin=tuple(o))
-                               .polyline(rr["exterior_uv"]).close()
-                               .extrude(sgn * rr["depth"]))
+                        base_wp = cq.Workplane(rr["plane_name"], origin=tuple(o))
+                        if rr.get("circle"):
+                            # True CAD circle (arcs in the STEP), not a polyline
+                            # trace of the noisy mesh outline.
+                            c = rr["circle"]
+                            cut = (base_wp.center(c["cu"], c["cv"])
+                                   .circle(c["r"]).extrude(sgn * rr["depth"]))
+                        else:
+                            cut = (base_wp.polyline(rr["exterior_uv"]).close()
+                                   .extrude(sgn * rr["depth"]))
                         wt = wp.cut(cut)
                         if vb - abs(float(wt.val().Volume())) > 0.5:
                             wp_done = wt
@@ -4007,16 +4162,10 @@ def _build_stepwise(
                 if wp_done is None:
                     continue
                 wp = wp_done
-                # Small round ring = a blind hole; larger = a recess cut.
-                try:
-                    from shapely.geometry import Polygon as _SP
-                    _p = _SP(rr["exterior_uv"])
-                    _circ = 4.0 * np.pi * _p.area / (_p.length ** 2 + 1e-9)
-                    _dia = 2.0 * float(np.sqrt(_p.area / np.pi))
-                except Exception:
-                    _circ, _dia = 0.0, 0.0
-                _nm = (f"Blind Hole ⌀{_dia:.1f}mm" if _circ > 0.7 and _dia < 10.0
-                       else f"Recess Cut (depth {rr['depth']:.1f}mm)")
+                if rr.get("circle"):
+                    _nm = f"Blind Hole ⌀{2 * rr['circle']['r']:.1f}mm"
+                else:
+                    _nm = f"Recess Cut (depth {rr['depth']:.1f}mm)"
                 v, f = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
                     name=_nm, tess_vertices=v, tess_faces=f,
@@ -4029,6 +4178,61 @@ def _build_stepwise(
                             ri + 1, rr["plane_name"], rr["depth"], rr["area"])
             except Exception as _rr_exc:
                 logger.warning("Failed to cut ring recess: %s", _rr_exc)
+
+    # --- Standing bosses (the enclosure lid's FEET): small pads standing
+    # proud of a face. The base slab spans the full bbox, so the layer
+    # BETWEEN the pads must be cut away: silhouette minus the kept pad
+    # circles, from the face to the pad height. Volume-gated like the rest. ---
+    if cleaned is not None:
+        try:
+            standing = _detect_standing_bosses(cleaned, extrude_dir)
+        except Exception:
+            standing = []
+        for bi2, sb in enumerate(standing):
+            try:
+                o = [0.0, 0.0, 0.0]
+                o[sb["axis"]] = sb["face_t"]
+                vb = abs(float(wp.val().Volume()))
+                wp_done = None
+                for sgn in (sb["sign"], -sb["sign"]):
+                    try:
+                        cut = (cq.Workplane(sb["plane_name"], origin=tuple(o))
+                               .polyline(sb["silhouette_uv"]).close()
+                               .extrude(sgn * sb["height"]))
+                        for k in sb["keeps"]:
+                            keep = (cq.Workplane(sb["plane_name"], origin=tuple(o))
+                                    .center(k["cu"], k["cv"]).circle(k["r"])
+                                    .extrude(sgn * sb["height"]))
+                            cut = cut.cut(keep)
+                        wt = wp.cut(cut)
+                        # Meaningful only if the layer was actually filled by
+                        # the base slab (removes ~expected). A solid that
+                        # already models the pads (AI1's screws) loses almost
+                        # nothing here — skip rather than clip their domes.
+                        _removed = vb - abs(float(wt.val().Volume()))
+                        if _removed > max(0.5, 0.4 * sb.get("expected_cut", 0.0)):
+                            wp_done = wt
+                            break
+                    except Exception:
+                        continue
+                if wp_done is None:
+                    continue
+                wp = wp_done
+                v, f = _tessellate_solid(wp, fast=True)
+                _r0 = sb["keeps"][0]["r"] if sb["keeps"] else 0.0
+                steps.append(ConstructionStep(
+                    name=(f"Boss Pattern ⌀{2 * _r0:.1f}mm x{len(sb['keeps'])} "
+                          f"(h={sb['height']:.1f}mm)"),
+                    tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+                script_lines.append(
+                    f"# Standing bosses on {sb['plane_name']}: "
+                    f"{len(sb['keeps'])} pads h={sb['height']:.2f}")
+                logger.info("Cut around %d standing boss(es) on %s h=%.1f",
+                            len(sb["keeps"]), sb["plane_name"], sb["height"])
+            except Exception as _sb_exc:
+                logger.warning("Failed standing-boss cut: %s", _sb_exc)
 
     # Fillet application is handled by the caller via
     # _apply_recognized_fillets_to_solid, which runs AFTER all bodies have

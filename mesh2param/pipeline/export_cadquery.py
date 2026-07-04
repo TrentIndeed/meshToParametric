@@ -2615,6 +2615,15 @@ def _detect_face_pockets(cleaned, extrude_dir):
                 try:
                     if p.area < max(20.0, 0.01 * m_mid.area):
                         continue
+                    # SLIVER guard: on noisy AI meshes the face-vs-mid diff
+                    # traces thin bands hugging the outer rim (jitter between
+                    # the two sections), which then cut bogus edge "pockets".
+                    # A real pocket is COMPACT: eroding ~1mm keeps most of its
+                    # area. A rim band collapses to crumbs (a plain is_empty
+                    # test misses the crumbs, so require the area fraction).
+                    _ero = p.buffer(-max(0.8, 0.008 * span))
+                    if _ero.is_empty or _ero.area < 0.25 * p.area:
+                        continue
                     ps = p.simplify(max(0.2, 0.003 * span))
                     if not isinstance(ps, SPoly) or ps.is_empty:
                         continue
@@ -2687,6 +2696,89 @@ def _detect_face_pockets(cleaned, extrude_dir):
         return out
     except Exception:
         logger.debug("face-pocket detection failed", exc_info=True)
+        return []
+
+
+def _detect_face_ring_recesses(cleaned, extrude_dir,
+                               max_frac: float = 0.15,
+                               min_area: float = 2.5):
+    """Detect BLIND recesses on the extrude-axis faces of a HOLLOW part — the
+    enclosure lid's oval top recess and its small blind holes.
+
+    `_detect_face_pockets` references material at the MID-plane, which is VOID
+    inside a hollow enclosure — every top-face feature there reads as "through"
+    and is skipped by design. Here a feature is instead an INTERIOR RING of the
+    face section: a void fully ENCLOSED by material just inside the face. Sweep
+    deeper to find its floor: material covering the ring = a BLIND recess (cut
+    face->floor); no floor within the span = a through window (skip — handled
+    elsewhere). Two insets are sampled so shallow recesses aren't missed.
+
+    Guards: `min_area` admits small blind holes but not mesh noise (the floor
+    requirement is the real filter); `max_frac` of the face section EXCLUDES
+    the giant open cavity — the volumetric refine reconstructs that better than
+    a prismatic carve (A/B'd). Downstream the cut is kept only if it actually
+    removes volume, so parts whose recognition already cut these features are
+    untouched. Returns [{plane_name, axis, face_t, sign, depth, exterior_uv}].
+    """
+    try:
+        import trimesh
+        from shapely.geometry import Polygon as SPoly
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return []
+    try:
+        axis = int(np.argmax(np.abs(extrude_dir)))
+        a_lo = float(cleaned.bbox[0][axis])
+        a_hi = float(cleaned.bbox[1][axis])
+        span = a_hi - a_lo
+        if span <= 1e-6:
+            return []
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+        out = []
+        for face_t, sign in ((a_hi, -1.0), (a_lo, 1.0)):
+            taken: list = []          # shapely rings already claimed (dedupe)
+            for inset in (max(0.5, 0.02 * span), max(0.9, 0.05 * span)):
+                g = _section_material(mesh, axis, face_t + sign * inset)
+                if g is None or g.is_empty:
+                    continue
+                sect_area = float(g.area)
+                for poly in getattr(g, "geoms", [g]):
+                    for ring in getattr(poly, "interiors", []):
+                        rp = SPoly(ring)
+                        if not rp.is_valid:
+                            rp = rp.buffer(0)
+                        if (not isinstance(rp, SPoly) or rp.is_empty
+                                or rp.area < min_area
+                                or rp.area > max_frac * (sect_area + rp.area)):
+                            continue
+                        if any(rp.intersection(t).area > 0.5 * min(rp.area, t.area)
+                               for t in taken):
+                            continue          # same feature seen at other inset
+                        # floor sweep: first depth where material covers the ring
+                        pt = rp.representative_point()
+                        depth = None
+                        for dd in np.linspace(inset + 0.4, 0.9 * span, 30):
+                            gg = _section_material(mesh, axis, face_t + sign * dd)
+                            if gg is not None and gg.buffer(-0.2).contains(pt):
+                                depth = float(dd)
+                                break
+                        if depth is None or depth < max(0.8, inset + 0.3):
+                            continue          # through window / too shallow
+                        ext = [(float(x), float(y)) for x, y in
+                               rp.simplify(max(0.15, 0.002 * span)).exterior.coords]
+                        if len(ext) < 4:
+                            continue
+                        taken.append(rp)
+                        out.append({
+                            "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
+                            "axis": axis, "face_t": face_t, "sign": sign,
+                            "depth": depth, "exterior_uv": ext,
+                            "area": float(rp.area),
+                        })
+        return out
+    except Exception:
+        logger.debug("face-ring recess detection failed", exc_info=True)
         return []
 
 
@@ -3885,6 +3977,58 @@ def _build_stepwise(
                             len(pk["interiors_uv"]), len(pk["holes_uv"]))
             except Exception as _fp_exc:
                 logger.warning("Failed to cut face pocket: %s", _fp_exc)
+
+    # --- Face RING recesses: blind features of a HOLLOW part (the enclosure
+    # lid's oval top recess + small blind holes), which the mid-plane pocket
+    # detector above cannot see (void at mid). Kept only if the cut removes
+    # volume, so a part whose recognition already cut them is untouched. ---
+    if cleaned is not None:
+        try:
+            ring_recesses = _detect_face_ring_recesses(cleaned, extrude_dir)
+        except Exception:
+            ring_recesses = []
+        for ri, rr in enumerate(ring_recesses):
+            try:
+                o = [0.0, 0.0, 0.0]
+                o[rr["axis"]] = rr["face_t"]
+                vb = abs(float(wp.val().Volume()))
+                wp_done = None
+                for sgn in (rr["sign"], -rr["sign"]):
+                    try:
+                        cut = (cq.Workplane(rr["plane_name"], origin=tuple(o))
+                               .polyline(rr["exterior_uv"]).close()
+                               .extrude(sgn * rr["depth"]))
+                        wt = wp.cut(cut)
+                        if vb - abs(float(wt.val().Volume())) > 0.5:
+                            wp_done = wt
+                            break
+                    except Exception:
+                        continue
+                if wp_done is None:
+                    continue
+                wp = wp_done
+                # Small round ring = a blind hole; larger = a recess cut.
+                try:
+                    from shapely.geometry import Polygon as _SP
+                    _p = _SP(rr["exterior_uv"])
+                    _circ = 4.0 * np.pi * _p.area / (_p.length ** 2 + 1e-9)
+                    _dia = 2.0 * float(np.sqrt(_p.area / np.pi))
+                except Exception:
+                    _circ, _dia = 0.0, 0.0
+                _nm = (f"Blind Hole ⌀{_dia:.1f}mm" if _circ > 0.7 and _dia < 10.0
+                       else f"Recess Cut (depth {rr['depth']:.1f}mm)")
+                v, f = _tessellate_solid(wp, fast=True)
+                steps.append(ConstructionStep(
+                    name=_nm, tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+                script_lines.append(
+                    f"# Ring recess {ri + 1} on {rr['plane_name']}, "
+                    f"depth {rr['depth']:.2f}")
+                logger.info("Cut ring recess %d on %s depth %.1f area %.0f",
+                            ri + 1, rr["plane_name"], rr["depth"], rr["area"])
+            except Exception as _rr_exc:
+                logger.warning("Failed to cut ring recess: %s", _rr_exc)
 
     # Fillet application is handled by the caller via
     # _apply_recognized_fillets_to_solid, which runs AFTER all bodies have

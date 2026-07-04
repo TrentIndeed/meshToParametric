@@ -2771,20 +2771,63 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                         # mesh trace. A non-round ring (the oval recess) gets a
                         # morphological-closing smooth so its outline reads as a
                         # designed shape rather than mesh noise.
-                        circ = 4.0 * np.pi * rp.area / (rp.length ** 2 + 1e-9)
-                        _bx = rp.bounds
+                        # SKETCH-INTENT regularization. Raised bumps inside a
+                        # recess bridge to its rim, so the traced void is a
+                        # CRESCENT rather than the designed outline — a strong
+                        # morphological closing (buffer +3/-3) re-bridges it
+                        # into the designed shape before classification.
+                        filled = rp.buffer(3.0, join_style=1).buffer(
+                            -3.0, join_style=1)
+                        if filled.is_empty or filled.geom_type != "Polygon":
+                            filled = rp
+                        circ = (4.0 * np.pi * filled.area
+                                / (filled.length ** 2 + 1e-9))
+                        _bx = filled.bounds
                         _w, _h = _bx[2] - _bx[0], _bx[3] - _bx[1]
                         aspect = max(_w, _h) / max(min(_w, _h), 1e-9)
                         circle = None
-                        # A true circle: high isoperimetric ratio AND ~square
-                        # bbox. The oval recess scores circ~0.76 but aspect
-                        # ~2 — it must stay an outline, not become a circle.
+                        ellipse = None
                         if circ > 0.82 and aspect < 1.3:
-                            cen = rp.centroid
+                            # A true circle: high isoperimetric ratio + ~square
+                            # bbox.
+                            cen = filled.centroid
                             circle = {"cu": float(cen.x), "cv": float(cen.y),
-                                      "r": float(np.sqrt(rp.area / np.pi))}
-                        smooth = rp.buffer(1.0, join_style=1).buffer(
-                            -1.0, join_style=1).simplify(max(0.25, 0.003 * span))
+                                      "r": float(np.sqrt(filled.area / np.pi))}
+                        else:
+                            # OVAL intent: fit an ellipse (principal axes of
+                            # the outline) and keep it if it explains the
+                            # shape; otherwise fall back to the smoothed
+                            # outline.
+                            try:
+                                bpts = np.asarray(
+                                    filled.exterior.coords, dtype=float)[:-1]
+                                cen = np.asarray(
+                                    filled.centroid.coords[0], dtype=float)
+                                d0 = bpts - cen
+                                cov = d0.T @ d0 / max(len(d0), 1)
+                                evals, evecs = np.linalg.eigh(cov)
+                                ax1 = evecs[:, 1]     # major direction
+                                proj1 = d0 @ evecs[:, 1]
+                                proj0 = d0 @ evecs[:, 0]
+                                ra = float(np.percentile(np.abs(proj1), 98))
+                                rb = float(np.percentile(np.abs(proj0), 98))
+                                ang = float(np.degrees(
+                                    np.arctan2(ax1[1], ax1[0])))
+                                th = np.linspace(0, 2 * np.pi, 64)
+                                epts = (cen[None, :]
+                                        + np.outer(np.cos(th), ra * evecs[:, 1])
+                                        + np.outer(np.sin(th), rb * evecs[:, 0]))
+                                ep = SPoly([(float(x), float(y))
+                                            for x, y in epts])
+                                iou = (ep.intersection(filled).area
+                                       / max(ep.union(filled).area, 1e-9))
+                                if iou >= 0.8:
+                                    ellipse = {"cu": float(cen[0]),
+                                               "cv": float(cen[1]),
+                                               "ra": ra, "rb": rb, "ang": ang}
+                            except Exception:
+                                ellipse = None
+                        smooth = filled.simplify(max(0.25, 0.003 * span))
                         if smooth.is_empty or smooth.geom_type != "Polygon":
                             smooth = rp.simplify(max(0.15, 0.002 * span))
                         ext = [(float(x), float(y)) for x, y in
@@ -2796,7 +2839,8 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                             "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
                             "axis": axis, "face_t": face_t, "sign": sign,
                             "depth": depth, "exterior_uv": ext,
-                            "area": float(rp.area), "circle": circle,
+                            "area": float(filled.area), "circle": circle,
+                            "ellipse": ellipse,
                         })
         # HOLE-PATTERN intent: holes on the same face that are the same feature
         # repeated (a bolt pattern) get ONE shared diameter and depth — snap
@@ -3405,8 +3449,28 @@ def _build_stepwise(
     # the base sketch above.
     for pi, profile in enumerate(extra_profiles, 1):
         try:
-            _cc = _BasePoly(profile).centroid
+            _pp = _BasePoly(profile)
+            _cc = _pp.centroid
             is_inner = _main_poly.contains(_BasePoint(_cc.x, _cc.y))
+
+            # NOISE guard (dirty meshes): a real small cutout is a designed
+            # shape — round or rectangular, i.e. it FILLS its convex hull. A
+            # mesh-noise blob (the enclosure lid's corner "V" squiggle) is
+            # tiny AND ragged (low solidity). Skip those instead of cutting a
+            # random divot into the part.
+            if (getattr(cleaned, "metadata", None) or {}).get("scan_mode"):
+                try:
+                    _sold = _pp.area / max(_pp.convex_hull.area, 1e-9)
+                    _rel = _pp.area / max(_main_poly.area, 1e-9)
+                    # A DESIGNED tiny cutout is a circle/slot/rect — solidity
+                    # ~0.95+. The corner "V" noise blob scores ~0.7-0.85.
+                    if _rel < 0.015 and _sold < 0.9:
+                        logger.info(
+                            "Skipping noise profile %d (area %.0f, solidity "
+                            "%.2f)", pi, _pp.area, _sold)
+                        continue
+                except Exception:
+                    pass
 
             # Build the sketch wireframe points for overlay display
             n_pts = len(profile)
@@ -4135,21 +4199,120 @@ def _build_stepwise(
             ring_recesses = _detect_face_ring_recesses(cleaned, extrude_dir)
         except Exception:
             ring_recesses = []
-        for ri, rr in enumerate(ring_recesses):
+        # GROUP same-face circles with the same (snapped) diameter into ONE
+        # pattern feature — one sketch of N circles, one cut — mirroring how a
+        # CAD operator models a bolt pattern. Ellipse/outline recesses each get
+        # their own sketch + cut pair.
+        def _ring_sketch_step(name, arcs=None, lines_uv=None, ax=None, pos=None):
+            try:
+                vsk, fsk = _tessellate_solid(wp, fast=True)
+                overlay = None
+                if lines_uv:
+                    us = [k for k in (0, 1, 2) if k != ax]
+                    seg3 = []
+                    for loop in lines_uv:
+                        for k in range(len(loop)):
+                            for pt in (loop[k], loop[(k + 1) % len(loop)]):
+                                p3 = [0.0, 0.0, 0.0]
+                                p3[us[0]], p3[us[1]] = pt
+                                p3[ax] = pos
+                                seg3.append(p3)
+                    overlay = np.asarray(seg3, np.float64)
+                steps.append(ConstructionStep(
+                    name=name,
+                    tess_vertices=np.asarray(vsk, np.float64),
+                    tess_faces=np.asarray(fsk, np.int64),
+                    volume=abs(float(wp.val().Volume())),
+                    sketch_overlay=overlay, overlay_arcs=arcs,
+                ))
+            except Exception:
+                logger.debug("ring sketch step failed", exc_info=True)
+
+        circle_groups: dict = {}
+        others = []
+        for rr in ring_recesses:
+            c = rr.get("circle")
+            if c:
+                key = (rr["face_t"], round(c["r"], 2))
+                circle_groups.setdefault(key, []).append(rr)
+            else:
+                others.append(rr)
+
+        for (face_t_g, r_g), grp in circle_groups.items():
+            try:
+                rr0 = grp[0]
+                o = [0.0, 0.0, 0.0]
+                o[rr0["axis"]] = face_t_g
+                _ring_sketch_step(
+                    f"Sketch Hole Pattern ({len(grp)}× ⌀{2 * r_g:.1f}mm)",
+                    arcs=[{"ax": rr0["axis"], "pos": face_t_g,
+                           "cu": g["circle"]["cu"], "cv": g["circle"]["cv"],
+                           "r": g["circle"]["r"], "a0": 0.0,
+                           "a1": 2.0 * np.pi} for g in grp])
+                vb = abs(float(wp.val().Volume()))
+                wp_done = None
+                for sgn in (rr0["sign"], -rr0["sign"]):
+                    try:
+                        wt = wp
+                        for g in grp:
+                            cgeo = g["circle"]
+                            cut = (cq.Workplane(rr0["plane_name"], origin=tuple(o))
+                                   .center(cgeo["cu"], cgeo["cv"])
+                                   .circle(cgeo["r"]).extrude(sgn * g["depth"]))
+                            wt = wt.cut(cut)
+                        if vb - abs(float(wt.val().Volume())) > 0.5:
+                            wp_done = wt
+                            break
+                    except Exception:
+                        continue
+                if wp_done is None:
+                    continue
+                wp = wp_done
+                _nm = (f"Blind Hole Pattern ⌀{2 * r_g:.1f}mm ×{len(grp)}"
+                       if len(grp) > 1 else f"Blind Hole ⌀{2 * r_g:.1f}mm")
+                v, f = _tessellate_solid(wp, fast=True)
+                steps.append(ConstructionStep(
+                    name=_nm, tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+                script_lines.append(
+                    f"# Hole pattern {len(grp)}x r={r_g:.2f} on {rr0['plane_name']}")
+                logger.info("Cut hole pattern %dx r=%.2f on %s",
+                            len(grp), r_g, rr0["plane_name"])
+            except Exception as _rr_exc:
+                logger.warning("Failed hole-pattern cut: %s", _rr_exc)
+
+        for ri, rr in enumerate(others):
             try:
                 o = [0.0, 0.0, 0.0]
                 o[rr["axis"]] = rr["face_t"]
+                el = rr.get("ellipse")
+                if el:
+                    th = np.linspace(0.0, 2.0 * np.pi, 72)
+                    _a = np.radians(el["ang"])
+                    _u = (el["cu"] + el["ra"] * np.cos(th) * np.cos(_a)
+                          - el["rb"] * np.sin(th) * np.sin(_a))
+                    _v = (el["cv"] + el["ra"] * np.cos(th) * np.sin(_a)
+                          + el["rb"] * np.sin(th) * np.cos(_a))
+                    sketch_loop = list(zip(_u.tolist(), _v.tolist()))
+                    _nm_sk = f"Sketch Oval ({2*el['ra']:.0f}×{2*el['rb']:.0f}mm)"
+                    _nm = f"Oval Cut (depth {rr['depth']:.1f}mm)"
+                else:
+                    sketch_loop = rr["exterior_uv"]
+                    _nm_sk = "Sketch Recess"
+                    _nm = f"Recess Cut (depth {rr['depth']:.1f}mm)"
+                _ring_sketch_step(_nm_sk, lines_uv=[sketch_loop],
+                                  ax=rr["axis"], pos=rr["face_t"])
                 vb = abs(float(wp.val().Volume()))
                 wp_done = None
                 for sgn in (rr["sign"], -rr["sign"]):
                     try:
                         base_wp = cq.Workplane(rr["plane_name"], origin=tuple(o))
-                        if rr.get("circle"):
-                            # True CAD circle (arcs in the STEP), not a polyline
-                            # trace of the noisy mesh outline.
-                            c = rr["circle"]
-                            cut = (base_wp.center(c["cu"], c["cv"])
-                                   .circle(c["r"]).extrude(sgn * rr["depth"]))
+                        if el:
+                            cut = (base_wp.center(el["cu"], el["cv"])
+                                   .ellipse(el["ra"], el["rb"],
+                                            rotation_angle=el["ang"])
+                                   .extrude(sgn * rr["depth"]))
                         else:
                             cut = (base_wp.polyline(rr["exterior_uv"]).close()
                                    .extrude(sgn * rr["depth"]))
@@ -4162,10 +4325,6 @@ def _build_stepwise(
                 if wp_done is None:
                     continue
                 wp = wp_done
-                if rr.get("circle"):
-                    _nm = f"Blind Hole ⌀{2 * rr['circle']['r']:.1f}mm"
-                else:
-                    _nm = f"Recess Cut (depth {rr['depth']:.1f}mm)"
                 v, f = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
                     name=_nm, tess_vertices=v, tess_faces=f,
@@ -4192,6 +4351,23 @@ def _build_stepwise(
             try:
                 o = [0.0, 0.0, 0.0]
                 o[sb["axis"]] = sb["face_t"]
+                # Sketch step: the pad circles on the face plane.
+                try:
+                    vsk, fsk = _tessellate_solid(wp, fast=True)
+                    steps.append(ConstructionStep(
+                        name=f"Sketch Boss Pattern ({len(sb['keeps'])}× "
+                             f"⌀{2 * sb['keeps'][0]['r']:.1f}mm)",
+                        tess_vertices=np.asarray(vsk, np.float64),
+                        tess_faces=np.asarray(fsk, np.int64),
+                        volume=abs(float(wp.val().Volume())),
+                        overlay_arcs=[{"ax": sb["axis"], "pos": sb["face_t"],
+                                       "cu": k["cu"], "cv": k["cv"],
+                                       "r": k["r"], "a0": 0.0,
+                                       "a1": 2.0 * np.pi}
+                                      for k in sb["keeps"]],
+                    ))
+                except Exception:
+                    logger.debug("boss sketch step failed", exc_info=True)
                 vb = abs(float(wp.val().Volume()))
                 wp_done = None
                 for sgn in (sb["sign"], -sb["sign"]):
@@ -7341,6 +7517,16 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
                 patch = _refine_op_to_solid(op, cq)
                 if patch is None:
                     continue
+                # Skip TINY add-boxes: they buy a sliver of IoU but read as
+                # random blocky extrusions stuck onto the model (user-visible
+                # on the enclosure lid). Cuts stay unrestricted — removing
+                # excess never adds phantom geometry.
+                if op.op == "add":
+                    try:
+                        if _solid_volume(patch) < 0.004 * mesh_volume:
+                            continue
+                    except Exception:
+                        pass
                 try:
                     refined = (refined.union(patch) if op.op == "add"
                                else refined.cut(patch))

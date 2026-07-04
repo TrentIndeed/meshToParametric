@@ -1310,6 +1310,21 @@ def _find_holes(
             )
             continue
 
+        # FIT-QUALITY gate (dirty meshes): a real bore's cylinder fit is tight
+        # relative to its radius; a noise region that HAPPENED to fit a tiny
+        # cylinder is not (AI4 grew a phantom X-axis "tangent pair", r=1.35
+        # with rms 0.21 — 15% of the radius — cutting two random circles into
+        # the side wall). Clean CAD keeps the permissive behavior.
+        if (config.conservative_detail and radius > 0
+                and float(f.rms_error) > 0.10 * radius):
+            logger.info(
+                "Rejecting noisy hole candidate r=%.2f rms=%.3f (%.0f%% of "
+                "radius) at %s", radius, float(f.rms_error),
+                100.0 * float(f.rms_error) / radius,
+                np.round(hole_center, 1).tolist(),
+            )
+            continue
+
         # Determine through vs blind. Radius alone is NOT enough:
         # Body1Mesh's small-radius edge holes are drilled only 27-47mm
         # into the plate edge (Z extent 138mm), and classifying them as

@@ -832,7 +832,9 @@ def export_cadquery(
             _stream_phase("Refining model…")
             try:
                 solid, _refined_vol = _residual_refine_solid(
-                    solid, cleaned, mesh_volume)
+                    solid, cleaned, mesh_volume,
+                    steps_out=(variants[0].construction_steps
+                               if variants else None))
                 if variants:
                     variants[0].cad_volume = _refined_vol
             except Exception:
@@ -981,9 +983,10 @@ def export_cadquery(
                             tp_base = fb_solid
                         tp = _transplant_mesh_features(
                             tp_base, cleaned, feature_tree, extrude_dir, _cq2)
+                        tp_steps: list = []
                         try:
                             tp, _ = _residual_refine_solid(
-                                tp, cleaned, mesh_volume)
+                                tp, cleaned, mesh_volume, steps_out=tp_steps)
                         except Exception:
                             logger.debug("post-transplant refine failed",
                                          exc_info=True)
@@ -1031,6 +1034,13 @@ def export_cadquery(
                     solid = fb_solid
                     if variants:
                         variants[0].cad_volume = fb_vol
+                        # Surface the transplant's refine ops as tree steps
+                        # when the transplant won the arbiter.
+                        try:
+                            if best_name == "transplant" and tp_steps:
+                                variants[0].construction_steps.extend(tp_steps)
+                        except Exception:
+                            pass
             except Exception:
                 logger.debug("contour fallback errored, ignoring",
                              exc_info=True)
@@ -2117,6 +2127,43 @@ def _extract_profile_and_holes(
             )
         best_profiles = kept_profiles
 
+    # Scan/AI: a slot whose rim is FILLETED double-traces — one ring at the
+    # WALL, one at the fillet's outer rim ("the AI mesh's bumpy fillet makes
+    # it think there's two levels"). Keep the WALL (smaller) contour; the rim
+    # band is blend geometry, not a second cut. Only INNER profiles compete
+    # (the outer profile at index 0 never participates, so a tube's bore
+    # cannot dedupe against its outer ring).
+    if len(best_profiles) > 2 and cleaned.metadata.get("scan_mode"):
+        try:
+            from shapely.geometry import Polygon as _DPoly
+            inner = best_profiles[1:]
+            polys = []
+            for p in inner:
+                try:
+                    polys.append(_DPoly(p).buffer(0))
+                except Exception:
+                    polys.append(None)
+            drop = set()
+            for i in range(len(inner)):
+                for j in range(len(inner)):
+                    if i == j or polys[i] is None or polys[j] is None:
+                        continue
+                    pi, pj = polys[i], polys[j]
+                    if pi.area <= pj.area:
+                        continue          # only the LARGER twin is dropped
+                    u = pi.union(pj).area
+                    if (u > 1e-9
+                            and pi.intersection(pj).area / u > 0.55
+                            and pi.area < 2.5 * pj.area):
+                        drop.add(i)
+            if drop:
+                logger.info("Dropped %d fillet-rim double-trace ring(s)",
+                            len(drop))
+                best_profiles = [best_profiles[0]] + [
+                    p for k, p in enumerate(inner) if k not in drop]
+        except Exception:
+            logger.debug("rim double-trace dedupe failed", exc_info=True)
+
     # Stage F (scan/AI only): regularize the OUTER profile — snap its straight
     # sides to axis-aligned and its corners to exact 90 deg with tangent arcs.
     # A scan/AI base profile comes out wavy with non-90 corners (user's "bumpy
@@ -2803,6 +2850,15 @@ def _void_intent_outline(coords):
             d0 = bpts - cen
             _, _, vt = np.linalg.svd(d0, full_matrices=False)
             u_maj, u_min = vt[0], vt[1]
+            # PARALLEL intent: a slot within ~12 deg of a part axis was
+            # designed axis-aligned — snap it (also makes sibling slots
+            # parallel to each other and to the outline).
+            for ax_v in ((1.0, 0.0), (0.0, 1.0)):
+                axv = np.asarray(ax_v)
+                if abs(float(u_maj @ axv)) > np.cos(np.radians(12.0)):
+                    u_maj = axv if (u_maj @ axv) > 0 else -axv
+                    u_min = np.asarray([-u_maj[1], u_maj[0]])
+                    break
             half_w = float(np.percentile(np.abs(d0 @ u_min), 95))
             half_l = float(np.percentile(np.abs(d0 @ u_maj), 98))
             r_cap = half_w
@@ -2987,6 +3043,15 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                                                          full_matrices=False)
                                 u_maj = vt[0]
                                 u_min = vt[1]
+                                for _axv in ((1.0, 0.0), (0.0, 1.0)):
+                                    _axv = np.asarray(_axv)
+                                    if abs(float(u_maj @ _axv)) > np.cos(
+                                            np.radians(12.0)):
+                                        u_maj = (_axv if (u_maj @ _axv) > 0
+                                                 else -_axv)
+                                        u_min = np.asarray(
+                                            [-u_maj[1], u_maj[0]])
+                                        break
                                 half_w = float(np.percentile(
                                     np.abs(d0 @ u_min), 95))
                                 half_l = float(np.percentile(
@@ -4022,6 +4087,12 @@ def _build_stepwise(
     ])
 
     # --- Steps 2+: Cut each hole ---
+    # Registry of drilled bores (3D center + radius). The mesh-derived ring
+    # detector later re-finds the SAME bores (measured deeper, so slightly
+    # larger) — without dedupe every hole was cut small first, then a bigger
+    # twin on top (the user's "made them small first then another bigger
+    # version"). Concentric ring circles get skipped against this registry.
+    _drilled_bores: list = []
     for i, (hole, note) in enumerate(ordered):
         sketch = hole.sketch_geometry
         if sketch.get("type") != "circle":
@@ -4123,6 +4194,8 @@ def _build_stepwise(
         except Exception:
             pass
 
+        for _cc in centers_all:
+            _drilled_bores.append((np.asarray(_cc, dtype=float), radius))
         n_holes = len(centers_all)
         if n_holes > 1:
             hole_name = (
@@ -4509,11 +4582,28 @@ def _build_stepwise(
             except Exception:
                 logger.debug("ring sketch step failed", exc_info=True)
 
+        def _is_drilled(rr, c):
+            # Concentric with an already-drilled bore of similar radius?
+            # (the ring re-finds the same hole slightly larger — cutting it
+            # again produced the small-then-big duplicate steps).
+            us2 = [k for k in (0, 1, 2) if k != rr["axis"]]
+            for (dc, dr) in _drilled_bores:
+                du = float(dc[us2[0]]) - c["cu"]
+                dv = float(dc[us2[1]]) - c["cv"]
+                if (np.hypot(du, dv) < 0.7 * max(c["r"], dr)
+                        and abs(c["r"] - dr) <= 0.35 * max(c["r"], dr)):
+                    return True
+            return False
+
         circle_groups: dict = {}
         others = []
         for rr in ring_recesses:
             c = rr.get("circle")
             if c:
+                if _is_drilled(rr, c):
+                    logger.info("Ring circle r=%.2f already drilled — skip",
+                                c["r"])
+                    continue
                 key = (rr["face_t"], round(c["r"], 2))
                 circle_groups.setdefault(key, []).append(rr)
             else:
@@ -4535,13 +4625,18 @@ def _build_stepwise(
                 for sgn in (rr0["sign"], -rr0["sign"]):
                     try:
                         wt = wp
+                        _exp = 0.0
                         for g in grp:
                             cgeo = g["circle"]
                             cut = (cq.Workplane(rr0["plane_name"], origin=tuple(o))
                                    .center(cgeo["cu"], cgeo["cv"])
                                    .circle(cgeo["r"]).extrude(sgn * g["depth"]))
                             wt = wt.cut(cut)
-                        if vb - abs(float(wt.val().Volume())) > 0.5:
+                            _exp += np.pi * cgeo["r"] ** 2 * g["depth"]
+                        # RELATIVE gate: removing only a thin shell of the
+                        # expected volume = re-cutting an existing void; skip.
+                        if (vb - abs(float(wt.val().Volume()))
+                                > max(0.5, 0.1 * _exp)):
                             wp_done = wt
                             break
                     except Exception:
@@ -4602,7 +4697,13 @@ def _build_stepwise(
                             cut = (base_wp.polyline(rr["exterior_uv"]).close()
                                    .extrude(sgn * rr["depth"]))
                         wt = wp.cut(cut)
-                        if vb - abs(float(wt.val().Volume())) > 0.5:
+                        # RELATIVE gate: removing only a thin shell of the
+                        # expected volume = re-cutting a void the base
+                        # already carries (the baked slot window); skip
+                        # instead of shaving a sliver + emitting a dup step.
+                        _exp2 = float(rr.get("area", 0.0)) * rr["depth"]
+                        if (vb - abs(float(wt.val().Volume()))
+                                > max(0.5, 0.1 * _exp2)):
                             wp_done = wt
                             break
                     except Exception:
@@ -7910,7 +8011,7 @@ def _refine_op_to_solid(op, cq):
 
 
 def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
-                           max_iters: int = 3):
+                           max_iters: int = 3, steps_out: list | None = None):
     """CADFit-style residual-refinement post-pass.
 
     The recognition pipeline is feed-forward — a mis-recognized or missed
@@ -8036,14 +8137,56 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
             else:
                 score = -abs(cand_vol - mesh_volume) / (mesh_volume + 1e-15)
             if best is None or score > best[0]:
-                best = (score, cand_solid, cand_vol)
+                best = (score, cand_solid, cand_vol, ops)
         if best is None:
             return solid, cad_vol
+
+        def _emit_steps(ops):
+            # Replay the WINNING op-set so each refine operation appears as
+            # its own feature-tree step (user ask: refine features must not
+            # be an opaque blob). Only ops that change volume materially get
+            # a step; the rest fold into the final Refined Model step.
+            if steps_out is None:
+                return
+            try:
+                cur = solid
+                prev_vol = _solid_volume(cur)
+                for op in ops:
+                    patch = _refine_op_to_solid(op, cq)
+                    if patch is None:
+                        continue
+                    if op.op == "add":
+                        try:
+                            if _solid_volume(patch) < 0.004 * mesh_volume:
+                                continue
+                        except Exception:
+                            pass
+                    try:
+                        cur = (cur.union(patch) if op.op == "add"
+                               else cur.cut(patch))
+                    except Exception:
+                        continue
+                    vol = _solid_volume(cur)
+                    dv = abs(vol - prev_vol)
+                    if dv >= 0.004 * mesh_volume:
+                        try:
+                            v3, f3 = _tessellate_solid(cur, fast=True)
+                            steps_out.append(ConstructionStep(
+                                name=(f"Refine {'Add' if op.op == 'add' else 'Cut'} "
+                                      f"({op.kind}, {dv:,.0f}mm³)"),
+                                tess_vertices=v3, tess_faces=f3, volume=vol,
+                            ))
+                        except Exception:
+                            pass
+                    prev_vol = vol
+            except Exception:
+                logger.debug("refine step replay failed", exc_info=True)
 
         if use_iou:
             if best[0] > iou0 + 1e-3:
                 logger.info("Residual refine: shape IoU %.3f -> %.3f",
                             iou0, best[0])
+                _emit_steps(best[3])
                 return best[1], best[2]
             return solid, cad_vol
 
@@ -8052,6 +8195,7 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
         if best_vol_err < old_err - 1e-4:
             logger.info("Residual refine: vol err %.2f%% -> %.2f%%",
                         old_err * 100, best_vol_err * 100)
+            _emit_steps(best[3])
             return best[1], best[2]
         return solid, cad_vol
     except Exception:

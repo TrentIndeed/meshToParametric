@@ -2731,7 +2731,12 @@ def _detect_face_pockets(cleaned, extrude_dir):
                 continue
             for p in polys:
                 try:
-                    if p.area < max(20.0, 0.01 * m_mid.area):
+                    # <1cm² shallow face recesses on scan/AI meshes are DENTS,
+                    # not intent (the L-bracket's 92mm² blob — flat-floored and
+                    # sharp-walled, so no downstream gate can tell it apart).
+                    # The smallest real recess in the fleet is 149mm² (cam
+                    # gear).
+                    if p.area < max(100.0, 0.01 * m_mid.area):
                         continue
                     # SLIVER guard: on noisy AI meshes the face-vs-mid diff
                     # traces thin bands hugging the outer rim (jitter between
@@ -2749,28 +2754,65 @@ def _detect_face_pockets(cleaned, extrude_dir):
                     if len(ext) < 4:
                         continue
 
-                    def _floor(pt):
-                        for dd in np.linspace(max(0.5, span * 0.05), span * 0.85, 24):
-                            g = _section_material(mesh, axis, face_t + sign * dd)
-                            if g is not None and g.buffer(-0.3).contains(pt):
-                                return float(dd)
-                        return None
-
-                    # MEDIAN floor over several sample points in the recess (a
-                    # single point is fragile on a noisy scan).
+                    # Floor depth over a GRID of sample points in the recess,
+                    # resolved with ONE shared section sweep. The floor SPREAD
+                    # is the phantom discriminator: a designed pocket has a
+                    # FLAT floor (AI1's panel recess: every sample 2.1mm); a
+                    # perimeter EDGE-FILLET band has a SLOPED floor (rounded
+                    # edges make the near-face section grow gradually — the
+                    # L-bracket's floors ran ~0.9→3.9mm across the band and
+                    # cut 4 phantom pockets).
                     samples = [ps.representative_point()]
                     mnx, mny, mxx, mxy = ps.bounds
-                    for fx, fy in ((0.3, 0.5), (0.7, 0.5), (0.5, 0.3),
-                                   (0.5, 0.7), (0.35, 0.35), (0.65, 0.65)):
-                        q = Point(mnx + (mxx - mnx) * fx, mny + (mxy - mny) * fy)
-                        if ps.contains(q):
-                            samples.append(q)
-                    depths = [d for d in (_floor(q) for q in samples) if d is not None]
-                    if not depths:
+                    for fx in (0.1, 0.3, 0.5, 0.7, 0.9):
+                        for fy in (0.1, 0.3, 0.5, 0.7, 0.9):
+                            q = Point(mnx + (mxx - mnx) * fx,
+                                      mny + (mxy - mny) * fy)
+                            if ps.contains(q):
+                                samples.append(q)
+                    pending = dict(enumerate(samples))
+                    depths = []
+                    for dd in np.linspace(max(0.5, span * 0.05), span * 0.85, 24):
+                        if not pending:
+                            break
+                        g = _section_material(mesh, axis, face_t + sign * dd)
+                        if g is None:
+                            continue
+                        gb = g.buffer(-0.3)
+                        hit = [i for i, q in pending.items() if gb.contains(q)]
+                        for i in hit:
+                            depths.append(float(dd))
+                            del pending[i]
+                    # <4 resolved floors = a sliver the grid barely lands in;
+                    # compact real pockets get many hits from their own-bounds
+                    # grid. Not enough evidence to cut.
+                    if len(depths) < 4:
                         continue
                     depth = float(np.median(depths))
+                    d_lo, d_hi = np.percentile(depths, [15.0, 85.0])
+                    if (d_hi - d_lo) > max(0.8, 0.45 * depth):
+                        continue                # sloped floor = fillet band
                     if depth < max(0.8, 0.03 * span):
                         continue                          # too shallow / through
+                    # PERSISTENCE: a designed pocket has SHARP walls — its
+                    # footprint at 80% of its depth still matches the near-face
+                    # footprint (AI1's panel recess: 0.9). A wide ROUNDED
+                    # transition shrinks steadily as the reference deepens
+                    # (the L-bracket's arm-to-base blend: 0.66 — it cut 4
+                    # phantom pockets). One extra section, per candidate.
+                    try:
+                        ref2 = max(max(0.5, span * 0.05), 0.8 * depth)
+                        g2 = _section_material(mesh, axis,
+                                               face_t + sign * ref2)
+                        if g2 is not None:
+                            p2 = m_mid.difference(g2.buffer(0))
+                            keep = (float(ps.intersection(p2).area)
+                                    / max(float(ps.area), 1e-9))
+                            if keep < 0.8:
+                                continue
+                    except Exception:
+                        logger.debug("face-pocket: persistence test failed",
+                                     exc_info=True)
 
                     # CUT SHAPE = recess MINUS material near the floor. Any region
                     # still SOLID near the floor (a raised hub/boss — including one

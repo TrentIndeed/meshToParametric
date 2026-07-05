@@ -1100,6 +1100,179 @@ def _symmetrize_rect_corners(coords: list, arc_samples: int = 18) -> list:
     return clean
 
 
+def _merge_stacked_coaxial(segments: list) -> list:
+    """Merge coaxial segments STACKED along their axis into one extrude when
+    they are the same body: adjacent spans, profiles mutually contained
+    (smaller ⊆ larger) and of comparable size.
+
+    The component tracker splits a single prismatic body at area plateaus, so
+    a noisy L-bracket came out as face-slab + mid-slab + face-slab + slivers —
+    the user saw a 2.6mm "base" plus join extrudes stacked to fill the part.
+    The comparable-size guard (ratio >= 0.5) keeps REAL stacked features
+    separate: a screw/boss whose circle is contained in the plate outline is
+    a tiny fraction of its area and must never merge (AI1).
+    """
+    from shapely.geometry import Polygon
+
+    segs = list(segments)
+    if not segs:
+        return segs
+    ax_lo = {s.axis_idx: min(x.start for x in segs if x.axis_idx == s.axis_idx)
+             for s in segs}
+    ax_hi = {s.axis_idx: max(x.end for x in segs if x.axis_idx == s.axis_idx)
+             for s in segs}
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(segs)):
+            for j in range(len(segs)):
+                if i == j:
+                    continue
+                a, b = segs[i], segs[j]
+                if a.axis_idx != b.axis_idx:
+                    continue
+                min_len = max(min(a.length, b.length), 1e-6)
+                gap = max(a.start, b.start) - min(a.end, b.end)
+                if gap > max(0.3 * min_len, 0.6):
+                    continue                    # not adjacent/overlapping
+                try:
+                    pa = Polygon(a.profile).buffer(0)
+                    pb = Polygon(b.profile).buffer(0)
+                    inter = pa.intersection(pb).area
+                except Exception:
+                    continue
+                small, large = (pa, pb) if pa.area <= pb.area else (pb, pa)
+                if small.area < 0.5 * large.area:
+                    continue                    # a real stacked feature
+                if inter < 0.85 * small.area:
+                    continue                    # not the same footprint
+                # TERMINAL-STEP guard (from the v1 engine): a smaller profile
+                # whose outer face IS a part face is a designed thinner level
+                # (a stacked plate/boss, AI1) — keep it a separate extrude.
+                # Merge only an INTERIOR reduction (the L-bracket's mid slab,
+                # bracketed by the full profile) or a same-profile resume.
+                same_profile = (min(pa.area, pb.area)
+                                >= 0.85 * max(pa.area, pb.area))
+                if not same_profile:
+                    sm_seg = a if pa.area <= pb.area else b
+                    tol = 0.02 * max(ax_hi[a.axis_idx] - ax_lo[a.axis_idx],
+                                     1e-9)
+                    terminal = (sm_seg.start <= ax_lo[a.axis_idx] + tol
+                                or sm_seg.end >= ax_hi[a.axis_idx] - tol)
+                    if terminal:
+                        continue
+                keep = a if pa.area >= pb.area else b
+                other = b if keep is a else a
+                merged = ExtrusionSegment(
+                    axis_idx=keep.axis_idx, direction=keep.direction,
+                    start=min(a.start, b.start), end=max(a.end, b.end),
+                    profile=list(keep.profile), area=keep.area,
+                    gain_frac=keep.gain_frac + other.gain_frac,
+                    coverage_frac=max(keep.coverage_frac, other.coverage_frac),
+                )
+                segs = [s for k, s in enumerate(segs) if k not in (i, j)]
+                segs.insert(0 if i == 0 or j == 0 else len(segs), merged)
+                logger.info(
+                    "Merged stacked coaxial segments (axis %d): span "
+                    "%.1f..%.1f area %.0f", merged.axis_idx, merged.start,
+                    merged.end, merged.area)
+                changed = True
+                break
+            if changed:
+                break
+    return segs
+
+
+def _regularize_any_angle(coords: list, diag: float) -> list | None:
+    """Straighten a jagged polyline whose sides are NOT axis-aligned (the
+    L-bracket's diagonal arm — the axis-aligned regularizer can't touch it).
+
+    Strong simplification keeps only the true corners; each side is then
+    least-squares refit to the ORIGINAL points assigned to it and corners are
+    recomputed as intersections of consecutive side lines. Accepted only when
+    the result explains the outline (IoU >= 0.92), so curved outlines keep
+    their measured shape.
+    """
+    from shapely.geometry import Polygon
+
+    try:
+        p = Polygon(coords)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty or p.geom_type != "Polygon" or len(coords) < 8:
+            return None
+        strong = p.simplify(max(0.012 * diag, 1.0), preserve_topology=True)
+        if strong.is_empty or strong.geom_type != "Polygon":
+            return None
+        corners = np.asarray(strong.exterior.coords[:-1], dtype=float)
+        n = len(corners)
+        if not (3 <= n <= 24):
+            return None
+        # CORNER gate: a designed polygon has SHARP corners; a discretized
+        # circle/arc has only uniform shallow turns (a 50mm tube simplifies to
+        # a 16-gon of 22.5-deg turns — straightening it to facets changed the
+        # volume and broke Mesh4). Require at least one genuine corner.
+        turn_max = 0.0
+        for k in range(n):
+            v1 = corners[k] - corners[(k - 1) % n]
+            v2 = corners[(k + 1) % n] - corners[k]
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 < 1e-9 or n2 < 1e-9:
+                continue
+            cosang = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+            turn_max = max(turn_max, float(np.degrees(np.arccos(cosang))))
+        if turn_max < 45.0:
+            return None                     # smooth outline (circle/arc)
+        pts = np.asarray(coords, dtype=float)
+        # assign each original point to its nearest side of the strong outline
+        assign = [[] for _ in range(n)]
+        for q in pts:
+            best, bi = None, 0
+            for k in range(n):
+                a, b = corners[k], corners[(k + 1) % n]
+                ab = b - a
+                t = np.clip(np.dot(q - a, ab) / max(np.dot(ab, ab), 1e-12), 0, 1)
+                d = float(np.linalg.norm(q - (a + t * ab)))
+                if best is None or d < best:
+                    best, bi = d, k
+            assign[bi].append(q)
+        # least-squares line per side: point c0 + direction u
+        lines = []
+        for k in range(n):
+            P = np.asarray(assign[k], dtype=float)
+            if len(P) < 2:
+                a, b = corners[k], corners[(k + 1) % n]
+                c0, u = a, (b - a) / max(np.linalg.norm(b - a), 1e-12)
+            else:
+                c0 = P.mean(axis=0)
+                d0 = P - c0
+                _, _, vt = np.linalg.svd(d0, full_matrices=False)
+                u = vt[0]
+            lines.append((c0, u))
+        # corners = intersections of consecutive lines
+        new_pts = []
+        for k in range(n):
+            (c1, u1) = lines[(k - 1) % n]
+            (c2, u2) = lines[k]
+            A = np.column_stack([u1, -u2])
+            if abs(np.linalg.det(A)) < 1e-9:
+                new_pts.append(corners[k])
+                continue
+            t = np.linalg.solve(A, c2 - c1)
+            new_pts.append(c1 + t[0] * u1)
+        ng = Polygon([(float(x), float(y)) for x, y in new_pts])
+        if not ng.is_valid or ng.is_empty:
+            return None
+        iou = ng.intersection(p).area / max(ng.union(p).area, 1e-9)
+        if iou < 0.92:
+            return None
+        logger.info("Any-angle profile straighten: %d -> %d pts (IoU %.2f)",
+                    len(coords), len(new_pts), iou)
+        return [(float(x), float(y)) for x, y in new_pts]
+    except Exception:
+        return None
+
+
 def _fit_regular_ngon(coords: list) -> list[tuple[float, float]] | None:
     """Snap an outline to a REGULAR N-gon (N=5..8) when that is clearly the
     design intent (the hex standoff: an AI mesh's wobbly hexagon should become
@@ -1194,6 +1367,12 @@ def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
                 [(float(x), float(y)) for x, y in reg])
     except Exception:
         pass
+    # Non-axis-aligned outlines (the L-bracket's diagonal arm): straighten the
+    # sides at ANY angle via least-squares refit. Strictly gated (IoU >= 0.92),
+    # so rounded/organic outlines keep their measured shape.
+    anyang = _regularize_any_angle(simplified, diag)
+    if anyang:
+        return anyang
     # Even when regularize bails (it rejects densely-sampled rounded outlines),
     # symmetrize the corners so a half-sharp rectangle becomes a clean rounded
     # one instead of extruding with one square side.
@@ -1364,6 +1543,11 @@ def plan_extrusions_components(
         segments = [segments[0]] + [
             _reaxis_to_base(s, base_ax) for s in segments[1:]
         ]
+    # Re-merge a prismatic body the tracker split into STACKED coaxial slabs
+    # (noisy L-bracket: face slab + mid slab + face slab -> one base extrude).
+    segments = _merge_stacked_coaxial(segments)
+    if segments:
+        segments = sorted(segments, key=lambda s: -s.area)
     return ExtrusionPlan(
         segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
     )

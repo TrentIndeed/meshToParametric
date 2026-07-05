@@ -1546,8 +1546,30 @@ def plan_extrusions_components(
     # Re-merge a prismatic body the tracker split into STACKED coaxial slabs
     # (noisy L-bracket: face slab + mid slab + face slab -> one base extrude).
     segments = _merge_stacked_coaxial(segments)
+    # Drop plateau-transition SLIVERS the merge leaves behind: sub-1mm slabs
+    # and thin rails hugging the base's faces (protruding <=1.5mm with a small
+    # footprint). These shipped as micro "Extrude Join" steps that only nudge
+    # volume. Real features survive: a foot pad protrudes ~2mm (kept), a
+    # stacked plate is thick (kept), a screw protrudes well beyond (kept).
     if segments:
-        segments = sorted(segments, key=lambda s: -s.area)
+        base = max(segments, key=lambda s: s.area * s.length)
+        kept = []
+        for s in segments:
+            if s is base:
+                kept.append(s)
+                continue
+            if s.axis_idx == base.axis_idx:
+                if s.length < 1.0:
+                    logger.info("Dropping sliver segment (len %.2fmm, "
+                                "area %.0f)", s.length, s.area)
+                    continue
+                prot = max(base.start - s.start, s.end - base.end, 0.0)
+                if prot <= 1.5 and s.area < 0.1 * base.area:
+                    logger.info("Dropping face-hugging rail (prot %.1fmm, "
+                                "area %.0f)", prot, s.area)
+                    continue
+            kept.append(s)
+        segments = sorted(kept, key=lambda s: -s.area)
     return ExtrusionPlan(
         segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
     )

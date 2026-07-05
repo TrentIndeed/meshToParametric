@@ -2875,13 +2875,54 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                         aspect = max(_w, _h) / max(min(_w, _h), 1e-9)
                         circle = None
                         ellipse = None
+                        stadium = None
                         if circ > 0.82 and aspect < 1.3:
                             # A true circle: high isoperimetric ratio + ~square
                             # bbox.
                             cen = filled.centroid
                             circle = {"cu": float(cen.x), "cv": float(cen.y),
                                       "r": float(np.sqrt(filled.area / np.pi))}
-                        else:
+                        elif aspect >= 1.4:
+                            # SLOT intent: an elongated void is a capsule
+                            # (stadium) — two semicircle ends + straight
+                            # sides — the designed shape of the carriage
+                            # block's long ovals (a raw mesh trace leaves
+                            # jagged rims).
+                            try:
+                                bpts = np.asarray(
+                                    filled.exterior.coords, dtype=float)[:-1]
+                                cen = np.asarray(
+                                    filled.centroid.coords[0], dtype=float)
+                                d0 = bpts - cen
+                                _, _, vt = np.linalg.svd(d0,
+                                                         full_matrices=False)
+                                u_maj = vt[0]
+                                u_min = vt[1]
+                                half_w = float(np.percentile(
+                                    np.abs(d0 @ u_min), 95))
+                                half_l = float(np.percentile(
+                                    np.abs(d0 @ u_maj), 98))
+                                r_cap = half_w
+                                straight = max(half_l - r_cap, 0.1)
+                                th = np.linspace(-np.pi / 2, np.pi / 2, 20)
+                                end1 = (cen + straight * u_maj
+                                        + np.outer(np.cos(th), r_cap * u_maj)
+                                        + np.outer(np.sin(th), r_cap * u_min))
+                                end2 = (cen - straight * u_maj
+                                        - np.outer(np.cos(th), r_cap * u_maj)
+                                        - np.outer(np.sin(th), r_cap * u_min))
+                                cap_pts = np.vstack([end1, end2])
+                                capsule = SPoly([(float(x), float(y))
+                                                 for x, y in cap_pts])
+                                if capsule.is_valid:
+                                    iou = (capsule.intersection(filled).area
+                                           / max(capsule.union(filled).area,
+                                                 1e-9))
+                                    if iou >= 0.82:
+                                        stadium = capsule
+                            except Exception:
+                                stadium = None
+                        if stadium is None and circle is None:
                             # OVAL intent: fit an ellipse (principal axes of
                             # the outline) and keep it if it explains the
                             # shape; otherwise fall back to the smoothed
@@ -2915,9 +2956,20 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                                                "ra": ra, "rb": rb, "ang": ang}
                             except Exception:
                                 ellipse = None
-                        smooth = filled.simplify(max(0.25, 0.003 * span))
+                        if stadium is not None:
+                            smooth = stadium
+                        else:
+                            smooth = filled.simplify(max(0.25, 0.003 * span))
                         if smooth.is_empty or smooth.geom_type != "Polygon":
                             smooth = rp.simplify(max(0.15, 0.002 * span))
+                        # THROUGH windows: dilate slightly so the clean cut
+                        # swallows the jagged baked window walls the fallback
+                        # base carries (otherwise both rims show).
+                        if through and circle is None:
+                            _dl = smooth.buffer(0.25, join_style=1)
+                            if (not _dl.is_empty
+                                    and _dl.geom_type == "Polygon"):
+                                smooth = _dl
                         ext = [(float(x), float(y)) for x, y in
                                smooth.exterior.coords]
                         if len(ext) < 4:
@@ -3020,6 +3072,12 @@ def _detect_standing_bosses(cleaned, extrude_dir,
             if height is None or main is None or not pads_at:
                 continue
             _, pads, pad_area = pads_at[-1]      # deepest pads-only level
+            # PROMINENCE gates: real designed pads carry real area AND real
+            # height (AI4's feet: ~7% of the face, 1.15mm). The bezel frame's
+            # distorted corner nubs (2.1%, 0.8mm) are mesh noise — modelling
+            # them as bosses adds junk the designer never drew.
+            if height < 1.0 or pad_area < 0.03 * float(main.area):
+                continue
             keeps = []
             keep_outline = None
             if pad_area > max_frac * float(main.area):

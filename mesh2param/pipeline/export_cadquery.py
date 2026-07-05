@@ -965,8 +965,28 @@ def export_cadquery(
                         logger.info("fallback-hybrid intersect failed",
                                      exc_info=True)
                     try:
+                        # Transplant onto the PRE-REFINE fallback and refine
+                        # LAST: refining first carved rectangular boxes around
+                        # the jagged baked windows, and those over-cuts
+                        # survived the transplant's clean slot cuts (the
+                        # carriage block's "bad rectangular cutout"). With the
+                        # slots already clean, the refine's residual there is
+                        # ~zero and its boxes go where they're really needed.
+                        try:
+                            b2 = reconstruct_segmentation_free(
+                                cleaned, residual=False)
+                            tp_base = (b2.solid if b2.solid is not None
+                                       else fb_solid)
+                        except Exception:
+                            tp_base = fb_solid
                         tp = _transplant_mesh_features(
-                            fb_solid, cleaned, feature_tree, extrude_dir, _cq2)
+                            tp_base, cleaned, feature_tree, extrude_dir, _cq2)
+                        try:
+                            tp, _ = _residual_refine_solid(
+                                tp, cleaned, mesh_volume)
+                        except Exception:
+                            logger.debug("post-transplant refine failed",
+                                         exc_info=True)
                         tp_vol = _solid_volume(tp)
                         if tp_vol > 0.25 * mesh_volume:
                             candidates.append(("transplant", tp, tp_vol))
@@ -1759,6 +1779,15 @@ def _extract_profile_and_holes(
                     if circularity < 0.5 or est_radius > 30.0:
                         if area > 10.0:  # ignore tiny noise
                             cutout_coords = list(ring.coords)[:-1]
+                            # Design-intent regularization on dirty meshes:
+                            # this ring traces the slot fillet's jagged outer
+                            # rim — snap it to a clean circle/capsule/smooth
+                            # outline instead of baking the jags.
+                            if (getattr(cleaned, "metadata", None)
+                                    or {}).get("scan_mode"):
+                                _reg = _void_intent_outline(cutout_coords)
+                                if _reg and len(_reg) >= 3:
+                                    cutout_coords = _reg
                             cutout_coords = _simplify_profile(cutout_coords, tolerance=0.5)
                             if len(cutout_coords) >= 3:
                                 best_profiles.append(cutout_coords)
@@ -2739,6 +2768,66 @@ def _detect_face_pockets(cleaned, extrude_dir):
     except Exception:
         logger.debug("face-pocket detection failed", exc_info=True)
         return []
+
+
+def _void_intent_outline(coords):
+    """Regularize a void outline (window/slot cutout) to its DESIGN-INTENT
+    shape: circle, capsule (stadium), or a smoothed outline. Used for the
+    cutout rings baked into the base sketch — on an AI mesh those trace the
+    slot fillet's jagged outer rim (the carriage block's 'jagged, slightly
+    wider sketch' around each smooth oval). Returns a point list, or None to
+    keep the input as-is."""
+    from shapely.geometry import Polygon as SPoly
+    try:
+        p = SPoly(coords)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty or p.geom_type != "Polygon" or p.area < 4.0:
+            return None
+        filled = p.buffer(2.0, join_style=1).buffer(-2.0, join_style=1)
+        if filled.is_empty or filled.geom_type != "Polygon":
+            filled = p
+        circ = 4.0 * np.pi * filled.area / (filled.length ** 2 + 1e-9)
+        bx = filled.bounds
+        w, h = bx[2] - bx[0], bx[3] - bx[1]
+        aspect = max(w, h) / max(min(w, h), 1e-9)
+        if circ > 0.82 and aspect < 1.3:
+            cen = filled.centroid
+            r = float(np.sqrt(filled.area / np.pi))
+            th = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+            return [(float(cen.x + r * np.cos(t)),
+                     float(cen.y + r * np.sin(t))) for t in th]
+        if aspect >= 1.4:
+            bpts = np.asarray(filled.exterior.coords, dtype=float)[:-1]
+            cen = np.asarray(filled.centroid.coords[0], dtype=float)
+            d0 = bpts - cen
+            _, _, vt = np.linalg.svd(d0, full_matrices=False)
+            u_maj, u_min = vt[0], vt[1]
+            half_w = float(np.percentile(np.abs(d0 @ u_min), 95))
+            half_l = float(np.percentile(np.abs(d0 @ u_maj), 98))
+            r_cap = half_w
+            straight = max(half_l - r_cap, 0.1)
+            th = np.linspace(-np.pi / 2, np.pi / 2, 20)
+            end1 = (cen + straight * u_maj
+                    + np.outer(np.cos(th), r_cap * u_maj)
+                    + np.outer(np.sin(th), r_cap * u_min))
+            end2 = (cen - straight * u_maj
+                    - np.outer(np.cos(th), r_cap * u_maj)
+                    - np.outer(np.sin(th), r_cap * u_min))
+            cap = SPoly([(float(x), float(y))
+                         for x, y in np.vstack([end1, end2])])
+            if cap.is_valid:
+                iou = (cap.intersection(filled).area
+                       / max(cap.union(filled).area, 1e-9))
+                if iou >= 0.8:
+                    return [(float(x), float(y))
+                            for x, y in cap.exterior.coords[:-1]]
+        sm = filled.simplify(0.4)
+        if sm.is_empty or sm.geom_type != "Polygon":
+            return None
+        return [(float(x), float(y)) for x, y in sm.exterior.coords[:-1]]
+    except Exception:
+        return None
 
 
 def _detect_face_ring_recesses(cleaned, extrude_dir,

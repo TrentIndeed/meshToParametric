@@ -1100,6 +1100,64 @@ def _symmetrize_rect_corners(coords: list, arc_samples: int = 18) -> list:
     return clean
 
 
+def _fit_regular_ngon(coords: list) -> list[tuple[float, float]] | None:
+    """Snap an outline to a REGULAR N-gon (N=5..8) when that is clearly the
+    design intent (the hex standoff: an AI mesh's wobbly hexagon should become
+    a perfect hexagon, not a trace of the wobble).
+
+    Method: sample the boundary's radius-vs-angle profile around the centroid
+    and FFT it — a regular N-gon has a dominant N-th harmonic; a circle is
+    flat (no dominant harmonic) and a rectangle peaks at 4 (handled by the
+    rectangle path). The harmonic's phase gives the rotation. Accept only if
+    the reconstructed N-gon explains the outline (IoU >= 0.93), so anything
+    ambiguous keeps its measured shape.
+    """
+    from shapely.geometry import Polygon
+    try:
+        p = Polygon(coords)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty or p.geom_type != "Polygon" or p.area < 4.0:
+            return None
+        c = np.asarray(p.centroid.coords[0], dtype=float)
+        # dense boundary sampling -> r(theta) on a uniform angle grid
+        L = p.exterior.length
+        ts = np.linspace(0.0, L, 256, endpoint=False)
+        pts = np.asarray([p.exterior.interpolate(t).coords[0] for t in ts],
+                         dtype=float) - c
+        ang = np.arctan2(pts[:, 1], pts[:, 0])
+        rad = np.linalg.norm(pts, axis=1)
+        order = np.argsort(ang)
+        grid = np.linspace(-np.pi, np.pi, 128, endpoint=False)
+        r_g = np.interp(grid, ang[order], rad[order], period=2 * np.pi)
+        spec = np.fft.rfft(r_g - r_g.mean())
+        mags = np.abs(spec)
+        if len(mags) < 10:
+            return None
+        best_n = int(np.argmax(mags[3:10])) + 3       # harmonics 3..9
+        if best_n not in (5, 6, 7, 8):
+            return None
+        # dominance: the N-th harmonic must stand clear of the rest
+        others = np.delete(mags[1:12], best_n - 1)
+        if mags[best_n] < 2.0 * (np.max(others) + 1e-9):
+            return None
+        phase = float(np.angle(spec[best_n]))
+        # r(theta) peaks (vertices) where cos(N*theta + phase) = 1
+        theta0 = -phase / best_n
+        R = float(np.sqrt(2.0 * p.area / (best_n * np.sin(2 * np.pi / best_n))))
+        verts = [(float(c[0] + R * np.cos(theta0 + 2 * np.pi * k / best_n)),
+                  float(c[1] + R * np.sin(theta0 + 2 * np.pi * k / best_n)))
+                 for k in range(best_n)]
+        ng = Polygon(verts)
+        iou = ng.intersection(p).area / max(ng.union(p).area, 1e-9)
+        if iou < 0.93:
+            return None
+        logger.info("Regular %d-gon snap: R=%.2f IoU=%.2f", best_n, R, iou)
+        return verts
+    except Exception:
+        return None
+
+
 def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
     """Clean a raw slice outline into a sketchable profile.
 
@@ -1118,6 +1176,12 @@ def _simplify_profile(coords: list, diag: float) -> list[tuple[float, float]]:
     if p.is_empty or p.geom_type != "Polygon":
         return [(float(x), float(y)) for x, y in coords]
     simplified = [(float(x), float(y)) for x, y in p.exterior.coords[:-1]]
+    # Regular-polygon intent (the hex standoff): a wobbly AI-mesh hexagon
+    # snaps to a perfect one. Strictly gated (dominant N-fold harmonic +
+    # IoU >= 0.93), so circles and rectangles never mis-snap.
+    ngon = _fit_regular_ngon(simplified)
+    if ngon:
+        return ngon
     # Regularize into a true CAD sketch: axis-aligned straight sides meeting at
     # exact 90-deg corners, with a tangent arc at each rounded corner. Self-
     # gating — returns None for a round/organic outline, so a screw circle

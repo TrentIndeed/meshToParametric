@@ -919,82 +919,95 @@ def export_cadquery(
                         "contour %.1f%% volume error", _cur_err,
                         b.volume_error_pct)
                     fb_solid, fb_vol = b.solid, b.cad_volume
-                    # HYBRID: the fallback carves the big shape (AI4's cavity)
-                    # but is FEATURELESS — adopting it wholesale DROPS the
-                    # recognized cuts (the 4 blind holes, the oval cut-extrude,
-                    # the pockets) and keeps its refiner's blocky add-boxes.
-                    # INTERSECTING it with the recognition solid keeps the
-                    # union of both cut-sets (cavity from the fallback, feature
-                    # cuts from recognition) and drops add material recognition
-                    # doesn't have (the fins). Guarded: keep the hybrid only if
-                    # it scores >= the plain fallback (exact IoU where
-                    # available, else volume error), so it can never regress.
+                    # The plain fallback is FEATURELESS — adopting it wholesale
+                    # drops every recognized cut. Build repair CANDIDATES and
+                    # let exact IoU pick the best (never worse than plain):
+                    #  * HYBRID (fallback ∩ recognition + bosses): right when
+                    #    recognition was OVER-solid (AI4 — the intersection
+                    #    keeps the union of both cut-sets).
+                    #  * TRANSPLANT (mesh-derived cuts applied to the
+                    #    fallback): right when recognition was UNDER-solid
+                    #    (the carriage block — intersecting there shrinks the
+                    #    part further, but its holes are real and re-cuttable
+                    #    straight from the mesh).
+                    candidates = [("fallback", fb_solid, fb_vol)]
+                    import cadquery as _cq2   # cq is shadowed by later local imports
                     try:
                         hy = fb_solid.intersect(solid)
-                        # Re-union the detected standing bosses (feet/panel):
-                        # they exist in the MESH, but the fallback's refine
-                        # carves the mostly-empty layer they stand in, so the
-                        # intersection would erase them. They're designed
-                        # features straight off the mesh — putting them back
-                        # can only move the solid toward the mesh (and the
-                        # exact-IoU keep-guard below still arbitrates).
                         try:
                             for _sb in _detect_standing_bosses(cleaned,
                                                                extrude_dir):
                                 _o = [0.0, 0.0, 0.0]
                                 _o[_sb["axis"]] = _sb["face_t"]
                                 _sgn = _sb["sign"]
+                                pads = []
                                 if _sb.get("keep_outline"):
-                                    pad = (cq.Workplane(_sb["plane_name"],
-                                                        origin=tuple(_o))
-                                           .polyline(_sb["keep_outline"])
-                                           .close()
-                                           .extrude(_sgn * _sb["height"]))
-                                    hy = hy.union(pad.intersect(solid))
+                                    pads.append(
+                                        _cq2.Workplane(_sb["plane_name"],
+                                                       origin=tuple(_o))
+                                        .polyline(_sb["keep_outline"]).close()
+                                        .extrude(_sgn * _sb["height"]))
                                 for _k in _sb["keeps"]:
-                                    pad = (cq.Workplane(_sb["plane_name"],
-                                                        origin=tuple(_o))
-                                           .center(_k["cu"], _k["cv"])
-                                           .circle(_k["r"])
-                                           .extrude(_sgn * _sb["height"]))
+                                    pads.append(
+                                        _cq2.Workplane(_sb["plane_name"],
+                                                       origin=tuple(_o))
+                                        .center(_k["cu"], _k["cv"])
+                                        .circle(_k["r"])
+                                        .extrude(_sgn * _sb["height"]))
+                                for pad in pads:
                                     hy = hy.union(pad.intersect(solid))
                         except Exception:
                             logger.debug("boss re-union failed", exc_info=True)
                         hy_vol = _solid_volume(hy)
                         if hy_vol > 0.25 * mesh_volume:
-                            take_hybrid = True
-                            try:
-                                from mesh2param.pipeline.iou_refine import (
-                                    exact_iou_available, mesh_iou_exact)
-                                if exact_iou_available():
-                                    target = trimesh.Trimesh(
-                                        vertices=cleaned.vertices,
-                                        faces=cleaned.faces, process=False)
-
-                                    def _iou_of(wp):
-                                        tv2, tf2 = _tessellate_solid(wp)
-                                        m2 = trimesh.Trimesh(
-                                            vertices=np.asarray(tv2, float).reshape(-1, 3),
-                                            faces=np.asarray(tf2, np.int64).reshape(-1, 3),
-                                            process=False)
-                                        return mesh_iou_exact(target, m2)
-
-                                    take_hybrid = _iou_of(hy) >= _iou_of(fb_solid) - 1e-4
-                                else:
-                                    take_hybrid = (abs(hy_vol - mesh_volume)
-                                                   <= abs(fb_vol - mesh_volume) + 1e-6)
-                            except Exception:
-                                logger.debug("hybrid scoring failed",
-                                             exc_info=True)
-                            if take_hybrid:
-                                logger.info(
-                                    "Fallback+recognition hybrid kept: "
-                                    "%.0f -> %.0f mm^3 (feature cuts restored)",
-                                    fb_vol, hy_vol)
-                                fb_solid, fb_vol = hy, hy_vol
+                            candidates.append(("hybrid", hy, hy_vol))
                     except Exception:
-                        logger.debug("fallback-hybrid intersect failed",
+                        logger.info("fallback-hybrid intersect failed",
                                      exc_info=True)
+                    try:
+                        tp = _transplant_mesh_features(
+                            fb_solid, cleaned, feature_tree, extrude_dir, _cq2)
+                        tp_vol = _solid_volume(tp)
+                        if tp_vol > 0.25 * mesh_volume:
+                            candidates.append(("transplant", tp, tp_vol))
+                    except Exception:
+                        logger.info("fallback transplant failed",
+                                     exc_info=True)
+                    best_name = "fallback"
+                    if len(candidates) > 1:
+                        try:
+                            from mesh2param.pipeline.iou_refine import (
+                                exact_iou_available, mesh_iou_exact)
+                            if exact_iou_available():
+                                target = trimesh.Trimesh(
+                                    vertices=cleaned.vertices,
+                                    faces=cleaned.faces, process=False)
+
+                                def _iou_of(wp2):
+                                    tv2, tf2 = _tessellate_solid(wp2)
+                                    m2 = trimesh.Trimesh(
+                                        vertices=np.asarray(tv2, float).reshape(-1, 3),
+                                        faces=np.asarray(tf2, np.int64).reshape(-1, 3),
+                                        process=False)
+                                    return mesh_iou_exact(target, m2)
+
+                                scored = [(nm, s, v, _iou_of(s))
+                                          for nm, s, v in candidates]
+                                # plain fallback wins ties (simplest model)
+                                best_name, fb_solid, fb_vol, _best_iou = max(
+                                    scored, key=lambda c: c[3] - 1e-4 * (c[0] != "fallback"))
+                                logger.info(
+                                    "Fallback repair arbiter: %s wins (%s)",
+                                    best_name,
+                                    ", ".join(f"{nm}={io:.3f}"
+                                              for nm, _, _, io in scored))
+                            else:
+                                best_name, fb_solid, fb_vol = min(
+                                    candidates,
+                                    key=lambda c: abs(c[2] - mesh_volume))
+                        except Exception:
+                            logger.info("fallback arbiter failed",
+                                         exc_info=True)
                     solid = fb_solid
                     if variants:
                         variants[0].cad_volume = fb_vol
@@ -2730,7 +2743,7 @@ def _detect_face_pockets(cleaned, extrude_dir):
 
 def _detect_face_ring_recesses(cleaned, extrude_dir,
                                max_frac: float = 0.15,
-                               min_area: float = 2.5):
+                               min_area: float = 4.0):
     """Detect BLIND recesses on the extrude-axis faces of a HOLLOW part — the
     enclosure lid's oval top recess and its small blind holes.
 
@@ -2784,24 +2797,38 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
         for axis, a_lo, a_hi in axes_faces:
             span = a_hi - a_lo
             for face_t, sign in ((a_hi, -1.0), (a_lo, 1.0)):
-                taken: list = []      # shapely rings already claimed (dedupe)
+                # PASS 1 — collect candidate rings from both insets (cheap
+                # geometric gates only), dedupe, keep the LARGEST few. The
+                # expensive floor sweep runs only on survivors: a gear's 46
+                # tooth gaps or a dirty mesh's dozens of sub-mm noise voids
+                # otherwise explode the build (the cam-gear 600s timeout).
+                cands: list = []      # (rp, inset, sect_area)
                 for inset in (max(0.5, 0.02 * span), max(0.9, 0.05 * span)):
                     g = _section_material(mesh, axis, face_t + sign * inset)
                     if g is None or g.is_empty:
                         continue
                     sect_area = float(g.area)
                     for poly in getattr(g, "geoms", [g]):
-                      for ring in getattr(poly, "interiors", []):
-                        rp = SPoly(ring)
-                        if not rp.is_valid:
-                            rp = rp.buffer(0)
-                        if (not isinstance(rp, SPoly) or rp.is_empty
-                                or rp.area < min_area
-                                or rp.area > max_frac * (sect_area + rp.area)):
-                            continue
-                        if any(rp.intersection(t).area > 0.5 * min(rp.area, t.area)
-                               for t in taken):
-                            continue      # same feature seen at other inset
+                        for ring in getattr(poly, "interiors", []):
+                            rp = SPoly(ring)
+                            if not rp.is_valid:
+                                rp = rp.buffer(0)
+                            if (not isinstance(rp, SPoly) or rp.is_empty
+                                    or rp.area < min_area
+                                    or rp.area > max_frac * (sect_area + rp.area)):
+                                continue
+                            if any(rp.intersection(c[0]).area
+                                   > 0.5 * min(rp.area, c[0].area)
+                                   for c in cands):
+                                continue    # same feature seen at other inset
+                            cands.append((rp, float(inset), sect_area))
+                if len(cands) > 8:
+                    logger.info(
+                        "Ring recesses: %d candidates on a face, keeping the "
+                        "8 largest (rest = noise/teeth)", len(cands))
+                    cands = sorted(cands, key=lambda c: -c[0].area)[:8]
+                for rp, inset, sect_area in cands:
+                    if True:
                         # Sweep deeper: material covering the ring = BLIND
                         # recess floor. The void merging into a MUCH larger
                         # enclosure (the cavity) or opening out of the part =
@@ -2895,7 +2922,6 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                                smooth.exterior.coords]
                         if len(ext) < 4:
                             continue
-                        taken.append(rp)
                         out.append({
                             "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
                             "axis": axis, "face_t": face_t, "sign": sign,
@@ -4301,11 +4327,24 @@ def _build_stepwise(
         def _ring_sketch_step(name, arcs=None, lines_uv=None, ax=None, pos=None):
             try:
                 vsk, fsk = _tessellate_solid(wp, fast=True)
+                # ALWAYS build sketch_overlay line segments: the viewer renders
+                # a step named "Sketch..." with NO overlay as a wireframe of
+                # the whole tessellation (the "glitch"). Circles from arcs are
+                # sampled into segments here so the solid+overlay path is taken.
+                loops = list(lines_uv or [])
+                if arcs:
+                    ax = arcs[0]["ax"]
+                    pos = arcs[0]["pos"]
+                    for a in arcs:
+                        th = np.linspace(a["a0"], a["a1"], 48)
+                        loops.append([
+                            (float(a["cu"] + a["r"] * np.cos(t)),
+                             float(a["cv"] + a["r"] * np.sin(t))) for t in th])
                 overlay = None
-                if lines_uv:
+                if loops:
                     us = [k for k in (0, 1, 2) if k != ax]
                     seg3 = []
-                    for loop in lines_uv:
+                    for loop in loops:
                         for k in range(len(loop)):
                             for pt in (loop[k], loop[(k + 1) % len(loop)]):
                                 p3 = [0.0, 0.0, 0.0]
@@ -4472,12 +4511,27 @@ def _build_stepwise(
                             sketch_overlay=np.asarray(seg3, np.float64),
                         )
                     else:
+                        # sketch_overlay segments too — a "Sketch" step with
+                        # no overlay renders as a wireframe of the whole solid.
+                        us = [k for k in (0, 1, 2) if k != sb["axis"]]
+                        seg3 = []
+                        for k in sb["keeps"]:
+                            th = np.linspace(0.0, 2.0 * np.pi, 48)
+                            loop = [(k["cu"] + k["r"] * np.cos(t),
+                                     k["cv"] + k["r"] * np.sin(t)) for t in th]
+                            for j in range(len(loop)):
+                                for pt in (loop[j], loop[(j + 1) % len(loop)]):
+                                    p3 = [0.0, 0.0, 0.0]
+                                    p3[us[0]], p3[us[1]] = pt
+                                    p3[sb["axis"]] = sb["face_t"]
+                                    seg3.append(p3)
                         _sk = ConstructionStep(
                             name=f"Sketch Boss Pattern ({len(sb['keeps'])}× "
                                  f"⌀{2 * sb['keeps'][0]['r']:.1f}mm)",
                             tess_vertices=np.asarray(vsk, np.float64),
                             tess_faces=np.asarray(fsk, np.int64),
                             volume=abs(float(wp.val().Volume())),
+                            sketch_overlay=np.asarray(seg3, np.float64),
                             overlay_arcs=[{"ax": sb["axis"], "pos": sb["face_t"],
                                            "cu": k["cu"], "cv": k["cv"],
                                            "r": k["r"], "a0": 0.0,
@@ -4488,11 +4542,21 @@ def _build_stepwise(
                 except Exception:
                     logger.debug("boss sketch step failed", exc_info=True)
                 vb = abs(float(wp.val().Volume()))
+                # Cut region = the ENTIRE layer (oversized rectangle), not the
+                # buffered face silhouette — the silhouette's margin left a
+                # ledge artifact at the corners where it met the cavity. The
+                # pads/panel are excluded, so they stand as positive bosses.
+                _us = [k for k in (0, 1, 2) if k != sb["axis"]]
+                _u0 = float(cleaned.bbox[0][_us[0]]) - 5.0
+                _u1 = float(cleaned.bbox[1][_us[0]]) + 5.0
+                _v0 = float(cleaned.bbox[0][_us[1]]) - 5.0
+                _v1 = float(cleaned.bbox[1][_us[1]]) + 5.0
+                _rect = [(_u0, _v0), (_u1, _v0), (_u1, _v1), (_u0, _v1)]
                 wp_done = None
                 for sgn in (sb["sign"], -sb["sign"]):
                     try:
                         cut = (cq.Workplane(sb["plane_name"], origin=tuple(o))
-                               .polyline(sb["silhouette_uv"]).close()
+                               .polyline(_rect).close()
                                .extrude(sgn * sb["height"]))
                         if _is_panel:
                             keep = (cq.Workplane(sb["plane_name"],
@@ -6938,6 +7002,16 @@ def _apply_recognized_fillets_to_solid(
                 )
         if not chosen:
             continue
+        # OVER-CLAIM guard: a real fillet cluster owns a handful of edges. A
+        # cluster claiming dozens-to-hundreds (AI5: one r=8.3 cluster matched
+        # 205 of 7,696 edges on a complex solid) is a mis-match, and asking
+        # OCC to roll a fillet across it SEGFAULTS the build. Skip it.
+        if len(chosen) > 64:
+            logger.warning(
+                "  cluster %d claims %d edges — mis-match, skipping "
+                "(OCC fillet on that many edges segfaults)",
+                int(c.get("group_id", ci)), len(chosen))
+            continue
         matched_by_cluster[ci] = [x[0] for x in chosen]
         cluster_radius[ci] = robust_r
         cluster_kind[ci] = str(c.get("kind", "fillet"))
@@ -7492,6 +7566,120 @@ def _solid_volume(solid) -> float:
         return abs(float(solid.val().Volume()))
     except Exception:
         return 0.0
+
+
+def _transplant_mesh_features(solid, cleaned, feature_tree, extrude_dir, cq):
+    """Cut the MESH-DERIVED features into an arbitrary solid (the contour
+    fallback): ring recesses/slots, tangent holes, the tree's cylindrical
+    holes; union detected standing bosses. Used when the fallback WINS but
+    recognition was UNDER-solid — there the fallback∩recognition hybrid
+    shrinks the part further (wrong), yet adopting the plain fallback DROPS
+    every hole (the carriage block's "refined model removed all the holes").
+    Every cut/union is volume-gated; the caller scores the result by exact
+    IoU against the plain fallback, so this can never ship a regression."""
+    out = solid
+
+    def _cut(shape):
+        nonlocal out
+        try:
+            before = _solid_volume(out)
+            wt = out.cut(shape)
+            if before - _solid_volume(wt) > 0.5:
+                out = wt
+        except Exception:
+            pass
+
+    plane_of = {0: "YZ", 1: "XZ", 2: "XY"}
+    # ring recesses / through slots (mesh sections)
+    try:
+        for rr in _detect_face_ring_recesses(cleaned, extrude_dir):
+            o = [0.0, 0.0, 0.0]
+            o[rr["axis"]] = rr["face_t"]
+            wp0 = cq.Workplane(rr["plane_name"], origin=tuple(o))
+            el = rr.get("ellipse")
+            c = rr.get("circle")
+            try:
+                if c:
+                    sh = (wp0.center(c["cu"], c["cv"]).circle(c["r"])
+                          .extrude(rr["depth"], both=True))
+                elif el:
+                    sh = (wp0.center(el["cu"], el["cv"])
+                          .ellipse(el["ra"], el["rb"],
+                                   rotation_angle=el["ang"])
+                          .extrude(rr["depth"], both=True))
+                else:
+                    sh = (wp0.polyline(rr["exterior_uv"]).close()
+                          .extrude(rr["depth"], both=True))
+                _cut(sh)
+            except Exception:
+                continue
+    except Exception:
+        logger.info("transplant rings failed", exc_info=True)
+    # tangent holes (mesh sections)
+    try:
+        for th in _detect_tangent_holes(cleaned, extrude_dir):
+            for (r, t0, t1) in th["levels"]:
+                o = [0.0, 0.0, 0.0]
+                o[th["axis"]] = 0.5 * (t0 + t1)
+                try:
+                    sh = (cq.Workplane(plane_of[th["axis"]], origin=tuple(o))
+                          .center(th["cu"], th["cv"]).circle(r)
+                          .extrude(0.5 * (t1 - t0) + 0.5, both=True))
+                    _cut(sh)
+                except Exception:
+                    continue
+    except Exception:
+        logger.info("transplant tangent holes failed", exc_info=True)
+    # the tree's cylindrical holes (recognition features)
+    try:
+        from mesh2param.models.feature import FeatureType as _FT
+        for f in getattr(feature_tree, "features", []) or []:
+            if f.type not in (_FT.THROUGH_HOLE, _FT.BLIND_HOLE):
+                continue
+            sg = f.sketch_geometry or {}
+            if sg.get("center") is None or not sg.get("radius"):
+                continue
+            cen = np.asarray(sg["center"], dtype=float)
+            d = np.asarray(f.direction, dtype=float)
+            ax = int(np.argmax(np.abs(d)))
+            length = (float(f.depth) if f.type == _FT.BLIND_HOLE
+                      and f.depth > 0 else 1e3)
+            o = [0.0, 0.0, 0.0]
+            o[ax] = float(cen[ax])
+            us = [k for k in (0, 1, 2) if k != ax]
+            try:
+                sh = (cq.Workplane(plane_of[ax], origin=tuple(o))
+                      .center(float(cen[us[0]]), float(cen[us[1]]))
+                      .circle(float(sg["radius"]))
+                      .extrude(length if f.type == _FT.BLIND_HOLE
+                               else 1e3, both=True))
+                _cut(sh)
+            except Exception:
+                continue
+    except Exception:
+        logger.info("transplant tree holes failed", exc_info=True)
+    # standing bosses (union — they exist in the mesh)
+    try:
+        for sb in _detect_standing_bosses(cleaned, extrude_dir):
+            o = [0.0, 0.0, 0.0]
+            o[sb["axis"]] = sb["face_t"]
+            pads = []
+            if sb.get("keep_outline"):
+                pads.append(cq.Workplane(sb["plane_name"], origin=tuple(o))
+                            .polyline(sb["keep_outline"]).close()
+                            .extrude(sb["sign"] * sb["height"]))
+            for k in sb["keeps"]:
+                pads.append(cq.Workplane(sb["plane_name"], origin=tuple(o))
+                            .center(k["cu"], k["cv"]).circle(k["r"])
+                            .extrude(sb["sign"] * sb["height"]))
+            for pad in pads:
+                try:
+                    out = out.union(pad)
+                except Exception:
+                    continue
+    except Exception:
+        logger.info("transplant bosses failed", exc_info=True)
+    return out
 
 
 def _contour_fallback_result(cleaned: CleanedMesh, mesh_volume: float):

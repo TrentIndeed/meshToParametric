@@ -8808,6 +8808,86 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
         if best is None:
             return solid, cad_vol
 
+        # FEATURE EDIT: when the result is still well off the mesh, don't
+        # leave a too-small cavity prism for the arbiter to paper over
+        # with an opaque swap or patch boxes — re-optimize the LARGEST
+        # prism cut's own parameters (footprint dilation, depth
+        # extension), scored by exact IoU against the mesh. One edited
+        # feature, not eight patches.
+        if use_iou:
+            try:
+                _err_now = abs(best[2] - mesh_volume) / (mesh_volume + 1e-15)
+                _prisms = [(i, op) for i, op in enumerate(best[3])
+                           if op.kind == "prism" and op.op == "cut"]
+                if _err_now > 0.06 and _prisms:
+                    from shapely.geometry import Polygon as _EP
+                    import copy as _copy
+
+                    def _p_vol(op):
+                        try:
+                            return (_EP(op.polygon).area
+                                    * float(op.hi - op.lo))
+                        except Exception:
+                            return 0.0
+
+                    _i0, _op0 = max(_prisms, key=lambda t: _p_vol(t[1]))
+
+                    def _score_edit(dil, ext):
+                        _op2 = _copy.deepcopy(_op0)
+                        try:
+                            if dil > 0:
+                                _p2 = _EP(_op0.polygon).buffer(
+                                    dil, join_style=1)
+                                if (_p2.geom_type != "Polygon"
+                                        or _p2.is_empty):
+                                    return None
+                                _op2.polygon = [
+                                    (float(x), float(y))
+                                    for x, y in _p2.exterior.coords[:-1]]
+                            _op2.lo = float(_op0.lo) - ext
+                            _op2.hi = float(_op0.hi) + ext
+                            _ops2 = list(best[3])
+                            _ops2[_i0] = _op2
+                            _s2, _v2 = _apply(_ops2)
+                            if _s2 is None:
+                                return None
+                            tv2, tf2 = _tessellate_solid(_s2)
+                            m2 = trimesh.Trimesh(
+                                vertices=np.asarray(
+                                    tv2, float).reshape(-1, 3),
+                                faces=np.asarray(
+                                    tf2, np.int64).reshape(-1, 3),
+                                process=False)
+                            return (mesh_iou_exact(target, m2),
+                                    _s2, _v2, _ops2)
+                        except Exception:
+                            return None
+
+                    _cur = best
+                    _bdil = 0.0
+                    for _dil in (0.8, 1.6, 2.4):
+                        _r = _score_edit(_dil, 0.0)
+                        logger.debug("prism edit dil=%.1f -> %s", _dil,
+                                     "fail" if _r is None else _r[0])
+                        if _r is not None and _r[0] > _cur[0] + 1e-3:
+                            _cur = _r
+                            _bdil = _dil
+                    for _ext in (1.0, 2.0, 4.0):
+                        _r = _score_edit(_bdil, _ext)
+                        logger.debug("prism edit dil=%.1f ext=%.1f -> %s",
+                                     _bdil, _ext,
+                                     "fail" if _r is None else _r[0])
+                        if _r is not None and _r[0] > _cur[0] + 1e-3:
+                            _cur = _r
+                    if _cur is not best:
+                        logger.info(
+                            "Refine prism EDIT: IoU %.3f -> %.3f "
+                            "(footprint/depth re-fit of the largest "
+                            "prism cut)", best[0], _cur[0])
+                        best = _cur
+            except Exception:
+                logger.debug("prism edit pass failed", exc_info=True)
+
         _op_sketch_segments = _refine_op_sketch_segments
 
         def _emit_steps(ops):

@@ -3503,25 +3503,51 @@ def _detect_standing_bosses(cleaned, extrude_dir,
                         and sold >= 0.75):
                     continue
                 # DESIGN-INTENT snap: the panel is a designed shape, not a
-                # wavy mesh trace — a near-rectangular panel becomes a true
-                # (rounded-corner) rectangle, so its sketch reads as lines
-                # + arcs instead of a jagged polyline.
+                # wavy mesh trace. Try ROUNDED rectangles across a radius
+                # sweep — the lid's panel has big corner rounds (~8mm), so
+                # its sharp-box IoU is only ~0.82 and a sharp-rect gate
+                # never fires; the rounded version fits.
                 try:
                     from shapely.geometry import box as _PBox
                     _pb = _PBox(*sm.bounds)
-                    if (sm.intersection(_pb).area
-                            / max(sm.union(_pb).area, 1e-9)) >= 0.88:
-                        _rp = float(np.sqrt(
-                            max(_pb.area - sm.area, 0.0) / (4.0 - np.pi)))
-                        _bx = _pb.bounds
-                        _mins = min(_bx[2] - _bx[0], _bx[3] - _bx[1])
-                        if 0.5 <= _rp <= 0.25 * _mins:
-                            _pbr = _pb.buffer(-_rp, join_style=1).buffer(
-                                _rp, join_style=1)
-                            if (not _pbr.is_empty
-                                    and _pbr.geom_type == "Polygon"):
-                                _pb = _pbr
-                        sm = _pb
+                    _bx = _pb.bounds
+                    _mins = min(_bx[2] - _bx[0], _bx[3] - _bx[1])
+                    _best_iou = (sm.intersection(_pb).area
+                                 / max(sm.union(_pb).area, 1e-9))
+                    _best_shape = _pb
+                    for _rp in (2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0):
+                        if _rp > 0.45 * _mins:
+                            break
+                        _cand = _pb.buffer(-_rp, join_style=1).buffer(
+                            _rp, join_style=1)
+                        if _cand.is_empty or _cand.geom_type != "Polygon":
+                            continue
+                        _iou = (sm.intersection(_cand).area
+                                / max(sm.union(_cand).area, 1e-9))
+                        if _iou > _best_iou:
+                            _best_iou, _best_shape = _iou, _cand
+                    if _best_iou >= 0.90:
+                        sm = _best_shape
+                    else:
+                        # Not a rounded rect (the lid's panel: 0.87 at
+                        # best) — smooth the real trace instead (Chaikin
+                        # corner-cutting) so the sketch reads as a
+                        # designed smooth curve, not a bumpy polyline.
+                        _cpts = np.asarray(sm.exterior.coords[:-1], float)
+                        for _ in range(3):
+                            _nxt = []
+                            _n2 = len(_cpts)
+                            for _i2 in range(_n2):
+                                _a2 = _cpts[_i2]
+                                _b2 = _cpts[(_i2 + 1) % _n2]
+                                _nxt.append(0.75 * _a2 + 0.25 * _b2)
+                                _nxt.append(0.25 * _a2 + 0.75 * _b2)
+                            _cpts = np.asarray(_nxt)
+                        from shapely.geometry import Polygon as _ChPoly
+                        _smc = _ChPoly(_cpts).buffer(0)
+                        if (not _smc.is_empty
+                                and _smc.geom_type == "Polygon"):
+                            sm = _smc
                 except Exception:
                     pass
                 sm = sm.simplify(0.4)
@@ -4228,12 +4254,22 @@ def _build_stepwise(
                 try:
                     _sold = _pp.area / max(_pp.convex_hull.area, 1e-9)
                     _rel = _pp.area / max(_main_poly.area, 1e-9)
-                    # A DESIGNED tiny cutout is a circle/slot/rect — solidity
-                    # ~0.95+. The corner "V" noise blob scores ~0.7-0.85.
-                    if _rel < 0.015 and _sold < 0.9:
+                    # A DESIGNED tiny cutout is a recognizable shape — a
+                    # circle or a rectangle. Solidity alone let the lid's
+                    # foot SHADOW through (a compact but irregular polygon,
+                    # cut straight through the part as a "weird polyshape").
+                    _circ = (4.0 * np.pi * _pp.area
+                             / (_pp.length ** 2 + 1e-9))
+                    from shapely.geometry import box as _NGBox
+                    _nb = _NGBox(*_pp.bounds)
+                    _biou = (_pp.intersection(_nb).area
+                             / max(_pp.union(_nb).area, 1e-9))
+                    if (_rel < 0.015
+                            and not (_circ >= 0.85 or _biou >= 0.85)):
                         logger.info(
-                            "Skipping noise profile %d (area %.0f, solidity "
-                            "%.2f)", pi, _pp.area, _sold)
+                            "Skipping noise profile %d (area %.0f, "
+                            "solidity %.2f, circ %.2f, rect %.2f)",
+                            pi, _pp.area, _sold, _circ, _biou)
                         continue
                 except Exception:
                     pass

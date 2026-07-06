@@ -909,7 +909,20 @@ def export_cadquery(
     if contour_fallback and solid is not None and mesh_volume > 0:
         _cur_vol = variants[0].cad_volume if variants else _solid_volume(solid)
         _cur_err = abs(_cur_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
-        if _cur_err >= contour_fallback_min_error_pct:
+        _eff_thr = contour_fallback_min_error_pct
+        # A symmetric thin-member restructure means the part IS explained by
+        # real extrudes; its residual error is soft blends the arbiter can
+        # only "fix" with an opaque solid swap ("Refined Model") — the exact
+        # presentation the user rejected. The L-bracket hovers at 12-16%
+        # run-to-run, flapping across the default 15% trigger: hold the
+        # honest tree unless recognition is truly bad.
+        try:
+            if variants and any(s.name.startswith("Extrude Member")
+                                for s in variants[0].construction_steps):
+                _eff_thr = max(_eff_thr, contour_fallback_min_error_pct + 6.0)
+        except Exception:
+            pass
+        if _cur_err >= _eff_thr:
             try:
                 from mesh2param.pipeline.contour_recon import (
                     reconstruct_segmentation_free,
@@ -2859,6 +2872,133 @@ def _detect_face_pockets(cleaned, extrude_dir):
         return []
 
 
+def _detect_symmetric_thinning(cleaned, extrude_dir):
+    """Detect a profile region that is THINNER than the base along the extrude
+    axis, set back symmetrically from BOTH faces — the L-bracket's diagonal
+    arm (17.2mm base, arm set back ~2.1mm per side). Design intent is a
+    second, thinner extrude of that region, NOT face pockets and NOT a
+    "Refined Model" chop after the fact.
+
+    Evidence = the same recess footprint on BOTH opposite faces (mirror IoU
+    ≥ 0.65) with similar measured setbacks. That mirror match replaces the
+    sharp-wall persistence gate `_detect_face_pockets` uses — a rounded
+    arm-to-base transition fails persistence by design but is exactly what
+    this detector is for.
+
+    Returns {axis, region_uv, d_lo, d_hi} or None. region_uv is the convex
+    hull of the matched footprints (the seam it cuts lies inside material).
+    """
+    try:
+        import trimesh
+        from shapely.geometry import Polygon as SPoly, Point
+        from mesh2param.pipeline.recognize import _section_material
+    except Exception:
+        return None
+    try:
+        axis = int(np.argmax(np.abs(extrude_dir)))
+        a_lo = float(cleaned.bbox[0][axis])
+        a_hi = float(cleaned.bbox[1][axis])
+        span = a_hi - a_lo
+        if span <= 1e-6:
+            return None
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices, faces=cleaned.faces,
+                               process=False)
+        m_mid = _section_material(mesh, axis, 0.5 * (a_lo + a_hi))
+        if m_mid is None or m_mid.is_empty:
+            return None
+        found = {}
+        for face_t, sign in ((a_hi, -1.0), (a_lo, 1.0)):
+            m_face = _section_material(mesh, axis,
+                                       face_t + sign * max(0.5, span * 0.05))
+            if m_face is None:
+                continue
+            recess = m_mid.difference(m_face.buffer(0))
+            polys = [g for g in getattr(recess, "geoms", [recess])
+                     if isinstance(g, SPoly) and not g.is_empty]
+            if not polys:
+                continue
+            p = max(polys, key=lambda g: g.area)
+            # A thinned MEMBER is a substantial partial region: not a sliver,
+            # not the whole face (a ~full-face mirror pair is a panel recess
+            # on both sides — AI1 — which stays a pocket pair).
+            if not (0.15 * m_mid.area <= p.area <= 0.85 * m_mid.area):
+                continue
+            _ero = p.buffer(-max(0.8, 0.008 * span))
+            if _ero.is_empty or _ero.area < 0.25 * p.area:
+                continue
+            # Setback = floor of the region's INTERIOR. Points near the
+            # rounded arm-to-base blend resolve early and bias the setback
+            # shallow (2.1 measured vs ~2.9 true on the L-bracket, leaving
+            # +13% volume) — so sample only well inside the region, and take
+            # a high percentile: the member's face is where the LAST interior
+            # points resolve, not the middle of the blend.
+            ps = p.simplify(max(0.2, 0.003 * span))
+            if not isinstance(ps, SPoly) or ps.is_empty:
+                continue
+            ps_in = ps.buffer(-max(1.2, 0.03 * float(np.sqrt(ps.area))))
+            if ps_in.is_empty:
+                ps_in = ps
+            if ps_in.geom_type != "Polygon":
+                ps_in = max(ps_in.geoms, key=lambda g: g.area)
+            samples = [ps_in.representative_point()]
+            mnx, mny, mxx, mxy = ps_in.bounds
+            for fx in np.linspace(0.08, 0.92, 7):
+                for fy in np.linspace(0.08, 0.92, 7):
+                    q = Point(mnx + (mxx - mnx) * fx, mny + (mxy - mny) * fy)
+                    if ps_in.contains(q):
+                        samples.append(q)
+            pending = dict(enumerate(samples))
+            depths = []
+            for dd in np.linspace(max(0.5, span * 0.05), 0.45 * span, 16):
+                if not pending:
+                    break
+                g = _section_material(mesh, axis, face_t + sign * dd)
+                if g is None:
+                    continue
+                gb = g.buffer(-0.3)
+                for i in [i for i, q in pending.items() if gb.contains(q)]:
+                    depths.append(float(dd))
+                    del pending[i]
+            if len(depths) < 4:
+                continue
+            d = float(np.percentile(depths, 75.0))
+            if not (max(0.8, 0.03 * span) <= d <= 0.25 * span):
+                continue
+            found[face_t] = (p, d)
+        if len(found) != 2:
+            return None
+        (p_hi, d_hi) = found[a_hi]
+        (p_lo, d_lo) = found[a_lo]
+        iou = (p_hi.intersection(p_lo).area
+               / max(p_hi.union(p_lo).area, 1e-9))
+        if iou < 0.65:
+            return None
+        if abs(d_hi - d_lo) > max(1.0, 0.5 * min(d_hi, d_lo)):
+            return None
+        # The ACTUAL matched footprint, smoothed — NOT its convex hull: the
+        # hull of the L-bracket's diagonal band overhangs into the
+        # full-thickness bar and the carve bit a visible notch out of it.
+        hull = p_hi.intersection(p_lo)
+        hull = hull.buffer(1.5, join_style=1).buffer(-1.5, join_style=1)
+        if hull.geom_type == "MultiPolygon":
+            hull = max(hull.geoms, key=lambda g: g.area)
+        hull = hull.simplify(0.6)
+        if hull.is_empty or hull.geom_type != "Polygon":
+            return None
+        region = [(float(x), float(y)) for x, y in hull.exterior.coords]
+        if len(region) < 4:
+            return None
+        logger.info(
+            "Symmetric thinning: region area %.0f (%.0f%% of mid), setbacks "
+            "%.2f/%.2f over span %.1f (mirror IoU %.2f)",
+            hull.area, 100.0 * hull.area / m_mid.area, d_lo, d_hi, span, iou)
+        return {"axis": axis, "region_uv": region,
+                "d_lo": float(d_lo), "d_hi": float(d_hi)}
+    except Exception:
+        logger.debug("symmetric-thinning detection failed", exc_info=True)
+        return None
+
+
 def _void_intent_outline(coords):
     """Regularize a void outline (window/slot cutout) to its DESIGN-INTENT
     shape: circle, capsule (stadium), or a smoothed outline. Used for the
@@ -3668,6 +3808,95 @@ def _build_stepwise(
     steps.append(ConstructionStep(
         name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
     ))
+
+    # --- Symmetric thinning: a profile region THINNER than the base span ---
+    # The L-bracket's diagonal arm: base 17.2mm, arm set back ~2.1mm per
+    # side. Modeled the way a CAD user would — the full-thickness extrude is
+    # replaced over that region by a second, thinner extrude — instead of
+    # leaving the correction to the arbiter's opaque "Refined Model" swap.
+    _thin = None
+    if (cleaned is not None
+            and (getattr(cleaned, "metadata", None) or {}).get("scan_mode")):
+        try:
+            _thin = _detect_symmetric_thinning(cleaned, extrude_dir)
+        except Exception:
+            _thin = None
+    if _thin is not None and _thin["axis"] == primary_axis:
+        try:
+            from shapely.geometry import (Polygon as _ThPoly,
+                                          Point as _ThPoint)
+            _rpoly = _ThPoly(_thin["region_uv"])
+            # A baked window/bore inside the region would be re-solidified by
+            # the thin extrude — bail (conservative).
+            _blocked = any(
+                _rpoly.contains(_ThPoint(*_ThPoly(_cut).centroid.coords[0]))
+                for _cut in base_inner_cutouts)
+            if not _blocked:
+                _A_lo = float(cleaned.bbox[0][primary_axis])
+                _A_hi = float(cleaned.bbox[1][primary_axis])
+                _t_lo = _A_lo + _thin["d_lo"]
+                _t_hi = _A_hi - _thin["d_hi"]
+                _thick = _t_hi - _t_lo
+                if _thick > 1.0:
+                    _vol_before = abs(float(wp.val().Volume()))
+                    _o_mid = [0.0, 0.0, 0.0]
+                    _o_mid[primary_axis] = 0.5 * (_A_lo + _A_hi)
+                    _carve = (cq.Workplane(plane_name, origin=tuple(_o_mid))
+                              .polyline(_thin["region_uv"]).close()
+                              .extrude(0.6 * (_A_hi - _A_lo) + 2.0, both=True))
+                    _o_thin = [0.0, 0.0, 0.0]
+                    _o_thin[primary_axis] = 0.5 * (_t_lo + _t_hi)
+                    _member = (cq.Workplane(plane_name, origin=tuple(_o_thin))
+                               .polyline(_thin["region_uv"]).close()
+                               .extrude(0.5 * _thick, both=True))
+                    _wp2 = wp.cut(_carve).union(_member)
+                    _removed = _vol_before - abs(float(_wp2.val().Volume()))
+                    # Expected removal counts only the region actually inside
+                    # the profile (the hull overhangs the outline).
+                    try:
+                        _ov = _ThPoly(profiles[0]).buffer(0).intersection(
+                            _rpoly).area
+                    except Exception:
+                        _ov = _rpoly.area
+                    _exp = _ov * (_thin["d_lo"] + _thin["d_hi"])
+                    # The restructure must remove ≈ the setback layers; far
+                    # less means the region was already thin, far more means
+                    # the carve ate geometry it shouldn't have.
+                    if 0.4 * _exp <= _removed <= 1.8 * _exp:
+                        wp = _wp2
+                        _ol2, _oa2 = _overlay_for_ring(
+                            _thin["region_uv"], primary_axis,
+                            0.5 * (_t_lo + _t_hi))
+                        _sv2 = (np.asarray(_ol2, np.float64)
+                                if _ol2 else np.zeros((0, 3)))
+                        _m2 = len(_sv2) // 2
+                        _sf2 = np.array(
+                            [[2 * i, 2 * i + 1, 2 * i] for i in range(_m2)],
+                            dtype=np.int64)
+                        steps.append(ConstructionStep(
+                            name=f"Sketch Member ({_thick:.1f}mm)",
+                            tess_vertices=_sv2, tess_faces=_sf2, volume=0.0,
+                            overlay_arcs=_oa2 or None,
+                        ))
+                        v, f = _tessellate_solid(wp, fast=True)
+                        steps.append(ConstructionStep(
+                            name=f"Extrude Member ({_thick:.1f}mm)",
+                            tess_vertices=v, tess_faces=f,
+                            volume=abs(float(wp.val().Volume())),
+                        ))
+                        script_lines.append(
+                            f"# Thin member: region re-extruded at "
+                            f"{_thick:.2f} mm (setbacks {_thin['d_lo']:.2f}/"
+                            f"{_thin['d_hi']:.2f})")
+                        logger.info(
+                            "Thin member: %.0f mm^3 removed, member %.1fmm "
+                            "vs base %.1fmm", _removed, _thick, _A_hi - _A_lo)
+                    else:
+                        logger.info(
+                            "Thin member skipped: removed %.0f vs expected "
+                            "%.0f mm^3", _removed, _exp)
+        except Exception:
+            logger.warning("Symmetric thinning failed", exc_info=True)
 
     # --- Join extrusions: the engine plan's non-primary segments ---
     # One part, one timeline: each join sketches its own profile on its
@@ -4686,8 +4915,14 @@ def _build_stepwise(
                 if wp_done is None:
                     continue
                 wp = wp_done
-                _nm = (f"Blind Hole Pattern ⌀{2 * r_g:.1f}mm ×{len(grp)}"
-                       if len(grp) > 1 else f"Blind Hole ⌀{2 * r_g:.1f}mm")
+                # A ring whose void exits the far side (or merges into the
+                # cavity) is a THROUGH hole — say so; "Blind" on a through
+                # hole reads as two pocket cuts in the feature tree.
+                _kind = ("Through Hole"
+                         if all(g.get("through") for g in grp)
+                         else "Blind Hole")
+                _nm = (f"{_kind} Pattern ⌀{2 * r_g:.1f}mm ×{len(grp)}"
+                       if len(grp) > 1 else f"{_kind} ⌀{2 * r_g:.1f}mm")
                 v, f = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
                     name=_nm, tess_vertices=v, tess_faces=f,

@@ -3896,11 +3896,9 @@ def _build_stepwise(
     script_lines.append(f"result = result.extrude({depth})")
 
     # --- Symmetric thinning: a profile region THINNER than the base span ---
-    # The L-bracket's diagonal arm: base 17.2mm, arm set back ~2.1mm per
-    # side. Detected BEFORE the base step is recorded so the timeline reads
-    # like Onshape: "Extrude Base" shows only the full-thickness regions,
-    # then the thin member arrives as its own JOIN extrude (volume goes UP).
-    # Carving after the base step read as a sketch+cut on both side faces.
+    # The L-bracket: leg full 17.2mm, bar/arm ~12.7mm (set back from both
+    # faces). Detected BEFORE the base step is recorded so the timeline
+    # reads like Onshape (see the thin-first build below).
     _thin = None
     if (cleaned is not None
             and (getattr(cleaned, "metadata", None) or {}).get("scan_mode")):
@@ -3908,66 +3906,92 @@ def _build_stepwise(
             _thin = _detect_symmetric_thinning(cleaned, extrude_dir)
         except Exception:
             _thin = None
-    _member_join = None      # (joined solid, thickness) once validated
+    # THIN-FIRST build: "Extrude Base" = the WHOLE profile at the member
+    # thickness (one clean connected solid), then only the regions that
+    # really are full-thickness (the L-bracket's leg) come back as PAD
+    # joins. Carving the member out of a full-thickness base left a
+    # shattered "Extrude (Base)" full of slivers and gaps, and the mesh's
+    # gentle taper (AI distortion, left end thicker) is absorbed into the
+    # flat base instead of earning its own mid-part extrude.
+    _member_join = None      # (joined solid, pad outlines, full span)
     if _thin is not None and _thin["axis"] == primary_axis:
         try:
-            from shapely.geometry import (Polygon as _ThPoly,
-                                          Point as _ThPoint)
-            _rpoly = _ThPoly(_thin["region_uv"])
-            # A baked window/bore inside the region would be re-solidified by
-            # the thin extrude — bail (conservative).
-            _blocked = any(
-                _rpoly.contains(_ThPoint(*_ThPoly(_cut).centroid.coords[0]))
-                for _cut in base_inner_cutouts)
-            if not _blocked:
-                _A_lo = float(cleaned.bbox[0][primary_axis])
-                _A_hi = float(cleaned.bbox[1][primary_axis])
-                _t_lo = _A_lo + _thin["d_lo"]
-                _t_hi = _A_hi - _thin["d_hi"]
-                _thick = _t_hi - _t_lo
-                if _thick > 1.0:
-                    _vol_before = abs(float(wp.val().Volume()))
-                    _o_mid = [0.0, 0.0, 0.0]
-                    _o_mid[primary_axis] = 0.5 * (_A_lo + _A_hi)
-                    _carve = (cq.Workplane(plane_name, origin=tuple(_o_mid))
-                              .polyline(_thin["region_uv"]).close()
-                              .extrude(0.6 * (_A_hi - _A_lo) + 2.0, both=True))
-                    _o_thin = [0.0, 0.0, 0.0]
-                    _o_thin[primary_axis] = 0.5 * (_t_lo + _t_hi)
-                    _member = (cq.Workplane(plane_name, origin=tuple(_o_thin))
-                               .polyline(_thin["region_uv"]).close()
-                               .extrude(0.5 * _thick, both=True))
-                    _wp_base = wp.cut(_carve)
-                    _wp_joined = _wp_base.union(_member)
-                    _removed = (_vol_before
-                                - abs(float(_wp_joined.val().Volume())))
-                    # Expected removal counts only the region actually inside
-                    # the profile (the region can overhang the outline).
-                    try:
-                        _ov = _ThPoly(profiles[0]).buffer(0).intersection(
-                            _rpoly).area
-                    except Exception:
-                        _ov = _rpoly.area
-                    _exp = _ov * (_thin["d_lo"] + _thin["d_hi"])
-                    # The restructure must remove ≈ the setback layers; far
-                    # less means the region was already thin, far more means
-                    # the carve ate geometry it shouldn't have.
-                    if 0.4 * _exp <= _removed <= 1.8 * _exp:
-                        wp = _wp_base          # base step shows this
-                        _member_join = (_wp_joined, _thick)
-                        if as_built_out is not None:
-                            as_built_out["thin_member"] = True
-                        script_lines.append(
-                            f"# Thin member: region re-extruded at "
-                            f"{_thick:.2f} mm (setbacks {_thin['d_lo']:.2f}/"
-                            f"{_thin['d_hi']:.2f})")
-                        logger.info(
-                            "Thin member: %.0f mm^3 removed, member %.1fmm "
-                            "vs base %.1fmm", _removed, _thick, _A_hi - _A_lo)
-                    else:
-                        logger.info(
-                            "Thin member skipped: removed %.0f vs expected "
-                            "%.0f mm^3", _removed, _exp)
+            from shapely.geometry import Polygon as _ThPoly
+            _prof = _ThPoly(profiles[0]).buffer(0)
+            _rpoly = _ThPoly(_thin["region_uv"]).buffer(0)
+            _A_lo = float(cleaned.bbox[0][primary_axis])
+            _A_hi = float(cleaned.bbox[1][primary_axis])
+            _t_lo = _A_lo + _thin["d_lo"]
+            _t_hi = _A_hi - _thin["d_hi"]
+            _thick = _t_hi - _t_lo
+            # Full-thickness pads = profile minus the thin region, minus
+            # slivers (taper fuzz along the region boundary — keeping them
+            # thick is what shattered the old base).
+            _tk = _prof.difference(_rpoly)
+            _pads = [g for g in getattr(_tk, "geoms", [_tk])
+                     if getattr(g, "area", 0.0)
+                     >= max(50.0, 0.05 * _prof.area)]
+            if _thick > 1.0 and _pads:
+                _vol_before = abs(float(wp.val().Volume()))
+                _us = [k for k in (0, 1, 2) if k != primary_axis]
+                _c = [0.0, 0.0, 0.0]
+                _c[primary_axis] = 0.5 * (_t_lo + _t_hi)
+                _c[_us[0]] = 0.5 * (float(cleaned.bbox[0][_us[0]])
+                                    + float(cleaned.bbox[1][_us[0]]))
+                _c[_us[1]] = 0.5 * (float(cleaned.bbox[0][_us[1]])
+                                    + float(cleaned.bbox[1][_us[1]]))
+                _dims = [0.0, 0.0, 0.0]
+                _dims[primary_axis] = _thick
+                _dims[_us[0]] = (float(cleaned.bbox[1][_us[0]])
+                                 - float(cleaned.bbox[0][_us[0]])) + 10.0
+                _dims[_us[1]] = (float(cleaned.bbox[1][_us[1]])
+                                 - float(cleaned.bbox[0][_us[1]])) + 10.0
+                _slab = (cq.Workplane("XY", origin=tuple(_c))
+                         .box(_dims[0], _dims[1], _dims[2]))
+                # Base = full solid clipped to the thin span: keeps every
+                # baked hole/corner of the real profile.
+                _wp_thin = wp.intersect(_slab)
+                _o_mid = [0.0, 0.0, 0.0]
+                _o_mid[primary_axis] = 0.5 * (_A_lo + _A_hi)
+                _pads_solid = None
+                _pad_loops = []
+                for _pad in _pads:
+                    _pl = [(float(x), float(y))
+                           for x, y in _pad.exterior.coords]
+                    _pad_loops.append(_pl)
+                    _prism = (cq.Workplane(plane_name, origin=tuple(_o_mid))
+                              .polyline(_pl).close()
+                              .extrude(0.6 * (_A_hi - _A_lo) + 2.0,
+                                       both=True))
+                    _ps = wp.intersect(_prism)
+                    _pads_solid = (_ps if _pads_solid is None
+                                   else _pads_solid.union(_ps))
+                _wp_joined = _wp_thin.union(_pads_solid)
+                _removed = (_vol_before
+                            - abs(float(_wp_joined.val().Volume())))
+                _thin_area = max(_prof.area - sum(g.area for g in _pads),
+                                 1.0)
+                _exp = _thin_area * (_thin["d_lo"] + _thin["d_hi"])
+                # The restructure must remove ≈ the setback layers over the
+                # thin region; far less means it was already thin, far more
+                # means the clip ate geometry it shouldn't have.
+                if 0.4 * _exp <= _removed <= 1.8 * _exp:
+                    wp = _wp_thin          # base step shows this
+                    _member_join = (_wp_joined, _pad_loops,
+                                    _A_hi - _A_lo)
+                    if as_built_out is not None:
+                        as_built_out["thin_member"] = True
+                    script_lines.append(
+                        f"# Thin-first base at {_thick:.2f} mm; "
+                        f"{len(_pads)} pad(s) rejoined at full span")
+                    logger.info(
+                        "Thin-first base %.1fmm, %d pad(s) at %.1fmm, "
+                        "%.0f mm^3 removed", _thick, len(_pads),
+                        _A_hi - _A_lo, _removed)
+                else:
+                    logger.info(
+                        "Thin-first base skipped: removed %.0f vs expected "
+                        "%.0f mm^3", _removed, _exp)
         except Exception:
             logger.warning("Symmetric thinning failed", exc_info=True)
 
@@ -3978,10 +4002,12 @@ def _build_stepwise(
     ))
 
     if _member_join is not None:
-        _wp_joined, _thick = _member_join
-        _ol2, _oa2 = _overlay_for_ring(
-            _thin["region_uv"], primary_axis,
-            0.5 * (_t_lo + _t_hi))
+        _wp_joined, _pad_loops, _full_span = _member_join
+        _ol2, _oa2 = [], []
+        for _pl in _pad_loops:
+            _o, _a = _overlay_for_ring(_pl, primary_axis, extrude_start)
+            _ol2.extend(_o)
+            _oa2.extend(_a)
         _sv2 = (np.asarray(_ol2, np.float64)
                 if _ol2 else np.zeros((0, 3)))
         _m2 = len(_sv2) // 2
@@ -3989,14 +4015,14 @@ def _build_stepwise(
             [[2 * i, 2 * i + 1, 2 * i] for i in range(_m2)],
             dtype=np.int64)
         steps.append(ConstructionStep(
-            name=f"Sketch Member ({_thick:.1f}mm)",
+            name="Sketch Pads",
             tess_vertices=_sv2, tess_faces=_sf2, volume=0.0,
             overlay_arcs=_oa2 or None,
         ))
         wp = _wp_joined
         v, f = _tessellate_solid(wp, fast=True)
         steps.append(ConstructionStep(
-            name=f"Extrude Member ({_thick:.1f}mm)",
+            name=f"Extrude Pads ({_full_span:.1f}mm)",
             tess_vertices=v, tess_faces=f,
             volume=abs(float(wp.val().Volume())),
         ))

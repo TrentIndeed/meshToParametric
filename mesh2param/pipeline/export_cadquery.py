@@ -4098,7 +4098,23 @@ def _build_stepwise(
             if best_wpj is None:
                 logger.warning("Join %d failed to extrude; skipping", ji)
                 continue
-            wp = wp.union(best_wpj)
+            _vol_pre_join = abs(float(wp.val().Volume()))
+            _wp_joined_j = wp.union(best_wpj)
+            _dv_j = abs(float(_wp_joined_j.val().Volume())) - _vol_pre_join
+            # On scan/AI meshes a join that adds ~nothing is a deformed
+            # corner NUB (the bezel frame's four sub-2mm "screws", 4-12mm³
+            # each on an 11,400mm³ part) — mesh noise, not a feature. Drop
+            # it and its sketch. Real joins add real volume (the L-bracket's
+            # feet: ~260mm³ each).
+            if (cleaned is not None
+                    and (getattr(cleaned, "metadata", None) or {}).get(
+                        "scan_mode")
+                    and _dv_j < max(15.0, 0.002 * _vol_pre_join)):
+                steps.pop()          # the Sketch Join step just appended
+                logger.info("Join %d dropped: adds only %.1f mm^3 "
+                            "(corner-nub noise)", ji, _dv_j)
+                continue
+            wp = _wp_joined_j
             v_j, f_j = _tessellate_solid(wp, fast=True)
             steps.append(ConstructionStep(
                 name=f"Extrude Join {ji}",
@@ -8341,6 +8357,33 @@ def _refine_op_to_solid(op, cq):
             poly = np.asarray(op.polygon, float)
             if poly.ndim != 2 or len(poly) < 3:
                 return None
+            # DESIGN-INTENT snap: the residual footprint is a voxel trace —
+            # jagged, with notches where small artifacts perturbed it (the
+            # bezel frame's pocket sketch had "two random notches"). A
+            # near-rectangular footprint IS a rectangle; otherwise smooth
+            # the outline. Runs inside the op builder so the scoring pass
+            # and the final cut see the same solid.
+            try:
+                from shapely.geometry import Polygon as _RSP, box as _RSB
+                _sp = _RSP(poly).buffer(0)
+                if not _sp.is_empty and _sp.geom_type == "Polygon":
+                    _ab = _RSB(*_sp.bounds)
+                    if (_sp.intersection(_ab).area
+                            / max(_sp.union(_ab).area, 1e-9)) >= 0.90:
+                        poly = np.asarray(_ab.exterior.coords[:-1], float)
+                    else:
+                        _mrr = _sp.minimum_rotated_rectangle
+                        if (_sp.intersection(_mrr).area
+                                / max(_sp.union(_mrr).area, 1e-9)) >= 0.90:
+                            poly = np.asarray(
+                                _mrr.exterior.coords[:-1], float)
+                        else:
+                            _sm = _void_intent_outline(
+                                [(float(a), float(b)) for a, b in poly])
+                            if _sm and len(_sm) >= 3:
+                                poly = np.asarray(_sm, float)
+            except Exception:
+                pass
             pts = []
             for (u, v) in poly:
                 p = np.zeros(3)

@@ -440,6 +440,7 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
         # 25mm tab) from noise, which showed up as one bogus rounded corner per
         # tab while the siblings stayed sharp. So measure the inset always, and
         # trust the circle fit only when it AGREES with it.
+        is_chamfer = False
         try:
             e1 = P[(m1[-1] + 1) % n]   # run k's far endpoint (flanks the corner)
             e2 = P[m2[0]]              # run k+1's near endpoint
@@ -447,8 +448,30 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
             r2 = float(np.linalg.norm(np.asarray(e2) - X))
             inset = min(r1, r2)
             symmetric = abs(r1 - r2) <= 0.5 * max(r1, r2, 1e-9)
+            # CHAMFER: the corner break is a STRAIGHT diagonal (Body1Mesh's
+            # 45° corners), not an arc. Fitting it as a fillet rounds every
+            # chamfered corner and the residual refiner then carves notch
+            # boxes to compensate. Signature: the e1->e2 chord is well off
+            # both axes AND every intermediate bend point lies ON that
+            # chord (an arc bulges off it by its sagitta).
+            _ch = np.asarray(e2, float) - np.asarray(e1, float)
+            _chL = float(np.linalg.norm(_ch))
+            if _chL > 0.6 and symmetric and 0.3 < inset < 60.0:
+                _chd = np.abs(_ch / _chL)
+                _diag = float(max(_chd[0], _chd[1])) < np.cos(np.radians(20.0))
+                _coll = True
+                if len(bend):
+                    _bp = P[bend]
+                    _u = _ch / _chL
+                    _t = (_bp - np.asarray(e1, float)) @ _u
+                    _proj = np.asarray(e1, float) + np.outer(_t, _u)
+                    _coll = (float(np.max(np.linalg.norm(_bp - _proj, axis=1)))
+                             <= max(0.15, 0.04 * _chL))
+                is_chamfer = _diag and _coll
             r_fillet = None
-            if len(bend) >= 2:
+            if is_chamfer:
+                pass                    # straight break — no fillet
+            elif len(bend) >= 2:
                 try:
                     _, _, rr = _fit_circle_2d_local(P[bend])
                 except np.linalg.LinAlgError:
@@ -469,7 +492,13 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
                 fillets[len(sharp)] = r_fillet
         except Exception:
             pass
-        sharp.append((float(X[0]), float(X[1])))
+        if is_chamfer:
+            # keep the chamfer's straight diagonal: its two endpoints are
+            # sharp corners, no arc.
+            sharp.append((float(e1[0]), float(e1[1])))
+            sharp.append((float(e2[0]), float(e2[1])))
+        else:
+            sharp.append((float(X[0]), float(X[1])))
 
     # Unify fillet radii across repeated/symmetric corners. A real part uses a
     # small palette of radii; a mesh estimates each corner independently and

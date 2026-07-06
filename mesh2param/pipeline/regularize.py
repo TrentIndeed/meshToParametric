@@ -422,6 +422,7 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
         run_lines.append((ctr, dvec, mem))
     m = len(runs)
     sharp, fillets = [], {}
+    chamfer_idx = set()
     for k in range(m):
         c1, d1, m1 = run_lines[k]
         c2, d2, m2 = run_lines[(k + 1) % m]
@@ -452,13 +453,21 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
             # 45° corners), not an arc. Fitting it as a fillet rounds every
             # chamfered corner and the residual refiner then carves notch
             # boxes to compensate. Signature: the e1->e2 chord is well off
-            # both axes AND every intermediate bend point lies ON that
-            # chord (an arc bulges off it by its sagitta).
+            # both axes, every intermediate bend point lies ON that chord
+            # (an arc bulges off it by its sagitta), AND the chord is LONG
+            # (>=4mm). A short single chord is ambiguous — upstream
+            # simplification collapses a small round corner to one chord
+            # (the bezel frame's r~2 corners arrived as 2-2.6mm chords and
+            # rendered as two chamfers + two sharp corners) — and a short
+            # diagonal reads as ROUNDING, the AI-mesh default, not as a
+            # deliberate chamfer.
             _ch = np.asarray(e2, float) - np.asarray(e1, float)
             _chL = float(np.linalg.norm(_ch))
-            if _chL > 0.6 and symmetric and 0.3 < inset < 60.0:
+            _diag = False
+            if _chL > 0.6:
                 _chd = np.abs(_ch / _chL)
                 _diag = float(max(_chd[0], _chd[1])) < np.cos(np.radians(20.0))
+            if _chL >= 4.0 and _diag and symmetric and 0.3 < inset < 60.0:
                 _coll = True
                 if len(bend):
                     _bp = P[bend]
@@ -469,8 +478,15 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
                              <= max(0.15, 0.04 * _chL))
                 is_chamfer = _diag and _coll
             r_fillet = None
-            if is_chamfer:
-                pass                    # straight break — no fillet
+            # Short diagonal chord = a collapsed ROUND corner. The collapse
+            # is often asymmetric (r1=2.3 vs r2=1.0 on the bezel), so relax
+            # the symmetry gate here and average the two insets.
+            if (not is_chamfer and _diag and 0.8 <= _chL < 4.0
+                    and not symmetric
+                    and abs(r1 - r2) <= 0.8 * max(r1, r2, 1e-9)):
+                r_fillet = 0.5 * (r1 + r2)
+            if is_chamfer or r_fillet is not None:
+                pass                    # already classified
             elif len(bend) >= 2:
                 try:
                     _, _, rr = _fit_circle_2d_local(P[bend])
@@ -495,6 +511,7 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
         if is_chamfer:
             # keep the chamfer's straight diagonal: its two endpoints are
             # sharp corners, no arc.
+            chamfer_idx.update((len(sharp), len(sharp) + 1))
             sharp.append((float(e1[0]), float(e1[1])))
             sharp.append((float(e2[0]), float(e2[1])))
         else:
@@ -523,6 +540,28 @@ def _regularize_outline(pts_mm, axis_tol_deg: float = 12.0, min_run: float = 1.0
             for v in cl:
                 rep[v] = med
         fillets = {i: rep[r] for i, r in fillets.items()}
+
+    # ROUNDED-RECT consensus: when most corners are fillets of one radius
+    # and a straggler came out sharp (its arc was eaten entirely upstream —
+    # the bezel frame's 4th corner), the design intent is uniform rounding.
+    # Only fires with a single radius cluster and no chamfer pairs, and
+    # only rounds corners whose flanking corners are far enough away.
+    try:
+        if fillets and len(fillets) * 2 >= len(sharp):
+            vals = sorted(fillets.values())
+            if vals[-1] <= vals[0] * 1.4:           # one radius cluster
+                r_med = float(np.median(vals))
+                for i in range(len(sharp)):
+                    if i in fillets or i in chamfer_idx:
+                        continue
+                    prev_p = np.asarray(sharp[(i - 1) % len(sharp)])
+                    next_p = np.asarray(sharp[(i + 1) % len(sharp)])
+                    cur = np.asarray(sharp[i])
+                    if (np.linalg.norm(cur - prev_p) > 2.0 * r_med
+                            and np.linalg.norm(cur - next_p) > 2.0 * r_med):
+                        fillets[i] = r_med
+    except Exception:
+        pass
 
     return (sharp, fillets) if len(sharp) >= 3 else (None, None)
 

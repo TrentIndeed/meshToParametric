@@ -1045,7 +1045,40 @@ def export_cadquery(
                         except Exception:
                             logger.info("fallback arbiter failed",
                                          exc_info=True)
+                    _recog_solid = solid
                     solid = fb_solid
+                    # Design-intent guarantee: recognized CIRCULAR boss pads
+                    # (the lid's feet) survive the solid swap as perfect
+                    # cylinders. The fallback bakes them as jagged blobs and
+                    # the intersect mixes blob and cylinder — the user sees
+                    # deformed feet. Carve a slightly dilated zone around
+                    # each pad and re-union the clean pad clipped to the
+                    # recognition solid.
+                    try:
+                        for _sb in _detect_standing_bosses(cleaned,
+                                                           extrude_dir):
+                            _o = [0.0, 0.0, 0.0]
+                            _o[_sb["axis"]] = _sb["face_t"]
+                            _sgn = _sb["sign"]
+                            for _k in _sb["keeps"]:
+                                _zone = (_cq2.Workplane(
+                                            _sb["plane_name"],
+                                            origin=tuple(_o))
+                                         .center(_k["cu"], _k["cv"])
+                                         .circle(_k["r"] + 0.6)
+                                         .extrude(_sgn * _sb["height"]))
+                                _pad = (_cq2.Workplane(
+                                            _sb["plane_name"],
+                                            origin=tuple(_o))
+                                        .center(_k["cu"], _k["cv"])
+                                        .circle(_k["r"])
+                                        .extrude(_sgn * _sb["height"]))
+                                solid = solid.cut(_zone).union(
+                                    _pad.intersect(_recog_solid))
+                        fb_vol = _solid_volume(solid)
+                    except Exception:
+                        logger.debug("boss preservation failed",
+                                     exc_info=True)
                     if variants:
                         variants[0].cad_volume = fb_vol
                         # Surface the transplant's refine ops as tree steps
@@ -3449,6 +3482,28 @@ def _detect_standing_bosses(cleaned, extrude_dir,
                 if not (0.08 * main.area <= sm.area <= 0.75 * main.area
                         and sold >= 0.75):
                     continue
+                # DESIGN-INTENT snap: the panel is a designed shape, not a
+                # wavy mesh trace — a near-rectangular panel becomes a true
+                # (rounded-corner) rectangle, so its sketch reads as lines
+                # + arcs instead of a jagged polyline.
+                try:
+                    from shapely.geometry import box as _PBox
+                    _pb = _PBox(*sm.bounds)
+                    if (sm.intersection(_pb).area
+                            / max(sm.union(_pb).area, 1e-9)) >= 0.88:
+                        _rp = float(np.sqrt(
+                            max(_pb.area - sm.area, 0.0) / (4.0 - np.pi)))
+                        _bx = _pb.bounds
+                        _mins = min(_bx[2] - _bx[0], _bx[3] - _bx[1])
+                        if 0.5 <= _rp <= 0.25 * _mins:
+                            _pbr = _pb.buffer(-_rp, join_style=1).buffer(
+                                _rp, join_style=1)
+                            if (not _pbr.is_empty
+                                    and _pbr.geom_type == "Polygon"):
+                                _pb = _pbr
+                        sm = _pb
+                except Exception:
+                    pass
                 sm = sm.simplify(0.4)
                 keep_outline = [(float(x), float(y))
                                 for x, y in sm.exterior.coords]
@@ -8367,21 +8422,37 @@ def _refine_op_to_solid(op, cq):
                 from shapely.geometry import Polygon as _RSP, box as _RSB
                 _sp = _RSP(poly).buffer(0)
                 if not _sp.is_empty and _sp.geom_type == "Polygon":
+                    _rect = None
                     _ab = _RSB(*_sp.bounds)
                     if (_sp.intersection(_ab).area
                             / max(_sp.union(_ab).area, 1e-9)) >= 0.90:
-                        poly = np.asarray(_ab.exterior.coords[:-1], float)
+                        _rect = _ab
                     else:
                         _mrr = _sp.minimum_rotated_rectangle
                         if (_sp.intersection(_mrr).area
                                 / max(_sp.union(_mrr).area, 1e-9)) >= 0.90:
-                            poly = np.asarray(
-                                _mrr.exterior.coords[:-1], float)
-                        else:
-                            _sm = _void_intent_outline(
-                                [(float(a), float(b)) for a, b in poly])
-                            if _sm and len(_sm) >= 3:
-                                poly = np.asarray(_sm, float)
+                            _rect = _mrr
+                    if _rect is not None:
+                        # Preserve ROUNDED corners: the area the true
+                        # footprint misses at the rect corners gives the
+                        # radius ((4-pi)r^2). The enclosure lid's pocket
+                        # was snapped to a sharp-cornered rectangle.
+                        _bx = _rect.bounds
+                        _mins = min(_bx[2] - _bx[0], _bx[3] - _bx[1])
+                        _r = float(np.sqrt(max(_rect.area - _sp.area, 0.0)
+                                           / (4.0 - np.pi)))
+                        if 0.5 <= _r <= 0.25 * _mins:
+                            _rr = _rect.buffer(-_r, join_style=1).buffer(
+                                _r, join_style=1)
+                            if (not _rr.is_empty
+                                    and _rr.geom_type == "Polygon"):
+                                _rect = _rr
+                        poly = np.asarray(_rect.exterior.coords[:-1], float)
+                    else:
+                        _sm = _void_intent_outline(
+                            [(float(a), float(b)) for a, b in poly])
+                        if _sm and len(_sm) >= 3:
+                            poly = np.asarray(_sm, float)
             except Exception:
                 pass
             pts = []

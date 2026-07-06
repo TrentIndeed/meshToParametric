@@ -1079,12 +1079,32 @@ def export_cadquery(
                     except Exception:
                         logger.debug("boss preservation failed",
                                      exc_info=True)
+                    # NEVER an opaque step: express the swap as itemized
+                    # cut/add features applied to the recognition solid.
+                    # Only if itemization fails badly does the plain swap
+                    # remain (and surfaces as the catch-all boolean).
+                    _swap_itemized = False
+                    try:
+                        _it_solid, _it_steps = _itemize_solid_swap(
+                            _recog_solid, solid, cleaned, mesh_volume)
+                        if _it_solid is not None:
+                            solid = _it_solid
+                            fb_vol = _solid_volume(solid)
+                            _swap_itemized = True
+                            if variants:
+                                variants[0].construction_steps.extend(
+                                    _it_steps)
+                    except Exception:
+                        logger.debug("swap itemization errored",
+                                     exc_info=True)
                     if variants:
                         variants[0].cad_volume = fb_vol
                         # Surface the transplant's refine ops as tree steps
-                        # when the transplant won the arbiter.
+                        # when the transplant won the arbiter (unless the
+                        # itemized ops replaced the swap wholesale).
                         try:
-                            if best_name == "transplant" and tp_steps:
+                            if (best_name == "transplant" and tp_steps
+                                    and not _swap_itemized):
                                 variants[0].construction_steps.extend(tp_steps)
                         except Exception:
                             pass
@@ -8472,6 +8492,191 @@ def _refine_op_to_solid(op, cq):
     return None
 
 
+def _refine_op_sketch_segments(op, patch):
+    """Wireframe outline of a refine patch's footprint, so each refine op
+    gets a Sketch step like every other feature (they previously appeared
+    as cuts with no sketch)."""
+    try:
+        if op.kind == "cylinder":
+            ax = int(op.axis)
+            us = [k for k in (0, 1, 2) if k != ax]
+            th = np.linspace(0, 2 * np.pi, 49)
+            ring = []
+            for t in th:
+                p3 = np.zeros(3)
+                p3[ax] = float(op.lo)
+                p3[us[0]] = float(op.center[0] + op.radius * np.cos(t))
+                p3[us[1]] = float(op.center[1] + op.radius * np.sin(t))
+                ring.append(p3)
+        else:
+            bb = patch.BoundingBox()
+            lo = np.array([bb.xmin, bb.ymin, bb.zmin])
+            hi = np.array([bb.xmax, bb.ymax, bb.zmax])
+            dims = hi - lo
+            ax = int(np.argmin(dims))   # sketch on the face plane
+            us = [k for k in (0, 1, 2) if k != ax]
+            ring = []
+            for cu, cv in ((lo[us[0]], lo[us[1]]),
+                           (hi[us[0]], lo[us[1]]),
+                           (hi[us[0]], hi[us[1]]),
+                           (lo[us[0]], hi[us[1]]),
+                           (lo[us[0]], lo[us[1]])):
+                p3 = np.zeros(3)
+                p3[ax] = hi[ax]
+                p3[us[0]], p3[us[1]] = cu, cv
+                ring.append(p3)
+        seg = []
+        for k in range(len(ring) - 1):
+            seg.append(ring[k])
+            seg.append(ring[k + 1])
+        return np.asarray(seg, np.float64)
+    except Exception:
+        return None
+
+
+def _itemize_solid_swap(pre_solid, target_solid, cleaned,
+                        mesh_volume: float):
+    """Express an arbiter solid SWAP as itemized refine features.
+
+    The contour-fallback arbiter used to REPLACE the whole solid with its
+    winner ("Boolean 1 (refine)" — the exact opaque step the user rejected).
+    Instead: run the box/prism carver with the WINNER as target and the
+    pre-swap solid as start, so the difference becomes ordinary cut/add
+    steps (each with a sketch). Returns (solid, steps) when the ops capture
+    enough of the swap's improvement, else (None, None) — the caller then
+    keeps the plain swap as a last resort.
+    """
+    import cadquery as cq
+    import trimesh
+    from mesh2param.pipeline.iou_refine import (refine_against_target,
+                                                exact_iou_available,
+                                                mesh_iou_exact)
+
+    def _tm(wp):
+        v, f = _tessellate_solid(wp)
+        return trimesh.Trimesh(
+            vertices=np.asarray(v, float).reshape(-1, 3),
+            faces=np.asarray(f, np.int64).reshape(-1, 3), process=False)
+
+    try:
+        tgt = _tm(target_solid)
+        pre = _tm(pre_solid)
+        mesh = trimesh.Trimesh(vertices=cleaned.vertices,
+                               faces=cleaned.faces, process=False)
+        v_tgt = _solid_volume(target_solid)
+        use_iou = exact_iou_available()
+
+        def _apply_set(start_solid, ops):
+            cur = start_solid
+            steps = []
+            prev_vol = _solid_volume(cur)
+            for op in ops:
+                patch = _refine_op_to_solid(op, cq)
+                if patch is None:
+                    continue
+                try:
+                    nxt = (cur.union(patch) if op.op == "add"
+                           else cur.cut(patch))
+                except Exception:
+                    continue
+                vol = _solid_volume(nxt)
+                dv = abs(vol - prev_vol)
+                if dv >= 0.004 * mesh_volume:
+                    try:
+                        seg = _refine_op_sketch_segments(op, patch)
+                        if seg is not None and len(seg):
+                            v2, f2 = _tessellate_solid(cur, fast=True)
+                            steps.append(ConstructionStep(
+                                name=("Sketch Cut" if op.op != "add"
+                                      else "Sketch Join"),
+                                tess_vertices=v2, tess_faces=f2,
+                                volume=prev_vol, sketch_overlay=seg,
+                            ))
+                        v3, f3 = _tessellate_solid(nxt, fast=True)
+                        steps.append(ConstructionStep(
+                            name=(f"Refine "
+                                  f"{'Add' if op.op == 'add' else 'Cut'} "
+                                  f"({op.kind}, {dv:,.0f}mm³)"),
+                            tess_vertices=v3, tess_faces=f3, volume=vol,
+                        ))
+                    except Exception:
+                        pass
+                cur = nxt
+                prev_vol = vol
+            return cur, steps
+
+        # MULTI-ROUND: the greedy box cover stalls on irregular shells;
+        # re-lattice from the ACTUAL solid each round and go again until
+        # the volume gap to the winner stops closing.
+        def _mesh_score(wp2):
+            return (mesh_iou_exact(mesh, _tm(wp2)) if use_iou
+                    else -abs(_solid_volume(wp2) - mesh_volume))
+
+        cur_solid = pre_solid
+        cur_score = _mesh_score(cur_solid)
+        all_steps: list = []
+        for _round in range(3):
+            _cur_tm = _tm(cur_solid)
+            op_sets = []
+            for _res in (96, 128):
+                try:
+                    rr = refine_against_target(tgt, _cur_tm, res=_res,
+                                               max_iters=12,
+                                               min_residual_frac=0.003)
+                    op_sets.extend(ops for ops in (rr.ops, rr.box_ops)
+                                   if ops)
+                except Exception:
+                    continue
+            if not op_sets:
+                break
+            # Ops are GUIDED by the arbiter's winner but each round is
+            # ACCEPTED by fit to the actual mesh — chasing the winner's
+            # volume alone traded mesh fit for volume.
+            round_best = None
+            for ops in op_sets:
+                cand, steps = _apply_set(cur_solid, ops)
+                if not steps:
+                    continue
+                sc = _mesh_score(cand)
+                if round_best is None or sc > round_best[0]:
+                    round_best = (sc, cand, steps)
+            if round_best is None or round_best[0] < cur_score + 0.003:
+                break
+            cur_solid, cur_score = round_best[1], round_best[0]
+            all_steps.extend(round_best[2])
+            logger.info("Swap itemization round %d: vol %.0f (winner "
+                        "%.0f), score %.3f, +%d step(s)", _round + 1,
+                        _solid_volume(cur_solid), v_tgt, cur_score,
+                        len(round_best[2]))
+        if not all_steps:
+            return None, None
+        # Adopt whenever the itemized result IMPROVES on the pre-swap
+        # solid — real features always beat an opaque boolean. Only when
+        # itemization fails to improve at all does the caller keep the
+        # plain swap.
+        if use_iou:
+            iou_pre = mesh_iou_exact(mesh, pre)
+            iou_swap = mesh_iou_exact(mesh, tgt)
+            iou_ops = mesh_iou_exact(mesh, _tm(cur_solid))
+            if iou_ops < iou_pre + 0.005:
+                logger.info(
+                    "Swap itemization did not improve: ops IoU %.3f vs "
+                    "pre %.3f / swap %.3f", iou_ops, iou_pre, iou_swap)
+                return None, None
+            logger.info(
+                "Arbiter swap itemized: %d step(s), IoU %.3f (pre %.3f, "
+                "swap %.3f)", len(all_steps), iou_ops, iou_pre, iou_swap)
+        else:
+            if (abs(_solid_volume(cur_solid) - mesh_volume)
+                    > abs(_solid_volume(pre_solid) - mesh_volume)
+                    - 0.005 * mesh_volume):
+                return None, None
+        return cur_solid, all_steps
+    except Exception:
+        logger.debug("swap itemization failed", exc_info=True)
+        return None, None
+
+
 def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
                            max_iters: int = 3, steps_out: list | None = None):
     """CADFit-style residual-refinement post-pass.
@@ -8603,46 +8808,7 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
         if best is None:
             return solid, cad_vol
 
-        def _op_sketch_segments(op, patch):
-            """Wireframe outline of a refine patch's footprint, so each
-            refine op gets a Sketch step like every other feature (they
-            previously appeared as cuts with no sketch)."""
-            try:
-                if op.kind == "cylinder":
-                    ax = int(op.axis)
-                    us = [k for k in (0, 1, 2) if k != ax]
-                    th = np.linspace(0, 2 * np.pi, 49)
-                    ring = []
-                    for t in th:
-                        p3 = np.zeros(3)
-                        p3[ax] = float(op.lo)
-                        p3[us[0]] = float(op.center[0] + op.radius * np.cos(t))
-                        p3[us[1]] = float(op.center[1] + op.radius * np.sin(t))
-                        ring.append(p3)
-                else:
-                    bb = patch.BoundingBox()
-                    lo = np.array([bb.xmin, bb.ymin, bb.zmin])
-                    hi = np.array([bb.xmax, bb.ymax, bb.zmax])
-                    dims = hi - lo
-                    ax = int(np.argmin(dims))   # sketch on the face plane
-                    us = [k for k in (0, 1, 2) if k != ax]
-                    ring = []
-                    for cu, cv in ((lo[us[0]], lo[us[1]]),
-                                   (hi[us[0]], lo[us[1]]),
-                                   (hi[us[0]], hi[us[1]]),
-                                   (lo[us[0]], hi[us[1]]),
-                                   (lo[us[0]], lo[us[1]])):
-                        p3 = np.zeros(3)
-                        p3[ax] = hi[ax]
-                        p3[us[0]], p3[us[1]] = cu, cv
-                        ring.append(p3)
-                seg = []
-                for k in range(len(ring) - 1):
-                    seg.append(ring[k])
-                    seg.append(ring[k + 1])
-                return np.asarray(seg, np.float64)
-            except Exception:
-                return None
+        _op_sketch_segments = _refine_op_sketch_segments
 
         def _emit_steps(ops):
             # Replay the WINNING op-set so each refine operation appears as

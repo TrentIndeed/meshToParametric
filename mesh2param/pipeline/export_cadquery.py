@@ -825,7 +825,12 @@ def export_cadquery(
     # Skip entirely when the build already matches well (avoids the
     # tessellation+voxelization cost on the common clean-CAD case, where it
     # only ever no-ops anyway).
-    if residual_refine and solid is not None and mesh_volume > 0:
+    # When a thin-member restructure explained the part, DON'T bolt refine
+    # boxes on top: they carved visible slits into the side faces and read as
+    # random subtractions in the tree ("three unnecessary cuts") — the
+    # residual there is soft blend material, not missing features.
+    if (residual_refine and solid is not None and mesh_volume > 0
+            and not (as_built_record or {}).get("thin_member")):
         _pre_vol = variants[0].cad_volume if variants else _solid_volume(solid)
         _pre_err = abs(_pre_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
         if _pre_err >= residual_refine_min_error_pct:
@@ -916,12 +921,8 @@ def export_cadquery(
         # presentation the user rejected. The L-bracket hovers at 12-16%
         # run-to-run, flapping across the default 15% trigger: hold the
         # honest tree unless recognition is truly bad.
-        try:
-            if variants and any(s.name.startswith("Extrude Member")
-                                for s in variants[0].construction_steps):
-                _eff_thr = max(_eff_thr, contour_fallback_min_error_pct + 6.0)
-        except Exception:
-            pass
+        if (as_built_record or {}).get("thin_member"):
+            _eff_thr = max(_eff_thr, contour_fallback_min_error_pct + 6.0)
         if _cur_err >= _eff_thr:
             try:
                 from mesh2param.pipeline.contour_recon import (
@@ -1091,6 +1092,18 @@ def export_cadquery(
                             _last_v, cad_volume)
     except Exception:
         logger.debug("refined-model catch-all step failed", exc_info=True)
+
+    # Onshape-vocabulary step names for scan/AI parts: the user reads the
+    # tree as an Onshape timeline, so every step is "<FeatureType> N (…)" —
+    # Sketch/Extrude/Hole/Fillet/Chamfer/Boolean — never internal jargon
+    # like "Refine Cut". Clean-CAD parts keep the legacy names (tests pin
+    # them, and no user-facing scan tree is involved).
+    if (getattr(cleaned, "metadata", None) or {}).get("scan_mode"):
+        for _v in variants:
+            try:
+                _onshape_step_names(_v.construction_steps)
+            except Exception:
+                logger.debug("step rename failed", exc_info=True)
 
     # Export STEP. If ingest normalized the part's scale (unit_scale in
     # CleanedMesh.metadata), scale the solid back so the STEP file is in
@@ -3593,6 +3606,85 @@ def _detect_tangent_holes(cleaned, extrude_dir):
         return []
 
 
+def _onshape_step_names(steps) -> None:
+    """Rename construction steps IN PLACE to Onshape feature vocabulary:
+    "Sketch N (…)", "Extrude N (Base|Join|Cut, …)", "Hole N (…)",
+    "Fillet N", "Chamfer N", "Boolean N". The parenthetical keeps the
+    descriptive detail (diameters, depths); the prefix is always a real
+    Onshape feature type — never internal jargon like "Refine Cut"."""
+    import re as _re
+
+    counters: dict = {}
+
+    def _n(kind):
+        counters[kind] = counters.get(kind, 0) + 1
+        return counters[kind]
+
+    def _detail(nm):
+        m = _re.search(r"\(([^)]*)\)", nm)
+        return m.group(1).strip() if m else ""
+
+    for s in steps:
+        nm = s.name or ""
+        if nm.startswith("Sketch"):
+            rest = _re.sub(r"^Sketch\s*", "", nm)
+            rest = rest.replace("(", "").replace(")", "").strip()
+            s.name = f"Sketch {_n('Sketch')}" + (f" ({rest})" if rest else "")
+        elif "Hole" in nm:
+            # "Through Hole Pattern ⌀9.0mm ×2" -> "Hole 1 (⌀9.0mm ×2, through)"
+            mode = ("through" if "Through" in nm
+                    else "blind" if "Blind" in nm else "")
+            rest = _re.sub(r"(Through|Blind|Tangent)?\s*Hole(\s+Pattern)?",
+                           "", nm)
+            rest = rest.replace("(", "").replace(")", "").strip()
+            # drop a bare leading hole index ("2 level 1") but never a
+            # pattern count ("3× r=3.2")
+            rest = _re.sub(r"^\d+\s+(?![×x(])", "", rest)
+            parts = ", ".join(x for x in (rest, mode) if x)
+            s.name = f"Hole {_n('Hole')}" + (f" ({parts})" if parts else "")
+        elif nm.startswith("Fillet"):
+            d = _detail(nm)
+            s.name = f"Fillet {_n('Fillet')}" + (f" ({d})" if d else "")
+        elif nm.startswith("Chamfer"):
+            d = _detail(nm)
+            s.name = f"Chamfer {_n('Chamfer')}" + (f" ({d})" if d else "")
+        elif nm == "Extrude Base":
+            s.name = f"Extrude {_n('Extrude')} (Base)"
+        elif nm.startswith("Extrude Member"):
+            d = _detail(nm)
+            s.name = (f"Extrude {_n('Extrude')} (Join"
+                      + (f", {d}" if d else "") + ")")
+        elif nm.startswith(("Extrude Join", "Extrude ")):
+            d = _detail(nm)
+            s.name = (f"Extrude {_n('Extrude')} (Join"
+                      + (f", {d}" if d else "") + ")")
+        elif nm.startswith(("Boss", "Panel Boss", "Refine Add")):
+            rest = _re.sub(r"^(Panel Boss|Boss Pattern|Boss|Refine Add)\s*",
+                           "", nm)
+            rest = rest.replace("(", "").replace(")", "").strip()
+            s.name = (f"Extrude {_n('Extrude')} (Join"
+                      + (f", {rest}" if rest else "") + ")")
+        elif nm.startswith("Side Profile"):
+            s.name = f"Sketch {_n('Sketch')} (side profile)"
+        elif nm.startswith(("Refine Cut", "Cut Extrude", "Pocket",
+                            "Oval Cut", "Slot Cut", "Recess Cut",
+                            "Ring Recess", "Vent", "Cut ", "Side Cut")):
+            m2 = _re.match(r"^(Oval|Slot|Recess)\s+Cut\s*(.*)$", nm)
+            if m2:
+                rest = f"{m2.group(1)} {m2.group(2)}"
+            else:
+                rest = _re.sub(r"^(Refine Cut|Cut Extrude|Side Cut|Cut)\s*",
+                               "", nm)
+            rest = rest.replace("(", "").replace(")", "").strip()
+            s.name = (f"Extrude {_n('Extrude')} (Cut"
+                      + (f", {rest}" if rest else "") + ")")
+        elif nm == "Refined Model":
+            s.name = f"Boolean {_n('Boolean')} (refine)"
+        elif nm == "Combine Bodies":
+            s.name = f"Boolean {_n('Boolean')} (union)"
+        # anything else keeps its name
+
+
 def _build_stepwise(
     profiles: list[list[tuple[float, float]]],
     depth: float,
@@ -3803,17 +3895,12 @@ def _build_stepwise(
     script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
     script_lines.append(f"result = result.extrude({depth})")
 
-    v, f = _tessellate_solid(wp, fast=True)
-    vol = abs(float(wp.val().Volume())) if wp else 0
-    steps.append(ConstructionStep(
-        name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
-    ))
-
     # --- Symmetric thinning: a profile region THINNER than the base span ---
     # The L-bracket's diagonal arm: base 17.2mm, arm set back ~2.1mm per
-    # side. Modeled the way a CAD user would — the full-thickness extrude is
-    # replaced over that region by a second, thinner extrude — instead of
-    # leaving the correction to the arbiter's opaque "Refined Model" swap.
+    # side. Detected BEFORE the base step is recorded so the timeline reads
+    # like Onshape: "Extrude Base" shows only the full-thickness regions,
+    # then the thin member arrives as its own JOIN extrude (volume goes UP).
+    # Carving after the base step read as a sketch+cut on both side faces.
     _thin = None
     if (cleaned is not None
             and (getattr(cleaned, "metadata", None) or {}).get("scan_mode")):
@@ -3821,6 +3908,7 @@ def _build_stepwise(
             _thin = _detect_symmetric_thinning(cleaned, extrude_dir)
         except Exception:
             _thin = None
+    _member_join = None      # (joined solid, thickness) once validated
     if _thin is not None and _thin["axis"] == primary_axis:
         try:
             from shapely.geometry import (Polygon as _ThPoly,
@@ -3849,10 +3937,12 @@ def _build_stepwise(
                     _member = (cq.Workplane(plane_name, origin=tuple(_o_thin))
                                .polyline(_thin["region_uv"]).close()
                                .extrude(0.5 * _thick, both=True))
-                    _wp2 = wp.cut(_carve).union(_member)
-                    _removed = _vol_before - abs(float(_wp2.val().Volume()))
+                    _wp_base = wp.cut(_carve)
+                    _wp_joined = _wp_base.union(_member)
+                    _removed = (_vol_before
+                                - abs(float(_wp_joined.val().Volume())))
                     # Expected removal counts only the region actually inside
-                    # the profile (the hull overhangs the outline).
+                    # the profile (the region can overhang the outline).
                     try:
                         _ov = _ThPoly(profiles[0]).buffer(0).intersection(
                             _rpoly).area
@@ -3863,27 +3953,10 @@ def _build_stepwise(
                     # less means the region was already thin, far more means
                     # the carve ate geometry it shouldn't have.
                     if 0.4 * _exp <= _removed <= 1.8 * _exp:
-                        wp = _wp2
-                        _ol2, _oa2 = _overlay_for_ring(
-                            _thin["region_uv"], primary_axis,
-                            0.5 * (_t_lo + _t_hi))
-                        _sv2 = (np.asarray(_ol2, np.float64)
-                                if _ol2 else np.zeros((0, 3)))
-                        _m2 = len(_sv2) // 2
-                        _sf2 = np.array(
-                            [[2 * i, 2 * i + 1, 2 * i] for i in range(_m2)],
-                            dtype=np.int64)
-                        steps.append(ConstructionStep(
-                            name=f"Sketch Member ({_thick:.1f}mm)",
-                            tess_vertices=_sv2, tess_faces=_sf2, volume=0.0,
-                            overlay_arcs=_oa2 or None,
-                        ))
-                        v, f = _tessellate_solid(wp, fast=True)
-                        steps.append(ConstructionStep(
-                            name=f"Extrude Member ({_thick:.1f}mm)",
-                            tess_vertices=v, tess_faces=f,
-                            volume=abs(float(wp.val().Volume())),
-                        ))
+                        wp = _wp_base          # base step shows this
+                        _member_join = (_wp_joined, _thick)
+                        if as_built_out is not None:
+                            as_built_out["thin_member"] = True
                         script_lines.append(
                             f"# Thin member: region re-extruded at "
                             f"{_thick:.2f} mm (setbacks {_thin['d_lo']:.2f}/"
@@ -3897,6 +3970,36 @@ def _build_stepwise(
                             "%.0f mm^3", _removed, _exp)
         except Exception:
             logger.warning("Symmetric thinning failed", exc_info=True)
+
+    v, f = _tessellate_solid(wp, fast=True)
+    vol = abs(float(wp.val().Volume())) if wp else 0
+    steps.append(ConstructionStep(
+        name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
+    ))
+
+    if _member_join is not None:
+        _wp_joined, _thick = _member_join
+        _ol2, _oa2 = _overlay_for_ring(
+            _thin["region_uv"], primary_axis,
+            0.5 * (_t_lo + _t_hi))
+        _sv2 = (np.asarray(_ol2, np.float64)
+                if _ol2 else np.zeros((0, 3)))
+        _m2 = len(_sv2) // 2
+        _sf2 = np.array(
+            [[2 * i, 2 * i + 1, 2 * i] for i in range(_m2)],
+            dtype=np.int64)
+        steps.append(ConstructionStep(
+            name=f"Sketch Member ({_thick:.1f}mm)",
+            tess_vertices=_sv2, tess_faces=_sf2, volume=0.0,
+            overlay_arcs=_oa2 or None,
+        ))
+        wp = _wp_joined
+        v, f = _tessellate_solid(wp, fast=True)
+        steps.append(ConstructionStep(
+            name=f"Extrude Member ({_thick:.1f}mm)",
+            tess_vertices=v, tess_faces=f,
+            volume=abs(float(wp.val().Volume())),
+        ))
 
     # --- Join extrusions: the engine plan's non-primary segments ---
     # One part, one timeline: each join sketches its own profile on its
@@ -8418,6 +8521,47 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
         if best is None:
             return solid, cad_vol
 
+        def _op_sketch_segments(op, patch):
+            """Wireframe outline of a refine patch's footprint, so each
+            refine op gets a Sketch step like every other feature (they
+            previously appeared as cuts with no sketch)."""
+            try:
+                if op.kind == "cylinder":
+                    ax = int(op.axis)
+                    us = [k for k in (0, 1, 2) if k != ax]
+                    th = np.linspace(0, 2 * np.pi, 49)
+                    ring = []
+                    for t in th:
+                        p3 = np.zeros(3)
+                        p3[ax] = float(op.lo)
+                        p3[us[0]] = float(op.center[0] + op.radius * np.cos(t))
+                        p3[us[1]] = float(op.center[1] + op.radius * np.sin(t))
+                        ring.append(p3)
+                else:
+                    bb = patch.BoundingBox()
+                    lo = np.array([bb.xmin, bb.ymin, bb.zmin])
+                    hi = np.array([bb.xmax, bb.ymax, bb.zmax])
+                    dims = hi - lo
+                    ax = int(np.argmin(dims))   # sketch on the face plane
+                    us = [k for k in (0, 1, 2) if k != ax]
+                    ring = []
+                    for cu, cv in ((lo[us[0]], lo[us[1]]),
+                                   (hi[us[0]], lo[us[1]]),
+                                   (hi[us[0]], hi[us[1]]),
+                                   (lo[us[0]], hi[us[1]]),
+                                   (lo[us[0]], lo[us[1]])):
+                        p3 = np.zeros(3)
+                        p3[ax] = hi[ax]
+                        p3[us[0]], p3[us[1]] = cu, cv
+                        ring.append(p3)
+                seg = []
+                for k in range(len(ring) - 1):
+                    seg.append(ring[k])
+                    seg.append(ring[k + 1])
+                return np.asarray(seg, np.float64)
+            except Exception:
+                return None
+
         def _emit_steps(ops):
             # Replay the WINNING op-set so each refine operation appears as
             # its own feature-tree step (user ask: refine features must not
@@ -8439,15 +8583,24 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
                         except Exception:
                             pass
                     try:
-                        cur = (cur.union(patch) if op.op == "add"
+                        nxt = (cur.union(patch) if op.op == "add"
                                else cur.cut(patch))
                     except Exception:
                         continue
-                    vol = _solid_volume(cur)
+                    vol = _solid_volume(nxt)
                     dv = abs(vol - prev_vol)
                     if dv >= 0.004 * mesh_volume:
                         try:
-                            v3, f3 = _tessellate_solid(cur, fast=True)
+                            _seg = _op_sketch_segments(op, patch)
+                            if _seg is not None and len(_seg):
+                                v2, f2 = _tessellate_solid(cur, fast=True)
+                                steps_out.append(ConstructionStep(
+                                    name=("Sketch Cut" if op.op != "add"
+                                          else "Sketch Join"),
+                                    tess_vertices=v2, tess_faces=f2,
+                                    volume=prev_vol, sketch_overlay=_seg,
+                                ))
+                            v3, f3 = _tessellate_solid(nxt, fast=True)
                             steps_out.append(ConstructionStep(
                                 name=(f"Refine {'Add' if op.op == 'add' else 'Cut'} "
                                       f"({op.kind}, {dv:,.0f}mm³)"),
@@ -8455,6 +8608,7 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
                             ))
                         except Exception:
                             pass
+                    cur = nxt
                     prev_vol = vol
             except Exception:
                 logger.debug("refine step replay failed", exc_info=True)

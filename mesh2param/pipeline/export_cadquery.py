@@ -420,6 +420,36 @@ def export_cadquery(
     ]
     _base_sg = (profile_tree.features[0].sketch_geometry or {}) \
         if profile_tree.features else {}
+    # REVOLVE as the BASE feature (turned parts, scan meshes): when the
+    # body is a recognized body of revolution and the revolve solid fits,
+    # it becomes the timeline's first feature ("Revolve") and every hole/
+    # recess cutter runs ON it — instead of the old end-of-build solid
+    # swap, which surfaced as an opaque boolean and ERASED all the drilled
+    # holes (the motor mount plate).
+    _revolve_base = None
+    try:
+        _rev_sg0 = (feature_tree.metadata or {}).get("revolve_candidate")
+        if (_rev_sg0 is not None and mesh_volume > 0
+                and (getattr(cleaned, "metadata", None) or {}).get(
+                    "scan_mode")):
+            from mesh2param.models.feature import Feature as _F0
+            _rev_feat0 = _F0(type=FeatureType.REVOLVE,
+                             face_indices=np.array([0]),
+                             sketch_geometry=_rev_sg0)
+            _rev0 = _build_revolve_result(_rev_feat0, cleaned, mesh_volume,
+                                          refine=False)
+            if _rev0 is not None and _rev0.solid is not None:
+                # The bare revolve carries no holes yet, so expect it a bit
+                # OVER the mesh volume; accept a generous window.
+                _rerr = (_rev0.cad_volume - mesh_volume) / mesh_volume
+                if -0.05 <= _rerr <= 0.30:
+                    _revolve_base = _rev0.solid
+                    logger.info(
+                        "Revolve adopted as BASE feature (vol %+.1f%% "
+                        "before holes)", 100 * _rerr)
+    except Exception:
+        logger.debug("revolve-base adoption failed", exc_info=True)
+
     build_args = dict(
         profiles=profiles, depth=depth, extrude_dir=extrude_dir,
         extrude_start=extrude_start, holes=hole_features,
@@ -429,6 +459,7 @@ def export_cadquery(
         # tangent fillets matching the Onshape sketch.
         base_corners=_base_sg.get("corners"),
         base_fillets=_base_sg.get("fillets"),
+        revolve_base=_revolve_base,
     )
 
     logger.debug(
@@ -830,7 +861,8 @@ def export_cadquery(
     # random subtractions in the tree ("three unnecessary cuts") — the
     # residual there is soft blend material, not missing features.
     if (residual_refine and solid is not None and mesh_volume > 0
-            and not (as_built_record or {}).get("thin_member")):
+            and not (as_built_record or {}).get("thin_member")
+            and not (as_built_record or {}).get("revolve_base")):
         _pre_vol = variants[0].cad_volume if variants else _solid_volume(solid)
         _pre_err = abs(_pre_vol - mesh_volume) / (mesh_volume + 1e-15) * 100
         if _pre_err >= residual_refine_min_error_pct:
@@ -870,7 +902,8 @@ def export_cadquery(
     # be badly wrong on a part prismatic models well (so this guards against
     # regression), and it wins for genuine turned parts.
     _rev_sg = (feature_tree.metadata or {}).get("revolve_candidate")
-    if _rev_sg is not None and mesh_volume > 0:
+    if (_rev_sg is not None and mesh_volume > 0
+            and not (as_built_record or {}).get("revolve_base")):
         try:
             from mesh2param.models.feature import Feature as _F
             rev_feat = _F(type=FeatureType.REVOLVE, face_indices=np.array([0]),
@@ -921,7 +954,8 @@ def export_cadquery(
         # presentation the user rejected. The L-bracket hovers at 12-16%
         # run-to-run, flapping across the default 15% trigger: hold the
         # honest tree unless recognition is truly bad.
-        if (as_built_record or {}).get("thin_member"):
+        if ((as_built_record or {}).get("thin_member")
+                or (as_built_record or {}).get("revolve_base")):
             _eff_thr = max(_eff_thr, contour_fallback_min_error_pct + 6.0)
         if _cur_err >= _eff_thr:
             try:
@@ -3376,6 +3410,25 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                                smooth.exterior.coords]
                         if len(ext) < 4:
                             continue
+                        # SCALE gates: features must be meaningful at the
+                        # part's scale. The ⌀300 motor plate grew tiny
+                        # "slot" cuts (~250mm², 0.35% of the face) and
+                        # r~1.6 hole circles from AI-mesh dimples.
+                        _bbext = (np.asarray(cleaned.bbox[1])
+                                  - np.asarray(cleaned.bbox[0]))
+                        _maxdim = float(np.max(_bbext))
+                        if circle is not None:
+                            if circle["r"] < 0.006 * _maxdim:
+                                logger.info(
+                                    "Ring circle r=%.2f skipped (< 0.6%% "
+                                    "of the part)", circle["r"])
+                                continue
+                        elif float(filled.area) < 0.008 * sect_area:
+                            logger.info(
+                                "Ring recess area %.0f skipped (< 0.8%% "
+                                "of the face section %.0f)",
+                                filled.area, sect_area)
+                            continue
                         out.append({
                             "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
                             "axis": axis, "face_t": face_t, "sign": sign,
@@ -3803,6 +3856,7 @@ def _build_stepwise(
     stream: bool = False,
     base_corners: list | None = None,
     base_fillets: list | None = None,
+    revolve_base: object = None,
 ) -> tuple[object, str, list[ConstructionStep], list[dict]]:
     """Build a clean CAD solid from scratch, step by step.
 
@@ -3907,6 +3961,23 @@ def _build_stepwise(
         _pt = _BasePoint(_c.x, _c.y)
         _under_boss = any(bf.contains(_pt) for bf in _boss_foot)
         if _area > 0.05 * _main_area:
+            # DESIGN-INTENT snap (scan meshes): a round bore baked into the
+            # base sketch is a true CIRCLE, not the jagged mesh trace (the
+            # motor plate's ⌀91 center bore).
+            if (cleaned is not None
+                    and (getattr(cleaned, "metadata", None) or {}).get(
+                        "scan_mode")):
+                try:
+                    _bcirc = (4.0 * np.pi * _area
+                              / (_poly.length ** 2 + 1e-9))
+                    if _bcirc >= 0.8:
+                        _br = float(np.sqrt(_area / np.pi))
+                        _bth = np.linspace(0.0, 2.0 * np.pi, 65)[:-1]
+                        _p = [(float(_c.x + _br * np.cos(t)),
+                               float(_c.y + _br * np.sin(t)))
+                              for t in _bth]
+                except Exception:
+                    pass
             base_inner_cutouts.append(_p)        # window/bore -> bake into base
         elif _under_boss:
             # Mounting hole under a standoff: cut PLATE-ONLY (baked here), the
@@ -3965,6 +4036,12 @@ def _build_stepwise(
     # part extends both ways from the base plane, so both directions overlap it
     # equally and the tie sends the base the wrong way (into the bottom plate's
     # region). The base span has a definite direction, so use it.
+    # REVOLVE base: the lathe solid replaces the extruded slab as the
+    # timeline's first feature; every cutter below still runs on it.
+    _revolved = revolve_base is not None
+    if _revolved and as_built_out is not None:
+        as_built_out["revolve_base"] = True
+
     _ed = 1.0 if float(extrude_dir[primary_axis]) >= 0 else -1.0
     tgt_lo = min(extrude_start, extrude_start + _ed * depth)
     tgt_hi = max(extrude_start, extrude_start + _ed * depth)
@@ -3993,15 +4070,19 @@ def _build_stepwise(
         wp = wp_pos
         extrude_sign = depth
 
-    script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
-    script_lines.append(f"result = result.extrude({depth})")
+    if _revolved:
+        wp = revolve_base
+        script_lines.append("# Step 2: Revolve (body of revolution)")
+    else:
+        script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
+        script_lines.append(f"result = result.extrude({depth})")
 
     # --- Symmetric thinning: a profile region THINNER than the base span ---
     # The L-bracket: leg full 17.2mm, bar/arm ~12.7mm (set back from both
     # faces). Detected BEFORE the base step is recorded so the timeline
     # reads like Onshape (see the thin-first build below).
     _thin = None
-    if (cleaned is not None
+    if (cleaned is not None and not _revolved
             and (getattr(cleaned, "metadata", None) or {}).get("scan_mode")):
         try:
             _thin = _detect_symmetric_thinning(cleaned, extrude_dir)
@@ -4067,8 +4148,47 @@ def _build_stepwise(
     v, f = _tessellate_solid(wp, fast=True)
     vol = abs(float(wp.val().Volume())) if wp else 0
     steps.append(ConstructionStep(
-        name="Extrude Base", tess_vertices=v, tess_faces=f, volume=vol,
+        name=("Revolve" if _revolved else "Extrude Base"),
+        tess_vertices=v, tess_faces=f, volume=vol,
     ))
+
+    # Baked windows/bores become real THROUGH cuts on the revolve (the
+    # motor plate's ⌀91 center bore — the lathe profile carries no holes).
+    if _revolved and base_inner_cutouts:
+        _A_lo_rb = float(cleaned.bbox[0][primary_axis])
+        _A_hi_rb = float(cleaned.bbox[1][primary_axis])
+        _o_rb = [0.0, 0.0, 0.0]
+        _o_rb[primary_axis] = 0.5 * (_A_lo_rb + _A_hi_rb)
+        for _ci, _cl in enumerate(base_inner_cutouts, 1):
+            try:
+                _ol_rb, _oa_rb = _overlay_for_ring(
+                    _cl, primary_axis, extrude_start)
+                _sv_rb = (np.asarray(_ol_rb, np.float64)
+                          if _ol_rb else np.zeros((0, 3)))
+                _sf_rb = np.array(
+                    [[2 * k, 2 * k + 1, 2 * k]
+                     for k in range(len(_sv_rb) // 2)], dtype=np.int64)
+                steps.append(ConstructionStep(
+                    name=f"Sketch Hole {_ci}",
+                    tess_vertices=_sv_rb, tess_faces=_sf_rb, volume=0.0,
+                    overlay_arcs=_oa_rb or None,
+                ))
+                _cut_rb = (cq.Workplane(plane_name, origin=tuple(_o_rb))
+                           .polyline([(float(a), float(b))
+                                      for a, b in _cl]).close()
+                           .extrude(0.6 * (_A_hi_rb - _A_lo_rb) + 2.0,
+                                    both=True))
+                wp = wp.cut(_cut_rb)
+                from shapely.geometry import Polygon as _RbPoly
+                _r_rb = float(np.sqrt(abs(_RbPoly(_cl).area) / np.pi))
+                v, f = _tessellate_solid(wp, fast=True)
+                steps.append(ConstructionStep(
+                    name=f"Through Hole (r={_r_rb:.1f})",
+                    tess_vertices=v, tess_faces=f,
+                    volume=abs(float(wp.val().Volume())),
+                ))
+            except Exception:
+                logger.debug("revolve bore cut failed", exc_info=True)
 
     # --- Join extrusions: the engine plan's non-primary segments ---
     # One part, one timeline: each join sketches its own profile on its
@@ -4239,8 +4359,23 @@ def _build_stepwise(
     # Remaining profiles: outer legs/bosses (union) and small circular
     # bolt-hole cutouts (cut). Large window/bore cutouts were baked into
     # the base sketch above.
+    _mid_material = None
+    if (cleaned is not None and extra_profiles
+            and (getattr(cleaned, "metadata", None) or {}).get("scan_mode")):
+        try:
+            import trimesh as _MidTm
+            from mesh2param.pipeline.recognize import (
+                _section_material as _MidSect)
+            _mm = _MidTm.Trimesh(vertices=cleaned.vertices,
+                                 faces=cleaned.faces, process=False)
+            _mid_t = 0.5 * (float(cleaned.bbox[0][primary_axis])
+                            + float(cleaned.bbox[1][primary_axis]))
+            _mid_material = _MidSect(_mm, primary_axis, _mid_t)
+        except Exception:
+            _mid_material = None
     for pi, profile in enumerate(extra_profiles, 1):
         try:
+            _snapped_hole_r = None
             _pp = _BasePoly(profile)
             _cc = _pp.centroid
             is_inner = _main_poly.contains(_BasePoint(_cc.x, _cc.y))
@@ -4252,25 +4387,40 @@ def _build_stepwise(
             # random divot into the part.
             if (getattr(cleaned, "metadata", None) or {}).get("scan_mode"):
                 try:
-                    _sold = _pp.area / max(_pp.convex_hull.area, 1e-9)
-                    _rel = _pp.area / max(_main_poly.area, 1e-9)
-                    # A DESIGNED tiny cutout is a recognizable shape — a
-                    # circle or a rectangle. Solidity alone let the lid's
-                    # foot SHADOW through (a compact but irregular polygon,
-                    # cut straight through the part as a "weird polyshape").
                     _circ = (4.0 * np.pi * _pp.area
                              / (_pp.length ** 2 + 1e-9))
-                    from shapely.geometry import box as _NGBox
-                    _nb = _NGBox(*_pp.bounds)
-                    _biou = (_pp.intersection(_nb).area
-                             / max(_pp.union(_nb).area, 1e-9))
-                    if (_rel < 0.015
-                            and not (_circ >= 0.85 or _biou >= 0.85)):
-                        logger.info(
-                            "Skipping noise profile %d (area %.0f, "
-                            "solidity %.2f, circ %.2f, rect %.2f)",
-                            pi, _pp.area, _sold, _circ, _biou)
-                        continue
+                    _rel = _pp.area / max(_main_poly.area, 1e-9)
+                    if is_inner and _rel < 0.015:
+                        # THROUGH-ness is the decisive test for a tiny
+                        # inner loop: a real hole is VOID at mid-depth; a
+                        # face artifact (the lid's foot shadow) is SOLID
+                        # there. Shape gates alone couldn't separate them —
+                        # a jagged real bolt circle scores circ 0.80, the
+                        # foot shadow 0.75 (and the 0.85 gate ate the motor
+                        # plate's real outer holes).
+                        if _mid_material is not None:
+                            if _mid_material.buffer(0).contains(
+                                    _BasePoint(_cc.x, _cc.y)):
+                                logger.info(
+                                    "Skipping face-artifact profile %d "
+                                    "(area %.0f: solid at mid-depth)",
+                                    pi, _pp.area)
+                                continue
+                        elif _circ < 0.75:
+                            logger.info(
+                                "Skipping noise profile %d (area %.0f, "
+                                "circ %.2f)", pi, _pp.area, _circ)
+                            continue
+                    # A kept round-ish inner loop is a HOLE: cut it as a
+                    # true circle, not a jagged polyline trace.
+                    if is_inner and _circ >= 0.6:
+                        _r_eq = float(np.sqrt(_pp.area / np.pi))
+                        _th = np.linspace(0.0, 2.0 * np.pi, 49)[:-1]
+                        profile = [
+                            (float(_cc.x + _r_eq * np.cos(t)),
+                             float(_cc.y + _r_eq * np.sin(t)))
+                            for t in _th]
+                        _snapped_hole_r = _r_eq
                 except Exception:
                     pass
 
@@ -4295,7 +4445,10 @@ def _build_stepwise(
             # For the sketch step, show the CURRENT solid with the sketch
             # drawn as a blue overlay on top (not the sketch alone).
             base_v_now, base_f_now = _tessellate_solid(wp, fast=True)
-            sketch_name = "Sketch Cutout" if is_inner else "Sketch Extra"
+            if _snapped_hole_r is not None:
+                sketch_name = f"Sketch Hole (r={_snapped_hole_r:.1f})"
+            else:
+                sketch_name = "Sketch Cutout" if is_inner else "Sketch Extra"
             steps.append(ConstructionStep(
                 name=sketch_name,
                 tess_vertices=np.asarray(base_v_now, dtype=np.float64),
@@ -4310,7 +4463,8 @@ def _build_stepwise(
             vol_before = abs(float(wp.val().Volume()))
             if is_inner:
                 wp = wp.cut(extra)
-                op_name = "Cut Extrude"
+                op_name = (f"Through Hole (r={_snapped_hole_r:.1f})"
+                           if _snapped_hole_r is not None else "Cut Extrude")
             else:
                 wp = wp.union(extra)
                 op_name = "Union Extrude"
@@ -4577,6 +4731,20 @@ def _build_stepwise(
             centers_all = [np.array(sketch["center"], dtype=float)]
         center = centers_all[0]  # primary center for legacy callers
         radius = float(sketch["radius"])
+        # NOISE gate (scan meshes): a hole whose radius is a fraction of a
+        # percent of the part is a distortion dimple, not a feature — the
+        # motor plate grew "7× r=1.6" and "3× r=1.5" hole patterns from
+        # AI-mesh pockmarks on a ⌀300 disc.
+        if (cleaned is not None
+                and (getattr(cleaned, "metadata", None) or {}).get(
+                    "scan_mode")):
+            _ext_max = float(np.max(np.asarray(cleaned.bbox[1])
+                                    - np.asarray(cleaned.bbox[0])))
+            if radius < 0.006 * _ext_max:
+                logger.info(
+                    "Skipping noise hole r=%.2f (< 0.6%% of the %.0fmm "
+                    "part)", radius, _ext_max)
+                continue
         h_depth = float(hole.depth)
         h_dir = np.array(hole.direction, dtype=float)
         h_dir = h_dir / (np.linalg.norm(h_dir) + 1e-15)
@@ -8199,8 +8367,39 @@ def _apply_recognized_fillets_to_solid(
     return wp, applied_steps, applied_script
 
 
+def _regularize_revolve_profile(profile: np.ndarray) -> np.ndarray:
+    """Snap a sampled (h, r) lathe profile to piecewise-CONSTANT radius
+    steps where the samples plateau — a turned part is cylinders and
+    shoulders, not 18 slightly-different radii. Sloped runs (cones) are
+    kept as-is. Returns the cleaned profile."""
+    try:
+        hs = profile[:, 0].astype(float)
+        rs = profile[:, 1].astype(float)
+        segs = []          # (i0, i1, median_r, is_flat)
+        i0 = 0
+        for i in range(1, len(rs) + 1):
+            if i == len(rs) or abs(rs[i] - np.median(rs[i0:i])) > 1.5:
+                seg = rs[i0:i]
+                flat = float(np.std(seg)) < 0.8 and len(seg) >= 2
+                segs.append((i0, i, float(np.median(seg)), flat))
+                i0 = i
+        out = []
+        for (a, b, med, flat) in segs:
+            if flat:
+                out.append((float(hs[a]), med))
+                out.append((float(hs[b - 1]), med))
+            else:
+                out.extend((float(hs[k]), float(rs[k]))
+                           for k in range(a, b))
+        if len(out) >= 2:
+            return np.asarray(out, dtype=float)
+    except Exception:
+        pass
+    return profile
+
+
 def _build_revolve_result(feature, cleaned: CleanedMesh, mesh_volume: float,
-                          output_path=None):
+                          output_path=None, refine: bool = True):
     """Build a CadQueryResult for a REVOLVE feature (turned part).
 
     The feature's sketch_geometry carries axis_origin, axis_dir, and a
@@ -8221,6 +8420,10 @@ def _build_revolve_result(feature, cleaned: CleanedMesh, mesh_volume: float,
         profile = np.asarray(sg["profile"], dtype=float)   # (M,2): (h, r)
         if profile.ndim != 2 or len(profile) < 3:
             return None
+        # Turned parts are cylinders + shoulders: snap the sampled profile
+        # to clean radius steps (a bumpy 18-sample lathe curve otherwise
+        # revolves into a wavy barrel).
+        profile = _regularize_revolve_profile(profile)
         tmp = (np.array([1.0, 0, 0]) if abs(axis[0]) < 0.9
                else np.array([0, 1.0, 0]))
         radial = np.cross(axis, tmp)
@@ -8242,10 +8445,14 @@ def _build_revolve_result(feature, cleaned: CleanedMesh, mesh_volume: float,
         return None
 
     # Patch any residual mismatch (holes/steps the smooth profile missed).
-    try:
-        wp, _ = _residual_refine_solid(wp, cleaned, mesh_volume)
-    except Exception:
-        logger.debug("revolve residual refine failed", exc_info=True)
+    # Skipped when the revolve serves as the timeline's BASE feature — the
+    # real cutters drill the holes there, and refine boxes on a bare lathe
+    # solid would be noise.
+    if refine:
+        try:
+            wp, _ = _residual_refine_solid(wp, cleaned, mesh_volume)
+        except Exception:
+            logger.debug("revolve residual refine failed", exc_info=True)
 
     cad_vol = _solid_volume(wp)
     if cad_vol <= 0:

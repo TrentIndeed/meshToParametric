@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim3 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260707-anim4 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -1017,11 +1017,10 @@ const LiveBuild = (() => {
           await _sleep(160);
           continue;
         }
-        // Re-frame on EVERY new solid (until the user takes over) so the camera
-        // keeps facing the busiest side as bosses accrete — the final view ends
-        // up looking at the side with the MOST extrudes, not the base plate's
-        // symmetric default.
-        try { _renderSolid(data, !userOrbited); frameDone = true; }
+        // Frame ONCE on the first solid, then leave the camera alone —
+        // reframing every step made the model zoom in/out and flip sides
+        // (the busier-side vote changes as bosses accrete).
+        try { _renderSolid(data, !userOrbited && !frameDone); frameDone = true; }
         catch (e) { console.warn('[LiveBuild] render failed', e); continue; }
         // Sketch steps carry the solid-so-far PLUS the new profile as a blue
         // overlay (straight segments) + true arcs — draw them so the sketch
@@ -1031,7 +1030,11 @@ const LiveBuild = (() => {
         }
         _addOverlayArcs(data.overlay_arcs);
         if (sub) sub.textContent = (data.name || '') + '  ·  ' + (idx + 1) + '/' + targetCount;
-        await _sleep(STEP_MS);
+        // Kind-based pacing: sketches are static context (brief dwell);
+        // feature steps hold long enough for their animation to play out.
+        const _isSk = data.is_sketch
+          || /^sketch/i.test(data.name || '');
+        await _sleep(_isSk ? 240 : STEP_MS + FEATURE_ANIM_MS);
       }
     } finally { pumping = false; }
   }
@@ -1165,7 +1168,7 @@ function _syncMainCamera(pos, target) {
 // clipping planes over the (previous solid, new solid) pair — the new solid is
 // identical to the old outside the feature, so sweeping a clip plane reads as
 // the feature itself growing/cutting.
-const FEATURE_ANIM_MS = 250;
+const FEATURE_ANIM_MS = 450;
 let _featAnim = null;          // { raf, cleanup }
 
 function cancelFeatureAnim() {

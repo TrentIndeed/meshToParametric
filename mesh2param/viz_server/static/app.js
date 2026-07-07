@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim1 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260707-anim2 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -946,7 +946,8 @@ const LiveBuild = (() => {
         group.remove(prevSolid);
       }
     } else {
-      const effKind = (kind === 'revolve' || kind === 'fade') ? kind
+      const effKind = (kind === 'revolve' || kind === 'fade'
+                       || kind === 'blend') ? kind
         : (_paneLastPlane ? kind : 'fade');
       animateFeatureTransition(group, prevSolid, solid, effKind,
                                _paneLastPlane, renderer);
@@ -1176,9 +1177,53 @@ function classifyStepKind(name) {
   const n = name || '';
   if (/^sketch/i.test(n)) return 'sketch';
   if (/revolve/i.test(n)) return 'revolve';
+  if (/fillet|chamfer/i.test(n)) return 'blend';
   if (/hole|\(cut|^cut\b|pocket|slot|recess|oval cut|cutout/i.test(n)) return 'cut';
   if (/extrude|join|boss|pads|member|union/i.test(n)) return 'add';
-  return 'fade';               // fillet / chamfer / boolean / refined
+  return 'fade';               // boolean / refined / unknown
+}
+
+// The triangles of the NEW solid that did not exist in the previous one —
+// for a fillet/chamfer step these are exactly the applied blend surfaces
+// (OCC retessellates unchanged faces identically). Returns a highlight
+// mesh to fade out, or null.
+function buildChangedTrianglesMesh(prevMesh, newMesh) {
+  if (!prevMesh || !newMesh) return null;
+  const pp = prevMesh.geometry.getAttribute('position');
+  const np = newMesh.geometry.getAttribute('position');
+  if (!pp || !np || pp.count > 600000 || np.count > 600000) return null;
+  const vkey = (attr, i) =>
+    Math.round(attr.getX(i) * 10) + ',' + Math.round(attr.getY(i) * 10)
+    + ',' + Math.round(attr.getZ(i) * 10);
+  const tkey = (attr, t) => {
+    const ks = [vkey(attr, t * 3), vkey(attr, t * 3 + 1), vkey(attr, t * 3 + 2)];
+    ks.sort();
+    return ks.join('|');
+  };
+  const prevSet = new Set();
+  const pTris = Math.floor(pp.count / 3);
+  for (let t = 0; t < pTris; t++) prevSet.add(tkey(pp, t));
+  const outPos = [];
+  const nArr = np.array;
+  const nTris = Math.floor(np.count / 3);
+  for (let t = 0; t < nTris; t++) {
+    if (!prevSet.has(tkey(np, t))) {
+      for (let k = 0; k < 9; k++) outPos.push(nArr[t * 9 + k]);
+    }
+  }
+  if (!outPos.length) return null;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position',
+    new THREE.BufferAttribute(new Float32Array(outPos), 3));
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x58A6FF, transparent: true, opacity: 0.85,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    depthWrite: false,
+  });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.copy(newMesh.position);
+  m.renderOrder = 2;
+  return m;
 }
 
 // Sketch plane from a step's overlay: the axis along which every overlay
@@ -1239,6 +1284,31 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
     disposePrev();
     _featAnim = null;
   };
+
+  if (kind === 'blend') {
+    // Fillet/chamfer: the new solid appears immediately, its APPLIED blend
+    // surfaces flash highlighted and the highlight fades out.
+    let hi = null;
+    try { hi = buildChangedTrianglesMesh(prevMesh, newMesh); } catch (e) {}
+    disposePrev();
+    if (!hi) { _featAnim = null; return; }
+    (newMesh.parent || group).add(hi);
+    const HI_MS = 700;
+    const dropHi = () => {
+      if (hi.parent) hi.parent.remove(hi);
+      if (hi.geometry) hi.geometry.dispose();
+      if (hi.material) hi.material.dispose();
+      _featAnim = null;
+    };
+    const tick = () => {
+      const t = Math.min(1, (performance.now() - t0) / HI_MS);
+      hi.material.opacity = 0.85 * (1 - t);
+      if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
+      else dropHi();
+    };
+    _featAnim = { raf: requestAnimationFrame(tick), cleanup: dropHi };
+    return;
+  }
 
   if (kind === 'fade' || (!plane && kind !== 'revolve')) {
     newMesh.material.transparent = true;
@@ -1466,6 +1536,7 @@ async function loadStep(index) {
         const seq = index === _mainLastStepIndex + 1;
         const plane = seq ? _mainLastSketchPlane : null;
         const effKind = (kind === 'revolve' || kind === 'fade') ? kind
+          : (kind === 'blend') ? (seq ? 'blend' : 'fade')
           : (plane ? kind : 'fade');
         animateFeatureTransition(modelGroup, prevSolid, mesh, effKind, plane, renderer);
       }

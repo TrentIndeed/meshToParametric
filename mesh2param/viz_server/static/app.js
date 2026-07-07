@@ -8,6 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
+console.log('%c[paramesh] app.js BUILD 20260707-anim1 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -104,6 +105,7 @@ camera.position.set(200, 150, 200);
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 renderer.setSize(container.clientWidth, container.clientHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.localClippingEnabled = true;   // feature build animations
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.4;
 renderer.shadowMap.enabled = true;
@@ -783,6 +785,8 @@ const LiveBuild = (() => {
 
   function _renderSketchLines(data) {
     _clearGroup();
+    const _plS = sketchPlaneFromOverlay(data.vertices, data.overlay_arcs);
+    if (_plS) _paneLastPlane = _plS;
     const verts = data.vertices, idxs = data.faces;
     const pts = [];
     for (let f = 0; f < idxs.length; f += 3) {
@@ -801,6 +805,7 @@ const LiveBuild = (() => {
   // shownIdx up to targetCount one step at a time with a delay, so features
   // visibly pop in one-by-one instead of jumping straight to the final solid.
   let targetCount = 0, shownIdx = -1, pumping = false, curJob = null;
+  let _paneLastPlane = null;   // sketch plane feeding the feature animations
   const STEP_MS = 480;
 
   function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -822,6 +827,7 @@ const LiveBuild = (() => {
     camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
     camera.position.set(120, 90, 120);
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.localClippingEnabled = true;   // feature build animations
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setClearColor(0x000000, 0);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -888,7 +894,18 @@ const LiveBuild = (() => {
   }
 
   function _renderSolid(data, frame) {
-    _clearGroup();
+    // Keep the previous solid aside so the new feature animates against it.
+    const prevSolid = group.children.find(
+      c => c.userData && c.userData.solidStep) || null;
+    for (const c of group.children.slice()) {
+      if (c === prevSolid) continue;
+      if (c.geometry) c.geometry.dispose();
+      if (c.material) {
+        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+        else c.material.dispose();
+      }
+      group.remove(c);
+    }
     const verts = new Float32Array(data.vertices);
     const indices = data.faces;
     const numFaces = Math.floor(indices.length / 3);
@@ -904,8 +921,11 @@ const LiveBuild = (() => {
     geo.computeVertexNormals();
     const mat = new THREE.MeshStandardMaterial({
       color: 0xB8C0C8, metalness: 0.35, roughness: 0.45, side: THREE.FrontSide,
+      polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     });
-    group.add(new THREE.Mesh(geo, mat));
+    const solid = new THREE.Mesh(geo, mat);
+    solid.userData.solidStep = true;
+    group.add(solid);
     // Model centered at origin; frame the camera only when asked (first solid,
     // and again on expand-to-full) so the orbit isn't reset on every accretion.
     group.position.set(0, 0, 0);
@@ -913,6 +933,24 @@ const LiveBuild = (() => {
     const center = box.getCenter(new THREE.Vector3());
     group.position.sub(center);
     if (frame) _reframe();
+    // Feature build animation (0.25s) against the previous solid.
+    const kind = classifyStepKind(data.name || '');
+    if (data.sketch_overlay) {
+      const pl = sketchPlaneFromOverlay(data.sketch_overlay, data.overlay_arcs);
+      if (pl) _paneLastPlane = pl;
+    }
+    if (kind === 'sketch') {
+      if (prevSolid) {
+        if (prevSolid.geometry) prevSolid.geometry.dispose();
+        if (prevSolid.material) prevSolid.material.dispose();
+        group.remove(prevSolid);
+      }
+    } else {
+      const effKind = (kind === 'revolve' || kind === 'fade') ? kind
+        : (_paneLastPlane ? kind : 'fade');
+      animateFeatureTransition(group, prevSolid, solid, effKind,
+                               _paneLastPlane, renderer);
+    }
   }
 
   function _reframe() {
@@ -1116,6 +1154,180 @@ function _syncMainCamera(pos, target) {
 });
 
 // ── Load step geometry ──
+// ---------------------------------------------------------------------------
+// Feature build animations (0.25s per feature): extrusions grow out of their
+// sketch plane, cuts/holes vanish along the drill direction, revolves sweep
+// around their axis, fillets/booleans cross-fade. Implemented with world-space
+// clipping planes over the (previous solid, new solid) pair — the new solid is
+// identical to the old outside the feature, so sweeping a clip plane reads as
+// the feature itself growing/cutting.
+const FEATURE_ANIM_MS = 250;
+let _featAnim = null;          // { raf, cleanup }
+
+function cancelFeatureAnim() {
+  if (_featAnim) {
+    try { _featAnim.cleanup(); } catch (e) {}
+    if (_featAnim.raf) cancelAnimationFrame(_featAnim.raf);
+    _featAnim = null;
+  }
+}
+
+function classifyStepKind(name) {
+  const n = name || '';
+  if (/^sketch/i.test(n)) return 'sketch';
+  if (/revolve/i.test(n)) return 'revolve';
+  if (/hole|\(cut|^cut\b|pocket|slot|recess|oval cut|cutout/i.test(n)) return 'cut';
+  if (/extrude|join|boss|pads|member|union/i.test(n)) return 'add';
+  return 'fade';               // fillet / chamfer / boolean / refined
+}
+
+// Sketch plane from a step's overlay: the axis along which every overlay
+// point is ~constant, in MODEL-LOCAL coordinates.
+function sketchPlaneFromOverlay(overlayFlat, arcs) {
+  try {
+    if (overlayFlat && overlayFlat.length >= 9) {
+      const n = Math.floor(overlayFlat.length / 3);
+      const mins = [Infinity, Infinity, Infinity], maxs = [-Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < n; i++) {
+        for (let a = 0; a < 3; a++) {
+          const v = overlayFlat[i * 3 + a];
+          if (v < mins[a]) mins[a] = v;
+          if (v > maxs[a]) maxs[a] = v;
+        }
+      }
+      for (let a = 0; a < 3; a++) {
+        if (maxs[a] - mins[a] < 0.5) return { axis: a, pos: (maxs[a] + mins[a]) / 2 };
+      }
+    }
+    if (arcs && arcs.length && arcs[0].ax !== undefined) {
+      return { axis: arcs[0].ax, pos: arcs[0].pos };
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Animate the transition prevMesh -> newMesh inside `group`. Both must already
+// be children of the (possibly re-centred) group; on completion prevMesh is
+// removed + disposed and all clipping cleared.
+function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendererRef) {
+  cancelFeatureAnim();
+  const disposePrev = () => {
+    if (prevMesh && prevMesh.parent) prevMesh.parent.remove(prevMesh);
+    if (prevMesh) {
+      if (prevMesh.geometry) prevMesh.geometry.dispose();
+      if (prevMesh.material) prevMesh.material.dispose();
+    }
+  };
+  if (!newMesh) { disposePrev(); return; }
+  // World-space offset of the model along each axis (group recentring).
+  newMesh.updateWorldMatrix(true, false);
+  const w = new THREE.Vector3();
+  newMesh.getWorldPosition(w);
+  const off = [w.x, w.y, w.z];
+  if (!newMesh.geometry.boundingBox) newMesh.geometry.computeBoundingBox();
+  const bb = newMesh.geometry.boundingBox;
+  const mins = [bb.min.x, bb.min.y, bb.min.z];
+  const maxs = [bb.max.x, bb.max.y, bb.max.z];
+
+  const t0 = performance.now();
+  const finish = () => {
+    newMesh.material.clippingPlanes = null;
+    newMesh.material.clipIntersection = false;
+    newMesh.material.transparent = false;
+    newMesh.material.opacity = 1.0;
+    newMesh.material.needsUpdate = true;
+    disposePrev();
+    _featAnim = null;
+  };
+
+  if (kind === 'fade' || (!plane && kind !== 'revolve')) {
+    newMesh.material.transparent = true;
+    newMesh.material.opacity = 0.0;
+    const tick = () => {
+      const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_MS);
+      newMesh.material.opacity = t;
+      if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
+      else finish();
+    };
+    _featAnim = { raf: requestAnimationFrame(tick), cleanup: finish };
+    return;
+  }
+
+  if (kind === 'revolve') {
+    // Wedge sweep about the model's thinnest axis through the bbox centre.
+    const dims = [maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2]];
+    let ax = 0;
+    if (dims[1] < dims[ax]) ax = 1;
+    if (dims[2] < dims[ax]) ax = 2;
+    const u = (ax + 1) % 3, v = (ax + 2) % 3;
+    const c = [(mins[0] + maxs[0]) / 2 + off[0], (mins[1] + maxs[1]) / 2 + off[1],
+               (mins[2] + maxs[2]) / 2 + off[2]];
+    const mkN = (cu, cv) => {
+      const n = new THREE.Vector3();
+      n.setComponent(u, cu);
+      n.setComponent(v, cv);
+      return n;
+    };
+    const p1 = new THREE.Plane(mkN(0, 1), 0);
+    const p2 = new THREE.Plane(mkN(0, -1), 0);
+    const cvec = new THREE.Vector3(c[0], c[1], c[2]);
+    const setTheta = (th) => {
+      p1.normal.copy(mkN(0, 1));
+      p1.constant = -p1.normal.dot(cvec);
+      p2.normal.copy(mkN(Math.sin(th), -Math.cos(th)));
+      p2.constant = -p2.normal.dot(cvec);
+      newMesh.material.clipIntersection = th > Math.PI;
+    };
+    newMesh.material.clippingPlanes = [p1, p2];
+    setTheta(0.02);
+    const tick = () => {
+      const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_MS);
+      setTheta(Math.max(0.02, t * 2 * Math.PI * 0.999));
+      if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
+      else finish();
+    };
+    _featAnim = { raf: requestAnimationFrame(tick), cleanup: finish };
+    return;
+  }
+
+  // add / cut: linear clip sweep along the sketch plane's normal axis,
+  // starting at the sketch side of the model.
+  const ax = plane.axis;
+  const lo = mins[ax], hi = maxs[ax];
+  const fromLow = Math.abs(plane.pos - lo) <= Math.abs(plane.pos - hi);
+  const start = (fromLow ? lo : hi) + off[ax];
+  const end = (fromLow ? hi : lo) + off[ax];
+  const e = new THREE.Vector3();
+  e.setComponent(ax, fromLow ? 1 : -1);
+  const clip = new THREE.Plane();
+  const target = (kind === 'cut' && prevMesh) ? prevMesh : newMesh;
+  if (kind === 'cut' && prevMesh) {
+    // OLD material vanishes along the drill direction: keep the far side.
+    clip.normal.copy(e);
+    prevMesh.material.polygonOffset = true;
+    prevMesh.material.polygonOffsetFactor = 0;   // draw over the new mesh
+    prevMesh.material.polygonOffsetUnits = 0;
+  } else {
+    // NEW material appears along the extrude direction: keep the near side.
+    clip.normal.copy(e).negate();
+  }
+  target.material.clippingPlanes = [clip];
+  target.material.needsUpdate = true;
+  const tick = () => {
+    const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_MS);
+    const L = start + (end - start) * t;
+    clip.constant = -(clip.normal.getComponent(ax)) * L;
+    if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
+    else finish();
+  };
+  _featAnim = { raf: requestAnimationFrame(tick), cleanup: finish };
+}
+
+// Per-viewer sketch-plane memory (a feature step animates from the plane of
+// the sketch step displayed just before it).
+let _mainLastSketchPlane = null;
+let _mainLastStepIndex = -2;
+
 async function loadStep(index) {
   console.debug('[loadStep]', index, 'of', steps.length, 'jobId:', currentJobId);
   // Leave edge-pick mode if active (the model is about to be replaced).
@@ -1150,10 +1362,15 @@ async function loadStep(index) {
     return;
   }
 
-  // Clear previous model — dispose geometry/materials to free GPU memory
+  // Clear previous model — dispose geometry/materials to free GPU memory.
+  // The previous SOLID is kept aside so the new feature can animate against
+  // it (0.25s grow/cut sweep); the animation disposes it when done.
+  cancelFeatureAnim();
+  const prevSolid = modelGroup.children.find(
+    c => c.userData && c.userData.solidStep) || null;
   const disposed = modelGroup.children.length;
-  while (modelGroup.children.length) {
-    const child = modelGroup.children[0];
+  for (const child of modelGroup.children.slice()) {
+    if (child === prevSolid) continue;
     if (child.geometry) child.geometry.dispose();
     if (child.material) {
       if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
@@ -1161,6 +1378,12 @@ async function loadStep(index) {
     }
     modelGroup.remove(child);
   }
+  const dropPrevSolid = () => {
+    if (!prevSolid) return;
+    if (prevSolid.geometry) prevSolid.geometry.dispose();
+    if (prevSolid.material) prevSolid.material.dispose();
+    modelGroup.remove(prevSolid);
+  };
   if (disposed > 0) console.debug('[loadStep] disposed', disposed, 'previous objects');
 
   try {
@@ -1168,6 +1391,11 @@ async function loadStep(index) {
     const indices = data.faces;
 
     if (data.is_sketch && !data.sketch_overlay) {
+      dropPrevSolid();
+      const _pl0 = sketchPlaneFromOverlay(
+        Array.from(new Float32Array(data.vertices)), data.overlay_arcs);
+      if (_pl0) _mainLastSketchPlane = _pl0;
+      _mainLastStepIndex = index;
       console.debug('[loadStep] rendering sketch, edges:', Math.floor(indices.length / 3));
       // Draw as lines using face indices (each degenerate tri = one edge)
       const points = [];
@@ -1219,7 +1447,29 @@ async function loadStep(index) {
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
+      mesh.userData.solidStep = true;
       modelGroup.add(mesh);
+
+      // Feature build animation (0.25s): grow/cut/revolve against the
+      // previous solid. Sketch steps just record their plane; a jump to a
+      // non-adjacent step cross-fades (the cached plane belongs elsewhere).
+      const stepName = data.name
+        || (typeof steps !== 'undefined' && steps[index] && steps[index].name) || '';
+      const kind = classifyStepKind(stepName);
+      if (data.sketch_overlay) {
+        const _pl = sketchPlaneFromOverlay(data.sketch_overlay, data.overlay_arcs);
+        if (_pl) _mainLastSketchPlane = _pl;
+      }
+      if (kind === 'sketch') {
+        dropPrevSolid();
+      } else {
+        const seq = index === _mainLastStepIndex + 1;
+        const plane = seq ? _mainLastSketchPlane : null;
+        const effKind = (kind === 'revolve' || kind === 'fade') ? kind
+          : (plane ? kind : 'fade');
+        animateFeatureTransition(modelGroup, prevSolid, mesh, effKind, plane, renderer);
+      }
+      _mainLastStepIndex = index;
 
       // If this step has a sketch overlay, draw visible blue edges on top of the solid
       if (data.sketch_overlay && data.sketch_overlay.length >= 6) {
@@ -1383,7 +1633,183 @@ function updateActiveStates() {
   });
   // Deactivate special buttons
   document.querySelectorAll('.timeline-special').forEach(el => el.classList.remove('active'));
+  // NOTE: the right-sidebar Stages cards are highlighted by the stages module
+  // itself (selectStage / _setActiveStageCard), not here — they no longer map
+  // 1:1 to construction steps (the whole build is a single "Final model" card).
 }
+
+// ─── Live stages panel (right sidebar, under Dimensions) ─────────────────────
+// One card per VISUAL STAGE that displays on the left during a run: the analysis
+// stages (segmentation, topology, … captured from progress_geometry), then a
+// SINGLE card for the whole CAD build — "Build model" while building, relabelled
+// "Final model" when done. (We deliberately do NOT show one card per applied
+// feature — the bottom timeline / feature tree already do that.)
+//
+// FOLLOW vs PINNED. While "following" (the default) the panel tracks the live
+// run: the status poll renders the latest stage on the left and the list
+// auto-scrolls to the newest card. Clicking an OLDER stage PINS it — the poll
+// stops overwriting the left pane (`stagesFollowing()` gate) AND, once the build
+// pane has expanded to full screen, the pinned stage is shown in the main screen
+// (LiveBuild is dismissed to reveal it). It stays until you click that card
+// again (toggle off) or click the "Final/Build model" card at the bottom, which
+// resumes follow and returns to the final model. Auto-scroll is suppressed while
+// pinned so a manual scroll-up isn't yanked back.
+let _stages = [];            // [{kind:'analysis'|'build'|'final', label, pg?, el}]
+let _stageFollow = true;     // track the live run/final model vs. a pinned stage
+let _stagesJobId = null;
+let _currentStageLabel = null;  // the stage running right now (highlight + loader)
+let _stageNumSteps = 0;      // latest construction step count (for "Final model")
+
+function stagesFollowing() { return _stageFollow; }
+
+function resetStagesPanel() {
+  _stages = []; _stageFollow = true; _stagesJobId = null;
+  _currentStageLabel = null; _stageNumSteps = 0;
+  const list = document.getElementById('stages-list');
+  const panel = document.getElementById('stages-panel');
+  if (list) list.innerHTML = '';
+  if (panel) panel.style.display = 'none';
+  const cnt = document.getElementById('stages-count');
+  if (cnt) cnt.textContent = '';
+}
+
+function _addStageCard(stage, idx) {
+  const list = document.getElementById('stages-list');
+  if (!list) return;
+  const card = document.createElement('div');
+  card.className = 'stage-card';
+  const label = stage.label || ('Stage ' + (idx + 1));
+  const safe = label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  card.innerHTML =
+    '<div class="stage-idx">' + (idx + 1) + '</div>' +
+    '<div class="stage-name" title="' + safe + '">' + safe + '</div>' +
+    '<i class="ri-check-line stage-tick"></i>' +
+    '<div class="stage-loader"></div>';
+  card.onclick = () => selectStage(idx);
+  stage.el = card;
+  list.appendChild(card);
+  if (_stageFollow) list.scrollTop = list.scrollHeight;  // only auto-scroll while following
+}
+
+function _setActiveStageCard(ci) {
+  _stages.forEach((s, i) => { if (s.el) s.el.classList.toggle('active', i === ci); });
+}
+
+function _stageSetLabel(stage, label) {
+  if (stage.label === label) return;
+  stage.label = label;
+  if (stage.el) {
+    const nm = stage.el.querySelector('.stage-name');
+    if (nm) { nm.textContent = label; nm.title = label; }
+  }
+}
+
+// Index of the card for the stage currently running (by label).
+function _currentStageIdx() {
+  if (_currentStageLabel == null) return _stages.length - 1;
+  const i = _stages.findIndex(s => s.label === _currentStageLabel);
+  return i >= 0 ? i : _stages.length - 1;
+}
+
+// Resume following the live run / return to the final model.
+function _stageResumeFollow() {
+  _stageFollow = true;
+  const finalIdx = _stages.findIndex(s => s.kind === 'final');
+  if (finalIdx >= 0 && _stageNumSteps > 0) {
+    // Build finished → reveal the final model in the interactive main viewer.
+    try { LiveBuild.dismiss(); } catch (e) {}
+    loadStep(_stageNumSteps - 1);
+    _setActiveStageCard(finalIdx);
+  } else {
+    // Still running → highlight + re-show the current stage; the poll keeps it advancing.
+    const ci = _currentStageIdx();
+    const cur = _stages[ci];
+    _setActiveStageCard(ci);
+    if (cur && cur.pg) {
+      window._explodePiecesVersion = null;
+      try { _renderProgressGeometry(cur.pg); } catch (e) {}
+    }
+  }
+}
+
+// Click a stage card. The "Final model" card, the current/live stage, or
+// re-clicking the active pinned card RESUME follow; clicking any other stage
+// that HAS a stored visual PINS it into the main screen.
+function selectStage(ci) {
+  const stage = _stages[ci];
+  if (!stage) return;
+  const isCurrent = (ci === _currentStageIdx());
+  const alreadyActive = !!(stage.el && stage.el.classList.contains('active'));
+  if (stage.kind === 'final' || isCurrent || alreadyActive || !stage.pg) {
+    _stageResumeFollow();
+    return;
+  }
+  // Pin this stage: reveal the main viewer (in case the build pane expanded to
+  // full) and render the stored snapshot there. Reset the pieces version guard
+  // so _renderProgressGeometry doesn't early-return.
+  _stageFollow = false;
+  try { LiveBuild.dismiss(); } catch (e) {}
+  window._explodePiecesVersion = null;
+  try { _renderProgressGeometry(stage.pg); } catch (e) { console.warn('[stage] render failed', e); }
+  _setActiveStageCard(ci);
+}
+
+function updateStagesPanel(jobId, d) {
+  const panel = document.getElementById('stages-panel');
+  const list = document.getElementById('stages-list');
+  if (!panel || !list) return;
+  if (jobId !== _stagesJobId) {            // new run → start fresh
+    _stagesJobId = jobId; _stages = []; _currentStageLabel = null;
+    _stageFollow = true; _stageNumSteps = 0; list.innerHTML = '';
+  }
+  _stageNumSteps = (d.num_steps || (d.steps || []).length) || _stageNumSteps;
+
+  // ONE card per UNIQUE pipeline STAGE NAME — exactly what the loading text /
+  // left panel shows (segmentation, fitting, topology, recognizing, blend,
+  // stitch, …). Driven purely by the stage NAME, never by build-state: on a
+  // multi-body part the CAD build of body 1 streams (building_live / num_steps)
+  // WHILE later bodies are still in topology/recognize, so build-state would
+  // wrongly cut the list off. The per-feature construction STEPS (d.steps) are
+  // deliberately NOT carded. "Building CAD model" collapses to one "Build model"
+  // card. The geometry snapshot is stored when present so a click re-shows it.
+  const raw = d.stage || (d.progress_geometry && d.progress_geometry.stage) || '';
+  const isCad = /cad model/i.test(raw);
+  const lbl = isCad ? 'Build model' : raw;
+  if (lbl && d.status === 'processing') {
+    let card = _stages.find(s => s.label === lbl);
+    if (!card) {
+      card = { kind: isCad ? 'build' : 'analysis', label: lbl, pg: d.progress_geometry || null };
+      _stages.push(card); _addStageCard(card, _stages.length - 1);
+    } else if (d.progress_geometry) {
+      card.pg = d.progress_geometry;       // refresh snapshot for re-show
+    }
+    _currentStageLabel = lbl;
+  }
+
+  // "Final model" — a dedicated card at the BOTTOM once the build is done; this
+  // is the default view and the "return to the final model" target.
+  if (d.status === 'done' && _stageNumSteps > 0
+      && !_stages.some(s => s.kind === 'final')) {
+    const fin = { kind: 'final', label: 'Final model', pg: null };
+    _stages.push(fin); _addStageCard(fin, _stages.length - 1);
+    _currentStageLabel = 'Final model';
+  }
+
+  if (_stages.length > 0) panel.style.display = 'flex';
+  const cnt = document.getElementById('stages-count');
+  if (cnt) cnt.textContent = _stages.length ? (_stages.length + ' stage' + (_stages.length > 1 ? 's' : '')) : '';
+
+  // Loading bar on the CURRENT stage's card while the pipeline is still working.
+  const building = (d.status === 'processing' || d.status === 'queued') && !d.paused;
+  const ci = _currentStageIdx();
+  _stages.forEach((s, i) => { if (s.el) s.el.classList.toggle('loading', building && i === ci); });
+
+  // While following, highlight the CURRENT stage card (it's what's on the left).
+  if (_stageFollow && _stages.length) _setActiveStageCard(ci);
+}
+window.toggleStagesPanel = function() {
+  document.getElementById('stages-panel').classList.toggle('collapsed');
+};
 
 // ─── Feature-tree editor (StudioCAD-style) ───────────────────────────────────
 // Top bar adds finishing features (fillet/chamfer) and the feature list lets you
@@ -1737,6 +2163,12 @@ function populateUI(statusData) {
   list.innerHTML = '';
   timeline.innerHTML = '';
   steps = statusData.steps;
+
+  // Keep the right-sidebar Stages panel in sync on every full render — covers
+  // non-live paths the status poll doesn't drive (variant switch, cached
+  // restore). It rebuilds when the step set changed; status 'done' here means
+  // all cards settle (no loaders).
+  updateStagesPanel(statusData.job_id || currentJobId, statusData);
 
   // (Icon mapping moved to the module-level featureRowInnerHTML helper so the
   // sidebar and live-build trees render identically.)
@@ -2273,6 +2705,7 @@ async function previewFile(file) {
     // Reset UI from any previous job
     document.getElementById('feature-list').innerHTML = '';
     document.getElementById('timeline').innerHTML = '';
+    resetStagesPanel();
     currentStep = -1;
     currentJobId = null;
     // If a previous analysis left the dual/expanded build pane up (live-split or
@@ -3078,8 +3511,10 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             }
           }
 
-          // Render progress geometry on the 3D model (LEFT pane = analysis)
-          if (d.progress_geometry) {
+          // Render progress geometry on the 3D model (LEFT pane = analysis).
+          // Skip while the user has PINNED an older stage card (not following),
+          // so their pinned visual isn't overwritten every 500ms.
+          if (d.progress_geometry && stagesFollowing()) {
             _renderProgressGeometry(d.progress_geometry);
           }
 
@@ -3097,6 +3532,11 @@ document.getElementById('btn-analyze').addEventListener('click', async () => {
             LiveBuild.show();
             LiveBuild.update(myJobId, d.num_steps || 0, d.steps_version || 0);
           }
+
+          // Stream construction stages into the right-sidebar Stages panel
+          // (cards pop in, newest shows a loading bar). Runs every poll so the
+          // final 'done' tick clears the loader and shows all ticks.
+          updateStagesPanel(myJobId, d);
 
           // Update debug summary panel (visible only when Debug toggle is on).
           // Group lines per body so the user can scan one body's stages at a

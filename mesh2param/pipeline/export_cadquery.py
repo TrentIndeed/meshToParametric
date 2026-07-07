@@ -3430,6 +3430,18 @@ def _detect_face_ring_recesses(cleaned, extrude_dir,
                                 "of the face section %.0f)",
                                 filled.area, sect_area)
                             continue
+                        elif through and (float(filled.area)
+                                          < 0.018 * sect_area):
+                            # A THROUGH window is a major feature (real
+                            # vents/ovals measure >=2.6% of their face); a
+                            # through "slot" under ~2% is an AI-mesh dent
+                            # punched through (the motor plate's six
+                            # ~250mm² slots on the boss face).
+                            logger.info(
+                                "Through ring recess area %.0f skipped "
+                                "(< 1.8%% of the face section %.0f)",
+                                filled.area, sect_area)
+                            continue
                         out.append({
                             "plane_name": {0: "YZ", 1: "XZ", 2: "XY"}[axis],
                             "axis": axis, "face_t": face_t, "sign": sign,
@@ -3762,10 +3774,15 @@ def _detect_tangent_holes(cleaned, extrude_dir):
 
 
 def _merge_coplanar_hole_steps(steps) -> None:
-    """Merge consecutive (Sketch, Through-Hole) pairs whose sketches lie on
-    the SAME plane into ONE sketch (all circles) + ONE cut — how a CAD user
-    drills a plate: one sketch per face, every through hole in it. Blind
-    holes keep their own steps (different depths are separate features)."""
+    """Merge consecutive (Sketch, op) pairs that share a PLANE and a
+    FEATURE LENGTH into ONE sketch (all profiles) + ONE op — how a CAD
+    user works: one sketch per face, then one cut/extrude at each depth.
+    Applies to holes (through, or blind at the same depth), cut extrudes,
+    and join extrudes; op classes never mix."""
+    import re as _re
+
+    _len_re = _re.compile(r"depth\s*([\d.]+)|\((?:[\d]+× )?([\d.]+)mm\)")
+
     def _plane_of(s):
         try:
             ov = s.sketch_overlay
@@ -3787,31 +3804,65 @@ def _merge_coplanar_hole_steps(steps) -> None:
             pass
         return None
 
-    def _pair_plane(i):
+    def _op_class(nm):
+        if "Hole" in nm:
+            return "hole"
+        if nm.startswith(("Extrude Join", "Union Extrude")):
+            return "join"
+        if nm.startswith(("Cut Extrude", "Pocket", "Slot Cut", "Oval Cut",
+                          "Recess Cut")):
+            return "cut"
+        return None
+
+    def _feat_len(nm):
+        if "through" in nm.lower():
+            return "through"
+        m = _len_re.search(nm)
+        if m:
+            return round(float(m.group(1) or m.group(2)), 1)
+        return None
+
+    def _pair_key(i):
         if i + 1 >= len(steps):
             return None
         a, b = steps[i], steps[i + 1]
         if not (a.name or "").startswith("Sketch"):
             return None
-        if "Through" not in (b.name or "") or "Hole" not in (b.name or ""):
+        cls = _op_class(b.name or "")
+        if cls is None:
             return None
-        return _plane_of(a)
+        ln = _feat_len(b.name or "")
+        if ln is None:
+            return None
+        pl = _plane_of(a)
+        if pl is None:
+            return None
+        return (cls, ln, pl)
 
-    def _same_plane(a, b):
-        return (a is not None and b is not None and a[0] == b[0]
-                and abs(a[1] - b[1]) < 2.0)
+    def _same_key(a, b):
+        if a is None or b is None or a[0] != b[0]:
+            return False
+        la, lb = a[1], b[1]
+        if isinstance(la, str) != isinstance(lb, str):
+            return False
+        if isinstance(la, str):
+            if la != lb:
+                return False
+        elif abs(la - lb) > 0.3:
+            return False
+        return a[2][0] == b[2][0] and abs(a[2][1] - b[2][1]) < 2.0
 
     out = []
     i = 0
     while i < len(steps):
-        pl = _pair_plane(i)
-        if pl is None:
+        key = _pair_key(i)
+        if key is None:
             out.append(steps[i])
             i += 1
             continue
         run = [i]
         j = i + 2
-        while _same_plane(_pair_plane(j), pl):
+        while _same_key(_pair_key(j), key):
             run.append(j)
             j += 2
         if len(run) == 1:
@@ -3830,11 +3881,24 @@ def _merge_coplanar_hole_steps(steps) -> None:
         if ovs:
             sk0.sketch_overlay = np.vstack(ovs)
         sk0.overlay_arcs = arcs or None
-        sk0.name = f"Sketch Holes ({len(run)} on one plane)"
-        last_cut = steps[run[-1] + 1]
-        last_cut.name = f"Through Holes ×{len(run)}"
+        cls, ln, _pl = key
+        _thr = ln == "through"
+        _len_sfx = "" if _thr else f", depth {ln}mm"
+        n = len(run)
+        last = steps[run[-1] + 1]
+        if cls == "hole":
+            sk0.name = f"Sketch Holes ({n} on one plane)"
+            last.name = (f"Through Holes ×{n}" if _thr
+                         else f"Blind Holes ×{n} (depth {ln}mm)")
+        elif cls == "join":
+            sk0.name = f"Sketch Joins ({n} on one plane)"
+            last.name = f"Extrude Join ×{n} ({ln}mm)"
+        else:
+            sk0.name = f"Sketch Cuts ({n} on one plane)"
+            last.name = (f"Cut Extrude ×{n} (through)" if _thr
+                         else f"Cut Extrude ×{n} (depth {ln}mm)")
         out.append(sk0)
-        out.append(last_cut)
+        out.append(last)
         i = run[-1] + 2
     steps[:] = out
 
@@ -4443,7 +4507,7 @@ def _build_stepwise(
             wp = _wp_joined_j
             v_j, f_j = _tessellate_solid(wp, fast=True)
             steps.append(ConstructionStep(
-                name=f"Extrude Join {ji}",
+                name=f"Extrude Join {ji} ({j_len:.1f}mm)",
                 tess_vertices=v_j, tess_faces=f_j,
                 volume=abs(float(wp.val().Volume())),
             ))
@@ -4939,13 +5003,15 @@ def _build_stepwise(
         for _cc in centers_all:
             _drilled_bores.append((np.asarray(_cc, dtype=float), radius))
         n_holes = len(centers_all)
+        _d_sfx = "" if is_through else f", depth {h_depth:.1f}mm"
         if n_holes > 1:
             hole_name = (
                 f"{'Through' if is_through else 'Blind'} Hole Pattern "
-                f"({n_holes}× r={radius:.1f})"
+                f"({n_holes}× r={radius:.1f}{_d_sfx})"
             )
         else:
-            hole_name = f"{'Through' if is_through else 'Blind'} Hole (r={radius:.1f})"
+            hole_name = (f"{'Through' if is_through else 'Blind'} Hole "
+                         f"(r={radius:.1f}{_d_sfx})")
         if note:
             hole_name += f" — {note}"
 
@@ -5389,11 +5455,14 @@ def _build_stepwise(
                 # A ring whose void exits the far side (or merges into the
                 # cavity) is a THROUGH hole — say so; "Blind" on a through
                 # hole reads as two pocket cuts in the feature tree.
-                _kind = ("Through Hole"
-                         if all(g.get("through") for g in grp)
-                         else "Blind Hole")
+                _is_thru_g = all(g.get("through") for g in grp)
+                _kind = "Through Hole" if _is_thru_g else "Blind Hole"
+                _dg_sfx = ("" if _is_thru_g
+                           else f" (depth {rr0['depth']:.1f}mm)")
                 _nm = (f"{_kind} Pattern ⌀{2 * r_g:.1f}mm ×{len(grp)}"
-                       if len(grp) > 1 else f"{_kind} ⌀{2 * r_g:.1f}mm")
+                       f"{_dg_sfx}"
+                       if len(grp) > 1
+                       else f"{_kind} ⌀{2 * r_g:.1f}mm{_dg_sfx}")
                 v, f = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
                     name=_nm, tess_vertices=v, tess_faces=f,

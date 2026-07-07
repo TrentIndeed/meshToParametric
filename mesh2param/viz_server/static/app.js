@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim2 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260707-anim3 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -928,8 +928,11 @@ const LiveBuild = (() => {
     group.add(solid);
     // Model centered at origin; frame the camera only when asked (first solid,
     // and again on expand-to-full) so the orbit isn't reset on every accretion.
+    // Centre on the NEW solid alone — the previous solid kept for the
+    // animation would otherwise skew the bbox at cut steps and make the
+    // model shift a little between steps.
     group.position.set(0, 0, 0);
-    const box = new THREE.Box3().setFromObject(group);
+    const box = new THREE.Box3().setFromObject(solid);
     const center = box.getCenter(new THREE.Vector3());
     group.position.sub(center);
     if (frame) _reframe();
@@ -1251,6 +1254,47 @@ function sketchPlaneFromOverlay(overlayFlat, arcs) {
   return null;
 }
 
+// Extent of the CHANGED region (triangles present in only one of the two
+// solids) along `ax`, in model-local coordinates — so a 2.3mm foot animates
+// across its own 2.3mm, not across the whole 50mm part in a blink.
+function changedExtentAlongAxis(prevMesh, newMesh, ax) {
+  if (!prevMesh || !newMesh) return null;
+  const pp = prevMesh.geometry.getAttribute('position');
+  const np = newMesh.geometry.getAttribute('position');
+  if (!pp || !np || pp.count > 600000 || np.count > 600000) return null;
+  const vkey = (attr, i) =>
+    Math.round(attr.getX(i) * 10) + ',' + Math.round(attr.getY(i) * 10)
+    + ',' + Math.round(attr.getZ(i) * 10);
+  const tkey = (attr, t) => {
+    const ks = [vkey(attr, t * 3), vkey(attr, t * 3 + 1), vkey(attr, t * 3 + 2)];
+    ks.sort();
+    return ks.join('|');
+  };
+  const setOf = (attr) => {
+    const s = new Set();
+    const n = Math.floor(attr.count / 3);
+    for (let t = 0; t < n; t++) s.add(tkey(attr, t));
+    return s;
+  };
+  const pSet = setOf(pp), nSet = setOf(np);
+  let lo = Infinity, hi = -Infinity;
+  const scan = (attr, other) => {
+    const n = Math.floor(attr.count / 3);
+    for (let t = 0; t < n; t++) {
+      if (other.has(tkey(attr, t))) continue;
+      for (let k = 0; k < 3; k++) {
+        const v = attr.getComponent(t * 3 + k, ax);
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    }
+  };
+  scan(np, pSet);
+  scan(pp, nSet);
+  if (!(hi > lo)) return null;
+  return { lo, hi };
+}
+
 // Animate the transition prevMesh -> newMesh inside `group`. Both must already
 // be children of the (possibly re-centred) group; on completion prevMesh is
 // removed + disposed and all clipping cleared.
@@ -1274,7 +1318,7 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
   const mins = [bb.min.x, bb.min.y, bb.min.z];
   const maxs = [bb.max.x, bb.max.y, bb.max.z];
 
-  const t0 = performance.now();
+  let t0 = performance.now();
   const finish = () => {
     newMesh.material.clippingPlanes = null;
     newMesh.material.clipIntersection = false;
@@ -1361,12 +1405,21 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
   }
 
   // add / cut: linear clip sweep along the sketch plane's normal axis,
-  // starting at the sketch side of the model.
+  // starting at the sketch side. The sweep covers the CHANGED region's own
+  // extent (not the whole part), so the full 0.25s is spent on the feature.
   const ax = plane.axis;
-  const lo = mins[ax], hi = maxs[ax];
+  let lo = mins[ax], hi = maxs[ax];
+  try {
+    const ext = changedExtentAlongAxis(prevMesh, newMesh, ax);
+    if (ext && ext.hi - ext.lo > 0.05) {
+      lo = Math.max(lo, ext.lo - 0.4);
+      hi = Math.min(hi, ext.hi + 0.4);
+    }
+  } catch (e) {}
   const fromLow = Math.abs(plane.pos - lo) <= Math.abs(plane.pos - hi);
   const start = (fromLow ? lo : hi) + off[ax];
   const end = (fromLow ? hi : lo) + off[ax];
+  t0 = performance.now();   // the diff above must not eat the 0.25s
   const e = new THREE.Vector3();
   e.setComponent(ax, fromLow ? 1 : -1);
   const clip = new THREE.Plane();

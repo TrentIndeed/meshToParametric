@@ -443,7 +443,7 @@ def export_cadquery(
                 # OVER the mesh volume; accept a generous window.
                 _rerr = (_rev0.cad_volume - mesh_volume) / mesh_volume
                 if -0.05 <= _rerr <= 0.30:
-                    _revolve_base = _rev0.solid
+                    _revolve_base = {"solid": _rev0.solid, "sg": _rev_sg0}
                     logger.info(
                         "Revolve adopted as BASE feature (vol %+.1f%% "
                         "before holes)", 100 * _rerr)
@@ -1188,6 +1188,7 @@ def export_cadquery(
     if (getattr(cleaned, "metadata", None) or {}).get("scan_mode"):
         for _v in variants:
             try:
+                _merge_coplanar_hole_steps(_v.construction_steps)
                 _onshape_step_names(_v.construction_steps)
             except Exception:
                 logger.debug("step rename failed", exc_info=True)
@@ -3760,6 +3761,84 @@ def _detect_tangent_holes(cleaned, extrude_dir):
         return []
 
 
+def _merge_coplanar_hole_steps(steps) -> None:
+    """Merge consecutive (Sketch, Through-Hole) pairs whose sketches lie on
+    the SAME plane into ONE sketch (all circles) + ONE cut — how a CAD user
+    drills a plate: one sketch per face, every through hole in it. Blind
+    holes keep their own steps (different depths are separate features)."""
+    def _plane_of(s):
+        try:
+            ov = s.sketch_overlay
+            if ov is not None and len(ov):
+                pts = np.asarray(ov, float).reshape(-1, 3)
+                for ax in range(3):
+                    if float(np.ptp(pts[:, ax])) < 0.5:
+                        return (ax, round(float(np.mean(pts[:, ax])), 1))
+            arcs = s.overlay_arcs
+            if arcs:
+                ax = arcs[0].get("ax")
+                pos = arcs[0].get("pos")
+                if (ax is not None and pos is not None
+                        and all(a.get("ax") == ax
+                                and abs(float(a.get("pos", 0)) - pos) < 0.5
+                                for a in arcs)):
+                    return (int(ax), round(float(pos), 1))
+        except Exception:
+            pass
+        return None
+
+    def _pair_plane(i):
+        if i + 1 >= len(steps):
+            return None
+        a, b = steps[i], steps[i + 1]
+        if not (a.name or "").startswith("Sketch"):
+            return None
+        if "Through" not in (b.name or "") or "Hole" not in (b.name or ""):
+            return None
+        return _plane_of(a)
+
+    def _same_plane(a, b):
+        return (a is not None and b is not None and a[0] == b[0]
+                and abs(a[1] - b[1]) < 2.0)
+
+    out = []
+    i = 0
+    while i < len(steps):
+        pl = _pair_plane(i)
+        if pl is None:
+            out.append(steps[i])
+            i += 1
+            continue
+        run = [i]
+        j = i + 2
+        while _same_plane(_pair_plane(j), pl):
+            run.append(j)
+            j += 2
+        if len(run) == 1:
+            out.append(steps[i])
+            out.append(steps[i + 1])
+            i += 2
+            continue
+        sk0 = steps[run[0]]
+        ovs = [np.asarray(steps[k].sketch_overlay, float).reshape(-1, 3)
+               for k in run
+               if steps[k].sketch_overlay is not None
+               and len(steps[k].sketch_overlay)]
+        arcs = []
+        for k in run:
+            arcs.extend(steps[k].overlay_arcs or [])
+        if ovs:
+            sk0.sketch_overlay = np.vstack(ovs)
+        sk0.overlay_arcs = arcs or None
+        sk0.name = f"Sketch Holes ({len(run)} on one plane)"
+        last_cut = steps[run[-1] + 1]
+        last_cut.name = f"Through Holes ×{len(run)}"
+        out.append(sk0)
+        out.append(last_cut)
+        i = run[-1] + 2
+    steps[:] = out
+
+
 def _onshape_step_names(steps) -> None:
     """Rename construction steps IN PLACE to Onshape feature vocabulary:
     "Sketch N (…)", "Extrude N (Base|Join|Cut, …)", "Hole N (…)",
@@ -3788,7 +3867,7 @@ def _onshape_step_names(steps) -> None:
             # "Through Hole Pattern ⌀9.0mm ×2" -> "Hole 1 (⌀9.0mm ×2, through)"
             mode = ("through" if "Through" in nm
                     else "blind" if "Blind" in nm else "")
-            rest = _re.sub(r"(Through|Blind|Tangent)?\s*Hole(\s+Pattern)?",
+            rest = _re.sub(r"(Through|Blind|Tangent)?\s*Holes?(\s+Pattern)?",
                            "", nm)
             rest = rest.replace("(", "").replace(")", "").strip()
             # drop a bare leading hole index ("2 level 1") but never a
@@ -3991,17 +4070,47 @@ def _build_stepwise(
     # on the rounded corners) when the parametric corners+fillets are carried —
     # the same source the solid and the Onshape sketch use. Holes chord their
     # own (already finely sampled) points.
+    # REVOLVE base: the lathe solid replaces the extruded slab as the
+    # timeline's first feature; every cutter below still runs on it.
+    _revolved = revolve_base is not None
+    if _revolved and as_built_out is not None:
+        as_built_out["revolve_base"] = True
+
     _overlay_line_pts = []   # flat list of 3D points, consecutive PAIRS = a segment
     _overlay_arcs = []
-    _ol, _oa = _overlay_for_ring(
-        profiles[0], primary_axis, extrude_start,
-        corners=base_corners, fillets=base_fillets)
-    _overlay_line_pts.extend(_ol)
-    _overlay_arcs.extend(_oa)
-    for profile in base_inner_cutouts:
-        _il, _ia = _overlay_for_ring(profile, primary_axis, extrude_start)
-        _overlay_line_pts.extend(_il)
-        _overlay_arcs.extend(_ia)
+    if _revolved:
+        # A Revolve's sketch is its SIDE (lathe) profile in the half-plane
+        # through the axis — not the base-face circles.
+        try:
+            _rsg = revolve_base["sg"]
+            _rax_o = np.asarray(_rsg["axis_origin"], dtype=float)
+            _rax_d = np.asarray(_rsg["axis_dir"], dtype=float)
+            _rax_d = _rax_d / (np.linalg.norm(_rax_d) + 1e-12)
+            _rprof = _regularize_revolve_profile(
+                np.asarray(_rsg["profile"], dtype=float))
+            _rtmp = (np.array([1.0, 0, 0]) if abs(_rax_d[0]) < 0.9
+                     else np.array([0, 1.0, 0]))
+            _rrad = np.cross(_rax_d, _rtmp)
+            _rrad = _rrad / (np.linalg.norm(_rrad) + 1e-12)
+            _rloop = ([(float(_rprof[0, 0]), 0.0)]
+                      + [(float(h), float(r)) for h, r in _rprof]
+                      + [(float(_rprof[-1, 0]), 0.0)])
+            _rp3 = [_rax_o + _rax_d * h + _rrad * r for (h, r) in _rloop]
+            for _k in range(len(_rp3) - 1):
+                _overlay_line_pts.append([float(x) for x in _rp3[_k]])
+                _overlay_line_pts.append([float(x) for x in _rp3[_k + 1]])
+        except Exception:
+            logger.debug("revolve profile overlay failed", exc_info=True)
+    if not _overlay_line_pts:
+        _ol, _oa = _overlay_for_ring(
+            profiles[0], primary_axis, extrude_start,
+            corners=base_corners, fillets=base_fillets)
+        _overlay_line_pts.extend(_ol)
+        _overlay_arcs.extend(_oa)
+        for profile in base_inner_cutouts:
+            _il, _ia = _overlay_for_ring(profile, primary_axis, extrude_start)
+            _overlay_line_pts.extend(_il)
+            _overlay_arcs.extend(_ia)
 
     # Build a degenerate-triangle wireframe from the straight segments so the
     # is_sketch render path (which walks faces as edges) still shows the lines;
@@ -4036,12 +4145,6 @@ def _build_stepwise(
     # part extends both ways from the base plane, so both directions overlap it
     # equally and the tie sends the base the wrong way (into the bottom plate's
     # region). The base span has a definite direction, so use it.
-    # REVOLVE base: the lathe solid replaces the extruded slab as the
-    # timeline's first feature; every cutter below still runs on it.
-    _revolved = revolve_base is not None
-    if _revolved and as_built_out is not None:
-        as_built_out["revolve_base"] = True
-
     _ed = 1.0 if float(extrude_dir[primary_axis]) >= 0 else -1.0
     tgt_lo = min(extrude_start, extrude_start + _ed * depth)
     tgt_hi = max(extrude_start, extrude_start + _ed * depth)
@@ -4071,7 +4174,7 @@ def _build_stepwise(
         extrude_sign = depth
 
     if _revolved:
-        wp = revolve_base
+        wp = revolve_base["solid"]
         script_lines.append("# Step 2: Revolve (body of revolution)")
     else:
         script_lines.append(f"# Step 2: Extrude {depth:.2f} mm")
@@ -4165,13 +4268,15 @@ def _build_stepwise(
                     _cl, primary_axis, extrude_start)
                 _sv_rb = (np.asarray(_ol_rb, np.float64)
                           if _ol_rb else np.zeros((0, 3)))
-                _sf_rb = np.array(
-                    [[2 * k, 2 * k + 1, 2 * k]
-                     for k in range(len(_sv_rb) // 2)], dtype=np.int64)
+                # Sketch step = the CURRENT solid with the circle overlaid
+                # (a wireframe-only step floats detached from the part).
+                _bv_rb, _bf_rb = _tessellate_solid(wp, fast=True)
                 steps.append(ConstructionStep(
                     name=f"Sketch Hole {_ci}",
-                    tess_vertices=_sv_rb, tess_faces=_sf_rb, volume=0.0,
-                    overlay_arcs=_oa_rb or None,
+                    tess_vertices=np.asarray(_bv_rb, np.float64),
+                    tess_faces=np.asarray(_bf_rb, np.int64),
+                    volume=abs(float(wp.val().Volume())),
+                    sketch_overlay=_sv_rb, overlay_arcs=_oa_rb or None,
                 ))
                 _cut_rb = (cq.Workplane(plane_name, origin=tuple(_o_rb))
                            .polyline([(float(a), float(b))

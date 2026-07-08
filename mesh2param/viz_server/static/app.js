@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim6 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260707-anim7 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -1034,7 +1034,14 @@ const LiveBuild = (() => {
         _treeAdd(data.name, idx, data.volume);
         if (data.is_sketch && !data.sketch_overlay) {
           // Pure sketch (just construction lines): keep the prior solid on
-          // screen, flash the label, advance quickly.
+          // screen, flash the label, advance quickly. Record the sketch
+          // PLANE so the following feature can animate — skipping this left
+          // _paneLastPlane null and the base extrude fell back to a fade
+          // ("the extrusion animation doesn't play during the pipeline").
+          try {
+            const pl = sketchPlaneFromOverlay(data.vertices, data.overlay_arcs);
+            if (pl) _paneLastPlane = pl;
+          } catch (e) {}
           if (sub) sub.textContent = (data.name || '') + '  ·  ' + (idx + 1) + '/' + targetCount;
           await _sleep(160);
           continue;
@@ -1197,7 +1204,9 @@ function _syncMainCamera(pos, target) {
 // clipping planes over the (previous solid, new solid) pair — the new solid is
 // identical to the old outside the feature, so sweeping a clip plane reads as
 // the feature itself growing/cutting.
-const FEATURE_ANIM_MS = 450;
+const FEATURE_ANIM_MS = 800;           // pacing budget (longest kind)
+// Per-kind durations: growth reads slower than removal; fades are brief.
+const FEATURE_ANIM_DUR = { add: 800, revolve: 800, cut: 600, fade: 400 };
 let _featAnim = null;          // { raf, cleanup }
 
 function cancelFeatureAnim() {
@@ -1390,7 +1399,7 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
     newMesh.material.transparent = true;
     newMesh.material.opacity = 0.0;
     const tick = () => {
-      const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_MS);
+      const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_DUR.fade);
       newMesh.material.opacity = t;
       if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
       else finish();
@@ -1427,7 +1436,7 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
     newMesh.material.clippingPlanes = [p1, p2];
     setTheta(0.02);
     const tick = () => {
-      const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_MS);
+      const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_DUR.revolve);
       setTheta(Math.max(0.02, t * 2 * Math.PI * 0.999));
       if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
       else finish();
@@ -1468,8 +1477,10 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
   }
   target.material.clippingPlanes = [clip];
   target.material.needsUpdate = true;
+  const sweepDur = (kind === 'cut' && prevMesh)
+    ? FEATURE_ANIM_DUR.cut : FEATURE_ANIM_DUR.add;
   const tick = () => {
-    const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_MS);
+    const t = Math.min(1, (performance.now() - t0) / sweepDur);
     const L = start + (end - start) * t;
     clip.constant = -(clip.normal.getComponent(ax)) * L;
     if (t < 1) _featAnim.raf = requestAnimationFrame(tick);
@@ -1482,6 +1493,12 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
 // the sketch step displayed just before it).
 let _mainLastSketchPlane = null;
 let _mainLastStepIndex = -2;
+window._mainDbg = () => ({
+  kids: modelGroup.children.map(c => c.type + (c.userData && c.userData.solidStep ? ':S' : '')
+    + ':' + (c.visible ? 'v' : 'H')),
+  gv: modelGroup.visible, sv: scene.children.length,
+  cam: camera.position.toArray().map(v => Math.round(v)),
+});
 
 async function loadStep(index) {
   console.debug('[loadStep]', index, 'of', steps.length, 'jobId:', currentJobId);
@@ -1763,8 +1780,10 @@ window.playBuildAnimation = async function() {
   btn.classList.add('playing');
   btn.querySelector('i').className = 'ri-stop-fill';
 
+  const _playT0 = performance.now();
   for (let i = 0; i < steps.length; i++) {
     if (!_animPlaying) break;
+    console.debug('[play] step', i, 'at', Math.round(performance.now() - _playT0), 'ms');
     try {
       await loadStep(i);
     } catch (e) {

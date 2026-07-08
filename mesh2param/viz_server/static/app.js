@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim4 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260707-anim5 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -952,8 +952,13 @@ const LiveBuild = (() => {
       const effKind = (kind === 'revolve' || kind === 'fade'
                        || kind === 'blend') ? kind
         : (_paneLastPlane ? kind : 'fade');
-      animateFeatureTransition(group, prevSolid, solid, effKind,
-                               _paneLastPlane, renderer);
+      try {
+        animateFeatureTransition(group, prevSolid, solid, effKind,
+                                 _paneLastPlane, renderer);
+      } catch (e) {
+        console.error('[LiveBuild] feature animation failed', e);
+        if (prevSolid && prevSolid.parent) prevSolid.parent.remove(prevSolid);
+      }
     }
   }
 
@@ -1049,6 +1054,7 @@ const LiveBuild = (() => {
   function show() {
     ensure();
     if (started && document.body.classList.contains('live-split')) return;
+    if (document.body.classList.contains('live-full')) return;
     started = true;
     document.body.classList.remove('live-full');
     document.body.classList.add('live-split');
@@ -1734,12 +1740,18 @@ window.playBuildAnimation = async function() {
   btn.classList.add('playing');
   btn.querySelector('i').className = 'ri-stop-fill';
 
-  const stepDelay = 350; // 350ms per feature
-
   for (let i = 0; i < steps.length; i++) {
     if (!_animPlaying) break;
-    await loadStep(i);
-    await new Promise(r => setTimeout(r, stepDelay));
+    try {
+      await loadStep(i);
+    } catch (e) {
+      console.error('[play] step', i, 'failed — continuing', e);
+    }
+    // Sketches are brief context; feature steps hold until their 0.45s
+    // animation has fully played (350ms pace was cutting every sweep off).
+    const nm = (steps[i] && steps[i].name) || '';
+    const isSk = /^sketch/i.test(nm);
+    await new Promise(r => setTimeout(r, isSk ? 300 : FEATURE_ANIM_MS + 400));
   }
 
   _animPlaying = false;

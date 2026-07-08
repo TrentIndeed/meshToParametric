@@ -8987,6 +8987,7 @@ def _itemize_solid_swap(pre_solid, target_solid, cleaned,
             cur = start_solid
             steps = []
             prev_vol = _solid_volume(cur)
+            _emitted = 0
             for op in ops:
                 patch = _refine_op_to_solid(op, cq)
                 if patch is None:
@@ -8998,7 +8999,8 @@ def _itemize_solid_swap(pre_solid, target_solid, cleaned,
                     continue
                 vol = _solid_volume(nxt)
                 dv = abs(vol - prev_vol)
-                if dv >= 0.004 * mesh_volume:
+                if dv >= 0.004 * mesh_volume and _emitted < 8:
+                    _emitted += 1
                     try:
                         seg = _refine_op_sketch_segments(op, patch)
                         if seg is not None and len(seg):
@@ -9079,6 +9081,15 @@ def _itemize_solid_swap(pre_solid, target_solid, cleaned,
                 logger.info(
                     "Swap itemization did not improve: ops IoU %.3f vs "
                     "pre %.3f / swap %.3f", iou_ops, iou_pre, iou_swap)
+                return None, None
+            # Quality floor: itemized features may cost a LITTLE fit vs
+            # the opaque swap (the lid traded 0.056) but not a lot — the
+            # pillow block's boxes captured so little that adopting them
+            # cost 0.18 IoU. Past the floor, correct geometry wins.
+            if iou_ops < iou_swap - 0.06:
+                logger.info(
+                    "Swap itemization too lossy: ops IoU %.3f vs swap "
+                    "%.3f — keeping the swap", iou_ops, iou_swap)
                 return None, None
             logger.info(
                 "Arbiter swap itemized: %d step(s), IoU %.3f (pre %.3f, "
@@ -9317,6 +9328,7 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
             try:
                 cur = solid
                 prev_vol = _solid_volume(cur)
+                _emitted = 0
                 for op in ops:
                     patch = _refine_op_to_solid(op, cq)
                     if patch is None:
@@ -9334,7 +9346,13 @@ def _residual_refine_solid(solid, cleaned: CleanedMesh, mesh_volume: float,
                         continue
                     vol = _solid_volume(nxt)
                     dv = abs(vol - prev_vol)
-                    if dv >= 0.004 * mesh_volume:
+                    # Cap the ITEMIZED steps: a badly-fit part can accept
+                    # 30+ refine boxes (the pillow block hit 34) — each
+                    # emitted pair costs two tessellations and floods the
+                    # tree. The largest ops come first (greedy); the tail
+                    # folds into the following steps' geometry.
+                    if dv >= 0.004 * mesh_volume and _emitted < 8:
+                        _emitted += 1
                         try:
                             _seg = _op_sketch_segments(op, patch)
                             if _seg is not None and len(_seg):

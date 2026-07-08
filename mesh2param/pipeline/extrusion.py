@@ -1570,6 +1570,63 @@ def plan_extrusions_components(
                     continue
             kept.append(s)
         segments = sorted(kept, key=lambda s: -s.area)
+    # GAP-TILING: coaxial slabs must tile their axis with no dead bands —
+    # the tracker ends a segment where the section stops matching (rounded
+    # transitions on AI meshes), leaving a GAP that builds as a FLOATING
+    # join (the pillow block's base ended at y=10.5 while the back slab
+    # started at 16.4). Fill each gap with a NEW segment whose profile is
+    # the mesh's ACTUAL section at the gap midpoint — extending a neighbor
+    # instead inflated the pillow block by 26k mm³ (its base footprint is
+    # 3× the gap band's true section).
+    if len(segments) >= 2:
+        ax0 = segments[0].axis_idx
+        coax = sorted((s for s in segments if s.axis_idx == ax0),
+                      key=lambda s: min(s.start, s.end))
+        gap_fills = []
+        for a, b in zip(coax, coax[1:]):
+            a_lo, a_hi = sorted((a.start, a.end))
+            b_lo, b_hi = sorted((b.start, b.end))
+            gap = b_lo - a_hi
+            if not (0.3 < gap <= 8.0):
+                continue
+            filled = False
+            try:
+                polys = _slice_components(mesh, ax0, a_hi + 0.5 * gap)
+                if polys:
+                    big = max(polys, key=lambda p: p.area)
+                    prof = [(float(x), float(y))
+                            for x, y in big.exterior.coords[:-1]]
+                    if len(prof) >= 3 and big.area > 1.0:
+                        d = np.zeros(3)
+                        d[ax0] = 1.0
+                        gap_fills.append(ExtrusionSegment(
+                            axis_idx=ax0, direction=d,
+                            start=float(a_hi), end=float(b_lo),
+                            profile=prof, area=float(big.area)))
+                        filled = True
+                        logger.info(
+                            "Filled %.1fmm slab gap on axis %d with its "
+                            "own section (area %.0f)", gap, ax0, big.area)
+            except Exception:
+                logger.debug("gap-fill section failed", exc_info=True)
+            if not filled:
+                # fall back: extend the SMALLER neighbor (less wrong
+                # volume than the big base footprint)
+                grow = a if a.area <= b.area else b
+                logger.info(
+                    "Closing %.1fmm slab gap on axis %d (extending the "
+                    "smaller segment)", gap, ax0)
+                if grow is a:
+                    if a.end >= a.start:
+                        a.end = b_lo
+                    else:
+                        a.start = b_lo
+                else:
+                    if b.end >= b.start:
+                        b.start = a_hi
+                    else:
+                        b.end = a_hi
+        segments.extend(gap_fills)
     return ExtrusionPlan(
         segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
     )

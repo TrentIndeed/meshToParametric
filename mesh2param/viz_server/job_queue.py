@@ -799,6 +799,11 @@ except BaseException as _exc:
                     (tree, cleaned, all_body_results, decomposition, []), f)
             os.replace(p + ".tmp", p)
             bundle['input_written'] = True
+            # The build's time budget starts NOW, not at pre-warm: the
+            # subprocess idles through the whole analysis phase, and heavy
+            # parts (pillow block: arbiter + transplant + itemization) were
+            # burning analysis minutes out of their 600s and timing out.
+            bundle['deadline'] = time.time() + 900.0
             bundle['job'].building_live = True  # build is starting -> show pane
             # Durable copy for interactive re-builds (feature tree editing): the
             # /api/job/{id}/edit endpoint loads this, mutates the tree, and
@@ -1751,7 +1756,7 @@ except BaseException as _exc:
                         # handler preserve it for offline replay.
                         Path(tmp_out.name).unlink(missing_ok=True)
                         raise RuntimeError(
-                            f"CadQuery subprocess timed out after 600s; "
+                            f"CadQuery subprocess timed out after 900s; "
                             f"see {cad_log_path}"
                         )
             finally:

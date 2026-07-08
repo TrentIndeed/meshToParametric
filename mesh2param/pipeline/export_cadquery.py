@@ -1117,10 +1117,26 @@ def export_cadquery(
                     # cut/add features applied to the recognition solid.
                     # Only if itemization fails badly does the plain swap
                     # remain (and surfaces as the catch-all boolean).
+                    # When the TRANSPLANT won and already carries itemized
+                    # refine steps, re-itemizing the swap is pure duplicate
+                    # work (minutes of box-carving the pillow block then
+                    # discarded by the quality floor) — the tp_steps below
+                    # give the tree its real features.
                     _swap_itemized = False
                     try:
-                        _it_solid, _it_steps = _itemize_solid_swap(
-                            _recog_solid, solid, cleaned, mesh_volume)
+                        _skip_itemize = (best_name == "transplant"
+                                         and bool(tp_steps))
+                    except Exception:
+                        _skip_itemize = False
+                    if _skip_itemize:
+                        logger.info(
+                            "Transplant won with %d itemized refine "
+                            "step(s) — skipping swap itemization",
+                            len(tp_steps))
+                    try:
+                        _it_solid, _it_steps = ((None, None) if _skip_itemize
+                                                else _itemize_solid_swap(
+                            _recog_solid, solid, cleaned, mesh_volume))
                         if _it_solid is not None:
                             solid = _it_solid
                             fb_vol = _solid_volume(solid)
@@ -9033,6 +9049,18 @@ def _itemize_solid_swap(pre_solid, target_solid, cleaned,
 
         cur_solid = pre_solid
         cur_score = _mesh_score(cur_solid)
+        _iou_swap_early = mesh_iou_exact(mesh, tgt) if use_iou else None
+        # Pre-bail: when the pre-swap solid is ALREADY far below the swap,
+        # ≤8 emitted boxes per round can never recover enough to clear the
+        # 0.06 quality floor (pillow block: pre 0.32 vs swap 0.81 — round 1
+        # alone cost minutes and its 600s timeout). Don't even start.
+        if (_iou_swap_early is not None
+                and cur_score < _iou_swap_early - 0.35):
+            logger.info(
+                "Swap itemization skipped: pre-swap fit %.3f too far "
+                "below the swap %.3f for ops to recover", cur_score,
+                _iou_swap_early)
+            return None, None
         all_steps: list = []
         for _round in range(3):
             _cur_tm = _tm(cur_solid)
@@ -9067,6 +9095,17 @@ def _itemize_solid_swap(pre_solid, target_solid, cleaned,
                         "%.0f), score %.3f, +%d step(s)", _round + 1,
                         _solid_volume(cur_solid), v_tgt, cur_score,
                         len(round_best[2]))
+            # Hopeless bail: when round 1 lands FAR below the swap, later
+            # rounds never close enough of the gap to clear the 0.06
+            # quality floor (pillow block: 0.321 → 0.639 vs swap 0.809,
+            # minutes wasted then discarded). Cut the losses now.
+            if (_round == 0 and _iou_swap_early is not None
+                    and cur_score < _iou_swap_early - 0.25):
+                logger.info(
+                    "Swap itemization round 1 far below the swap "
+                    "(%.3f vs %.3f) — bailing early", cur_score,
+                    _iou_swap_early)
+                return None, None
         if not all_steps:
             return None, None
         # Adopt whenever the itemized result IMPROVES on the pre-swap
@@ -9075,7 +9114,7 @@ def _itemize_solid_swap(pre_solid, target_solid, cleaned,
         # plain swap.
         if use_iou:
             iou_pre = mesh_iou_exact(mesh, pre)
-            iou_swap = mesh_iou_exact(mesh, tgt)
+            iou_swap = _iou_swap_early
             iou_ops = mesh_iou_exact(mesh, _tm(cur_solid))
             if iou_ops < iou_pre + 0.005:
                 logger.info(

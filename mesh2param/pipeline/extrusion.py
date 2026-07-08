@@ -1627,6 +1627,126 @@ def plan_extrusions_components(
                     else:
                         b.end = a_hi
         segments.extend(gap_fills)
+    # BAND REFINEMENT: a segment whose stored profile is a UNION HULL of a
+    # changing cross-section (the pillow block's base: 4391mm² footprint
+    # over bands whose true sections are 1770/2950/3270/1330) builds far
+    # too much material. Split such segments at the section-area plateaus
+    # and give each band the mesh's ACTUAL section profile — this is how
+    # a CAD user models a stacked part: one sketch per band, all on one
+    # axis (ring | square | wings | square | ring).
+    segments = _reband_axis(segments, mesh)
     return ExtrusionPlan(
         segments=segments, coverage_frac=coverage, voxel_pitch=pitch,
     )
+
+
+def _reband_axis(segments: list, mesh: trimesh.Trimesh) -> list:
+    """Re-band ALL coaxial slabs from the measured section-area profile
+    when any of them carries a hull-inflated footprint.
+
+    The tracker can hand a changing cross-section ONE union-hull profile
+    (the pillow block's base: 4391mm² over bands whose true sections are
+    1770/2950/3270/1330), which builds 30-60% extra material. When that
+    is detected, the whole axis is re-split at its area plateaus and each
+    band gets the mesh's ACTUAL section — the way a CAD user models a
+    stacked turned/blocked part: ring | square | wings | square | ring,
+    one sketch per band on one axis."""
+    try:
+        if not segments:
+            return segments
+        ax0 = segments[0].axis_idx
+        coax = [g for g in segments if g.axis_idx == ax0]
+        rest = [g for g in segments if g.axis_idx != ax0]
+        if rest or len(coax) < 1:
+            return segments          # multi-axis plans: leave alone
+        lo = min(min(g.start, g.end) for g in coax)
+        hi = max(max(g.start, g.end) for g in coax)
+        span = hi - lo
+        if span < 8.0:
+            return segments
+        n = max(16, min(48, int(span / 1.0)))
+        ts = np.linspace(lo + 0.5, hi - 0.5, n)
+        areas = np.zeros(n)
+        npoly = np.zeros(n, dtype=int)
+        for i, t in enumerate(ts):
+            polys = _slice_components(mesh, ax0, float(t))
+            areas[i] = sum(p.area for p in polys) if polys else 0.0
+            npoly[i] = len(polys)
+        good = areas[areas > 1.0]
+        if len(good) < 6:
+            return segments
+        # Multi-component sections (a plate plus separate screws) are the
+        # component tracker's job, not banding's — bail.
+        if int(np.max(npoly)) > 1:
+            return segments
+        # Only intervene when some segment is hull-inflated vs the true
+        # sections over its own span.
+        amax = float(np.max(good))
+
+        def _true_p25(g):
+            # 25th percentile, NOT the median: a footprint smeared across
+            # a big band and a small band has a median inside the big
+            # plateau (the pillow block's 4391 vs median 4200 — looked
+            # honest), while a quarter of its span is a 2577 square.
+            g_lo, g_hi = sorted((g.start, g.end))
+            m2 = (ts >= g_lo) & (ts <= g_hi) & (areas > 1.0)
+            return (float(np.percentile(areas[m2], 25.0))
+                    if int(m2.sum()) >= 4 else None)
+
+        inflated = False
+        for g in coax:
+            p25 = _true_p25(g)
+            if p25 and g.area > 1.3 * p25:
+                inflated = True
+                break
+        if not inflated:
+            return segments
+        # Plateau runs: consecutive samples within 8% of the running
+        # median; ramps between runs get split at their midpoint.
+        runs = []          # (i0, i1_exclusive, median)
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and abs(areas[j] - float(np.median(areas[i:j])))                     <= 0.08 * amax:
+                j += 1
+            runs.append((i, j, float(np.median(areas[i:j]))))
+            i = j
+        plateaus = [r for r in runs if (r[1] - r[0]) >= 2 and r[2] > 1.0]
+        if not (2 <= len(plateaus) <= 6):
+            return segments
+        bands = []
+        for k, (i0, i1, med) in enumerate(plateaus):
+            t0 = lo if k == 0 else 0.5 * (ts[plateaus[k - 1][1] - 1]
+                                          + ts[i0])
+            t1 = hi if k == len(plateaus) - 1 else 0.5 * (
+                ts[i1 - 1] + ts[plateaus[k + 1][0]])
+            if t1 - t0 < 1.5:
+                return segments
+            bands.append((t0, t1, i0, i1))
+        out = []
+        d = np.zeros(3)
+        d[ax0] = 1.0
+        for (t0, t1, i0, i1) in bands:
+            mid = float(ts[(i0 + i1 - 1) // 2])
+            polys = _slice_components(mesh, ax0, mid)
+            if not polys:
+                return segments
+            big = max(polys, key=lambda p: p.area)
+            prof = [(float(x), float(y))
+                    for x, y in big.exterior.coords[:-1]]
+            if len(prof) < 3 or big.area <= 1.0:
+                return segments
+            out.append(ExtrusionSegment(
+                axis_idx=ax0, direction=d.copy(),
+                start=float(t0), end=float(t1),
+                profile=prof, area=float(big.area)))
+        logger.info(
+            "Re-banded axis %d into %d true-section slabs: %s", ax0,
+            len(out), [f"{g.area:.0f}@{g.length:.1f}mm" for g in out])
+        return sorted(out, key=lambda g: -(g.area * abs(g.length)))
+    except Exception:
+        logger.debug("axis re-banding failed", exc_info=True)
+        return segments
+    except Exception:
+        logger.debug("band refinement failed", exc_info=True)
+        return [seg]

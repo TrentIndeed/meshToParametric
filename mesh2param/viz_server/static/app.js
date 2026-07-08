@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim5 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260707-anim6 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -702,6 +702,7 @@ function _renderProgressGeometry(pg) {
 // the CAD model accretes feature-by-feature as construction steps stream in
 // from the build subprocess. Self-contained: its own renderer/scene/camera so
 // it never touches the main viewer's state.
+window.LiveBuild = null;  // exposed after module init (e2e/debug access)
 const LiveBuild = (() => {
   let pane, renderer, scene, camera, controls, group, sub, treeList;
   let started = false, frameDone = false, userOrbited = false, userPaused = false;
@@ -798,14 +799,19 @@ const LiveBuild = (() => {
     group.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x58A6FF })));
     _addOverlayArcs(data.overlay_arcs);
     group.position.set(0, 0, 0);
-    const box = new THREE.Box3().setFromObject(group);
-    group.position.sub(box.getCenter(new THREE.Vector3()));
+    if (_paneCenter) {
+      group.position.sub(_paneCenter);
+    } else {
+      const box = new THREE.Box3().setFromObject(group);
+      group.position.sub(box.getCenter(new THREE.Vector3()));
+    }
   }
   // Animation pump state: steps stream in (targetCount grows); the pump walks
   // shownIdx up to targetCount one step at a time with a delay, so features
   // visibly pop in one-by-one instead of jumping straight to the final solid.
   let targetCount = 0, shownIdx = -1, pumping = false, curJob = null;
   let _paneLastPlane = null;   // sketch plane feeding the feature animations
+  let _paneCenter = null;      // model centre, locked per job
   const STEP_MS = 480;
 
   function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -931,10 +937,21 @@ const LiveBuild = (() => {
     // Centre on the NEW solid alone — the previous solid kept for the
     // animation would otherwise skew the bbox at cut steps and make the
     // model shift a little between steps.
+    // ONE fixed centre for the whole job, locked on the first real solid.
+    // Recentring per step oscillated: sketch steps in older jobs carry an
+    // EMPTY solid tessellation, so their box centre is (0,0,0) while
+    // feature steps subtract the true centre — the model jumped ~26mm
+    // toward/away from the camera every other step ("zooming in and out
+    // over and over").
     group.position.set(0, 0, 0);
-    const box = new THREE.Box3().setFromObject(solid);
-    const center = box.getCenter(new THREE.Vector3());
-    group.position.sub(center);
+    if (!_paneCenter) {
+      const box = new THREE.Box3().setFromObject(solid);
+      if (!box.isEmpty()) {
+        const c = box.getCenter(new THREE.Vector3());
+        if (c.lengthSq() > 1e-9 || numFaces > 0) _paneCenter = c;
+      }
+    }
+    if (_paneCenter) group.position.sub(_paneCenter);
     if (frame) _reframe();
     // Feature build animation (0.25s) against the previous solid.
     const kind = classifyStepKind(data.name || '');
@@ -1124,6 +1141,7 @@ const LiveBuild = (() => {
 
   function reset() {
     targetCount = 0; shownIdx = -1; frameDone = false; curJob = null;
+    _paneCenter = null; _paneLastPlane = null;
     userOrbited = false; userPaused = false;
     if (group) _clearGroup();
     if (sub) sub.textContent = '';
@@ -1133,8 +1151,13 @@ const LiveBuild = (() => {
   }
 
   window.addEventListener('resize', () => { if (started) resize(); });
-  return { show, hide: dismiss, dismiss, update, reset, expandToFull, isActive, resize };
+  const _dbg = () => ({ gp: group ? group.position.toArray() : null,
+    cam: camera ? camera.position.toArray() : null,
+    tgt: controls ? controls.target.toArray() : null,
+    kids: group ? group.children.length : 0 });
+  return { show, hide: dismiss, dismiss, update, reset, expandToFull, isActive, resize, _dbg };
 })();
+window.LiveBuild = LiveBuild;
 
 // Keep both renderers sized correctly DURING the CSS split/expand transition
 // (~0.45s) so the model glides from center to the left half instead of

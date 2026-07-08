@@ -4507,6 +4507,16 @@ def _build_stepwise(
             _vol_pre_join = abs(float(wp.val().Volume()))
             _wp_joined_j = wp.union(best_wpj)
             _dv_j = abs(float(_wp_joined_j.val().Volume())) - _vol_pre_join
+            # A union can only ADD material. A materially negative delta
+            # means OCC produced a corrupt boolean (a self-intersecting
+            # join profile) — keep the pre-union solid and its step out
+            # of the tree rather than shipping the wreckage.
+            if _dv_j < -1.0:
+                steps.pop()          # the Sketch Join step just appended
+                logger.warning(
+                    "Join %d union corrupted the solid (dv %.0f mm^3); "
+                    "skipped", ji, _dv_j)
+                continue
             # On scan/AI meshes a join that adds ~nothing is a deformed
             # corner NUB (the bezel frame's four sub-2mm "screws", 4-12mm³
             # each on an 11,400mm³ part) — mesh noise, not a feature. Drop

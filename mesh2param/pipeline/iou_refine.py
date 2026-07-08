@@ -221,6 +221,18 @@ def _to_manifold(mesh):
     if wrapped is not None:
         w = _conv(wrapped)
         if w is not None:
+            # Same volume-consistency check the direct path gets: the
+            # alpha-wrap of a seam-cracked (T-junction) tessellation can
+            # distort badly, and feeding that into the boolean silently
+            # reports IoU≈0 for a perfectly sound solid (the pillow
+            # block's stacked-band tess read 0.034 at +9% volume).
+            # Inconsistent wrap -> None -> callers voxel-fallback.
+            try:
+                raw = abs(float(mesh.volume))
+                if raw > 0 and not (0.85 <= w.volume() / raw <= 1.15):
+                    return None
+            except Exception:
+                pass
             return w
     return direct
 

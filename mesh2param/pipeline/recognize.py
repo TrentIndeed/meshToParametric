@@ -148,9 +148,13 @@ def recognize_features(
 
             def _seg_inner(seg):
                 try:
-                    return [[list(p) for p in ring]
-                            for ring in segment_inner_rings(cleaned, seg)]
+                    _rings = [[list(p) for p in ring]
+                              for ring in segment_inner_rings(cleaned, seg)]
+                    logger.debug("JOIN inner rings: span %.1f..%.1f -> %d",
+                                 seg.start, seg.end, len(_rings))
+                    return _rings
                 except Exception:
+                    logger.debug("JOIN inner rings failed", exc_info=True)
                     return []
 
             if config.use_component_planner:
@@ -362,6 +366,14 @@ def recognize_features(
     # geometry, the way Onshape models a rounded outline (lines + tangent arcs).
     _attach_arc_segments(features)
 
+    # A bore that runs through several stacked bands is ONE physical hole:
+    # unify near-matching coaxial inner circles across the band sketches to
+    # the shared median circle. Nearly-equal (but not equal) radii leave
+    # razor-thin annular ledges at every band boundary, and the OCC unions
+    # shatter the shell (the pillow block's final tessellation came back as
+    # fragments — exact IoU 0.04 on a +9% solid).
+    _unify_coaxial_inner_rings(features)
+
     # Build dependency DAG
     dep_graph = nx.DiGraph()
     for i, f in enumerate(features):
@@ -444,6 +456,114 @@ def _thin_axis_tapered(verts: np.ndarray, bbox: np.ndarray, axis: int,
     if max(a_min, a_max) < 1e-9:
         return False
     return (min(a_min, a_max) / max(a_min, a_max)) < ratio_thresh
+
+
+def _unify_coaxial_inner_rings(features: list) -> None:
+    """Coaxial circular inner rings across stacked band sketches are ONE
+    physical bore, not N per-band cutouts.
+
+    Baking the bore into every band leaves coincident/near-coincident
+    cylinder walls at each band interface — OCC unions produce sliver
+    faces and a cracked (T-junction) tessellation the IoU arbiter can't
+    measure. So: a coaxial cluster spanning (nearly) the whole stack is
+    LIFTED out of the band sketches and emitted as one real THROUGH_HOLE
+    feature cut through the finished stack — exactly how a CAD user
+    models it. Partial-span clusters stay baked but get unified to the
+    shared median circle (identical walls fuse far better than nearly-
+    equal ones).
+    """
+    entries = []          # [sg, ring_idx, cx, cy, r, axis, span]
+    all_spans = []
+    for f in features:
+        sg = f.sketch_geometry or {}
+        span = sg.get("span")
+        if span:
+            all_spans.append((float(span[0]), float(span[1])))
+        axis = sg.get("axis_idx")
+        if axis is None and f.type == FeatureType.BASE_EXTRUSION:
+            try:
+                axis = int(np.argmax(np.abs(np.asarray(f.direction))))
+            except Exception:
+                axis = None
+        for i, ring in enumerate(sg.get("inner") or []):
+            P = np.asarray(ring, dtype=float)
+            if len(P) < 8:
+                continue
+            c = P.mean(axis=0)
+            rr = np.linalg.norm(P - c, axis=1)
+            r = float(rr.mean())
+            if r <= 0 or float(rr.std()) > 0.08 * r:
+                continue          # not circular; leave windows alone
+            entries.append([sg, i, float(c[0]), float(c[1]), r, axis, span])
+    if not entries:
+        return
+    ext_lo = min(s[0] for s in all_spans) if all_spans else None
+    ext_hi = max(s[1] for s in all_spans) if all_spans else None
+    removals: dict[int, set] = {}         # id(sg) -> ring indices to delete
+    sg_by_id: dict[int, dict] = {}
+    used = [False] * len(entries)
+    for a in range(len(entries)):
+        if used[a]:
+            continue
+        used[a] = True
+        cluster = [entries[a]]
+        for b in range(a + 1, len(entries)):
+            if used[b]:
+                continue
+            ea, eb = entries[a], entries[b]
+            if (abs(ea[2] - eb[2]) < 1.5 and abs(ea[3] - eb[3]) < 1.5
+                    and abs(ea[4] - eb[4]) < 0.12 * max(ea[4], eb[4])):
+                cluster.append(eb)
+                used[b] = True
+        if len(cluster) < 2:
+            continue
+        cx = float(np.median([e[2] for e in cluster]))
+        cy = float(np.median([e[3] for e in cluster]))
+        r = float(np.median([e[4] for e in cluster]))
+        axis = next((e[5] for e in cluster if e[5] is not None), None)
+        spans = [e[6] for e in cluster if e[6]]
+        c_lo = min(float(s[0]) for s in spans) if spans else None
+        c_hi = max(float(s[1]) for s in spans) if spans else None
+        full_stack = (axis is not None and None not in
+                      (c_lo, c_hi, ext_lo, ext_hi)
+                      and (c_hi - c_lo) >= 0.85 * (ext_hi - ext_lo))
+        if full_stack:
+            u, v = [x for x in range(3) if x != axis]
+            centre3 = [0.0, 0.0, 0.0]
+            centre3[u], centre3[v] = cx, cy
+            centre3[axis] = 0.5 * (c_lo + c_hi)
+            d = np.zeros(3)
+            d[axis] = 1.0
+            features.append(Feature(
+                type=FeatureType.THROUGH_HOLE,
+                face_indices=np.array([], dtype=np.int64),
+                sketch_geometry={"type": "circle", "center": centre3,
+                                 "radius": r},
+                depth=float(c_hi - c_lo),
+                direction=d,
+                operation="REMOVE",
+                dependencies=[0],
+            ))
+            for e in cluster:
+                sid = id(e[0])
+                sg_by_id[sid] = e[0]
+                removals.setdefault(sid, set()).add(e[1])
+            logger.info(
+                "Lifted %d-band coaxial bore at (%.1f, %.1f) r=%.2f into "
+                "one through hole", len(cluster), cx, cy, r)
+        else:
+            th = np.linspace(0.0, 2.0 * np.pi, 49)[:-1]
+            circle = [[float(cx + r * np.cos(t)), float(cy + r * np.sin(t))]
+                      for t in th]
+            for e in cluster:
+                e[0]["inner"][e[1]] = [list(p) for p in circle]
+            logger.info(
+                "Unified %d coaxial inner rings at (%.1f, %.1f) to r=%.2f",
+                len(cluster), cx, cy, r)
+    for sid, idxs in removals.items():
+        sg = sg_by_id[sid]
+        sg["inner"] = [ring for i, ring in enumerate(sg.get("inner") or [])
+                       if i not in idxs]
 
 
 def _attach_arc_segments(features: list) -> None:

@@ -532,7 +532,14 @@ def segment_inner_rings(
             p = Polygon(np.column_stack([ring3d[:, ax_u], ring3d[:, ax_v]]))
             if not p.is_valid:
                 p = p.buffer(0)
-            if not p.is_empty and p.area > 0.1:
+                # buffer(0) on a self-intersecting jagged loop can return
+                # a MultiPolygon; keep the dominant piece — downstream
+                # needs .exterior, and one bad ring must not throw away
+                # the band's real bore (the pillow block's squares lost
+                # their Ø30 bore to a sliver noise ring).
+                if p.geom_type == "MultiPolygon" and len(p.geoms):
+                    p = max(p.geoms, key=lambda g: g.area)
+            if not p.is_empty and p.geom_type == "Polygon" and p.area > 0.1:
                 loops.append(p)
         # A hole is a loop with ODD containment depth among the
         # SECTION's own loops — merely lying inside the segment outline
@@ -568,17 +575,34 @@ def segment_inner_rings(
     station_rings = [_station_rings(f) for f in (0.25, 0.5, 0.75)]
     out = []
     for p in station_rings[1]:
-        present_everywhere = all(
-            any(
-                p.intersection(q).area / max(p.union(q).area, 1e-9) > 0.7
-                for q in others
+        # One malformed ring must not throw away the band's real rings:
+        # everything per-ring stays inside this try.
+        try:
+            present_everywhere = all(
+                any(
+                    p.intersection(q).area / max(p.union(q).area, 1e-9) > 0.7
+                    for q in others
+                )
+                for others in (station_rings[0], station_rings[2])
             )
-            for others in (station_rings[0], station_rings[2])
-        )
-        if present_everywhere:
-            out.append([
-                (float(x), float(y)) for x, y in p.exterior.coords[:-1]
-            ])
+            if present_everywhere:
+                # Bores are circles by design intent: snap round rings to
+                # the fitted circle (jagged mesh loops self-intersect and
+                # break the profile face); leave windows/rects alone.
+                circ = 4.0 * np.pi * p.area / max(p.length ** 2, 1e-9)
+                if circ >= 0.85:
+                    c, r = p.centroid, float(np.sqrt(p.area / np.pi))
+                    th = np.linspace(0.0, 2.0 * np.pi, 49)[:-1]
+                    out.append([(float(c.x + r * np.cos(a)),
+                                 float(c.y + r * np.sin(a))) for a in th])
+                else:
+                    out.append([
+                        (float(x), float(y))
+                        for x, y in p.exterior.coords[:-1]
+                    ])
+        except Exception:
+            logger.debug("segment_inner_rings: skipping malformed ring",
+                         exc_info=True)
     return out
 
 
@@ -1726,6 +1750,12 @@ def _reband_axis(segments: list, mesh: trimesh.Trimesh) -> list:
         out = []
         d = np.zeros(3)
         d[ax0] = 1.0
+        # Honest gain fractions: the base-axis adoption gate in recognize
+        # requires segments[0].gain_frac >= 0.4 — leaving the default 0.0
+        # made the whole re-banded plan "inconclusive", so the BASE fell
+        # back to the legacy axis (a jagged side profile perpendicular to
+        # the slabs) while the bands became floating joins.
+        total_vol = float(abs(mesh.volume)) or 1.0
         for (t0, t1, i0, i1) in bands:
             mid = float(ts[(i0 + i1 - 1) // 2])
             polys = _slice_components(mesh, ax0, mid)
@@ -1736,10 +1766,27 @@ def _reband_axis(segments: list, mesh: trimesh.Trimesh) -> list:
                     for x, y in big.exterior.coords[:-1]]
             if len(prof) < 3 or big.area <= 1.0:
                 return segments
+            # A circular band (the pillow block's top/bottom collar rings)
+            # is a CIRCLE by design intent — and its jagged 200+ point
+            # mesh outline can self-intersect, which corrupts the join's
+            # OCC union (the bottom ring "added" -93k mm³ and got dropped
+            # as a nub). Snap round outlines to the fitted circle. The
+            # test is RADIAL deviation, not 4πA/P² circularity — a smooth
+            # ROUNDED SQUARE scores 0.85+ on perimeter circularity and got
+            # rebuilt as a cylinder poking 3.5mm past the part.
+            _P = np.asarray(prof, dtype=float)
+            _c = _P.mean(axis=0)
+            _rr = np.linalg.norm(_P - _c, axis=1)
+            _rm = float(_rr.mean())
+            if _rm > 0 and float(np.abs(_rr - _rm).max()) < 0.08 * _rm:
+                th = np.linspace(0.0, 2.0 * np.pi, 73)[:-1]
+                prof = [(float(_c[0] + _rm * np.cos(a)),
+                         float(_c[1] + _rm * np.sin(a))) for a in th]
             out.append(ExtrusionSegment(
                 axis_idx=ax0, direction=d.copy(),
                 start=float(t0), end=float(t1),
-                profile=prof, area=float(big.area)))
+                profile=prof, area=float(big.area),
+                gain_frac=float(min(1.0, big.area * (t1 - t0) / total_vol))))
         logger.info(
             "Re-banded axis %d into %d true-section slabs: %s", ax0,
             len(out), [f"{g.area:.0f}@{g.length:.1f}mm" for g in out])

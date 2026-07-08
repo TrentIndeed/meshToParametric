@@ -8,7 +8,7 @@ import { PLYLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/j
 import { ThreeMFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/3MFLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/fflate.module.js';
 
-console.log('%c[paramesh] app.js BUILD 20260707-anim7 loaded', 'color:#0969DA;font-weight:bold');
+console.log('%c[paramesh] app.js BUILD 20260708-anim8 loaded', 'color:#0969DA;font-weight:bold');
 console.debug('[init] app.js loading, Three.js revision:', THREE.REVISION);
 
 // Sample a sketch-overlay arc descriptor {ax,pos,cu,cv,r,a0,a1} into a smooth
@@ -1365,6 +1365,7 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
     newMesh.material.clipIntersection = false;
     newMesh.material.transparent = false;
     newMesh.material.opacity = 1.0;
+    newMesh.material.side = THREE.FrontSide;
     newMesh.material.needsUpdate = true;
     disposePrev();
     _featAnim = null;
@@ -1434,6 +1435,10 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
       newMesh.material.clipIntersection = th > Math.PI;
     };
     newMesh.material.clippingPlanes = [p1, p2];
+    // While a clip plane is active the cut face exposes the hollow
+    // interior; without this the open shell renders dark ("the lighting
+    // changes to the underside") until the clip is removed.
+    newMesh.material.side = THREE.DoubleSide;
     setTheta(0.02);
     const tick = () => {
       const t = Math.min(1, (performance.now() - t0) / FEATURE_ANIM_DUR.revolve);
@@ -1476,6 +1481,9 @@ function animateFeatureTransition(group, prevMesh, newMesh, kind, plane, rendere
     clip.normal.copy(e).negate();
   }
   target.material.clippingPlanes = [clip];
+  // Clipped cross-sections expose the hollow interior — render both faces
+  // so the inside is lit instead of culled dark for the sweep's duration.
+  target.material.side = THREE.DoubleSide;
   target.material.needsUpdate = true;
   const sweepDur = (kind === 'cut' && prevMesh)
     ? FEATURE_ANIM_DUR.cut : FEATURE_ANIM_DUR.add;

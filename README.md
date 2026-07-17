@@ -171,8 +171,8 @@ python -m mesh2param.viz_server.app
 Deploys via SSH to a Hetzner VPS running Docker + Caddy (port 8081), alongside operatorDashboard.
 
 ```bash
-# Deploy (VPS IP: 5.161.100.230)
-python deploy.py --ip 5.161.100.230 --domain parameshai.com
+# Deploy (VPS IP: YOUR_VPS_IP)
+python deploy.py --ip YOUR_VPS_IP --domain parameshai.com
 ```
 
 The deploy script will:
@@ -189,7 +189,7 @@ The deploy script will:
 ```bash
 # Start local server and deploy to VPS in parallel
 python -m mesh2param.viz_server.app &
-python deploy.py --ip 5.161.100.230 --domain parameshai.com
+python deploy.py --ip YOUR_VPS_IP --domain parameshai.com
 ```
 
 ## Key Libraries

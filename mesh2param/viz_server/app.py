@@ -1389,7 +1389,7 @@ async def contact_form(body: dict):
         smtp_port = int(os.getenv("SMTP_PORT", "587"))
         smtp_user = os.getenv("SMTP_USER", "")
         smtp_pass = os.getenv("SMTP_PASS", "")
-        notify_email = os.getenv("NOTIFY_EMAIL", "trentondragon02@gmail.com")
+        notify_email = os.getenv("NOTIFY_EMAIL", "")
 
         if smtp_user and smtp_pass:
             msg = MIMEText(f"From: {name} <{email}>\n\n{message}")

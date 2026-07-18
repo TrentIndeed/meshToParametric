@@ -1,5 +1,11 @@
 # Paramesh AI
 
+![Mesh to parametric CAD - L-bracket](docs/lbracket.png)
+*Left: raw triangulated mesh. Right: the reconstructed parametric CAD model with an editable feature tree.*
+
+![Mesh to parametric CAD - motor mount plate](docs/motormount.png)
+*A scanned motor-mount plate rebuilt as parametric CAD.*
+
 Reverse-engineering pipeline that converts triangulated mesh files (STL/OBJ/PLY/3MF) of prismatic mechanical parts into fully parametric CAD models. AI-powered feature recognition, construction timeline, and interactive web viewer.
 
 **Live at [parameshai.com](https://parameshai.com)**

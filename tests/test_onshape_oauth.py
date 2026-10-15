@@ -39,6 +39,37 @@ def test_decrypt_with_rotated_key_returns_none(monkeypatch):
     assert o.decrypt_token(ct) is None  # graceful -> reconnect
 
 
+def test_token_crypto_requires_configured_key(monkeypatch):
+    ct = o.encrypt_token("access-xyz")
+    monkeypatch.delenv("ONSHAPE_TOKEN_KEY")
+    monkeypatch.delenv("AUTH_SECRET", raising=False)
+    monkeypatch.setattr(o, "_load_dotenv_fallback", lambda: None)
+    with pytest.raises(o.OnshapeOAuthError, match="ONSHAPE_TOKEN_KEY or AUTH_SECRET"):
+        o.encrypt_token("access-xyz")
+    with pytest.raises(o.OnshapeOAuthError, match="ONSHAPE_TOKEN_KEY or AUTH_SECRET"):
+        o.decrypt_token(ct)
+
+
+def test_token_crypto_auth_secret_fallback(monkeypatch):
+    monkeypatch.delenv("ONSHAPE_TOKEN_KEY")
+    monkeypatch.setenv("AUTH_SECRET", "unit-test-auth-secret")
+    ct = o.encrypt_token("access-xyz")
+    assert o.decrypt_token(ct) == "access-xyz"
+    monkeypatch.setenv("ONSHAPE_TOKEN_KEY", "separate-token-key")
+    assert o.decrypt_token(ct) is None
+
+
+def test_token_crypto_loads_dotenv_key(monkeypatch):
+    monkeypatch.delenv("ONSHAPE_TOKEN_KEY")
+    monkeypatch.delenv("AUTH_SECRET", raising=False)
+    monkeypatch.setattr(
+        o, "_load_dotenv_fallback",
+        lambda: monkeypatch.setenv("ONSHAPE_TOKEN_KEY", "dotenv-test-key"),
+    )
+    ct = o.encrypt_token("access-xyz")
+    assert o.decrypt_token(ct) == "access-xyz"
+
+
 # ── bearer client ──
 
 def test_bearer_client_header():

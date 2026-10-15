@@ -9,7 +9,7 @@ services:
       # Docker Desktop Windows mount. On Linux either works; named is portable.
       - paramesh-data:/app/data
     environment:
-      - AUTH_SECRET=${AUTH_SECRET:-change-me-in-production}
+      - AUTH_SECRET=${AUTH_SECRET:?Set AUTH_SECRET to a strong private value before starting the service}
       - DATABASE_URL=sqlite:////app/data/mesh2param.db
     restart: unless-stopped
 

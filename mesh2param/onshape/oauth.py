@@ -84,13 +84,10 @@ def _fernet() -> Fernet:
             or os.environ.get("AUTH_SECRET")
         )
     if not secret:
-        # Dev-only ephemeral key: tokens won't survive a restart, so the
-        # user just reconnects. Never hit in prod (AUTH_SECRET is set).
-        logger.warning(
-            "No ONSHAPE_TOKEN_KEY/AUTH_SECRET; using an ephemeral token "
-            "encryption key (stored Onshape tokens will not persist).",
+        raise OnshapeOAuthError(
+            "Set ONSHAPE_TOKEN_KEY or AUTH_SECRET before storing or "
+            "reading Onshape tokens.",
         )
-        secret = "mesh2param-dev-ephemeral"
     key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
     return Fernet(key)
 
